@@ -116,6 +116,24 @@ install_payload() {
     mv "$tmp" "$dest"; chmod 644 "$dest"; info "wrote $dest"
     return 0
 }
+# The panels' font, served by the panels themselves: every font host worth
+# using is blocked or slow from Iran. The one payload that is not text, so it
+# travels as base64; its licence goes with it, as the licence asks.
+install_font() {
+    local dir=/usr/local/share/smart-dns tmp
+    mkdir -p "$dir"
+    tmp="$(mktemp)"
+    if payload FONT | base64 -d > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        note_file "$dir/Vazirmatn.woff2"
+        mv "$tmp" "$dir/Vazirmatn.woff2"; chmod 644 "$dir/Vazirmatn.woff2"
+    else
+        rm -f "$tmp"
+        warn "the panel font could not be unpacked - the pages use the system font"
+    fi
+    note_file "$dir/Vazirmatn-OFL.txt"
+    payload FONT_LICENSE > "$dir/Vazirmatn-OFL.txt"
+    chmod 644 "$dir/Vazirmatn-OFL.txt"
+}
 
 # Set KEY=VALUE in a shell-style config file, replacing the line if it is
 # already there and appending it if not. Used for the panel's config, which the
@@ -1589,8 +1607,27 @@ EOF
             info "keeping the admin URL and password already set up here"
             info "change them with: smartdns-access"
         fi
+        install_font
+        # Which operator each customer's address is on, for the users page: a
+        # daily list of the operators' own address blocks from RIPE, matched
+        # here, so no customer's address is sent anywhere.
+        for f in /usr/local/bin/smartdns-operators \
+                 /etc/systemd/system/smartdns-operators.service \
+                 /etc/systemd/system/smartdns-operators.timer; do
+            note_file "$f"
+        done
+        payload OPERATORS > /usr/local/bin/smartdns-operators
+        chmod +x /usr/local/bin/smartdns-operators
+        payload OPERATORS_SERVICE > /etc/systemd/system/smartdns-operators.service
+        payload OPERATORS_TIMER   > /etc/systemd/system/smartdns-operators.timer
         systemctl daemon-reload
         enable_service smartdns-admin.service
+        enable_service smartdns-operators.timer
+        systemctl start smartdns-operators.timer >/dev/null 2>&1 || true
+        # The first list now, in the background, rather than at the timer's
+        # first tick - so the users page has operators on it from the start.
+        [ -s /var/lib/smart-dns/operators.json ] \
+            || systemctl start --no-block smartdns-operators.service >/dev/null 2>&1 || true
         systemctl restart smartdns-admin.service
         sleep 2
         if systemctl is-active --quiet smartdns-admin.service; then
@@ -1676,6 +1713,7 @@ EOF
     payload SYNC > /usr/local/bin/smartdns-sync
     chmod +x /usr/local/bin/smartdns-sync
     note_file /usr/local/bin/smartdns-sync
+    install_font
     # A systemd template, one instance per service profile. The instances
     # themselves are started and stopped by the sync agent as the panel adds
     # and retires templates, so nothing here is enabled.

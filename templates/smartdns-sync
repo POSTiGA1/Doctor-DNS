@@ -881,10 +881,33 @@ THEME_BUTTON = (
     "try{localStorage.setItem('theme',n)}catch(e){}})(document.documentElement)\">"
     "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>")
 
-USER_CSS = THEME_CSS + """
+# Vazirmatn, served by this panel: every font host worth using is blocked or
+# slow from Iran. swap: the page is readable in the system font at once, on a
+# slow line, and changes over when the font arrives. The version goes in the
+# address, so a browser's kept copy is never stale.
+FONT_FILE = "/usr/local/share/smart-dns/Vazirmatn.woff2"
+FONT_VERSION = "33.0.3"
+FONT_FACE = ("@font-face{font-family:Vazirmatn;font-weight:100 900;"
+             "font-display:swap;src:url('/vazirmatn.woff2?v=%s') format('woff2')}\n"
+             % FONT_VERSION)
+_FONT = []
+
+
+def font_bytes():
+    """The font file, read once; None while it is not there."""
+    if not _FONT:
+        try:
+            with open(FONT_FILE, "rb") as fh:
+                _FONT.append(fh.read())
+        except OSError:
+            return None
+    return _FONT[0]
+
+
+USER_CSS = THEME_CSS + FONT_FACE + """
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
- font:15px/1.9 system-ui,'Segoe UI',Tahoma,sans-serif;position:relative;
+ font:15px/1.9 Vazirmatn,system-ui,'Segoe UI',Tahoma,sans-serif;position:relative;
  display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;
  padding:26px;max-width:440px;width:100%}
@@ -1317,8 +1340,26 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         return "<div class='msg %s'>%s</div>" % (
             "err" if q.get("e") else "good", html.escape(msg[:200]))
 
+    def send_font(self):
+        """The one thing this panel lets a browser keep: the same file for
+        everybody, and a new version comes at a new address."""
+        blob = font_bytes()
+        if blob is None:
+            return self.send_html("<div class='icon'>❔</div><h1>صفحه پیدا نشد</h1>", 404)
+        self._headers_buffer = []
+        self.send_response(200)
+        self.send_header("Content-Type", "font/woff2")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(blob)
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if path == "/vazirmatn.woff2":
+            return self.send_font()
 
         if path in ("/signup", "/login"):
             # Whether a cookie is here decides only whether to offer a way back

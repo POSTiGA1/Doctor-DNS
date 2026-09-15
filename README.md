@@ -549,6 +549,12 @@ reach the service from.
   between the relay and the exit. It is his work, released under the AGPL-3.0:
   this project only downloads his own unmodified releases, checks them against
   a pinned hash, and runs them. Thank you, Amin.
+- **[Vazirmatn](https://github.com/rastikerdar/vazirmatn)**, by **Saber Rastikerdar**,
+  is the font of both panels. It is released under the SIL Open Font License 1.1
+  and travels inside the installer with its licence. With thanks to him and the
+  Vazirmatn project.
+- The operator shown for each customer in the admin panel comes from
+  [RIPEstat](https://stat.ripe.net/), RIPE NCC's public routing data.
 - The exit's nginx configuration started from
   [rohammosalli/smart-dns](https://github.com/rohammosalli/smart-dns).
 
