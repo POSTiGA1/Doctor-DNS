@@ -331,6 +331,38 @@ def save_template_names(info):
     return True
 
 
+# What the operator wants written under the sign-in form, so a customer who
+# has forgotten their password knows whom to ask.
+SUPPORT_FILE = "/var/lib/smart-dns/support.json"
+
+
+def save_support(value):
+    """Keep the support contact the panel sent. Returns whether it changed."""
+    if value is None:
+        return False      # an older panel, which does not send one
+    text = json.dumps({"contact": str(value)[:64]}, ensure_ascii=False) + "\n"
+    try:
+        with open(SUPPORT_FILE, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(SUPPORT_FILE), exist_ok=True)
+    tmp = SUPPORT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, SUPPORT_FILE)
+    return True
+
+
+def support_contact():
+    try:
+        with open(SUPPORT_FILE, encoding="utf-8") as fh:
+            return str(json.load(fh).get("contact") or "")[:64]
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 # Who each allowed address belongs to, as the panel knows them. Only
 # smartdns-watch reads it, to take a username where an address would do.
 USER_NAMES = "/var/lib/smart-dns/users.json"
@@ -788,6 +820,10 @@ def sync_once():
         save_user_names(answer.get("allowed"))
     except Exception as e:
         log(WARN, "user names not saved: %s" % e)
+    try:
+        save_support(answer.get("support"))
+    except Exception as e:
+        log(WARN, "support contact not saved: %s" % e)
 
     names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
     want = set(names)
@@ -1093,9 +1129,33 @@ def login_form(banner=""):
             "<label>رمز عبور</label>"
             "<input name='password' type='password' required "
             "autocomplete='current-password'>"
-            "<button>ورود</button></form>"
+            "<button>ورود</button></form>%s"
             "<p class='alt'>حساب ندارید؟ <a href='/signup'>ثبت‌نام کنید</a></p>"
-            % html.escape(brand()))
+            % (html.escape(brand()), forgot_line()))
+
+
+def forgot_line():
+    contact = support_contact()
+    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ به پشتیبانی پیام دهید%s</p>"
+            % ((": <b dir='ltr'>%s</b>" % html.escape(contact)) if contact else "."))
+
+
+def choose_password_page(banner=""):
+    """All an account on a temporary password is shown: somewhere to choose
+    its own. The panel refuses everything else until then."""
+    return (banner +
+            "<div class='icon'>🔑</div><h1>رمز خودتان را انتخاب کنید</h1>"
+            "<p class='sub'>با رمز موقت وارد شده‌اید. برای ادامه یک رمز تازه "
+            "بگذارید؛ بعد از آن رمز موقت دیگر کار نمی‌کند.</p>"
+            "<form method='post' action='/password-first'>"
+            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+            "<input name='new' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<label>تکرار رمز تازه</label>"
+            "<input name='again' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<button>ذخیرهٔ رمز</button></form>"
+            "<p class='alt'><a href='/logout'>خروج</a></p>")
 
 
 def register_ip_page(ip, banner=""):
@@ -1423,9 +1483,25 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             # Straight to the address page either way. A new account has no
             # address yet, and somebody signing in from a new connection is
             # usually signing in precisely because the address changed.
+            # A temporary password goes to the one page it is good for.
             return self.send("", 303, {
-                "Location": "/register-ip",
+                "Location": "/" if res.get("must_change") else "/register-ip",
                 "Set-Cookie": self.cookie_for(res["session"])})
+
+        if path == "/password-first":
+            if not self.session():
+                return self.redirect("/")
+            form = self.form()
+            if form.get("new") != form.get("again"):
+                return self.redirect("/", "دو رمز یکی نیستند", bad=True)
+            try:
+                res = post("/user-password-first", {
+                    "session": self.session(), "new": form.get("new", "")})
+            except Exception as e:
+                log(ERROR, "panel: choosing a password failed: %s" % e)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""),
+                                 bad=not res.get("ok"))
 
         if path == "/password":
             if not self.session():
@@ -1503,6 +1579,8 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 "<div class='icon'>🔑</div><h1>نشست منقضی شده</h1>"
                 "<p class='sub'>دوباره <a href='/login'>وارد شوید</a>.</p>",
                 200, {"Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+        if info.get("must_change"):
+            return self.send_html(choose_password_page(self.banner()))
 
         banner = self.banner()
 
