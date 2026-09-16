@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.5.3"
+VERSION="0.5.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -3525,6 +3525,9 @@ exit 0
 #    # every account that predates this gets.
 #    ("users", "speed_kbps", "INTEGER NOT NULL DEFAULT 0"),
 #    ("users", "expires_at", "TEXT"),
+#    # Set when the operator hands out a temporary password: until the
+#    # customer has chosen their own, that is all their account lets them do.
+#    ("users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"),
 #    ("transactions", "receipt_blob", "BLOB"),
 #    ("transactions", "receipt_type", "TEXT"),
 #    ("transactions", "note", "TEXT"),
@@ -3974,8 +3977,11 @@ exit 0
 #
 #    def set_password(self, user_id, password):
 #        salt = secrets.token_hex(16)
-#        self.run("UPDATE users SET password_hash = ?, password_salt = ?"
-#                 " WHERE id = ?", (hash_password(password, salt), salt, user_id))
+#        # A password the customer set is their own, so any temporary one is
+#        # over - whichever of the two forms it came through.
+#        self.run("UPDATE users SET password_hash = ?, password_salt = ?,"
+#                 " must_change_password = 0 WHERE id = ?",
+#                 (hash_password(password, salt), salt, user_id))
 #
 #    def open_session(self, user_id, days=30):
 #        token = secrets.token_urlsafe(32)
@@ -4657,6 +4663,9 @@ exit 0
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
 #                                    "templates": self.store.template_names(),
+#                                    # Written under the sign-in form, for
+#                                    # whoever has forgotten their password.
+#                                    "support": self.store.setting("support_contact"),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -4672,6 +4681,8 @@ exit 0
 #            return self.reply(200, self.do_user_receipt(body))
 #        if self.path == "/user-password":
 #            return self.reply(200, self.do_user_password(body))
+#        if self.path == "/user-password-first":
+#            return self.reply(200, self.do_user_password_first(body))
 #
 #        return self.reply(404, {"error": "no such endpoint"})
 #
@@ -4750,7 +4761,40 @@ exit 0
 #        THROTTLE.clear("login:%s" % ip)
 #        self._who = "user #%d" % user["id"]
 #        log(INFO, "api login: user #%d (%s) from %s" % (user["id"], username, ip))
-#        return {"ok": True, "session": self.store.open_session(user["id"])}
+#        return {"ok": True, "session": self.store.open_session(user["id"]),
+#                "must_change": bool(user["must_change_password"])}
+#
+#    def _must_choose(self, user):
+#        """The refusal for an account still on a temporary password, or None."""
+#        if user["must_change_password"]:
+#            return {"ok": False, "message": "اول رمز خودتان را انتخاب کنید"}
+#        return None
+#
+#    def do_user_password_first(self, body):
+#        """Replace a temporary password with the customer's own.
+#
+#        Only for an account the operator has just given a temporary password.
+#        The session came from signing in with it, which is the proof; asking
+#        for it again would only mean typing it twice. Once the customer's own
+#        is set, the temporary one is gone and this door is shut.
+#        """
+#        user = self._session_user(body.get("session"))
+#        if not user:
+#            return {"ok": False, "message": "نشست معتبر نیست"}
+#        if not user["must_change_password"]:
+#            return {"ok": False, "message":
+#                    "رمز شما قبلاً انتخاب شده؛ برای عوض کردنش از «تغییر رمز» استفاده کنید"}
+#        new = body.get("new") or ""
+#        if len(new) < 8:
+#            return {"ok": False, "message": "رمز تازه باید دست‌کم ۸ نویسه باشد"}
+#        if check_password(user, new):
+#            return {"ok": False, "message": "رمز تازه نباید همان رمز موقت باشد"}
+#        self.store.set_password(user["id"], new)
+#        self.store.run(
+#            "DELETE FROM panel_sessions WHERE user_id = ? AND token != ?",
+#            (user["id"], body.get("session")))
+#        log(INFO, "user #%d chose their own password" % user["id"])
+#        return {"ok": True, "message": "رمز شما ذخیره شد"}
 #
 #    def do_user_password(self, body):
 #        """Let a customer change their own password.
@@ -4806,6 +4850,8 @@ exit 0
 #        user = self._session_user(body.get("session"))
 #        if not user:
 #            return {"ok": False, "message": "نشست معتبر نیست"}
+#        if self._must_choose(user):
+#            return self._must_choose(user)
 #
 #        kind = (body.get("content_type") or "").split(";")[0].strip().lower()
 #        if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
@@ -4850,6 +4896,8 @@ exit 0
 #        user = self._session_user(body.get("session"))
 #        if not user:
 #            return {"ok": False, "message": "نشست معتبر نیست"}
+#        if self._must_choose(user):
+#            return self._must_choose(user)
 #        ip = body.get("ip", "")
 #        if not valid_ip(ip):
 #            return {"ok": False, "message": "آی‌پی نامعتبر"}
@@ -4897,6 +4945,7 @@ exit 0
 #            # page turns this into the banner the bot used to send.
 #            "warned": user["warned"] or 0,
 #            "seen_ip": body.get("ip", ""),
+#            "must_change": bool(user["must_change_password"]),
 #        }
 #
 #
@@ -5324,6 +5373,38 @@ exit 0
 #        fh.write(text)
 #    os.replace(tmp, TEMPLATE_NAMES)
 #    return True
+#
+#
+## What the operator wants written under the sign-in form, so a customer who
+## has forgotten their password knows whom to ask.
+#SUPPORT_FILE = "/var/lib/smart-dns/support.json"
+#
+#
+#def save_support(value):
+#    """Keep the support contact the panel sent. Returns whether it changed."""
+#    if value is None:
+#        return False      # an older panel, which does not send one
+#    text = json.dumps({"contact": str(value)[:64]}, ensure_ascii=False) + "\n"
+#    try:
+#        with open(SUPPORT_FILE, encoding="utf-8") as fh:
+#            if fh.read() == text:
+#                return False
+#    except OSError:
+#        pass
+#    os.makedirs(os.path.dirname(SUPPORT_FILE), exist_ok=True)
+#    tmp = SUPPORT_FILE + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write(text)
+#    os.replace(tmp, SUPPORT_FILE)
+#    return True
+#
+#
+#def support_contact():
+#    try:
+#        with open(SUPPORT_FILE, encoding="utf-8") as fh:
+#            return str(json.load(fh).get("contact") or "")[:64]
+#    except (OSError, ValueError, AttributeError):
+#        return ""
 #
 #
 ## Who each allowed address belongs to, as the panel knows them. Only
@@ -5783,6 +5864,10 @@ exit 0
 #        save_user_names(answer.get("allowed"))
 #    except Exception as e:
 #        log(WARN, "user names not saved: %s" % e)
+#    try:
+#        save_support(answer.get("support"))
+#    except Exception as e:
+#        log(WARN, "support contact not saved: %s" % e)
 #
 #    names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
 #    want = set(names)
@@ -6088,9 +6173,33 @@ exit 0
 #            "<label>رمز عبور</label>"
 #            "<input name='password' type='password' required "
 #            "autocomplete='current-password'>"
-#            "<button>ورود</button></form>"
+#            "<button>ورود</button></form>%s"
 #            "<p class='alt'>حساب ندارید؟ <a href='/signup'>ثبت‌نام کنید</a></p>"
-#            % html.escape(brand()))
+#            % (html.escape(brand()), forgot_line()))
+#
+#
+#def forgot_line():
+#    contact = support_contact()
+#    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ به پشتیبانی پیام دهید%s</p>"
+#            % ((": <b dir='ltr'>%s</b>" % html.escape(contact)) if contact else "."))
+#
+#
+#def choose_password_page(banner=""):
+#    """All an account on a temporary password is shown: somewhere to choose
+#    its own. The panel refuses everything else until then."""
+#    return (banner +
+#            "<div class='icon'>🔑</div><h1>رمز خودتان را انتخاب کنید</h1>"
+#            "<p class='sub'>با رمز موقت وارد شده‌اید. برای ادامه یک رمز تازه "
+#            "بگذارید؛ بعد از آن رمز موقت دیگر کار نمی‌کند.</p>"
+#            "<form method='post' action='/password-first'>"
+#            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+#            "<input name='new' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<label>تکرار رمز تازه</label>"
+#            "<input name='again' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<button>ذخیرهٔ رمز</button></form>"
+#            "<p class='alt'><a href='/logout'>خروج</a></p>")
 #
 #
 #def register_ip_page(ip, banner=""):
@@ -6418,9 +6527,25 @@ exit 0
 #            # Straight to the address page either way. A new account has no
 #            # address yet, and somebody signing in from a new connection is
 #            # usually signing in precisely because the address changed.
+#            # A temporary password goes to the one page it is good for.
 #            return self.send("", 303, {
-#                "Location": "/register-ip",
+#                "Location": "/" if res.get("must_change") else "/register-ip",
 #                "Set-Cookie": self.cookie_for(res["session"])})
+#
+#        if path == "/password-first":
+#            if not self.session():
+#                return self.redirect("/")
+#            form = self.form()
+#            if form.get("new") != form.get("again"):
+#                return self.redirect("/", "دو رمز یکی نیستند", bad=True)
+#            try:
+#                res = post("/user-password-first", {
+#                    "session": self.session(), "new": form.get("new", "")})
+#            except Exception as e:
+#                log(ERROR, "panel: choosing a password failed: %s" % e)
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""),
+#                                 bad=not res.get("ok"))
 #
 #        if path == "/password":
 #            if not self.session():
@@ -6498,6 +6623,8 @@ exit 0
 #                "<div class='icon'>🔑</div><h1>نشست منقضی شده</h1>"
 #                "<p class='sub'>دوباره <a href='/login'>وارد شوید</a>.</p>",
 #                200, {"Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+#        if info.get("must_change"):
+#            return self.send_html(choose_password_page(self.banner()))
 #
 #        banner = self.banner()
 #
@@ -7112,6 +7239,33 @@ exit 0
 #                self.db.rollback()
 #                raise
 #
+#    def reset_password(self, uid, password):
+#        """Give an account a temporary password; False if there is no such
+#        account, or it has no username to sign in with.
+#
+#        Every place it is signed in is closed in the same transaction, so
+#        whoever might have had the old password is out by the time the new
+#        one is on the screen. Its connection is not touched: the address stays
+#        registered, and the service keeps working.
+#        """
+#        salt = secrets.token_hex(16)
+#        with self.lock:
+#            try:
+#                if self.db.execute(
+#                        "UPDATE users SET password_hash = ?, password_salt = ?,"
+#                        " must_change_password = 1 WHERE id = ?"
+#                        " AND COALESCE(username, '') != ''",
+#                        (hash_password(password, salt), salt, uid)).rowcount == 0:
+#                    self.db.rollback()
+#                    return False
+#                self.db.execute("DELETE FROM panel_sessions WHERE user_id = ?",
+#                                (uid,))
+#                self.db.commit()
+#                return True
+#            except BaseException:
+#                self.db.rollback()
+#                raise
+#
 #    # The same two reads smartdns-panel does, spelled the same way. This panel
 #    # keeps its own connection rather than importing that one, so they are
 #    # written twice on purpose - but they must agree, because one writes what
@@ -7303,6 +7457,8 @@ exit 0
 #button.ghost{background:transparent;border-color:var(--line2);color:var(--dim);font-weight:400}
 #button.del{background:transparent;border-color:var(--bad);color:var(--bad);font-weight:400}
 #button.del:hover{background:var(--err-bg)}
+#.onetime code{display:inline-block;direction:ltr;font-size:22px;letter-spacing:1px;
+# padding:8px 14px}
 #form.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 #.muted{color:var(--muted);font-size:12px}
 #.ok{color:var(--accent)}.bad{color:var(--bad)}.warn{color:var(--warn)}
@@ -7471,6 +7627,31 @@ exit 0
 #
 #
 #OPERATORS = Operators(OPERATORS_FILE)
+#
+#
+## Letters and digits nobody misreads when a password is read out or copied
+## from a chat: no 0/o, no 1/l/i.
+#TEMP_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+#
+#
+#def temp_password():
+#    """Three groups of four - easy to pass on, and about 59 bits."""
+#    return "-".join("".join(secrets.choice(TEMP_ALPHABET) for _ in range(4))
+#                    for _ in range(3))
+#
+#
+#def temp_password_card(name, password):
+#    return ("<div class='card'><h2>رمز موقت «%s»</h2>"
+#            "<p class='onetime'><code>%s</code></p>"
+#            "<p>این رمز را برای مشتری بفرستید. فقط همین یک بار نشان داده می‌شود.</p>"
+#            "<ul class='muted'>"
+#            "<li>مشتری از همهٔ دستگاه‌ها بیرون آمد. اینترنتش قطع نشده.</li>"
+#            "<li>با اولین ورود باید رمز خودش را انتخاب کند؛ بعد از آن این رمز "
+#            "دیگر کار نمی‌کند.</li>"
+#            "<li>این صفحه را رفرش نکنید: رفرش یک رمز تازهٔ دیگر می‌سازد.</li></ul>"
+#            "<p><a href='/%s/users'>برگشت به کاربران</a></p></div>"
+#            % (html.escape(name), html.escape(password),
+#               html.escape(CFG["ADMIN_PATH"])))
 #
 #
 #def operator_label(ip):
@@ -8233,6 +8414,19 @@ exit 0
 #            ask = html.escape(json.dumps(
 #                "«%s» برای همیشه حذف شود؟ آی‌پی‌ها و رسیدهایش هم پاک می‌شوند "
 #                "و برنمی‌گردند." % who, ensure_ascii=False), quote=True)
+#            # Only an account with a username signs in on the web, so only
+#            # such an account has a password worth replacing.
+#            reset = ""
+#            if r["username"]:
+#                reset = (
+#                    "<form method='post' action='/%s/user-password-reset'"
+#                    " onsubmit='return confirm(%s)'>"
+#                    "<input type='hidden' name='id' value='%d'>"
+#                    "<button class='ghost' title='ساختن رمز موقت برای این کاربر'>"
+#                    "رمز تازه</button></form>"
+#                    % (p, html.escape(json.dumps(
+#                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
+#                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
 #                "<tr><td><code>%s</code><br><span class='muted'>%s</span></td>"
 #                "<td><code>%s</code>%s</td><td>%s</td>"
@@ -8258,6 +8452,7 @@ exit 0
 #                " onsubmit='return confirm(\"مصرف این کاربر صفر شود؟\")'>"
 #                "<input type='hidden' name='id' value='%d'>"
 #                "<button class='ghost' title='صفر کردن مصرف'>صفر</button></form>"
+#                "%s"
 #                "<form method='post' action='/%s/user-delete'"
 #                " onsubmit='return confirm(%s)'>"
 #                "<input type='hidden' name='id' value='%d'>"
@@ -8281,6 +8476,7 @@ exit 0
 #                   "برگرداندن" if r["status"] == "suspended" else "مسدود کردن",
 #                   "فعال" if r["status"] == "suspended" else "مسدود",
 #                   p, r["id"],
+#                   reset,
 #                   p, ask, r["id"]))
 #        out.append("</table><p class='muted'>ثبت‌نام تازه با وضعیت «در انتظار "
 #                   "پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی "
@@ -8522,6 +8718,18 @@ exit 0
 #            "<button class='ghost'>بررسی فایل</button></form>"
 #            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
 #            "تأیید می‌خواهد.</p></div>" % (p, p))
+#
+#        support = STORE.one("SELECT value FROM settings WHERE key = 'support_contact'")
+#        out.append("<div class='card'><h2>پشتیبانی</h2>"
+#                   "<form method='post' action='/%s/support-save' class='row'>"
+#                   "<input name='contact' value='%s' maxlength='64' "
+#                   "placeholder='@your_support' style='min-width:240px;direction:ltr'>"
+#                   "<button class='ghost'>ذخیره</button></form>"
+#                   "<p class='muted'>زیر فرم ورود مشتری‌ها نوشته می‌شود: «رمز را "
+#                   "فراموش کرده‌اید؟ به پشتیبانی پیام دهید» و بعد همین آیدی یا "
+#                   "شماره. خالی باشد، همان جمله بدون آیدی می‌آید.</p></div>"
+#                   % (p, html.escape(support["value"] if support else "",
+#                                     quote=True)))
 #
 #        out.append("<div class='card'><h2>آدرس این پنل</h2>"
 #                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
@@ -8843,6 +9051,34 @@ exit 0
 #            set_config_key("ADMIN_PATH", new)
 #            CFG["ADMIN_PATH"] = new
 #            return self.moving_to(CFG["ADMIN_PORT"], new)
+#
+#        if rest == "user-password-reset":
+#            uid = int(one("id") or 0)
+#            user = STORE.one("SELECT username FROM users WHERE id = ?", (uid,))
+#            if not user:
+#                return self.redirect("users?m=!این کاربر پیدا نشد")
+#            if not user["username"]:
+#                return self.redirect("users?m=!این حساب نام کاربری ندارد و از "
+#                                     "پنل وارد نمی‌شود")
+#            password = temp_password()
+#            if not STORE.reset_password(uid, password):
+#                return self.redirect("users?m=!نشد، دوباره امتحان کنید")
+#            log(INFO, "temporary password for user #%d; its sign-ins closed" % uid)
+#            # On this page and nowhere else. Not in a redirect: the message
+#            # rides in the address, and the address stays in the history.
+#            return self.send(page("رمز موقت",
+#                                  temp_password_card(user["username"], password),
+#                                  CFG, "users"))
+#
+#        if rest == "support-save":
+#            contact = " ".join(one("contact").split())
+#            if len(contact) > 64:
+#                return self.redirect("settings?m=!حداکثر ۶۴ نویسه")
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('support_contact', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      (contact,))
+#            return self.redirect("settings?m=ذخیره شد؛ تا ۳۰ ثانیه دیگر زیر "
+#                                 "فرم ورود مشتری‌ها می‌آید")
 #
 #        if rest == "password":
 #            new = one("password")
@@ -11291,6 +11527,7 @@ exit 0
 #gemini.google.com
 #getbootstrap.com
 #getcaddy.com
+#ggpht.com
 #ghcr.io
 #github.com
 #githubapp.com
@@ -11325,6 +11562,7 @@ exit 0
 #gravatar.com
 #groq.com
 #gstatic.com
+#gvt1.com
 #hackerrank.com
 #hashicorp.com
 #helm.sh
@@ -12182,6 +12420,7 @@ exit 0
 #            "fiber.google.com",
 #            "firebase.google.com",
 #            "gemini.google.com",
+#            "ggpht.com",
 #            "google-analytics.com",
 #            "google.ai",
 #            "googleadservices.com",
@@ -12192,6 +12431,7 @@ exit 0
 #            "googletagservices.com",
 #            "googleusercontent.com",
 #            "gstatic.com",
+#            "gvt1.com",
 #            "issuetracker.google.com",
 #            "labs.google",
 #            "marketingplantform.google.com",
