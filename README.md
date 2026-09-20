@@ -223,6 +223,9 @@ in front of the tunnel.
 
 - The relay's nginx goes through the tunnel, and straight to the exit only
   while the tunnel is down.
+- The relay's sync with the panel (port 8443) goes through the tunnel too.
+  Filtering kills a large upload on the direct path - a customer's receipt
+  never arrived - and it falls back to direct when the tunnel's end is not up.
 - BackPack is fetched from its own releases when you ask for it and checked
   against a hash pinned in the installer. It is not part of this project (it is
   AGPL-3.0). A server with no internet: `BACKPACK_TARBALL=/path/to/the.tar.gz`.

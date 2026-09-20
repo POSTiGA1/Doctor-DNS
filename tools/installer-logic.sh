@@ -204,6 +204,11 @@ TUNNEL_NFT=/etc/nftables.d/40-smartdns-tunnel.conf
 # nothing outside the machine can reach either port.
 TUNNEL_LOCAL_HTTPS=18443
 TUNNEL_LOCAL_HTTP=18080
+# The sync API's end of the tunnel on the relay. Filtering between Iran and an
+# exit kills a large upload on the direct path - a customer's receipt never
+# arrived, while the same bytes went through the tunnel untouched - so the
+# sync goes through the tunnel too when there is one.
+TUNNEL_LOCAL_API=18843
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -230,7 +235,7 @@ tunnel_port_problem() {
         8446) echo "the exit's route to Google over IPv6" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
-        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP") echo "the tunnel's own end on the relay" ;;
+        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5300 ] && [ "$p" -le 5399 ]; } && echo "the templates' resolvers on the relay"
     admin="$(sed -n 's/^ADMIN_PORT=//p' /etc/smart-dns/admin.env 2>/dev/null | head -1 || true)"
@@ -382,13 +387,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80"]\n' "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80"]\n' "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"

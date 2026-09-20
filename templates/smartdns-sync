@@ -148,6 +148,27 @@ class NamedHTTPS(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.sni)
 
 
+API_PORT = 8443
+# The sync API's end of the tunnel on this machine, when there is a tunnel.
+# It comes out on the exit's own 8443, which is why the exit accepts the
+# request from its own loopback.
+API_TUNNEL_PORT = 18843
+
+
+def api_endpoints():
+    """Where to reach the exit's API, best first.
+
+    Through the tunnel when there is one. Filtering between Iran and an exit
+    kills a large upload on the direct path while leaving small ones alone: a
+    customer's receipt timed out every time, the exit logging a read that
+    never finished, and the same bytes went through the tunnel untouched.
+    """
+    direct = (CFG["PANEL_HOST"], API_PORT)
+    if (CFG.get("TUNNEL") or "off") != "backpack":
+        return [direct]
+    return [("127.0.0.1", API_TUNNEL_PORT), direct]
+
+
 def post(path, payload):
     """POST JSON to the exit's API, pinned to its certificate.
 
@@ -156,32 +177,47 @@ def post(path, payload):
     with a fingerprint comparison. That is stricter than a public CA would be,
     not weaker: exactly one certificate is accepted, and the secret is never
     sent until it matches.
+
+    Only the way in is retried, never a request that has already been sent:
+    the far end may have acted on it, and a second copy of "add this much
+    quota" is worse than an error.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    conn = NamedHTTPS(CFG["PANEL_HOST"], 8443, sync_sni(), timeout=25, context=ctx)
-    try:
-        conn.connect()
-        seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
-        if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
-            raise RuntimeError(
-                "certificate fingerprint mismatch - refusing to send anything.\n"
-                "  expected %s\n  got      %s" % (CFG["SYNC_FINGERPRINT"], seen)
+    ways = api_endpoints()
+    for i, (host, port) in enumerate(ways):
+        conn = NamedHTTPS(host, port, sync_sni(), timeout=25, context=ctx)
+        try:
+            try:
+                conn.connect()
+                seen = hashlib.sha256(
+                    conn.sock.getpeercert(binary_form=True)).hexdigest()
+            except OSError as e:
+                # The tunnel's end is not up, or the exit is unreachable.
+                if i + 1 < len(ways):
+                    log(WARN, "the API is not answering through the tunnel"
+                              " (%s) - going straight to the exit" % e)
+                    continue
+                raise
+            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
+                raise RuntimeError(
+                    "certificate fingerprint mismatch - refusing to send anything.\n"
+                    "  expected %s\n  got      %s" % (CFG["SYNC_FINGERPRINT"], seen)
+                )
+            body = json.dumps(payload)
+            conn.request(
+                "POST", path, body,
+                {"Content-Type": "application/json",
+                 "Authorization": "Bearer " + CFG["SYNC_SECRET"]},
             )
-        body = json.dumps(payload)
-        conn.request(
-            "POST", path, body,
-            {"Content-Type": "application/json",
-             "Authorization": "Bearer " + CFG["SYNC_SECRET"]},
-        )
-        res = conn.getresponse()
-        data = json.loads(res.read() or b"{}")
-        if res.status != 200:
-            raise RuntimeError("exit returned %d: %s" % (res.status, data))
-        return data
-    finally:
-        conn.close()
+            res = conn.getresponse()
+            data = json.loads(res.read() or b"{}")
+            if res.status != 200:
+                raise RuntimeError("exit returned %d: %s" % (res.status, data))
+            return data
+        finally:
+            conn.close()
 
 
 # ------------------------------------------------------------------ health
@@ -811,7 +847,11 @@ def sync_once():
         host = HEALTH.sample()
     except Exception as e:
         host = {"error": str(e)}
-    answer = post("/sync", {"counters": counters, "host": host})
+    # This relay names itself. Through the tunnel the request arrives at the
+    # exit from its own loopback, and the address it came from would no longer
+    # say which relay sent it - usage is counted per relay.
+    answer = post("/sync", {"counters": counters, "host": host,
+                            "relay": CFG["SELF_IP"]})
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:

@@ -57,7 +57,8 @@ def function(name):
 
 tmp = tempfile.mkdtemp()
 variables = "\n".join(re.findall(
-    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS))=.*$",
+    r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API"
+    r"|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS))=.*$",
     LOGIC, re.M))
 names = ["tunnel_transport_ok", "tunnel_port_problem", "parse_tunnel_spec",
          "tunnel_token", "tunnel_toml", "ask_tunnel"]
@@ -147,6 +148,7 @@ for p in ("8444", "2083", "9443", "31337"):
 for p, why in (("22", "ssh"), ("53", "dns"), ("80", "proxy"), ("443", "proxy"),
                ("8443", "sync"), ("8446", "Google"), ("8402", "certificates"),
                ("3478", "STUN"), ("18443", "tunnel"), ("18080", "tunnel"),
+               ("18843", "tunnel"),
                ("5300", "resolvers"), ("5350", "resolvers"),
                ("abc", "number"), ("0", "port"), ("70000", "port")):
     got = sh('tunnel_port_problem %s' % p)
@@ -182,12 +184,14 @@ for role in ("relay", "exit"):
 rr, xr, rd, xd = confs["relay", "reverse"], confs["exit", "reverse"], confs["relay", "direct"], confs["exit", "direct"]
 check("reverse: the relay listens on the tunnel port",
       "[server]" in rr and 'bind_addr = "0.0.0.0:8444"' in rr, rr)
-check("  and hands the exit's 443 and 80 to loopback only",
-      'ports = ["127.0.0.1:18443=443", "127.0.0.1:18080=80"]' in rr, rr)
+check("  and hands the exit's 443, 80 and sync API to loopback only",
+      'ports = ["127.0.0.1:18443=443", "127.0.0.1:18080=80",'
+      ' "127.0.0.1:18843=8443"]' in rr, rr)
 check("reverse: the exit dials the relay",
       "[client]" in xr and 'remote_addr = "198.51.100.1:8444"' in xr, xr)
 check("direct: the relay dials the exit, with the same local ports",
-      'role = "iran"' in rd and 'addr = "203.0.113.2:8444"' in rd and "127.0.0.1:18443=443" in rd, rd)
+      'role = "iran"' in rd and 'addr = "203.0.113.2:8444"' in rd
+      and "127.0.0.1:18443=443" in rd and "127.0.0.1:18843=8443" in rd, rd)
 check("direct: the exit listens", 'role = "kharej"' in xd and 'addr = "0.0.0.0:8444"' in xd, xd)
 tokens = {re.search(r'token = "(\w+)"', c).group(1) for c in confs.values()}
 check("every end carries the same token", len(tokens) == 1, str(tokens))

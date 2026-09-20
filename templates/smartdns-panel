@@ -1329,7 +1329,11 @@ class API(http.server.BaseHTTPRequestHandler):
         # is not the only thing standing in front of the database. Only the
         # relays this exit is paired with may talk to it at all - a scanner
         # that finds the port gets nothing to guess against.
-        if self.client_address[0] not in self.relays:
+        # Loopback as well as the paired relays: a relay whose sync comes
+        # through the tunnel arrives here from this machine's own address.
+        # Nothing is waved through - the secret below is still required.
+        if self.client_address[0] not in self.relays \
+                and self.client_address[0] not in ("127.0.0.1", "::1"):
             return False
         given = self.headers.get("Authorization", "")
         want = "Bearer " + self.secret
@@ -1363,10 +1367,11 @@ class API(http.server.BaseHTTPRequestHandler):
             clean = {
                 ip: int(v) for ip, v in counters.items() if valid_ip(ip) and int(v) >= 0
             }
-            self.store.fold_counters(self.client_address[0], clean)
+            who = self.relay_name(body)
+            self.store.fold_counters(who, clean)
             # The relay names itself by the address it connected from, so a
             # second relay appears on its own without any configuration.
-            self.store.record_metrics(self.client_address[0], body.get("host") or {})
+            self.store.record_metrics(who, body.get("host") or {})
             # Quotas are evaluated here, on fresh numbers, so a user who runs
             # out is off the list this relay is about to be handed.
             try:
@@ -1412,6 +1417,19 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, self.do_user_password_first(body))
 
         return self.reply(404, {"error": "no such endpoint"})
+
+    def relay_name(self, body):
+        """Which relay this sync is from.
+
+        Usually the address it connected from. Through the tunnel that is this
+        machine's own loopback, so the relay says which one it is - and only a
+        name this exit is actually paired with is taken, or one relay could be
+        credited with another's usage.
+        """
+        claimed = str(body.get("relay") or "").strip()
+        if claimed and claimed in self.relays:
+            return claimed
+        return self.client_address[0]
 
     # ---- user panel ------------------------------------------------------
     def _session_user(self, token):
