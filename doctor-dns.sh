@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.5.5"
+VERSION="0.5.6"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -204,6 +204,11 @@ TUNNEL_NFT=/etc/nftables.d/40-smartdns-tunnel.conf
 # nothing outside the machine can reach either port.
 TUNNEL_LOCAL_HTTPS=18443
 TUNNEL_LOCAL_HTTP=18080
+# The sync API's end of the tunnel on the relay. Filtering between Iran and an
+# exit kills a large upload on the direct path - a customer's receipt never
+# arrived, while the same bytes went through the tunnel untouched - so the
+# sync goes through the tunnel too when there is one.
+TUNNEL_LOCAL_API=18843
 # Which transports each direction has. A direct tunnel has four; BackPack's
 # spoofing carrier is a different kind of tunnel and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
@@ -230,7 +235,7 @@ tunnel_port_problem() {
         8446) echo "the exit's route to Google over IPv6" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
-        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP") echo "the tunnel's own end on the relay" ;;
+        "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5300 ] && [ "$p" -le 5399 ]; } && echo "the templates' resolvers on the relay"
     admin="$(sed -n 's/^ADMIN_PORT=//p' /etc/smart-dns/admin.env 2>/dev/null | head -1 || true)"
@@ -382,13 +387,15 @@ tunnel_toml() {
     printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80"]\n' "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     elif [ "$TUNNEL_DIRECTION" = reverse ]; then
         printf '[client]\nremote_addr = "%s:%s"\n' "$RELAY_IP" "$TUNNEL_PORT"
     elif [ "$ROLE" = relay ]; then
         printf '[direct]\nrole = "iran"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
-        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80"]\n' "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP"
+        printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443"]\n' \
+               "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API"
     else
         printf '[direct]\nrole = "kharej"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
@@ -4602,7 +4609,11 @@ exit 0
 #        # is not the only thing standing in front of the database. Only the
 #        # relays this exit is paired with may talk to it at all - a scanner
 #        # that finds the port gets nothing to guess against.
-#        if self.client_address[0] not in self.relays:
+#        # Loopback as well as the paired relays: a relay whose sync comes
+#        # through the tunnel arrives here from this machine's own address.
+#        # Nothing is waved through - the secret below is still required.
+#        if self.client_address[0] not in self.relays \
+#                and self.client_address[0] not in ("127.0.0.1", "::1"):
 #            return False
 #        given = self.headers.get("Authorization", "")
 #        want = "Bearer " + self.secret
@@ -4636,10 +4647,11 @@ exit 0
 #            clean = {
 #                ip: int(v) for ip, v in counters.items() if valid_ip(ip) and int(v) >= 0
 #            }
-#            self.store.fold_counters(self.client_address[0], clean)
+#            who = self.relay_name(body)
+#            self.store.fold_counters(who, clean)
 #            # The relay names itself by the address it connected from, so a
 #            # second relay appears on its own without any configuration.
-#            self.store.record_metrics(self.client_address[0], body.get("host") or {})
+#            self.store.record_metrics(who, body.get("host") or {})
 #            # Quotas are evaluated here, on fresh numbers, so a user who runs
 #            # out is off the list this relay is about to be handed.
 #            try:
@@ -4685,6 +4697,19 @@ exit 0
 #            return self.reply(200, self.do_user_password_first(body))
 #
 #        return self.reply(404, {"error": "no such endpoint"})
+#
+#    def relay_name(self, body):
+#        """Which relay this sync is from.
+#
+#        Usually the address it connected from. Through the tunnel that is this
+#        machine's own loopback, so the relay says which one it is - and only a
+#        name this exit is actually paired with is taken, or one relay could be
+#        credited with another's usage.
+#        """
+#        claimed = str(body.get("relay") or "").strip()
+#        if claimed and claimed in self.relays:
+#            return claimed
+#        return self.client_address[0]
 #
 #    # ---- user panel ------------------------------------------------------
 #    def _session_user(self, token):
@@ -5192,6 +5217,27 @@ exit 0
 #        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.sni)
 #
 #
+#API_PORT = 8443
+## The sync API's end of the tunnel on this machine, when there is a tunnel.
+## It comes out on the exit's own 8443, which is why the exit accepts the
+## request from its own loopback.
+#API_TUNNEL_PORT = 18843
+#
+#
+#def api_endpoints():
+#    """Where to reach the exit's API, best first.
+#
+#    Through the tunnel when there is one. Filtering between Iran and an exit
+#    kills a large upload on the direct path while leaving small ones alone: a
+#    customer's receipt timed out every time, the exit logging a read that
+#    never finished, and the same bytes went through the tunnel untouched.
+#    """
+#    direct = (CFG["PANEL_HOST"], API_PORT)
+#    if (CFG.get("TUNNEL") or "off") != "backpack":
+#        return [direct]
+#    return [("127.0.0.1", API_TUNNEL_PORT), direct]
+#
+#
 #def post(path, payload):
 #    """POST JSON to the exit's API, pinned to its certificate.
 #
@@ -5200,32 +5246,47 @@ exit 0
 #    with a fingerprint comparison. That is stricter than a public CA would be,
 #    not weaker: exactly one certificate is accepted, and the secret is never
 #    sent until it matches.
+#
+#    Only the way in is retried, never a request that has already been sent:
+#    the far end may have acted on it, and a second copy of "add this much
+#    quota" is worse than an error.
 #    """
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 #    ctx.check_hostname = False
 #    ctx.verify_mode = ssl.CERT_NONE
-#    conn = NamedHTTPS(CFG["PANEL_HOST"], 8443, sync_sni(), timeout=25, context=ctx)
-#    try:
-#        conn.connect()
-#        seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
-#        if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
-#            raise RuntimeError(
-#                "certificate fingerprint mismatch - refusing to send anything.\n"
-#                "  expected %s\n  got      %s" % (CFG["SYNC_FINGERPRINT"], seen)
+#    ways = api_endpoints()
+#    for i, (host, port) in enumerate(ways):
+#        conn = NamedHTTPS(host, port, sync_sni(), timeout=25, context=ctx)
+#        try:
+#            try:
+#                conn.connect()
+#                seen = hashlib.sha256(
+#                    conn.sock.getpeercert(binary_form=True)).hexdigest()
+#            except OSError as e:
+#                # The tunnel's end is not up, or the exit is unreachable.
+#                if i + 1 < len(ways):
+#                    log(WARN, "the API is not answering through the tunnel"
+#                              " (%s) - going straight to the exit" % e)
+#                    continue
+#                raise
+#            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
+#                raise RuntimeError(
+#                    "certificate fingerprint mismatch - refusing to send anything.\n"
+#                    "  expected %s\n  got      %s" % (CFG["SYNC_FINGERPRINT"], seen)
+#                )
+#            body = json.dumps(payload)
+#            conn.request(
+#                "POST", path, body,
+#                {"Content-Type": "application/json",
+#                 "Authorization": "Bearer " + CFG["SYNC_SECRET"]},
 #            )
-#        body = json.dumps(payload)
-#        conn.request(
-#            "POST", path, body,
-#            {"Content-Type": "application/json",
-#             "Authorization": "Bearer " + CFG["SYNC_SECRET"]},
-#        )
-#        res = conn.getresponse()
-#        data = json.loads(res.read() or b"{}")
-#        if res.status != 200:
-#            raise RuntimeError("exit returned %d: %s" % (res.status, data))
-#        return data
-#    finally:
-#        conn.close()
+#            res = conn.getresponse()
+#            data = json.loads(res.read() or b"{}")
+#            if res.status != 200:
+#                raise RuntimeError("exit returned %d: %s" % (res.status, data))
+#            return data
+#        finally:
+#            conn.close()
 #
 #
 ## ------------------------------------------------------------------ health
@@ -5855,7 +5916,11 @@ exit 0
 #        host = HEALTH.sample()
 #    except Exception as e:
 #        host = {"error": str(e)}
-#    answer = post("/sync", {"counters": counters, "host": host})
+#    # This relay names itself. Through the tunnel the request arrives at the
+#    # exit from its own loopback, and the address it came from would no longer
+#    # say which relay sent it - usage is counted per relay.
+#    answer = post("/sync", {"counters": counters, "host": host,
+#                            "relay": CFG["SELF_IP"]})
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
