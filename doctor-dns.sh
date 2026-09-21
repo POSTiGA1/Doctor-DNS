@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.5.6"
+VERSION="0.5.7"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -11183,6 +11183,7 @@ exit 0
 #    (57218, "رایتل"),            # RighTel - Rightel Communication Service
 #    (58224, "مخابرات"),          # TCI - Iran Telecommunication Company
 #    (31549, "شاتل"),             # RASANA - Aria Shatel
+#    (34369, "شاتل موبایل"),      # AS-SHATELMOBILE - Aria Shatel PJSC
 #    (43754, "آسیاتک"),           # ASIATECH - Asiatech Data Transmission
 #    (16322, "پارس‌آنلاین"),      # PARSONLINE - Parsan Lin
 #    (50810, "مبین‌نت"),          # Mobinnet - Mobin Net Communication
