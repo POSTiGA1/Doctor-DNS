@@ -34,6 +34,7 @@ OPERATORS = [
     (57218, "رایتل"),            # RighTel - Rightel Communication Service
     (58224, "مخابرات"),          # TCI - Iran Telecommunication Company
     (31549, "شاتل"),             # RASANA - Aria Shatel
+    (34369, "شاتل موبایل"),      # AS-SHATELMOBILE - Aria Shatel PJSC
     (43754, "آسیاتک"),           # ASIATECH - Asiatech Data Transmission
     (16322, "پارس‌آنلاین"),      # PARSONLINE - Parsan Lin
     (50810, "مبین‌نت"),          # Mobinnet - Mobin Net Communication
