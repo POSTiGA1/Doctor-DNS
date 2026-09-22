@@ -817,6 +817,86 @@ def bot_getme(token):
     return res["result"].get("username") or "", None
 
 
+BOT_LOG_LINES = 200
+
+
+def bot_journal(lines):
+    """The bot's last lines from the journal, the token masked - this page is
+    for looking at, and a screenshot of it may well be sent to somebody."""
+    try:
+        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", str(lines), "-o",
+                            "short-iso", "--no-pager"], capture_output=True, text=True,
+                           timeout=15)
+        text = r.stdout
+    except Exception as e:
+        return "journalctl: %s" % e
+    token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+    return text.replace(token, "<token>") if token else text
+
+
+def ago(ts):
+    """"3 دقیقه پیش" - how old a relay's last word is."""
+    when = parse_ts(ts)
+    if not when:
+        return "نامعلوم"
+    secs = max(0, int((datetime.now(timezone.utc) - when).total_seconds()))
+    if secs < 90:
+        return "همین الان"
+    if secs < 3600:
+        return "%d دقیقه پیش" % (secs // 60)
+    if secs < 86400:
+        return "%d ساعت پیش" % (secs // 3600)
+    return "%d روز پیش" % (secs // 86400)
+
+
+def watch_card(pre):
+    """Asking the relays to run smartdns-watch, and what they saw."""
+    p = CFG["ADMIN_PATH"]
+    try:
+        job = json.loads(STORE.one("SELECT value FROM settings WHERE key = 'watch_job'")
+                         ["value"] or "null")
+    except (TypeError, ValueError):
+        job = None
+    out = ["<div id='watch'></div><div class='card'><h2>دامنه‌هایی که مشتری باز می‌کند "
+           "<span class='muted'>(smartdns-watch)</span></h2>"
+           "<p class='muted'>برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را "
+           "انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار "
+           "نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت "
+           "(اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه "
+           "کنید)، «filtered» یعنی فیلتر خود ایران است.</p>"
+           "<form method='post' action='/%s/watch-start' class='row'>"
+           "<input name='target' dir='ltr' placeholder='نام کاربری یا آی‌پی (خالی = همه)'"
+           " maxlength='40' style='min-width:220px'>"
+           "<select name='seconds'><option value='60'>۱ دقیقه</option>"
+           "<option value='120' selected>۲ دقیقه</option>"
+           "<option value='300'>۵ دقیقه</option></select>"
+           "<button>شروع</button></form>" % p]
+    if job:
+        asked = parse_ts(job.get("asked_at"))
+        age = (datetime.now(timezone.utc) - asked).total_seconds() if asked else 1e9
+        results = STORE.q("SELECT * FROM watch_results WHERE job_id = ? ORDER BY relay",
+                          (job.get("id"),))
+        waiting = age < int(job.get("seconds") or 60) + 120 and not results
+        out.append("<p>درخواست برای <b>%s</b>، %d ثانیه — %s%s</p>" % (
+            html.escape(job.get("target") or "همهٔ مشتری‌ها"), int(job.get("seconds") or 60),
+            html.escape(ago(job.get("asked_at"))),
+            " · <span class='warn'>در حال ضبط؛ این صفحه خودش تازه می‌شود</span>"
+            if waiting else ""))
+        for r in results:
+            out.append("<p class='muted'>سرور ایران <code>%s</code> — %s</p>%s"
+                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
+                          pre(r["text"])))
+        if not results and not waiting:
+            out.append("<p class='muted'>جوابی از سرورهای ایران نیامد. سرور ایران باید "
+                       "روی نسخهٔ تازه باشد.</p>")
+        if waiting:
+            out.append("<script>setTimeout(function(){location.reload()},15000)</script>")
+    out.append("</div>")
+    return "".join(out)
+
+# -- actions ----------------------------------------------------------
+
+
 def bot_state():
     """(installed, set up, running, a line of what it last said)."""
     installed = os.path.exists(BOT_BIN)
@@ -829,6 +909,9 @@ def bot_state():
         r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", "3", "-o", "cat",
                             "--no-pager"], capture_output=True, text=True, timeout=10)
         last = r.stdout.strip()
+        token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+        if token:
+            last = last.replace(token, "<token>")
     except Exception:
         pass
     return installed, configured, running, last
@@ -2051,6 +2134,16 @@ class Admin(http.server.BaseHTTPRequestHandler):
 
     def bot_page(self):
         p = CFG["ADMIN_PATH"]
+        if urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("log"):
+            return ("<div class='card'><h2>لاگ ربات — %d خط آخر</h2>"
+                    "<p><a href='/%s/bot'>برگشت به ربات</a> · <a href='/%s/bot?log=1'>تازه کردن</a>"
+                    "</p><pre dir='ltr' style='white-space:pre-wrap;font-size:12px;"
+                    "max-height:70vh;overflow:auto'>%s</pre>"
+                    "<p class='muted'>روی سرور هم: <code>sudo smartdns-bot-logs</code> "
+                    "(با <code>-f</code> زنده، با <code>-e</code> فقط خطاها). توکن ربات همه‌جا "
+                    "با &lt;token&gt; پوشانده می‌شود.</p></div>"
+                    % (BOT_LOG_LINES, p, p,
+                       html.escape(bot_journal(BOT_LOG_LINES).strip() or "هنوز چیزی نیست")))
         installed, configured, running, last = bot_state()
         env = read_env(BOT_ENV)
         name = STORE.one("SELECT value FROM settings WHERE key = 'bot_username'")
@@ -2073,9 +2166,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
                        "<form method='post' action='/%s/bot-power'><input type='hidden'"
                        " name='to' value='%s'><button class='ghost'>%s</button></form>"
                        "<form method='post' action='/%s/bot-test'>"
-                       "<button class='ghost'>ارسال پیام آزمایشی</button></form></div>"
+                       "<button class='ghost'>ارسال پیام آزمایشی</button></form>"
+                       "<a class='dl' href='/%s/bot?log=1'>نمایش لاگ کامل</a></div>"
                        % (p, "off" if running else "on",
-                          "خاموش کردن" if running else "روشن کردن", p))
+                          "خاموش کردن" if running else "روشن کردن", p, p))
         else:
             out.append("<p>یک ربات تلگرام برای مشتری‌ها و خودتان: خرید پلن و فرستادن رسید، "
                        "ثبت آی‌پی، تیکت، و برای شما رسید تازه با دکمهٔ تأیید. همه‌چیز روی "
@@ -2532,8 +2626,25 @@ class Admin(http.server.BaseHTTPRequestHandler):
         return "".join(out)
 
     def logs(self):
-        out = []
-        for unit in ("smartdns-panel", "smartdns-admin"):
+        """Everything in one place: this machine's two services, the bot if
+        there is one, and what each relay last sent of its own."""
+        token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+        box = ("<pre dir='ltr' style='overflow-x:auto;font-size:12px;color:var(--dim);"
+               "white-space:pre-wrap;max-height:60vh;overflow-y:auto'>%s</pre>")
+
+        def pre(text):
+            # The bot's token, masked wherever it might turn up on this page.
+            return box % html.escape(text.replace(token, "<token>") if token else text)
+        out = ["<div class='card'><p class='muted'>پرش به: <a href='#watch'>دامنه‌های "
+               "مشتری</a> · <a href='#exit'>سرور خارج</a> · <a href='#bot'>ربات</a> · "
+               "<a href='#relays'>سرورهای ایران</a></p></div>"]
+        out.append(watch_card(pre))
+        out.append("<div id='exit'></div>")
+        units = [("smartdns-panel", "پنل و API — سرور خارج"),
+                 ("smartdns-admin", "پنل ادمین — سرور خارج")]
+        if os.path.exists("/etc/systemd/system/smartdns-tunnel.service"):
+            units.append(("smartdns-tunnel", "تونل — سرور خارج"))
+        for unit, label in units:
             try:
                 txt = subprocess.run(
                     ["journalctl", "-u", unit, "-n", "60", "--no-pager",
@@ -2541,12 +2652,37 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     timeout=20).stdout
             except Exception as e:
                 txt = str(e)
-            out.append("<div class='card'><h2>%s</h2><pre style='overflow-x:auto;"
-                       "font-size:12px;color:var(--dim);white-space:pre-wrap'>%s</pre>"
-                       "</div>" % (unit, html.escape(txt or "(چیزی نیست)")))
+            out.append("<div class='card'><h2>%s <span class='muted'>(%s)</span></h2>%s</div>"
+                       % (label, unit, pre(txt or "(چیزی نیست)")))
+
+        out.append("<div id='bot'></div><div class='card'><h2>ربات تلگرام "
+                   "<span class='muted'>(doctor-dns-bot)</span></h2>")
+        if read_env(BOT_ENV).get("BOT_TOKEN"):
+            out.append(pre(bot_journal(60).strip() or "(چیزی نیست)"))
+            out.append("<p class='muted'><a href='/%s/bot?log=1'>۲۰۰ خط آخر</a> · توکن "
+                       "پوشانده شده است.</p>" % CFG["ADMIN_PATH"])
+        else:
+            out.append("<p class='muted'>ربات راه‌اندازی نشده (صفحهٔ «ربات»).</p>")
+        out.append("</div>")
+
+        out.append("<div id='relays'></div>")
+        rows = STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+        if not rows:
+            out.append("<div class='card'><h2>سرورهای ایران</h2><p class='muted'>هنوز لاگی "
+                       "نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ "
+                       "سرورهای قدیمی‌تر بعد از ارتقا.</p></div>")
+        for r in rows:
+            out.append("<div class='card'><h2>سرور ایران <code>%s</code></h2>"
+                       "<p class='muted'>آخرین بار %s — هر ۵ دقیقه تازه می‌شود. DNS، "
+                       "همگام‌سازی، پنل مشتری، nginx، STUN و تونل. روی خود سرور: "
+                       "<code>sudo smartdns-logs</code></p>%s</div>"
+                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
+                          pre(r["text"] or "(چیزی نیست)")))
+            if r["tunnel"] and r["tunnel"].strip():
+                out.append("<div class='card'><h2>تونل — سرور ایران <code>%s</code></h2>%s</div>"
+                           % (html.escape(r["relay"]), pre(r["tunnel"])))
         return "".join(out)
 
-    # -- actions ----------------------------------------------------------
     def action(self, rest, params):
         one = lambda k, d="": self.one(params, k, d)
 
@@ -2806,6 +2942,20 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 return self.redirect("tickets?m=!این تیکت پیدا نشد")
             return self.redirect("tickets?t=%d&m=%s" % (
                 tid, "تیکت بسته شد" if to == "closed" else "تیکت دوباره باز شد"))
+
+        if rest == "watch-start":
+            target = one("target").strip()
+            if target and not re.fullmatch(r"[A-Za-z0-9._@-]{1,40}", target):
+                return self.redirect("logs?m=!نام کاربری یا آی‌پی درست نیست")
+            seconds = one("seconds")
+            seconds = int(seconds) if seconds in ("60", "120", "300") else 120
+            job = {"id": secrets.token_hex(6), "target": target, "seconds": seconds,
+                   "asked_at": now()}
+            STORE.run("INSERT INTO settings (key, value) VALUES ('watch_job', ?)"
+                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                      (json.dumps(job),))
+            return self.redirect("logs?m=درخواست رفت؛ تا ۳۰ ثانیه دیگر سرورهای ایران شروع "
+                                 "می‌کنند. از مشتری بخواهید سرویس را باز کند")
 
         if rest == "bot-setup":
             if not os.path.exists(BOT_BIN):

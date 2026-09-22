@@ -330,6 +330,24 @@ CREATE TABLE IF NOT EXISTS webhook_outbox (
 );
 CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(delivered_at, next_at);
 
+-- Each relay's recent logs, as it last sent them, for the admin panel's logs
+-- page. One row per relay, replaced each time: only the latest is worth
+-- reading, and it must not grow.
+CREATE TABLE IF NOT EXISTS relay_logs (
+    relay TEXT PRIMARY KEY,
+    at    TEXT NOT NULL,
+    text  TEXT NOT NULL
+);
+
+-- What smartdns-watch saw on each relay, for the admin panel's request of the
+-- same id. Only the latest request is kept.
+CREATE TABLE IF NOT EXISTS watch_results (
+    relay  TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    at     TEXT NOT NULL,
+    text   TEXT NOT NULL
+);
+
 -- The answer already given to a request that carried an Idempotency-Key. A
 -- bot that sends the same request twice - a retry after a timeout, a user
 -- tapping twice - gets the first answer back instead of a second action.
@@ -389,6 +407,8 @@ MIGRATIONS = [
     # 'customer' acts for customers; 'admin' may also approve receipts and
     # manage accounts - the operator's own bot.
     ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
+    # The tunnel's own lines, apart from the rest of a relay's log.
+    ("relay_logs", "tunnel", "TEXT"),
     # A free trial: given with one tap, never bought.
     ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
     # When this account had its trial; one per account.
@@ -2248,6 +2268,26 @@ def daily_report_due(store, stamp=None):
     return True
 
 
+# How long after it is asked for a watch is still handed to the relays: a
+# relay that was down when it was asked should not start one an hour later.
+WATCH_FRESH = 600
+
+
+def watch_job(store):
+    """The admin panel's current request to run smartdns-watch, while fresh."""
+    try:
+        job = json.loads(store.setting("watch_job") or "null")
+    except ValueError:
+        return None
+    if not isinstance(job, dict):
+        return None
+    asked = parse_ts(job.get("asked_at"))
+    if not asked or (datetime.now(timezone.utc) - asked).total_seconds() > WATCH_FRESH:
+        return None
+    return {"id": job.get("id"), "target": job.get("target") or "",
+            "seconds": job.get("seconds") or 60}
+
+
 def enforce_quotas(store):
     """Reset, warn and cut off. Called after every sync.
 
@@ -2517,6 +2557,19 @@ class API(http.server.BaseHTTPRequestHandler):
             }
             who = self.relay_name(body)
             self.store.fold_counters(who, clean)
+            # The relay's own recent logs, now and then, for the logs page.
+            if isinstance(body.get("logs"), str):
+                tunnel = body.get("tunnel_logs")
+                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel)"
+                               " VALUES (?, ?, ?, ?)",
+                               (who, now(), body["logs"][-40000:],
+                                tunnel[-20000:] if isinstance(tunnel, str) else None))
+            # What smartdns-watch saw, when the admin panel asked for it.
+            done = body.get("watch_result")
+            if isinstance(done, dict) and isinstance(done.get("text"), str):
+                self.store.run("INSERT OR REPLACE INTO watch_results (relay, job_id, at, text)"
+                               " VALUES (?, ?, ?, ?)", (who, str(done.get("id"))[:40], now(),
+                                                        done["text"][-40000:]))
             # Where customers sign in, so a bot can send them there. Only a
             # plain https address; the relay knows its own domain, nobody
             # has to type it twice.
@@ -2550,6 +2603,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra,
                                     "templates": self.store.template_names(),
+                                    "watch": watch_job(self.store),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----

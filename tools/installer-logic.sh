@@ -1649,6 +1649,9 @@ EOF
         payload BOT > /usr/local/bin/doctor-dns-bot
         chmod +x /usr/local/bin/doctor-dns-bot
         payload BOT_SERVICE > /etc/systemd/system/doctor-dns-bot.service
+        note_file /usr/local/bin/smartdns-bot-logs
+        payload SMARTDNS_BOT_LOGS > /usr/local/bin/smartdns-bot-logs
+        chmod +x /usr/local/bin/smartdns-bot-logs
         systemctl daemon-reload
         enable_service smartdns-admin.service
         enable_service smartdns-operators.timer

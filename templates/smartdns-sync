@@ -805,6 +805,88 @@ def close_relay_when_ready(allowed_count):
           % allowed_count, flush=True)
 
 
+# The relay's own recent logs, sent to the panel now and then so the operator
+# can read them in the admin panel without logging in to this machine. Every
+# few minutes rather than every sync: a log is read by a person, not a
+# program, and it need not cost the link anything the rest of the time.
+LOG_EVERY = 300
+LOG_LINES = 150
+LOG_MAX = 40000
+LOG_UNITS = ("smartdns-sync", "dnsmasq", "nginx", "coturn", "epic-pin",
+             "smartdns-acl-save", "smartdns-dns@*")
+# The tunnel's own lines go separately: the operator looking for why the link
+# to the exit dropped should not have to find them among DNS and nginx.
+TUNNEL_UNIT = "smartdns-tunnel"
+LOG_SENT = [0.0]
+
+# smartdns-watch run on the panel's request: which request was done last, and
+# what it saw, waiting to go back with the next sync.
+WATCH = "/usr/local/bin/smartdns-watch"
+WATCH_DONE = {"id": None, "result": None}
+WATCH_MAX = 40000
+
+
+def recent_logs(units=LOG_UNITS, lines=LOG_LINES):
+    """The last lines of this relay's parts, with the sync secret masked -
+    the same parts `smartdns-logs` shows. Customers' addresses stay: they are
+    what the logs are about, and the panel has them already."""
+    args = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short-iso"]
+    for unit in units:
+        args += ["-u", unit]
+    try:
+        text = subprocess.run(args, capture_output=True, text=True, timeout=20).stdout
+    except Exception as e:
+        return "journalctl: %s" % e
+    # nginx turning strangers away is the gate working, not news.
+    text = "\n".join(l for l in text.splitlines() if "access forbidden by rule" not in l)
+    secret = CFG.get("SYNC_SECRET") or ""
+    if secret:
+        text = text.replace(secret, "<secret>")
+    return text[-LOG_MAX:]
+
+
+def run_watch(job):
+    """Run smartdns-watch for the panel, for as long as it asked, and keep
+    what it printed for the next sync. In its own thread: it takes minutes,
+    and the syncs must go on meanwhile."""
+    target = str(job.get("target") or "")
+    try:
+        seconds = max(10, min(300, int(job.get("seconds") or 60)))
+    except (TypeError, ValueError):
+        seconds = 60
+    if target and not re.fullmatch(r"[A-Za-z0-9._@-]{1,40}", target):
+        WATCH_DONE["result"] = {"id": job["id"], "text": "not a customer or address: %r"
+                                % target[:40]}
+        return
+    # timeout(1) ends it with SIGTERM, which smartdns-watch turns into its
+    # summary line - a kill would lose that.
+    cmd = ["timeout", str(seconds), WATCH] + ([target] if target else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 30)
+        text = (r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")).strip()
+    except Exception as e:
+        text = "smartdns-watch: %s" % e
+    if len(text) > WATCH_MAX:
+        text = "... (only the end)\n" + text[-WATCH_MAX:]
+    WATCH_DONE["result"] = {"id": job["id"], "text": text or "(nothing seen)"}
+
+
+def start_watch(job):
+    """A request from the panel, once per request."""
+    if not isinstance(job, dict) or not job.get("id") or job["id"] == WATCH_DONE["id"]:
+        return False
+    WATCH_DONE["id"] = job["id"]
+    threading.Thread(target=run_watch, args=(job,), daemon=True).start()
+    return True
+
+
+def logs_due(clock=time.monotonic):
+    if clock() - LOG_SENT[0] < LOG_EVERY and LOG_SENT[0]:
+        return False
+    LOG_SENT[0] = clock()
+    return True
+
+
 def sync_once():
     rows = current_state()
     counters = {r["ip"]: r["total"] for r in rows}
@@ -821,8 +903,22 @@ def sync_once():
     # Where this relay's customer panel is, so the panel can send people to it.
     url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
            if CFG.get("PANEL_DOMAIN") else "")
-    answer = post("/sync", {"counters": counters, "host": host,
-                            "relay": CFG["SELF_IP"], "panel_url": url})
+    payload = {"counters": counters, "host": host, "relay": CFG["SELF_IP"],
+               "panel_url": url}
+    if logs_due():
+        payload["logs"] = recent_logs()
+        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+    finished = WATCH_DONE["result"]
+    if finished:
+        payload["watch_result"] = finished
+    answer = post("/sync", payload)
+    # Delivered: the panel has it, so it is not sent again.
+    if finished and WATCH_DONE["result"] is finished:
+        WATCH_DONE["result"] = None
+    try:
+        start_watch(answer.get("watch"))
+    except Exception as e:
+        log(WARN, "watch not started: %s" % e)
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:

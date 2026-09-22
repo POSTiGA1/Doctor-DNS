@@ -469,6 +469,16 @@ is for your own screen - the admin panel's start-up line includes its address.
 that address included; it still holds customers' addresses and usernames, so
 send it only to someone you trust.
 
+The admin panel's **Logs** page shows the same without ssh: the panel, the
+admin panel, the exit's tunnel, the Telegram bot, and each relay - a relay
+sends its last lines every five minutes, its tunnel apart, secrets masked. The
+same page runs `smartdns-watch` on the relays for a customer you name, for one
+to five minutes, and shows what their device asked for and where each name went.
+
+**`smartdns-bot-logs`** (exit) — the Telegram bot's log, its token masked:
+`-f` live, `-e` only what went wrong, `-n 500` more lines. Also on the admin
+panel's Bot page, as "show the full log".
+
 **`smartdns-restart`** — restart every part of this machine at once, then
 show which came back up. It tells a relay from an exit by itself.
 

@@ -149,6 +149,9 @@ menu_logs() {
         'more lines per part   (smartdns-logs -n)|ask "lines per part" && run smartdns-logs -n "$REPLY"'
         'one file to send, secrets masked   (smartdns-logs --report)|run smartdns-logs --report'
     )
+    [ "$role" = exit ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
+        'logs of the Telegram bot   (smartdns-bot-logs)|run smartdns-bot-logs'
+    )
     [ "$role" = relay ] && items+=(
         'what this relay is doing   (smartdns status)|run smartdns status'
         'the names a customer asks for, live   (smartdns-watch)|watch_customer'
