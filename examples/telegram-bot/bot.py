@@ -16,8 +16,8 @@ Settings come from the environment (see bot.env.example):
     WEBHOOK_SECRET   the key's webhook signing secret (whsec_...)
     LISTEN           where the panel's messages arrive, default 127.0.0.1:18990
     ADMIN_IDS        Telegram ids of the operator, comma separated (optional)
-    PAY_TEXT         how to pay, only if the admin panel's "payment details"
-                     (Settings) is empty - that one wins
+    PAY_TEXT         how to pay, only if the admin panel's Payment page is
+                     empty - that one wins
     SUPPORT_TEXT     shown under "help" (optional)
 """
 import base64

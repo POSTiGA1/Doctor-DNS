@@ -834,6 +834,22 @@ def bot_journal(lines):
     return text.replace(token, "<token>") if token else text
 
 
+NGINX_ERRORS = "/var/log/nginx/error.log"
+
+
+def nginx_error_tail(lines=60, path=None):
+    """The end of this machine's nginx error log, without nginx turning away
+    everybody but the relays - the gate working, at nginx's error level."""
+    try:
+        with open(path or NGINX_ERRORS, encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 200000))
+            kept = [l.rstrip("\n") for l in fh if "access forbidden by rule" not in l]
+    except OSError:
+        return ""
+    return "\n".join(kept[-lines:])
+
+
 def ago(ts):
     """"3 دقیقه پیش" - how old a relay's last word is."""
     when = parse_ts(ts)
@@ -1066,7 +1082,7 @@ def page(title, body, cfg, active="", msg=None, msg_kind="good"):
     waiting = tickets_waiting()
     for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
                         ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
-                        ("plans", "پلن‌ها"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
+                        ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
                         ("bot", "ربات"), ("api", "API"), ("settings", "تنظیمات"),
                         ("logs", "لاگ")):
         cls = " class='on'" if active == path else ""
@@ -1788,6 +1804,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                  "users": ("کاربران", self.users),
                  "receipts": ("رسیدها", self.receipts),
                  "plans": ("پلن‌ها", self.plans),
+                 "pay": ("اطلاعات پرداخت", self.pay_page),
                  "tickets": ("تیکت‌ها", self.tickets),
                  "templates": ("قالب‌ها", self.templates),
                  "domains": ("دامنه‌ها", self.domains),
@@ -2193,7 +2210,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             "<div class='f'><label>متن راهنما (اختیاری، زیر «راهنما» در ربات)</label>"
             "<input name='support' value='%s' maxlength='200' style='width:100%%'></div>"
             "<button>%s</button></form>"
-            "<p class='muted'>شماره کارت را در تنظیمات ← «اطلاعات پرداخت» بنویسید؛ ربات از "
+            "<p class='muted'>شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از "
             "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد (صفحهٔ API)، "
             "آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را "
             "روشن می‌کند.</p></div>"
@@ -2203,6 +2220,31 @@ class Admin(http.server.BaseHTTPRequestHandler):
                html.escape(env.get("ADMIN_IDS", ""), quote=True),
                html.escape(env.get("SUPPORT_TEXT", "").replace("\\n", " "), quote=True),
                "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات"))
+        return "".join(out)
+
+    def pay_page(self):
+        """Where customers send the money - its own page, beside the plans."""
+        p = CFG["ADMIN_PATH"]
+        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
+        text = pay["value"] if pay and pay["value"] else ""
+        out = ["<div class='card'><h2>اطلاعات پرداخت</h2>"
+               "<p>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و در ربات همین را می‌بیند: "
+               "کجا و به نام چه کسی واریز کند. عوض کردنش فوراً همه‌جا عوض می‌شود.</p>"
+               "<form method='post' action='/%s/pay-save'>"
+               "<textarea name='text' rows='4' maxlength='%d' style='width:100%%'"
+               " placeholder='مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید'>"
+               "%s</textarea><button style='margin-top:8px'>ذخیره</button></form>"
+               "<p class='muted'>شماره کارت، اسم صاحب کارت، و اگر لازم است یک خط توضیح "
+               "(مثلاً «کد پیگیری را هم بفرستید»). تا %d نویسه، چند خطی.</p></div>"
+               % (p, PAY_TEXT_MAX, html.escape(text), PAY_TEXT_MAX)]
+        if text:
+            out.append("<div class='card'><h2>مشتری این را می‌بیند</h2>"
+                       "<div style='white-space:pre-wrap;padding:10px 12px;border:1px dashed "
+                       "var(--btn);border-radius:10px;line-height:1.9'>💳 %s</div></div>"
+                       % html.escape(text))
+        else:
+            out.append("<div class='card'><p class='warn'>هنوز چیزی ننوشته‌اید؛ مشتری موقع خرید "
+                       "نمی‌داند کجا واریز کند.</p></div>")
         return "".join(out)
 
     def api_keys(self):
@@ -2579,17 +2621,6 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       "" if bot else "<p class='bad'>هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ "
                       "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
 
-        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
-        out.append("<div class='card'><h2>اطلاعات پرداخت</h2>"
-                   "<form method='post' action='/%s/pay-save'>"
-                   "<textarea name='text' rows='3' maxlength='%d' style='width:100%%'"
-                   " placeholder='مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید'>"
-                   "%s</textarea><button class='ghost' style='margin-top:8px'>ذخیره</button>"
-                   "</form><p class='muted'>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و "
-                   "در ربات همین را می‌بیند: کجا و به نام چه کسی واریز کند. عوض کردنش "
-                   "فوراً همه‌جا عوض می‌شود.</p></div>"
-                   % (p, PAY_TEXT_MAX, html.escape(pay["value"] if pay else "")))
-
         out.append("<div class='card'><h2>آدرس این پنل</h2>"
                    "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
                    "<div class='f'><label>پورت</label>"
@@ -2644,6 +2675,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
                  ("smartdns-admin", "پنل ادمین — سرور خارج")]
         if os.path.exists("/etc/systemd/system/smartdns-tunnel.service"):
             units.append(("smartdns-tunnel", "تونل — سرور خارج"))
+        # Renewing the certificates: when this fails, the panels show a
+        # certificate error some weeks later, so it is worth seeing early.
+        units.append(("smartdns-cert", "تمدید گواهی HTTPS — سرور خارج"))
+        if os.path.exists("/etc/systemd/system/smartdns-operators.timer"):
+            units.append(("smartdns-operators", "لیست اپراتورها — سرور خارج"))
+        units.append(("nginx", "nginx — سرور خارج"))
         for unit, label in units:
             try:
                 txt = subprocess.run(
@@ -2654,6 +2691,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 txt = str(e)
             out.append("<div class='card'><h2>%s <span class='muted'>(%s)</span></h2>%s</div>"
                        % (label, unit, pre(txt or "(چیزی نیست)")))
+        errors = nginx_error_tail()
+        if errors:
+            out.append("<div class='card'><h2>خطاهای nginx — سرور خارج <span class='muted'>"
+                       "(/var/log/nginx/error.log)</span></h2>%s</div>" % pre(errors))
 
         out.append("<div id='bot'></div><div class='card'><h2>ربات تلگرام "
                    "<span class='muted'>(doctor-dns-bot)</span></h2>")
@@ -2681,6 +2722,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
             if r["tunnel"] and r["tunnel"].strip():
                 out.append("<div class='card'><h2>تونل — سرور ایران <code>%s</code></h2>%s</div>"
                            % (html.escape(r["relay"]), pre(r["tunnel"])))
+            if r["nginx"] and r["nginx"].strip():
+                out.append("<div class='card'><h2>خطاهای nginx — سرور ایران <code>%s</code>"
+                           "</h2><p class='muted'>اگر مشتری به سایتی وصل نمی‌شود، دلیلش "
+                           "معمولاً این‌جاست.</p>%s</div>"
+                           % (html.escape(r["relay"]), pre(r["nginx"])))
         return "".join(out)
 
     def action(self, rest, params):
@@ -3346,10 +3392,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
         if rest == "pay-save":
             text = one("text").replace("\r\n", "\n").strip()
             if len(text) > PAY_TEXT_MAX:
-                return self.redirect("settings?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
+                return self.redirect("pay?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
             STORE.run("INSERT INTO settings (key, value) VALUES ('pay_text', ?)"
                       " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (text,))
-            return self.redirect("settings?m=%s" % (
+            return self.redirect("pay?m=%s" % (
                 "اطلاعات پرداخت ذخیره شد؛ در پنل مشتری و ربات دیده می‌شود" if text
                 else "اطلاعات پرداخت پاک شد"))
 

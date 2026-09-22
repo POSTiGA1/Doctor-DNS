@@ -178,6 +178,13 @@ where = act("pay-save", text="x" * 501)
 check("within a length", "m=!" in where and store.setting("pay_text").startswith("به کارت"))
 box = sync.receipt_box(api.do_user_info({"session": session}))
 check("the customer sees it beside the plans", "💳 به کارت 6037-1111 به نام مهدی" in box)
+for name in ("pay_page", "settings"):
+    setattr(Rec, name, getattr(admin.Admin, name))
+admin.CFG.update(ADMIN_PORT="9443")
+page = Rec().pay_page()
+check("it has its own page, with a preview of what the customer sees",
+      "action='/p/pay-save'" in page and "💳 به کارت 6037-1111" in page)
+check("and is no longer in Settings", "pay-save" not in Rec().settings())
 check("and it is escaped", "<script>" not in sync.pay_box({"pay_text": "<script>"}))
 
 print("paying for a plan")

@@ -409,6 +409,8 @@ MIGRATIONS = [
     ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
     # The tunnel's own lines, apart from the rest of a relay's log.
     ("relay_logs", "tunnel", "TEXT"),
+    # And nginx's error log, which is a file on the relay, not its journal.
+    ("relay_logs", "nginx", "TEXT"),
     # A free trial: given with one tap, never bought.
     ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
     # When this account had its trial; one per account.
@@ -2559,11 +2561,12 @@ class API(http.server.BaseHTTPRequestHandler):
             self.store.fold_counters(who, clean)
             # The relay's own recent logs, now and then, for the logs page.
             if isinstance(body.get("logs"), str):
-                tunnel = body.get("tunnel_logs")
-                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel)"
-                               " VALUES (?, ?, ?, ?)",
+                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
+                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel,"
+                               " nginx) VALUES (?, ?, ?, ?, ?)",
                                (who, now(), body["logs"][-40000:],
-                                tunnel[-20000:] if isinstance(tunnel, str) else None))
+                                tunnel[-20000:] if isinstance(tunnel, str) else None,
+                                errors[-20000:] if isinstance(errors, str) else None))
             # What smartdns-watch saw, when the admin panel asked for it.
             done = body.get("watch_result")
             if isinstance(done, dict) and isinstance(done.get("text"), str):

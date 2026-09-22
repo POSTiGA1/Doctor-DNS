@@ -283,8 +283,8 @@ you can no longer reach.
 - **Plans** (admin panel → Plans): a template for some days, with an
   allowance and a price. The customer picks one on their page or in the bot
   and sends the slip; approving it puts the plan on their account. Buying the
-  same plan again before it ends is a renewal. Where to pay goes in Settings →
-  payment details.
+  same plan again before it ends is a renewal. Where to pay goes on the
+  admin panel's Payment page.
 - **Free trial**: a plan ticked as one, taken with one tap and no slip - with
   a linked Telegram account, once per Telegram account and once per account.
 - **Tickets**: from the customer's page, the bot, and the admin panel's
@@ -470,8 +470,10 @@ that address included; it still holds customers' addresses and usernames, so
 send it only to someone you trust.
 
 The admin panel's **Logs** page shows the same without ssh: the panel, the
-admin panel, the exit's tunnel, the Telegram bot, and each relay - a relay
-sends its last lines every five minutes, its tunnel apart, secrets masked. The
+admin panel, the exit's tunnel, certificate renewals, the operators list and
+nginx with its error log, the Telegram bot, and each relay with its tunnel and
+nginx errors - a relay sends its last lines every five minutes, secrets
+masked. The
 same page runs `smartdns-watch` on the relays for a customer you name, for one
 to five minutes, and shows what their device asked for and where each name went.
 

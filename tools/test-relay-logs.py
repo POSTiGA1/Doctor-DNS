@@ -91,6 +91,15 @@ sync.sync_once()
 sync.sync_once()
 check("a sync carries them when due, and the next does not",
       "logs" in sent[0] and "logs" not in sent[1], str([list(p) for p in sent]))
+check("and nginx's error log, which is a file, not the journal", "nginx_logs" in sent[0])
+errlog = os.path.join(tempfile.mkdtemp(), "error.log")
+with open(errlog, "w") as fh:
+    fh.write("2026/09/22 upstream timed out while connecting to upstream, client: 5.1.2.3\n"
+             "2026/09/22 access forbidden by rule, client: 9.9.9.9\n")
+got = sync.nginx_errors(path=errlog)
+check("its lines are read, without nginx turning strangers away",
+      "upstream timed out" in got and "access forbidden" not in got, got)
+check("and no file is no lines, not a failure", sync.nginx_errors(path=errlog + ".x") == "")
 check("the tunnel's lines go apart from the rest", "tunnel_logs" in sent[0]
       and "smartdns-tunnel" not in sync.LOG_UNITS and "smartdns-tunnel" in asked[-1],
       str(asked[-1]))
@@ -163,9 +172,11 @@ check("newer ones replace them - one row per relay",
       [dict(r) for r in store.q("SELECT relay, text FROM relay_logs")]
       == [{"relay": "127.0.0.1", "text": "newer lines"}])
 sync_call({"counters": {}, "relay": "127.0.0.1", "logs": "newer lines",
-           "tunnel_logs": "tunnel connected"})
+           "tunnel_logs": "tunnel connected", "nginx_logs": "upstream timed out"})
 check("with the tunnel's apart", store.one("SELECT tunnel FROM relay_logs")["tunnel"]
       == "tunnel connected")
+check("and nginx's errors", store.one("SELECT nginx FROM relay_logs")["nginx"]
+      == "upstream timed out")
 
 print("the panel hands out a watch, and keeps what comes back")
 store.set_setting("watch_job", json.dumps({"id": "abc", "target": "ali", "seconds": 60,
@@ -190,7 +201,14 @@ admin.BOT_ENV = os.path.join(tmp, "bot.env")
 with open(admin.BOT_ENV, "w") as fh:
     fh.write("BOT_TOKEN=%s\n" % TOKEN)
 admin.subprocess.run = lambda cmd, **kw: Ran("line from %s with %s\n" % (cmd[2], TOKEN))
+admin.NGINX_ERRORS = errlog
 page = admin.Admin.logs(None)
+check("the certificate renewals, and nginx, of this machine",
+      "line from smartdns-cert" in page and "line from nginx" in page)
+check("and this machine's nginx errors, without the gate's noise",
+      "upstream timed out while connecting" in page and "access forbidden" not in page)
+check("each relay's nginx errors", page.count("upstream timed out") >= 2
+      and "خطاهای nginx — سرور ایران" in page)
 check("this machine's two services", "smartdns-panel" in page and "smartdns-admin" in page)
 check("the bot's, with its token masked", "doctor-dns-bot" in page and TOKEN not in page)
 check("and each relay's, with when it came", "newer lines" in page and "127.0.0.1" in page

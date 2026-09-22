@@ -880,6 +880,23 @@ def start_watch(job):
     return True
 
 
+NGINX_ERRORS = "/var/log/nginx/error.log"
+
+
+def nginx_errors(lines=80, path=None):
+    """The end of nginx's own error log - a file, not the journal, and where
+    the reason a customer cannot reach a site usually is. nginx turning
+    strangers away is left out: that is the gate working."""
+    try:
+        with open(path or NGINX_ERRORS, encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 200000))
+            kept = [l.rstrip("\n") for l in fh if "access forbidden by rule" not in l]
+    except OSError:
+        return ""
+    return "\n".join(kept[-lines:])
+
+
 def logs_due(clock=time.monotonic):
     if clock() - LOG_SENT[0] < LOG_EVERY and LOG_SENT[0]:
         return False
@@ -908,6 +925,7 @@ def sync_once():
     if logs_due():
         payload["logs"] = recent_logs()
         payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+        payload["nginx_logs"] = nginx_errors()
     finished = WATCH_DONE["result"]
     if finished:
         payload["watch_result"] = finished
