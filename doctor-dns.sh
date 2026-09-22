@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.1"
+VERSION="0.6.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -3711,6 +3711,8 @@ exit 0
 #    ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
 #    # The tunnel's own lines, apart from the rest of a relay's log.
 #    ("relay_logs", "tunnel", "TEXT"),
+#    # And nginx's error log, which is a file on the relay, not its journal.
+#    ("relay_logs", "nginx", "TEXT"),
 #    # A free trial: given with one tap, never bought.
 #    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
 #    # When this account had its trial; one per account.
@@ -5861,11 +5863,12 @@ exit 0
 #            self.store.fold_counters(who, clean)
 #            # The relay's own recent logs, now and then, for the logs page.
 #            if isinstance(body.get("logs"), str):
-#                tunnel = body.get("tunnel_logs")
-#                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel)"
-#                               " VALUES (?, ?, ?, ?)",
+#                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
+#                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel,"
+#                               " nginx) VALUES (?, ?, ?, ?, ?)",
 #                               (who, now(), body["logs"][-40000:],
-#                                tunnel[-20000:] if isinstance(tunnel, str) else None))
+#                                tunnel[-20000:] if isinstance(tunnel, str) else None,
+#                                errors[-20000:] if isinstance(errors, str) else None))
 #            # What smartdns-watch saw, when the admin panel asked for it.
 #            done = body.get("watch_result")
 #            if isinstance(done, dict) and isinstance(done.get("text"), str):
@@ -7972,6 +7975,23 @@ exit 0
 #    return True
 #
 #
+#NGINX_ERRORS = "/var/log/nginx/error.log"
+#
+#
+#def nginx_errors(lines=80, path=None):
+#    """The end of nginx's own error log - a file, not the journal, and where
+#    the reason a customer cannot reach a site usually is. nginx turning
+#    strangers away is left out: that is the gate working."""
+#    try:
+#        with open(path or NGINX_ERRORS, encoding="utf-8", errors="replace") as fh:
+#            fh.seek(0, 2)
+#            fh.seek(max(0, fh.tell() - 200000))
+#            kept = [l.rstrip("\n") for l in fh if "access forbidden by rule" not in l]
+#    except OSError:
+#        return ""
+#    return "\n".join(kept[-lines:])
+#
+#
 #def logs_due(clock=time.monotonic):
 #    if clock() - LOG_SENT[0] < LOG_EVERY and LOG_SENT[0]:
 #        return False
@@ -8000,6 +8020,7 @@ exit 0
 #    if logs_due():
 #        payload["logs"] = recent_logs()
 #        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+#        payload["nginx_logs"] = nginx_errors()
 #    finished = WATCH_DONE["result"]
 #    if finished:
 #        payload["watch_result"] = finished
@@ -10536,6 +10557,22 @@ exit 0
 #    return text.replace(token, "<token>") if token else text
 #
 #
+#NGINX_ERRORS = "/var/log/nginx/error.log"
+#
+#
+#def nginx_error_tail(lines=60, path=None):
+#    """The end of this machine's nginx error log, without nginx turning away
+#    everybody but the relays - the gate working, at nginx's error level."""
+#    try:
+#        with open(path or NGINX_ERRORS, encoding="utf-8", errors="replace") as fh:
+#            fh.seek(0, 2)
+#            fh.seek(max(0, fh.tell() - 200000))
+#            kept = [l.rstrip("\n") for l in fh if "access forbidden by rule" not in l]
+#    except OSError:
+#        return ""
+#    return "\n".join(kept[-lines:])
+#
+#
 #def ago(ts):
 #    """"3 دقیقه پیش" - how old a relay's last word is."""
 #    when = parse_ts(ts)
@@ -10768,7 +10805,7 @@ exit 0
 #    waiting = tickets_waiting()
 #    for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
 #                        ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
-#                        ("plans", "پلن‌ها"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
+#                        ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
 #                        ("bot", "ربات"), ("api", "API"), ("settings", "تنظیمات"),
 #                        ("logs", "لاگ")):
 #        cls = " class='on'" if active == path else ""
@@ -11490,6 +11527,7 @@ exit 0
 #                 "users": ("کاربران", self.users),
 #                 "receipts": ("رسیدها", self.receipts),
 #                 "plans": ("پلن‌ها", self.plans),
+#                 "pay": ("اطلاعات پرداخت", self.pay_page),
 #                 "tickets": ("تیکت‌ها", self.tickets),
 #                 "templates": ("قالب‌ها", self.templates),
 #                 "domains": ("دامنه‌ها", self.domains),
@@ -11895,7 +11933,7 @@ exit 0
 #            "<div class='f'><label>متن راهنما (اختیاری، زیر «راهنما» در ربات)</label>"
 #            "<input name='support' value='%s' maxlength='200' style='width:100%%'></div>"
 #            "<button>%s</button></form>"
-#            "<p class='muted'>شماره کارت را در تنظیمات ← «اطلاعات پرداخت» بنویسید؛ ربات از "
+#            "<p class='muted'>شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از "
 #            "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد (صفحهٔ API)، "
 #            "آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را "
 #            "روشن می‌کند.</p></div>"
@@ -11905,6 +11943,31 @@ exit 0
 #               html.escape(env.get("ADMIN_IDS", ""), quote=True),
 #               html.escape(env.get("SUPPORT_TEXT", "").replace("\\n", " "), quote=True),
 #               "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات"))
+#        return "".join(out)
+#
+#    def pay_page(self):
+#        """Where customers send the money - its own page, beside the plans."""
+#        p = CFG["ADMIN_PATH"]
+#        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
+#        text = pay["value"] if pay and pay["value"] else ""
+#        out = ["<div class='card'><h2>اطلاعات پرداخت</h2>"
+#               "<p>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و در ربات همین را می‌بیند: "
+#               "کجا و به نام چه کسی واریز کند. عوض کردنش فوراً همه‌جا عوض می‌شود.</p>"
+#               "<form method='post' action='/%s/pay-save'>"
+#               "<textarea name='text' rows='4' maxlength='%d' style='width:100%%'"
+#               " placeholder='مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید'>"
+#               "%s</textarea><button style='margin-top:8px'>ذخیره</button></form>"
+#               "<p class='muted'>شماره کارت، اسم صاحب کارت، و اگر لازم است یک خط توضیح "
+#               "(مثلاً «کد پیگیری را هم بفرستید»). تا %d نویسه، چند خطی.</p></div>"
+#               % (p, PAY_TEXT_MAX, html.escape(text), PAY_TEXT_MAX)]
+#        if text:
+#            out.append("<div class='card'><h2>مشتری این را می‌بیند</h2>"
+#                       "<div style='white-space:pre-wrap;padding:10px 12px;border:1px dashed "
+#                       "var(--btn);border-radius:10px;line-height:1.9'>💳 %s</div></div>"
+#                       % html.escape(text))
+#        else:
+#            out.append("<div class='card'><p class='warn'>هنوز چیزی ننوشته‌اید؛ مشتری موقع خرید "
+#                       "نمی‌داند کجا واریز کند.</p></div>")
 #        return "".join(out)
 #
 #    def api_keys(self):
@@ -12281,17 +12344,6 @@ exit 0
 #                      "" if bot else "<p class='bad'>هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ "
 #                      "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
 #
-#        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
-#        out.append("<div class='card'><h2>اطلاعات پرداخت</h2>"
-#                   "<form method='post' action='/%s/pay-save'>"
-#                   "<textarea name='text' rows='3' maxlength='%d' style='width:100%%'"
-#                   " placeholder='مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید'>"
-#                   "%s</textarea><button class='ghost' style='margin-top:8px'>ذخیره</button>"
-#                   "</form><p class='muted'>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و "
-#                   "در ربات همین را می‌بیند: کجا و به نام چه کسی واریز کند. عوض کردنش "
-#                   "فوراً همه‌جا عوض می‌شود.</p></div>"
-#                   % (p, PAY_TEXT_MAX, html.escape(pay["value"] if pay else "")))
-#
 #        out.append("<div class='card'><h2>آدرس این پنل</h2>"
 #                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
 #                   "<div class='f'><label>پورت</label>"
@@ -12346,6 +12398,12 @@ exit 0
 #                 ("smartdns-admin", "پنل ادمین — سرور خارج")]
 #        if os.path.exists("/etc/systemd/system/smartdns-tunnel.service"):
 #            units.append(("smartdns-tunnel", "تونل — سرور خارج"))
+#        # Renewing the certificates: when this fails, the panels show a
+#        # certificate error some weeks later, so it is worth seeing early.
+#        units.append(("smartdns-cert", "تمدید گواهی HTTPS — سرور خارج"))
+#        if os.path.exists("/etc/systemd/system/smartdns-operators.timer"):
+#            units.append(("smartdns-operators", "لیست اپراتورها — سرور خارج"))
+#        units.append(("nginx", "nginx — سرور خارج"))
 #        for unit, label in units:
 #            try:
 #                txt = subprocess.run(
@@ -12356,6 +12414,10 @@ exit 0
 #                txt = str(e)
 #            out.append("<div class='card'><h2>%s <span class='muted'>(%s)</span></h2>%s</div>"
 #                       % (label, unit, pre(txt or "(چیزی نیست)")))
+#        errors = nginx_error_tail()
+#        if errors:
+#            out.append("<div class='card'><h2>خطاهای nginx — سرور خارج <span class='muted'>"
+#                       "(/var/log/nginx/error.log)</span></h2>%s</div>" % pre(errors))
 #
 #        out.append("<div id='bot'></div><div class='card'><h2>ربات تلگرام "
 #                   "<span class='muted'>(doctor-dns-bot)</span></h2>")
@@ -12383,6 +12445,11 @@ exit 0
 #            if r["tunnel"] and r["tunnel"].strip():
 #                out.append("<div class='card'><h2>تونل — سرور ایران <code>%s</code></h2>%s</div>"
 #                           % (html.escape(r["relay"]), pre(r["tunnel"])))
+#            if r["nginx"] and r["nginx"].strip():
+#                out.append("<div class='card'><h2>خطاهای nginx — سرور ایران <code>%s</code>"
+#                           "</h2><p class='muted'>اگر مشتری به سایتی وصل نمی‌شود، دلیلش "
+#                           "معمولاً این‌جاست.</p>%s</div>"
+#                           % (html.escape(r["relay"]), pre(r["nginx"])))
 #        return "".join(out)
 #
 #    def action(self, rest, params):
@@ -13048,10 +13115,10 @@ exit 0
 #        if rest == "pay-save":
 #            text = one("text").replace("\r\n", "\n").strip()
 #            if len(text) > PAY_TEXT_MAX:
-#                return self.redirect("settings?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
+#                return self.redirect("pay?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
 #            STORE.run("INSERT INTO settings (key, value) VALUES ('pay_text', ?)"
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (text,))
-#            return self.redirect("settings?m=%s" % (
+#            return self.redirect("pay?m=%s" % (
 #                "اطلاعات پرداخت ذخیره شد؛ در پنل مشتری و ربات دیده می‌شود" if text
 #                else "اطلاعات پرداخت پاک شد"))
 #
@@ -15247,8 +15314,8 @@ exit 0
 #    WEBHOOK_SECRET   the key's webhook signing secret (whsec_...)
 #    LISTEN           where the panel's messages arrive, default 127.0.0.1:18990
 #    ADMIN_IDS        Telegram ids of the operator, comma separated (optional)
-#    PAY_TEXT         how to pay, only if the admin panel's "payment details"
-#                     (Settings) is empty - that one wins
+#    PAY_TEXT         how to pay, only if the admin panel's Payment page is
+#                     empty - that one wins
 #    SUPPORT_TEXT     shown under "help" (optional)
 #"""
 #import base64
