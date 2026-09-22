@@ -367,38 +367,6 @@ def save_template_names(info):
     return True
 
 
-# What the operator wants written under the sign-in form, so a customer who
-# has forgotten their password knows whom to ask.
-SUPPORT_FILE = "/var/lib/smart-dns/support.json"
-
-
-def save_support(value):
-    """Keep the support contact the panel sent. Returns whether it changed."""
-    if value is None:
-        return False      # an older panel, which does not send one
-    text = json.dumps({"contact": str(value)[:64]}, ensure_ascii=False) + "\n"
-    try:
-        with open(SUPPORT_FILE, encoding="utf-8") as fh:
-            if fh.read() == text:
-                return False
-    except OSError:
-        pass
-    os.makedirs(os.path.dirname(SUPPORT_FILE), exist_ok=True)
-    tmp = SUPPORT_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, SUPPORT_FILE)
-    return True
-
-
-def support_contact():
-    try:
-        with open(SUPPORT_FILE, encoding="utf-8") as fh:
-            return str(json.load(fh).get("contact") or "")[:64]
-    except (OSError, ValueError, AttributeError):
-        return ""
-
-
 # Who each allowed address belongs to, as the panel knows them. Only
 # smartdns-watch reads it, to take a username where an address would do.
 USER_NAMES = "/var/lib/smart-dns/users.json"
@@ -850,8 +818,11 @@ def sync_once():
     # This relay names itself. Through the tunnel the request arrives at the
     # exit from its own loopback, and the address it came from would no longer
     # say which relay sent it - usage is counted per relay.
+    # Where this relay's customer panel is, so the panel can send people to it.
+    url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
+           if CFG.get("PANEL_DOMAIN") else "")
     answer = post("/sync", {"counters": counters, "host": host,
-                            "relay": CFG["SELF_IP"]})
+                            "relay": CFG["SELF_IP"], "panel_url": url})
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:
@@ -860,10 +831,6 @@ def sync_once():
         save_user_names(answer.get("allowed"))
     except Exception as e:
         log(WARN, "user names not saved: %s" % e)
-    try:
-        save_support(answer.get("support"))
-    except Exception as e:
-        log(WARN, "support contact not saved: %s" % e)
 
     names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
     want = set(names)
@@ -1026,6 +993,32 @@ input:focus{outline:0;border-color:var(--btn)}
 .dns .k{color:var(--muted);font-size:12px;margin-bottom:8px}
 .dns .big{margin:0}
 .dns .note{margin-top:12px}
+textarea{width:100%;padding:12px;font:inherit;background:var(--bg);color:var(--fg);
+ border:1px solid var(--line2);border-radius:10px;resize:vertical}
+textarea:focus{outline:0;border-color:var(--btn)}
+.tickets{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+a.tk{display:block;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
+ color:var(--fg);text-decoration:none;font-size:13px}
+a.tk .s{font-weight:600;margin-left:8px}
+a.tk small{display:block;color:var(--muted);margin-top:2px}
+.thread{display:flex;flex-direction:column;gap:10px;margin:16px 0}
+.thread>div{max-width:88%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);
+ font-size:14px}
+.thread .msg-customer{align-self:flex-start;background:var(--bg)}
+.thread .msg-admin{align-self:flex-end;background:var(--good-bg);border-color:var(--btn)}
+.thread .meta{font-size:11px;color:var(--muted);margin-bottom:4px}
+.thread .text{white-space:pre-wrap;word-break:break-word;line-height:1.8}
+.thread img{display:block;max-width:100%;max-height:300px;margin-top:8px;border-radius:8px}
+.pay{white-space:pre-wrap;margin:10px 0;padding:10px 12px;border:1px dashed var(--btn);
+ border-radius:10px;font-size:13px;line-height:1.9}
+.plans .t{color:var(--muted);font-size:12px;margin:14px 0 4px}
+label.plan{display:flex;gap:10px;align-items:flex-start;margin:6px 0;padding:10px 12px;
+ border:1px solid var(--line);border-radius:10px;cursor:pointer;color:var(--fg);
+ font-size:13px;line-height:1.8}
+label.plan:has(input:checked){border-color:var(--btn)}
+label.plan input{width:auto;margin:5px 0 0;accent-color:var(--btn)}
+label.plan .p{font-weight:600}
+label.plan small{color:var(--muted)}
 .dns input[type=file]{width:100%;padding:10px;font-size:12px;
  border:1px dashed var(--line2);background:transparent;margin-bottom:4px}
 details.pw{margin-top:16px;border:1px solid var(--line);border-radius:12px;
@@ -1175,9 +1168,95 @@ def login_form(banner=""):
 
 
 def forgot_line():
-    contact = support_contact()
-    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ به پشتیبانی پیام دهید%s</p>"
-            % ((": <b dir='ltr'>%s</b>" % html.escape(contact)) if contact else "."))
+    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ <a href='/forgot'>بازیابی با "
+            "تلگرام</a></p>")
+
+
+def go_page(token):
+    """The one-time link's page: it hands the link back by POST."""
+    return ("<div class='icon'>🔗</div><h1>ورود به حساب</h1>"
+            "<form method='post' action='/go' id='go'>"
+            "<input type='hidden' name='token' value='%s'>"
+            "<button>ورود و ثبت آی‌پی</button></form>"
+            "<p class='note'>این صفحه را با همان اینترنتی باز کنید که می‌خواهید سرویس "
+            "رویش کار کند.</p>"
+            "<script>document.getElementById('go').submit()</script>"
+            % html.escape(token, quote=True))
+
+
+def forgot_page(banner=""):
+    """Step one of a forgotten password: which account."""
+    return (banner +
+            "<div class='icon'>🔑</div><h1>بازیابی رمز</h1>"
+            "<p class='sub'>اگر حسابتان به تلگرام وصل باشد، یک کد شش‌رقمی به تلگرامتان "
+            "می‌فرستیم.</p>"
+            "<form method='post' action='/forgot'>"
+            "<label>نام کاربری</label>"
+            "<input name='username' required maxlength='32' autocapitalize='none' "
+            "spellcheck='false' autocomplete='username'>"
+            "<button>فرستادن کد</button></form>"
+            "<p class='alt'><a href='/login'>برگشت به ورود</a></p>")
+
+
+def forgot_code_page(username, banner=""):
+    """Step two: the six digits from Telegram, and the new password."""
+    return (banner +
+            "<div class='icon'>✉️</div><h1>کد را وارد کنید</h1>"
+            "<p class='sub'>کد شش‌رقمی‌ای که در تلگرام گرفتید، و رمز تازه.</p>"
+            "<form method='post' action='/forgot-code'>"
+            "<input type='hidden' name='username' value='%s'>"
+            "<label>کد</label>"
+            "<input name='code' required maxlength='6' inputmode='numeric' "
+            "autocomplete='one-time-code' dir='ltr'>"
+            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+            "<input name='new' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<label>تکرار رمز تازه</label>"
+            "<input name='again' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<button>ذخیره و ورود</button></form>"
+            "<p class='alt'>کد نرسید؟ <a href='/forgot'>دوباره بفرستید</a></p>"
+            % html.escape(username, quote=True))
+
+
+def telegram_box(info):
+    """Linking this account to Telegram, which is what makes a forgotten
+    password something the customer can fix alone."""
+    ask = ("<label>رمز فعلی حساب</label><input name='password' type='password' "
+           "required autocomplete='current-password'>")
+    if info.get("telegram_linked"):
+        return ("<p class='note'>✅ حساب شما به تلگرام وصل است؛ اگر رمز را فراموش "
+                "کنید، از صفحهٔ ورود با کد تلگرام بازیابی‌اش می‌کنید.</p>"
+                "<details class='pw'><summary>تلگرامتان عوض شده؟ جدا کردن تلگرام"
+                "</summary><form method='post' action='/telegram-unlink'>%s"
+                "<button class='ghost'>جدا کردن تلگرام</button></form>"
+                "<p class='note'>بعد از جدا کردن، می‌توانید تلگرام تازه را وصل کنید."
+                "</p></details>" % ask)
+    if not info.get("telegram_ready"):
+        return ""
+    return ("<details class='pw'%s><summary>اتصال حساب به تلگرام</summary>"
+            "<form method='post' action='/telegram-link'>%s"
+            "<button class='ghost'>گرفتن کد اتصال</button></form>"
+            "<p class='note'>با اتصال به تلگرام، اگر رمز را فراموش کنید خودتان با یک "
+            "کد بازیابی‌اش می‌کنید.</p></details>"
+            % (" open" if info.get("open") else "", ask))
+
+
+def link_code_page(res):
+    code, minutes = res["code"], res.get("minutes", 15)
+    bot = res.get("bot_link") or ""
+    deep = ""
+    if bot.startswith("https://t.me/"):
+        deep = ("<a class='btn' href='%s?start=link_%s' target='_blank' rel='noopener'>"
+                "باز کردن ربات و اتصال</a>" % (html.escape(bot, quote=True),
+                                                html.escape(code)))
+    return ("<div class='icon'>🔗</div><h1>اتصال به تلگرام</h1>"
+            "<p class='sub'>این کد را برای ربات ما بفرستید. %d دقیقه اعتبار دارد.</p>"
+            "<div class='big'>%s</div>%s"
+            "<p class='note'>ربات جواب می‌دهد که حساب وصل شد. بعد از آن اگر رمز را "
+            "فراموش کنید، از صفحهٔ ورود کد بازیابی به همین تلگرام می‌آید.</p>"
+            "<p class='alt'><a href='/'>برگشت به حساب</a></p>"
+            % (minutes, html.escape(code), deep))
 
 
 def choose_password_page(banner=""):
@@ -1287,6 +1366,123 @@ def account_notice(info):
         return ("<div class='msg warnbox'>دورهٔ شما در <b>%s</b> "
                 "تمام می‌شود.</div>" % html.escape(ends))
     return ""
+
+
+# Digits as a Persian keyboard types them, for the reset code.
+FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+TICKET_STATES = {"open": ("منتظر جواب پشتیبانی", "warn"),
+                 "answered": ("جواب آمده", "ok"),
+                 "closed": ("بسته", "")}
+TICKET_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
+NOT_NOW = ("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
+           "<p class='sub'>چند دقیقه دیگر دوباره.</p>")
+
+
+def support_box(info):
+    """The way to the tickets, with a word when there is a reply waiting."""
+    answered = info.get("tickets_answered") or 0
+    return ("<a class='btn ghost' href='/tickets'>پشتیبانی و تیکت‌ها%s</a>"
+            % (" — <span class='ok'>%d جواب تازه</span>" % answered if answered else ""))
+
+
+def plan_line(p):
+    """One plan as the customer reads it: what they get and what it costs."""
+    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
+        else "حجم نامحدود"
+    bits = [size, "%d روز" % p["days"]]
+    if p.get("speed_kbps"):
+        bits.append("تا %g مگابیت" % (p["speed_kbps"] / 1000.0))
+    return "%s · %s تومان" % ("، ".join(bits), format(p["price"], ","))
+
+
+def pay_box(info):
+    """Where to send the money, as the operator wrote it in the admin panel."""
+    text = (info.get("pay_text") or "").strip()
+    if not text:
+        return ""
+    return "<div class='pay'>💳 %s</div>" % html.escape(text)
+
+
+def trial_box(info):
+    """The free trial, when the operator offers one and this customer has not
+    had it: a button, or what stands in the way."""
+    trial = info.get("trial")
+    if not trial:
+        return ""
+    p = trial["plan"]
+    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] else "نامحدود"
+    what = "%s — %s، %d روز%s" % (html.escape(p["name"]), size, p["days"],
+                                  "، " + html.escape(p["note"]) if p.get("note") else "")
+    if trial.get("available"):
+        return ("<div class='dns'><div class='k'>🎁 تست رایگان</div>"
+                "<p class='note' style='margin-top:0'>%s. یک بار، با یک کلیک، بدون رسید.</p>"
+                "<form method='post' action='/trial'><button>دریافت تست رایگان</button>"
+                "</form></div>" % what)
+    return ("<div class='dns'><div class='k'>🎁 تست رایگان</div>"
+            "<p class='note' style='margin-top:0'>%s.<br>%s</p></div>"
+            % (what, html.escape(trial.get("why") or "")))
+
+
+def receipt_box(info):
+    """Paying: pick what you are paying for, then send the slip.
+
+    With plans on sale the choice is required, and it comes first - the price
+    the customer transfers is the plan's. Grouped by template, because that is
+    the difference a customer cares about: which services it opens. Holding a
+    plan and picking another replaces it from the moment it is approved, and
+    they are told so here, before they pay, not after.
+    """
+    plans = info.get("plans") or []
+    held = info.get("plan_id")
+    out = ["<div class='dns'><div class='k'>خرید یا تمدید</div>"]
+    if info.get("telegram_required"):
+        # The operator asks for Telegram first; the way to it is right here.
+        return ("<div class='dns'><div class='k'>خرید یا تمدید</div>"
+                "<div class='msg warnbox'>برای خرید یا تمدید، اول حسابتان را به تلگرام "
+                "وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.</div>%s</div>"
+                % telegram_box(dict(info, telegram_ready=True, open=True)))
+    waiting = info.get("receipt_waiting")
+    if waiting:
+        out.append("<div class='msg warnbox'>رسید شما%s از %s در انتظار بررسی است."
+                   " رسید تازه جای آن را می‌گیرد.</div>"
+                   % (" برای «%s»" % html.escape(waiting["plan"])
+                      if waiting.get("plan") else "", html.escape(waiting["at"])))
+    out.append("<form method='post' action='/receipt' enctype='multipart/form-data'>")
+    if plans:
+        out.append("<p class='note' style='margin-top:0'>پلن را انتخاب کنید، مبلغش "
+                   "را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار "
+                   "روی حسابتان فعال می‌شود.</p>" + pay_box(info) + "<div class='plans'>")
+        group = None
+        for p in plans:
+            if p["template"] != group:
+                group = p["template"]
+                out.append("<div class='t'>%s</div>" % html.escape(group))
+            mine = p["id"] == held
+            out.append(
+                "<label class='plan'><input type='radio' name='plan' value='%d'"
+                " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
+                % (p["id"], " checked" if mine else "", html.escape(p["name"]),
+                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
+                   html.escape(plan_line(p)),
+                   "<br><small>%s</small>" % html.escape(p["note"])
+                   if p.get("note") else ""))
+        out.append("</div>")
+        if held:
+            out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
+                       "باقی‌مانده‌تان اضافه می‌کند. <b>پلن دیگری</b> که انتخاب کنید "
+                       "از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین "
+                       "می‌رود.</p>")
+        out.append("<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>")
+    else:
+        out.append("<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید "
+                   "تا مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ "
+                   "مگابایت. اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.</p>"
+                   + pay_box(info))
+    out.append("<input type='file' name='file' required "
+               "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+               "<button class='ghost'>فرستادن رسید</button></form></div>")
+    return "".join(out)
 
 
 def dns_box():
@@ -1482,6 +1678,30 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             return self.send("", 303, {"Location": "/",
                                        "Set-Cookie": "sdu=; Path=/; Max-Age=0"})
 
+        if path.startswith("/go/"):
+            # Not signed in here: a link preview fetching this address must
+            # not use the link up. The page posts it back, by itself in a
+            # browser and with a button without script.
+            token = path[4:]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token):
+                return self.redirect("/login", "این لینک درست نیست", bad=True)
+            return self.send_html(go_page(token))
+        if path == "/forgot":
+            return self.send_html(forgot_page(self.banner()))
+        if path == "/forgot-code":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            return self.send_html(forgot_code_page((q.get("u") or [""])[0][:32],
+                                                   self.banner()))
+
+        if path in ("/tickets", "/ticket", "/ticket-image"):
+            if not self.session():
+                return self.redirect("/login")
+            if path == "/tickets":
+                return self.tickets_page()
+            if path == "/ticket":
+                return self.ticket_page()
+            return self.ticket_image()
+
         if path != "/":
             return self.send_html("<div class='icon'>❔</div><h1>صفحه پیدا نشد</h1>", 404)
         return self.dashboard()
@@ -1528,6 +1748,93 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 "Location": "/" if res.get("must_change") else "/register-ip",
                 "Set-Cookie": self.cookie_for(res["session"])})
 
+        if path == "/go":
+            form = self.form()
+            try:
+                res = post("/user-login-link", {"token": form.get("token", "")})
+            except Exception as e:
+                log(ERROR, "panel: login link failed: %s" % e)
+                return self.redirect("/login", "الان نشد، چند دقیقه دیگر", bad=True)
+            if not res.get("ok"):
+                return self.redirect("/login", res.get("message", ""), bad=True)
+            return self.send("", 303, {"Location": "/register-ip",
+                                       "Set-Cookie": self.cookie_for(res["session"])})
+
+        if path == "/forgot":
+            form = self.form()
+            username = (form.get("username") or "").strip()[:32]
+            try:
+                res = post("/user-reset-request", {"username": username,
+                                                   "ip": self.client_ip()})
+            except Exception as e:
+                log(ERROR, "panel: reset request failed: %s" % e)
+                return self.redirect("/forgot", "الان نشد، چند دقیقه دیگر", bad=True)
+            if not res.get("ok"):
+                return self.redirect("/forgot", res.get("message", ""), bad=True)
+            return self.redirect("/forgot-code?u=" + urllib.parse.quote(username),
+                                 res.get("message", ""))
+
+        if path == "/forgot-code":
+            form = self.form()
+            username = (form.get("username") or "").strip()[:32]
+            back = "/forgot-code?u=" + urllib.parse.quote(username)
+            if form.get("new") != form.get("again"):
+                return self.redirect(back, "دو رمز یکی نیستند", bad=True)
+            code = (form.get("code") or "").strip().translate(FA_DIGITS)
+            try:
+                res = post("/user-reset-confirm", {"username": username, "code": code,
+                                                   "password": form.get("new", ""),
+                                                   "ip": self.client_ip()})
+            except Exception as e:
+                log(ERROR, "panel: reset confirm failed: %s" % e)
+                return self.redirect(back, "الان نشد، چند دقیقه دیگر", bad=True)
+            if not res.get("ok"):
+                return self.redirect(back, res.get("message", ""), bad=True)
+            return self.send("", 303, {
+                "Location": "/?m=" + urllib.parse.quote(res.get("message", "")),
+                "Set-Cookie": self.cookie_for(res["session"])})
+
+        if path == "/telegram-link":
+            if not self.session():
+                return self.redirect("/login")
+            form = self.form()
+            try:
+                res = post("/user-link-code", {"session": self.session(),
+                                               "password": form.get("password", "")})
+            except Exception as e:
+                log(ERROR, "panel: link code failed: %s" % e)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            if not res.get("ok"):
+                return self.redirect("/", res.get("message", ""), bad=True)
+            return self.send_html(link_code_page(res))
+
+        if path == "/trial":
+            if not self.session():
+                return self.redirect("/login")
+            try:
+                res = post("/user-trial", {"session": self.session()})
+            except Exception as e:
+                log(ERROR, "panel: trial failed: %s" % e)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
+        if path == "/telegram-unlink":
+            if not self.session():
+                return self.redirect("/login")
+            form = self.form()
+            try:
+                res = post("/user-unlink-telegram", {"session": self.session(),
+                                                     "password": form.get("password", "")})
+            except Exception as e:
+                log(ERROR, "panel: unlink failed: %s" % e)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
+        if path in ("/ticket-new", "/ticket-reply", "/ticket-close"):
+            if not self.session():
+                return self.redirect("/login")
+            return self.ticket_post(path)
+
         if path == "/password-first":
             if not self.session():
                 return self.redirect("/")
@@ -1571,11 +1878,18 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 blob, kind = self.upload("file")
             except ValueError as e:
                 return self.redirect("/", str(e), bad=True)
+            # Which plan it pays for. Not checked here: the panel decides
+            # whether that plan is on sale, and whether one was needed at all.
+            try:
+                plan = int(self.upload("plan")[0].strip() or 0)
+            except ValueError:
+                plan = 0
             try:
                 res = post("/user-receipt", {
                     "session": self.session(),
                     "content_type": kind,
                     "data": base64.b64encode(blob).decode("ascii"),
+                    "plan_id": plan,
                 })
             except Exception as e:
                 log(ERROR, "panel: receipt failed: %s" % e)
@@ -1604,6 +1918,145 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             res = {"ok": False, "message": "الان نشد"}
         return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
+    # -- tickets ------------------------------------------------------------
+    def ask_panel(self, endpoint, payload):
+        """One call to the panel on the customer's behalf; None when it could
+        not be made, so the page can say "not now" rather than fall over."""
+        payload = dict(payload, session=self.session())
+        try:
+            return post(endpoint, payload)
+        except Exception as e:
+            log(ERROR, "panel: %s failed: %s" % (endpoint, e))
+            return None
+
+    def ticket_id(self, name="id"):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw = (q.get(name) or [""])[0]
+        return int(raw) if raw.isdigit() else 0
+
+    def tickets_page(self):
+        res = self.ask_panel("/user-tickets", {})
+        if res is None:
+            return self.send_html(NOT_NOW, 502)
+        if not res.get("ok"):
+            return self.redirect("/", res.get("message", ""), bad=True)
+        body = ["<h1>پشتیبانی</h1>", "<div class='sub'>%s</div>" % html.escape(brand()),
+                self.banner()]
+        tickets = res.get("tickets") or []
+        if tickets:
+            body.append("<div class='tickets'>")
+            for t in tickets:
+                label, cls = TICKET_STATES.get(t["status"], (t["status"], ""))
+                body.append("<a class='tk' href='/ticket?id=%d'><span class='s'>%s</span>"
+                            "<span class='%s'>%s</span><small>%s · %d پیام</small></a>"
+                            % (t["id"], html.escape(t["subject"]), cls, label,
+                               html.escape(t["updated_at"][:16].replace("T", " ")),
+                               t["messages"]))
+            body.append("</div>")
+        else:
+            body.append("<p class='note'>هنوز تیکتی نفرستاده‌اید.</p>")
+        body.append(
+            "<div class='dns'><div class='k'>تیکت تازه</div>"
+            "<form method='post' action='/ticket-new' enctype='multipart/form-data'>"
+            "<label>موضوع</label><input name='subject' required maxlength='80'>"
+            "<label>پیام</label><textarea name='body' rows='5' required maxlength='2000'>"
+            "</textarea>"
+            "<label>عکس (اختیاری، مثلاً اسکرین‌شات خطا)</label>"
+            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
+            "<button>فرستادن تیکت</button></form></div>")
+        body.append("<p class='alt'><a href='/'>برگشت به حساب</a></p>")
+        return self.send_html("".join(body))
+
+    def ticket_page(self):
+        res = self.ask_panel("/user-ticket", {"id": self.ticket_id()})
+        if res is None:
+            return self.send_html(NOT_NOW, 502)
+        if not res.get("ok"):
+            return self.redirect("/tickets", res.get("message", ""), bad=True)
+        t = res["ticket"]
+        label, cls = TICKET_STATES.get(t["status"], (t["status"], ""))
+        body = ["<h1>%s</h1>" % html.escape(t["subject"]),
+                "<div class='sub'><span class='%s'>%s</span></div>" % (cls, label),
+                self.banner(), "<div class='thread'>"]
+        for m in t["messages"]:
+            pic = ("<a href='/ticket-image?img=%d' target='_blank'>"
+                   "<img src='/ticket-image?img=%d' alt='عکس'></a>" % (m["id"], m["id"])
+                   if m.get("has_image") else "")
+            body.append("<div class='msg-%s'><div class='meta'>%s · %s</div>"
+                        "<div class='text'>%s</div>%s</div>"
+                        % ("admin" if m["from"] == "admin" else "customer",
+                           "پشتیبانی" if m["from"] == "admin" else "شما",
+                           html.escape(m["created_at"][:16].replace("T", " ")),
+                           html.escape(m["body"]), pic))
+        body.append("</div>")
+        body.append(
+            "<form method='post' action='/ticket-reply' enctype='multipart/form-data'>"
+            "<input type='hidden' name='id' value='%d'>"
+            "<label>%s</label><textarea name='body' rows='4' required maxlength='2000'>"
+            "</textarea><label>عکس (اختیاری)</label>"
+            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
+            "<button>فرستادن</button></form>"
+            % (t["id"], "پیام تازه — تیکت دوباره باز می‌شود"
+               if t["status"] == "closed" else "پیام تازه"))
+        if t["status"] != "closed":
+            body.append("<form method='post' action='/ticket-close'>"
+                        "<input type='hidden' name='id' value='%d'>"
+                        "<button class='ghost'>مشکلم حل شد، تیکت را ببند</button></form>"
+                        % t["id"])
+        body.append("<p class='alt'><a href='/tickets'>همهٔ تیکت‌ها</a> · "
+                    "<a href='/'>حساب</a></p>")
+        return self.send_html("".join(body))
+
+    def ticket_image(self):
+        res = self.ask_panel("/user-ticket-image", {"message_id": self.ticket_id("img")})
+        if not res or not res.get("ok") or res.get("image_type") not in TICKET_IMAGE_TYPES:
+            return self.send_html("<div class='icon'>❔</div><h1>عکس پیدا نشد</h1>", 404)
+        try:
+            blob = base64.b64decode(res["image_data"])
+        except Exception:
+            return self.send_html("<div class='icon'>❔</div><h1>عکس پیدا نشد</h1>", 404)
+        return self.send(blob, 200, {"Content-Type": res["image_type"],
+                                     "Cache-Control": "private, max-age=3600",
+                                     "X-Content-Type-Options": "nosniff"})
+
+    def ticket_post(self, path):
+        form = self.form()
+        if form.get("too_big"):
+            return self.redirect("/tickets", "فایل خیلی بزرگ است", bad=True)
+        multipart = "multipart/form-data" in (self.headers.get("Content-Type") or "")
+
+        def field(name):
+            if not multipart:
+                return form.get(name, "")
+            try:
+                return self.upload(name)[0].decode("utf-8", "replace")
+            except ValueError:
+                return ""
+
+        tid = field("id").strip()
+        tid = int(tid) if tid.isdigit() else 0
+        payload = {"id": tid, "subject": field("subject"),
+                   "body": field("body").replace("\r\n", "\n")}
+        if multipart:
+            try:
+                blob, kind = self.upload("image")
+            except ValueError:
+                blob, kind = b"", ""
+            if blob:
+                payload["image_data"] = base64.b64encode(blob).decode("ascii")
+                payload["image_type"] = kind
+        endpoint = {"/ticket-new": "/user-ticket-new", "/ticket-reply": "/user-ticket-reply",
+                    "/ticket-close": "/user-ticket-close"}[path]
+        res = self.ask_panel(endpoint, payload)
+        if res is None:
+            back = "/ticket?id=%d" % tid if tid else "/tickets"
+            return self.redirect(back, "الان نشد، چند دقیقه دیگر", bad=True)
+        if not res.get("ok"):
+            back = "/ticket?id=%d" % tid if tid else "/tickets"
+            return self.redirect(back, res.get("message", ""), bad=True)
+        return self.redirect("/ticket?id=%d" % res.get("ticket_id", tid),
+                             res.get("message", ""))
+
     def dashboard(self):
         token = self.session()
         if not token:
@@ -1626,7 +2079,10 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
 
         used, quota = info["used"], info["quota"]
         seen = info.get("seen_ip") or self.client_ip()
-        rows = [("پلن", html.escape(info.get("plan") or "-")),
+        rows = []
+        if info.get("plan_name"):
+            rows.append(("پلن", html.escape(info["plan_name"])))
+        rows += [("قالب", html.escape(info.get("plan") or "-")),
                 ("آی‌پی ثبت‌شده", "<code>%s</code>" % html.escape(info["ip"] or "ثبت نشده")),
                 ("مصرف", human_fa(used))]
         if quota:
@@ -1683,15 +2139,11 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 "<p class='note'>آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و "
                 "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
         body.append(manual_ip_box("/"))
-        body.append(
-            "<div class='dns'><div class='k'>ارسال رسید پرداخت</div>"
-            "<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید تا "
-            "مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ مگابایت. "
-            "اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.</p>"
-            "<form method='post' action='/receipt' enctype='multipart/form-data'>"
-            "<input type='file' name='file' required "
-            "accept='image/jpeg,image/png,image/webp,application/pdf'>"
-            "<button class='ghost'>فرستادن رسید</button></form></div>")
+        body.append(trial_box(info))
+        body.append(receipt_box(info))
+        body.append(support_box(info))
+        if not info.get("telegram_required"):
+            body.append(telegram_box(info))
         body.append(
             "<details class='pw'><summary>تغییر رمز عبور</summary>"
             "<form method='post' action='/password'>"
@@ -1762,7 +2214,51 @@ class PanelServer(http.server.ThreadingHTTPServer):
         self.ctx = ctx
         super().__init__(addr, handler)
 
+    # The certificate to reload when it is renewed; None for a context made
+    # once and kept, which is what the tests hand in.
+    cert = key = None
+    stamp = failed = None
+
+    def follow(self, cert, key):
+        """Pick up a renewed certificate by itself.
+
+        Renewal writes new files and moves the live/ links, and nothing tells
+        this process: it would go on serving the old certificate from memory
+        until it expired in every visitor's browser. So each connection looks
+        at the files first - a stat is nothing next to a handshake. Both
+        files, because the two links do not move at once: loading between the
+        two moves pairs a new certificate with the old key and fails, and the
+        old context stays in use until the second one lands.
+        """
+        self.cert, self.key = cert, key
+        self.stamp = self.cert_stamp()
+
+    def cert_stamp(self):
+        return (os.stat(self.cert).st_mtime, os.stat(self.key).st_mtime)
+
+    def reload_if_renewed(self):
+        if not self.cert:
+            return
+        try:
+            stamp = self.cert_stamp()
+        except OSError:
+            return
+        if stamp == self.stamp or stamp == self.failed:
+            return
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(self.cert, self.key)
+        except (OSError, ssl.SSLError) as e:
+            # Once per change, not once per visitor.
+            self.failed = stamp
+            log(WARN, "could not load the renewed certificate yet, still serving "
+                "the old one: %r" % e)
+            return
+        self.ctx, self.stamp, self.failed = ctx, stamp, None
+        log(INFO, "loaded the renewed certificate %s" % self.cert)
+
     def finish_request(self, request, client_address):
+        self.reload_if_renewed()
         if self.ctx is None:      # plain http, for tests only
             return super().finish_request(request, client_address)
         request.settimeout(HANDSHAKE_TIMEOUT)
@@ -1802,6 +2298,7 @@ def serve_panel():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     httpd = make_panel_server(ctx)
+    httpd.follow(cert, key)
     print("sync up: every %ds to %s, panel on https://%s:%d/"
           % (INTERVAL, CFG["PANEL_HOST"], CFG["PANEL_DOMAIN"], PANEL_TLS_PORT),
           flush=True)

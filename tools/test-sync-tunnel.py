@@ -161,7 +161,7 @@ print("the relay names itself")
 sent = {}
 sync.post = lambda path, payload: sent.setdefault(path, payload) and None or {
     "allowed": [], "profiles": {}, "extra_domains": [], "templates": {}, "support": ""}
-for name in ("save_template_names", "save_user_names", "save_support",
+for name in ("save_template_names", "save_user_names",
              "apply_custom_domains", "apply_speeds", "close_relay_when_ready"):
     setattr(sync, name, lambda *a, **k: False)
 sync.apply_profiles = lambda *a, **k: None

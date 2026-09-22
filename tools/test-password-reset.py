@@ -196,18 +196,8 @@ check("and nobody else had the flag",
       store.one("SELECT count(*) c FROM users WHERE must_change_password = 1")["c"] == 0)
 
 print("the relay's pages")
-sync.SUPPORT_FILE = os.path.join(tmp, "support.json")
-check("with nothing from the panel, the line has no contact",
-      "به پشتیبانی پیام دهید." in sync.login_form())
-check("an older panel sends none, and nothing is written",
-      sync.save_support(None) is False and not os.path.exists(sync.SUPPORT_FILE))
-check("a contact is kept", sync.save_support("@doctor_<b>support</b>"))
-check("once", sync.save_support("@doctor_<b>support</b>") is False)
-form = sync.login_form()
-check("and shown under the form, escaped",
-      "@doctor_&lt;b&gt;support&lt;/b&gt;" in form and "<b>support</b>" not in form, form)
-check("an emptied contact takes the line back to plain",
-      sync.save_support("") and "به پشتیبانی پیام دهید." in sync.login_form())
+check("the sign-in page points to the Telegram reset, and names no contact",
+      "/forgot" in sync.login_form() and "به پشتیبانی پیام دهید" not in sync.login_form())
 
 
 def request(method, path, cookie="", form=None, answer=None):
@@ -264,19 +254,9 @@ check("an account with a username has the button",
 question = re.search(r"action='/p/user-password-reset' onsubmit='([^']*)'", page)
 check("which asks first, naming it",
       question and "«forgetful»" in html.unescape(question.group(1)))
-r = Rec()
-r.action("support-save", {"contact": ["  @doctor   support "]})
-check("the support contact is saved, tidied",
-      store.setting("support_contact") == "@doctor support", store.setting("support_contact"))
 admin.CFG = {"ADMIN_PATH": "p", "ADMIN_PORT": "9443"}
-check("and shown in settings", "value='@doctor support'" in admin.Admin.settings(None))
-r = Rec()
-r.action("support-save", {"contact": ["x" * 65]})
-check("too long is refused", "m=%21" in r.sent.get("Location", "")
-      and store.setting("support_contact") == "@doctor support")
-src = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8").read()
-check("and the sync carries it to the relays",
-      '"support": self.store.setting("support_contact")' in src)
+check("the settings page has no support contact any more",
+      "support-save" not in admin.Admin.settings(None))
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

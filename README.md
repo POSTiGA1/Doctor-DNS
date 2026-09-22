@@ -58,8 +58,11 @@ certificate naming no console host at all.
 | **Quotas** | monthly or one-off, with warnings at 80% and 95% and automatic cutoff |
 | **Speed limits** | a per-customer download cap, shaped with htb + fq_codel rather than by dropping packets |
 | **Service templates** | which brands a customer's plan routes, down to individual domains; a few groups ship visible but unticked, because routing them breaks the thing they belong to |
-| **Customer panel** | sign up, register an address, see usage, send a payment receipt |
-| **Operator panel** | customers, templates, domains, host monitoring, backup and restore |
+| **Selling** | a plan is a template for some days with an allowance and a price; the customer picks one and sends the slip, and approving it puts the plan on; renewals, and a free trial once per Telegram account |
+| **Customer panel** | sign up, register an address, see usage, buy a plan and send the slip, tickets, link Telegram and reset a forgotten password with a Telegram code |
+| **Operator panel** | customers, plans, receipts, tickets, templates, domains, host monitoring, backup and restore |
+| **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report), set up from the admin panel |
+| **API** | to plug in a sales bot of your own: [docs/bot-api.md](docs/bot-api.md) (in Persian) |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
 
 ## What it looks like
@@ -193,12 +196,13 @@ can see, but a firewall rule you wrote yourself it cannot.
 | **443** tcp | the SNI proxy | the same |
 | **3478** udp | STUN, so a console can work out its own NAT | — |
 | **8443** tcp | the customer panel — TLS only, so a relay without a certificate serves no panel at all | the sync API — it answers the relays and nobody else |
+| **8445** tcp | — | the bot API — answers only a key made in the admin panel; open it if your bot runs elsewhere |
 | **8446** tcp | — | loopback only: the exit's route to Google over IPv6, where it has IPv6 |
 | **8444** tcp + udp | only with a tunnel: its port, answering the exit alone — a *reverse* tunnel listens here | the same, for a *direct* tunnel |
 | **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
 
 The admin panel is the one port you choose. It defaults to **9443** and can be
-anything free; the installer stops you at 22, 53, 80, 443, 8443, 8446 and the
+anything free; the installer stops you at 22, 53, 80, 443, 8443, 8445, 8446 and the
 tunnel's port, and `smartdns-access port` applies the same rule later, plus a
 check that nothing else is already listening.
 
@@ -269,10 +273,31 @@ DNS address and the customers' panel, the exit names the operator's panel and
 its password, shown once.
 
 The operator's panel is the whole administrative interface — customers, their
-quotas and speeds, service templates, the domain list, host monitoring,
-payment receipts, and backup and restore. Everything below is for the cases a
+quotas and speeds, plans, payment receipts, tickets, service templates, the
+domain list, host monitoring, the Telegram bot, and backup and restore. Everything below is for the cases a
 web page cannot serve: reading state over ssh, and getting back into a panel
 you can no longer reach.
+
+### Selling, tickets and the Telegram bot
+
+- **Plans** (admin panel → Plans): a template for some days, with an
+  allowance and a price. The customer picks one on their page or in the bot
+  and sends the slip; approving it puts the plan on their account. Buying the
+  same plan again before it ends is a renewal. Where to pay goes in Settings →
+  payment details.
+- **Free trial**: a plan ticked as one, taken with one tap and no slip - with
+  a linked Telegram account, once per Telegram account and once per account.
+- **Tickets**: from the customer's page, the bot, and the admin panel's
+  Tickets page, with pictures.
+- **Telegram bot** (admin panel → Bot): get a token from @BotFather, press
+  Start in the new bot, give the token and your numeric Telegram id, and press
+  set up. The bot runs on this exit. Its customers get a web sign-in too and
+  register their address with a one-time link; you approve receipts with a
+  button. More in [examples/telegram-bot](examples/telegram-bot).
+- **Telegram required** (Settings): when on, a web customer links Telegram
+  before buying; one Telegram account links to one panel account.
+- **The API** for a sales bot of your own, on port 8445:
+  [docs/bot-api.md](docs/bot-api.md).
 
 ### On the exit
 

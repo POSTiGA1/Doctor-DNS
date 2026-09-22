@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import html
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -223,6 +224,124 @@ CREATE TABLE IF NOT EXISTS metrics (
     uptime     INTEGER
 );
 CREATE INDEX IF NOT EXISTS metrics_host_at ON metrics(host, at);
+
+-- What is for sale. A plan is a template for a number of days with an
+-- allowance and a price, so buying one decides everything a customer gets and
+-- approving the receipt is the whole of the operator's work.
+--
+-- quota_bytes 0 is unlimited, as everywhere else, and it is only ever written
+-- from an explicit "unlimited" tick: an empty box must not become a plan that
+-- gives away everything. price is in tomans. A plan that is switched off is
+-- no longer offered, but whoever holds it keeps it to the end of their term.
+CREATE TABLE IF NOT EXISTS plans (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    template_id INTEGER NOT NULL REFERENCES templates(id),
+    days        INTEGER NOT NULL,
+    quota_bytes INTEGER NOT NULL DEFAULT 0,
+    price       INTEGER NOT NULL DEFAULT 0,
+    speed_kbps  INTEGER NOT NULL DEFAULT 0,
+    note        TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
+);
+
+-- Support tickets. status is whose turn it is: 'open' waits for the operator,
+-- 'answered' for the customer, 'closed' for nobody. Either side can close a
+-- ticket, and a customer writing into a closed one opens it again.
+CREATE TABLE IF NOT EXISTS tickets (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subject    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tickets_user ON tickets(user_id);
+
+-- One row per message. The picture, when there is one, lives here like a
+-- receipt does, so one backup is the whole story; it is dropped a while after
+-- the ticket is closed, leaving the words.
+CREATE TABLE IF NOT EXISTS ticket_messages (
+    id         INTEGER PRIMARY KEY,
+    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    from_admin INTEGER NOT NULL DEFAULT 0,
+    body       TEXT NOT NULL,
+    image_blob BLOB,
+    image_type TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ticket_messages_ticket ON ticket_messages(ticket_id);
+
+-- Who has had the free trial, by Telegram account. Its own table rather than a
+-- column on users, so it outlives the account: deleting an account, or taking
+-- Telegram off it, must not make that Telegram account new again.
+CREATE TABLE IF NOT EXISTS trial_log (
+    telegram_id INTEGER PRIMARY KEY,
+    user_id     INTEGER,
+    plan_id     INTEGER,
+    created_at  TEXT NOT NULL
+);
+
+-- Short-lived codes: 'link' ties a web account to the Telegram account that
+-- sends the code to the bot; 'reset' is the six digits that bot hands the
+-- customer to choose a new password. One of each per account at a time, a new
+-- one replacing the old; only a hash is kept.
+CREATE TABLE IF NOT EXISTS user_codes (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    code_hash  TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, kind)
+);
+
+-- Keys for the bot API, made in the admin panel. Only a hash is kept: the key
+-- is shown once when it is made and cannot be read back, only replaced. A key
+-- speaks for every customer at once - the bot says which one by Telegram id -
+-- so it is as strong as the admin password, and revoking is one click.
+-- allow_ips, when set, is the only addresses the key is accepted from.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL,
+    token_hash   TEXT UNIQUE NOT NULL,
+    allow_ips    TEXT,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at   TEXT
+);
+
+-- Things the panel tells a bot, waiting to be delivered. Written wherever
+-- the thing happens - the admin approving a receipt, a sync finding somebody
+-- out of allowance - and sent by one worker in the panel, never inside the
+-- request that caused it: a bot that is down or slow must not make the
+-- operator's click hang. One row per key with a webhook, so each bot has its
+-- own retries.
+CREATE TABLE IF NOT EXISTS webhook_outbox (
+    id           INTEGER PRIMARY KEY,
+    token_id     INTEGER NOT NULL,
+    event        TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_at      TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(delivered_at, next_at);
+
+-- The answer already given to a request that carried an Idempotency-Key. A
+-- bot that sends the same request twice - a retry after a timeout, a user
+-- tapping twice - gets the first answer back instead of a second action.
+CREATE TABLE IF NOT EXISTS api_idempotency (
+    token_id   INTEGER NOT NULL,
+    key        TEXT NOT NULL,
+    request    TEXT NOT NULL,
+    status     INTEGER NOT NULL,
+    response   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (token_id, key)
+);
 """
 
 METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
@@ -258,6 +377,22 @@ MIGRATIONS = [
     ("transactions", "receipt_blob", "BLOB"),
     ("transactions", "receipt_type", "TEXT"),
     ("transactions", "note", "TEXT"),
+    # Which plan the account is on, and which one a receipt is paying for.
+    # Null for everything from before plans, and for an account whose
+    # allowance was set by hand.
+    ("users", "plan_id", "INTEGER"),
+    ("transactions", "plan_id", "INTEGER"),
+    # Where a bot wants to be told things, and the secret its messages are
+    # signed with. Kept readable, unlike the key: the panel has to sign with it.
+    ("api_tokens", "webhook_url", "TEXT"),
+    ("api_tokens", "webhook_secret", "TEXT"),
+    # 'customer' acts for customers; 'admin' may also approve receipts and
+    # manage accounts - the operator's own bot.
+    ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
+    # A free trial: given with one tap, never bought.
+    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
+    # When this account had its trial; one per account.
+    ("users", "trial_at", "TEXT"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -304,6 +439,10 @@ DEFAULT_SETTINGS = {
 # Fractions of the quota at which the user is warned, and the bit each one
 # sets in users.warned.
 THRESHOLDS = [(0.80, 1), (0.95, 2)]
+# Set in users.warned once the bot has been told the term ends soon. Cleared
+# with the other bits whenever the account is given more.
+WARNED_EXPIRING = 4
+EXPIRING_DAYS = 3
 
 IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
 
@@ -437,6 +576,15 @@ def human(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
             return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+        n /= 1024
+
+
+def human_fa(n):
+    """A size as a customer reads it, in the messages a bot passes on."""
+    n = float(n)
+    for unit in ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"):
+        if n < 1024 or unit == "ترابایت":
+            return ("%d %s" if unit == "بایت" else "%.1f %s") % (n, unit)
         n /= 1024
 
 
@@ -719,6 +867,23 @@ class Store:
              (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
                  timespec="seconds")))
         return token
+
+    def plans_for_sale(self):
+        """The plans a customer may buy, grouped the way they are shown: by
+        template, then cheapest first."""
+        return [dict(r) for r in self.q(
+            "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
+            " p.note, t.name AS template FROM plans p"
+            " JOIN templates t ON t.id = p.template_id"
+            " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+
+    def trial_plan(self):
+        """The free trial on offer, if the operator made one."""
+        row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
+                       " t.name AS template FROM plans p JOIN templates t"
+                       " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
+                       " ORDER BY p.id LIMIT 1")
+        return dict(row) if row else None
 
     def user_ips(self, user_id):
         return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
@@ -1130,6 +1295,959 @@ class Health:
 
 
 # ------------------------------------------------------------------ quota
+def refused(error, message):
+    return {"ok": False, "error": error, "message": message}
+
+
+def telegram_required(store, user):
+    """Whether this customer must link Telegram before buying.
+
+    Only while a bot is there to link to - otherwise the rule would lock
+    every web customer out of paying, with no way to comply."""
+    return (store.setting("require_telegram") == "1" and not user["telegram_id"]
+            and telegram_ready(store))
+
+
+def trial_offer(store, user):
+    """(the trial plan, None) when this customer may take it now, else
+    (the plan or None, why not): 'none' - there is no trial; 'telegram' - link
+    Telegram first; 'used' - this account or this Telegram account had one;
+    'running' - a plan is running, and a trial would end it."""
+    plan = store.trial_plan()
+    if not plan:
+        return None, "none"
+    if user["trial_at"]:
+        return plan, "used"
+    if not user["telegram_id"]:
+        return plan, "telegram"
+    if store.one("SELECT 1 FROM trial_log WHERE telegram_id = ?", (user["telegram_id"],)):
+        return plan, "used"
+    # Whatever the account has, while it is running - a plan, or an allowance
+    # set by hand - a trial would replace it, and it is the customer's.
+    if user["status"] in ("active", "over_quota"):
+        return plan, "running"
+    return plan, None
+
+
+TRIAL_WHY = {"none": "تست رایگانی تعریف نشده",
+             "telegram": "برای تست رایگان، اول حسابتان را به تلگرام وصل کنید",
+             "used": "تست رایگان را قبلاً گرفته‌اید",
+             "running": "الان پلن فعال دارید؛ تست رایگان برای وقتی است که پلنی ندارید"}
+
+
+def trial_view(store, user):
+    """What the customer's page and the bot show about the trial."""
+    plan, why = trial_offer(store, user)
+    if not plan or why == "used":
+        return None
+    return {"plan": plan, "available": why is None,
+            "why": TRIAL_WHY.get(why) if why else None}
+
+
+def take_trial(store, user):
+    plan, why = trial_offer(store, user)
+    if why:
+        return refused("trial_" + why, TRIAL_WHY[why])
+    # The Telegram account is written down first, under its primary key: two
+    # taps at once cannot both get through.
+    try:
+        store.run("INSERT INTO trial_log (telegram_id, user_id, plan_id, created_at)"
+                  " VALUES (?, ?, ?, ?)", (user["telegram_id"], user["id"], plan["id"], now()))
+    except sqlite3.IntegrityError:
+        return refused("trial_used", TRIAL_WHY["used"])
+    store.run("UPDATE users SET trial_at = ? WHERE id = ?", (now(), user["id"]))
+    done = apply_plan(store, user["id"], plan["id"])
+    log(INFO, "free trial for user #%d (telegram %d): %s"
+        % (user["id"], user["telegram_id"], done))
+    emit_admin(store, "trial.started", {
+        "user_id": user["id"], "plan": {"id": plan["id"], "name": plan["name"]},
+        "text": "🎁 تست رایگان گرفت: %s" % who_label(user)})
+    return {"ok": True, "message": "🎁 تست رایگان فعال شد. %s" % done}
+
+
+def create_receipt(store, user, body):
+    """Record a photograph of a payment slip against a customer.
+
+    One function for every way in - the web panel through a relay, and a bot
+    through the API - so a rule about what a receipt may be cannot hold on one
+    and not the other. Nothing about the account changes here: this records a
+    claim, and the operator decides what it is worth.
+    """
+    # One account per person, as far as one Telegram account per person goes:
+    # the operator can ask that buying wait until Telegram is linked.
+    if telegram_required(store, user):
+        return refused("telegram_required", "برای خرید، اول حسابتان را به تلگرام "
+                                            "وصل کنید")
+    kind = (body.get("content_type") or "").split(";")[0].strip().lower()
+    if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
+        return refused("bad_type", "فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود")
+    try:
+        blob = base64.b64decode(body.get("data") or "", validate=True)
+    except Exception:
+        return refused("bad_file", "فایل خراب بود، دوباره بفرستید")
+    if not blob:
+        return refused("empty_file", "فایل خالی بود")
+    if len(blob) > MAX_RECEIPT:
+        return refused("too_big", "فایل بزرگ‌تر از %s است" % human(MAX_RECEIPT))
+
+    # What the receipt pays for. Once there is anything on sale a receipt has
+    # to name one of those plans, or the operator is back to guessing what a
+    # sum of money was meant to buy. The price comes from the plan, never from
+    # the form.
+    try:
+        amount = max(0, int(body.get("amount") or 0))
+    except (TypeError, ValueError):
+        amount = 0
+    plan = None
+    try:
+        wanted = int(body.get("plan_id") or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    if wanted:
+        plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1"
+                         " AND is_trial = 0", (wanted,))
+        if not plan:
+            return refused("plan_not_on_sale",
+                           "این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید")
+        amount = plan["price"]
+    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"):
+        return refused("plan_required", "اول پلنی را که خریده‌اید انتخاب کنید")
+
+    # One pending receipt per customer. A second one replaces the first rather
+    # than queueing: somebody who sends three photographs of the same slip
+    # means the last one, and the operator should not have to work out which.
+    with store.lock:
+        store.db.execute("DELETE FROM transactions WHERE user_id = ?"
+                         " AND status = 'pending'", (user["id"],))
+        cur = store.db.execute(
+            "INSERT INTO transactions"
+            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
+            "  status, created_at, plan_id)"
+            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, ?)",
+            (user["id"], amount, blob, kind,
+             (body.get("note") or "").strip()[:200], now(),
+             plan["id"] if plan else None))
+        store.db.commit()
+    print("receipt from user %d: %s, %s%s"
+          % (user["id"], kind, human(len(blob)),
+             ", plan %d" % plan["id"] if plan else ""), flush=True)
+    emit_admin(store, "receipt.submitted", {
+        "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
+        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
+        "text": "رسید تازه از %s%s — %s تومان"
+                % (who_label(user), " برای «%s»" % plan["name"] if plan else "",
+                   format(amount, ","))})
+    return {"ok": True, "receipt_id": cur.lastrowid,
+            "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+
+
+def register_ip(store, user_id, ip):
+    """Put an address on an account - the web panel's button and the API's
+    call both land here."""
+    owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+    if owner and owner["user_id"] != user_id:
+        return refused("ip_taken", "این آی‌پی به حساب دیگری ثبت شده است")
+    user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
+    existing = store.user_ips(user_id)
+    # One active address per account, with as many changes as they like.
+    # Replacing rather than adding is what makes that true.
+    if existing and len(existing) >= user["max_ips"]:
+        for old in existing[: len(existing) - user["max_ips"] + 1]:
+            if old["ip"] != ip:
+                store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
+    store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
+              (user_id, ip, now()))
+    return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+
+
+# ----------------------------------------------------------------- tickets
+# The limits are about one customer filling the operator's queue, not about
+# storage: a ticket is a conversation, and nobody needs more than a few open.
+TICKET_OPEN_MAX = 3
+TICKET_BODY_MAX = 2000
+TICKET_SUBJECT_MAX = 80
+# Messages from one customer per hour, across all their tickets.
+TICKET_RATE = (20, 3600)
+# Pictures in a closed ticket are dropped after this long; the words stay.
+TICKET_IMAGE_DAYS = 30
+TICKET_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
+
+
+def ticket_image(body):
+    """(blob, type) for an optional picture in a request, (None, None) for
+    none, or a refusal."""
+    data = body.get("image_data") or ""
+    if not data:
+        return None, None
+    kind = (body.get("image_type") or "").split(";")[0].strip().lower()
+    if kind not in TICKET_IMAGE_TYPES:
+        return refused("bad_type", "فقط عکس (JPG، PNG یا WEBP) قبول می‌شود"), None
+    try:
+        blob = base64.b64decode(data, validate=True)
+    except Exception:
+        return refused("bad_file", "عکس خراب بود، دوباره بفرستید"), None
+    if not blob:
+        return None, None
+    if len(blob) > MAX_RECEIPT:
+        return refused("too_big", "عکس بزرگ‌تر از %s است" % human(MAX_RECEIPT)), None
+    return blob, kind
+
+
+def ticket_text(body, field, limit):
+    text = unicodedata.normalize("NFC", str(body.get(field) or ""))
+    # Keep line breaks, drop other control characters a client might send.
+    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
+    return text.strip()[:limit]
+
+
+def ticket_rate_ok(user):
+    ok, _ = THROTTLE.check("ticket:%d" % user["id"], *TICKET_RATE)
+    if ok:
+        THROTTLE.hit("ticket:%d" % user["id"])
+    return ok
+
+
+def ticket_open(store, user, body):
+    """A new ticket with its first message."""
+    subject = ticket_text(body, "subject", TICKET_SUBJECT_MAX)
+    text = ticket_text(body, "body", TICKET_BODY_MAX)
+    if not subject:
+        return refused("subject_required", "موضوع تیکت را بنویسید")
+    if not text:
+        return refused("body_required", "متن پیام را بنویسید")
+    blob, kind = ticket_image(body)
+    if isinstance(blob, dict):
+        return blob
+    waiting = store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
+                        " AND status != 'closed'", (user["id"],))["c"]
+    if waiting >= TICKET_OPEN_MAX:
+        return refused("too_many_tickets",
+                       "%d تیکت باز دارید؛ در همان‌ها بنویسید یا یکی را ببندید"
+                       % TICKET_OPEN_MAX)
+    if not ticket_rate_ok(user):
+        return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
+    stamp = now()
+    with store.lock:
+        cur = store.db.execute("INSERT INTO tickets (user_id, subject, status,"
+                               " created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
+                               (user["id"], subject, stamp, stamp))
+        tid = cur.lastrowid
+        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+                         (tid, text, blob, kind, stamp))
+        store.db.commit()
+    print("ticket #%d opened by user %d" % (tid, user["id"]), flush=True)
+    emit_admin(store, "ticket.opened", {
+        "ticket_id": tid, "user_id": user["id"], "subject": subject, "body": text,
+        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject, text)})
+    return {"ok": True, "ticket_id": tid,
+            "message": "تیکت ثبت شد؛ جواب همین‌جا می‌آید"}
+
+
+def ticket_row(store, user, tid):
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return None
+    # Always by owner as well as by number: a customer guessing numbers
+    # must not read somebody else's conversation.
+    return store.one("SELECT * FROM tickets WHERE id = ? AND user_id = ?",
+                     (tid, user["id"]))
+
+
+def ticket_reply(store, user, tid, body):
+    ticket = ticket_row(store, user, tid)
+    if not ticket:
+        return refused("ticket_not_found", "این تیکت پیدا نشد")
+    text = ticket_text(body, "body", TICKET_BODY_MAX)
+    if not text:
+        return refused("body_required", "متن پیام را بنویسید")
+    blob, kind = ticket_image(body)
+    if isinstance(blob, dict):
+        return blob
+    if not ticket_rate_ok(user):
+        return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
+    stamp = now()
+    with store.lock:
+        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+                         (ticket["id"], text, blob, kind, stamp))
+        # Whatever it was, it is the operator's turn now - a closed ticket
+        # written into is open again.
+        store.db.execute("UPDATE tickets SET status = 'open', updated_at = ?"
+                         " WHERE id = ?", (stamp, ticket["id"]))
+        store.db.commit()
+    emit_admin(store, "ticket.message", {
+        "ticket_id": ticket["id"], "user_id": user["id"], "subject": ticket["subject"],
+        "body": text,
+        "text": "پیام تازه از %s در تیکت «%s»:\n\n%s"
+                % (who_label(user), ticket["subject"], text)})
+    return {"ok": True, "ticket_id": ticket["id"], "message": "پیام فرستاده شد"}
+
+
+def ticket_close(store, user, tid):
+    ticket = ticket_row(store, user, tid)
+    if not ticket:
+        return refused("ticket_not_found", "این تیکت پیدا نشد")
+    store.run("UPDATE tickets SET status = 'closed', updated_at = ? WHERE id = ?",
+              (now(), ticket["id"]))
+    return {"ok": True, "ticket_id": ticket["id"], "message": "تیکت بسته شد"}
+
+
+def ticket_list(store, user):
+    return [dict(r) for r in store.q(
+        "SELECT t.id, t.subject, t.status, t.created_at, t.updated_at,"
+        " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS messages"
+        " FROM tickets t WHERE t.user_id = ?"
+        " ORDER BY CASE t.status WHEN 'answered' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,"
+        " t.updated_at DESC LIMIT 50", (user["id"],))]
+
+
+def ticket_get(store, user, tid):
+    ticket = ticket_row(store, user, tid)
+    if not ticket:
+        return refused("ticket_not_found", "این تیکت پیدا نشد")
+    messages = [{"id": m["id"], "from": "admin" if m["from_admin"] else "customer",
+                 "body": m["body"], "has_image": bool(m["has_image"]),
+                 "created_at": m["created_at"]}
+                for m in store.q("SELECT id, from_admin, body, created_at,"
+                                 " image_blob IS NOT NULL AS has_image"
+                                 " FROM ticket_messages WHERE ticket_id = ?"
+                                 " ORDER BY id", (ticket["id"],))]
+    return {"ok": True, "ticket": {
+        "id": ticket["id"], "subject": ticket["subject"], "status": ticket["status"],
+        "created_at": ticket["created_at"], "updated_at": ticket["updated_at"],
+        "messages": messages}}
+
+
+def ticket_picture(store, user, mid):
+    """A message's picture, for its own customer only."""
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        mid = 0
+    row = store.one("SELECT m.image_blob, m.image_type FROM ticket_messages m"
+                    " JOIN tickets t ON t.id = m.ticket_id"
+                    " WHERE m.id = ? AND t.user_id = ?", (mid, user["id"]))
+    if not row or row["image_blob"] is None:
+        return refused("image_not_found", "این عکس پیدا نشد")
+    return {"ok": True, "image_type": row["image_type"],
+            "image_data": base64.b64encode(bytes(row["image_blob"])).decode("ascii")}
+
+
+def prune_ticket_images(store):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=TICKET_IMAGE_DAYS)
+              ).isoformat(timespec="seconds")
+    store.run("UPDATE ticket_messages SET image_blob = NULL, image_type = NULL"
+              " WHERE image_blob IS NOT NULL AND ticket_id IN (SELECT id FROM tickets"
+              " WHERE status = 'closed' AND updated_at < ?)", (cutoff,))
+
+
+# ------------------------------------------------ Telegram link and reset
+# Linking: the web panel shows a code, the customer sends it to the bot, and
+# the bot tells the panel which Telegram account sent it. From then on a
+# forgotten password is six digits the bot delivers - there is no SMS here,
+# and Telegram is the one channel every customer already has.
+LINK_MINUTES = 15
+RESET_MINUTES = 10
+RESET_TRIES = 5
+# Letters nobody misreads when copying from one app to another.
+LINK_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def code_hash(user_id, kind, code):
+    # The user and the kind go into it, so a code is only ever good for the
+    # one account and the one purpose it was made for.
+    return hashlib.sha256(("%s:%s:%s" % (user_id, kind, code.strip().lower()))
+                          .encode("utf-8")).hexdigest()
+
+
+def new_code(store, user_id, kind, code, minutes):
+    store.run("INSERT OR REPLACE INTO user_codes (user_id, kind, code_hash, expires_at,"
+              " attempts) VALUES (?, ?, ?, ?, 0)",
+              (user_id, kind, code_hash(user_id, kind, code),
+               (datetime.now(timezone.utc) + timedelta(minutes=minutes))
+               .isoformat(timespec="seconds")))
+
+
+def telegram_ready(store):
+    """Whether any bot is listening - without one, a code has no way out."""
+    return bool(store.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
+                          " AND COALESCE(webhook_url, '') != ''"))
+
+
+def password_again(user, password):
+    """The account's password, asked for again before anything that decides
+    who can get into it. A session alone can be a borrowed phone, and a
+    Telegram account linked from one would let its holder reset the password
+    whenever they liked. None when it matches, else the refusal."""
+    if not user["password_hash"]:
+        return refused("no_password", "این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید")
+    if check_password(user, password or ""):
+        THROTTLE.clear("pw:%d" % user["id"])
+        return None
+    ok, wait = THROTTLE.check("pw:%d" % user["id"], limit=8, window=900)
+    if not ok:
+        return refused("slow_down", "تلاش زیاد بوده. %d دقیقه دیگر." % max(1, wait // 60))
+    THROTTLE.hit("pw:%d" % user["id"])
+    return refused("wrong_password", "رمز فعلی درست نیست")
+
+
+def link_code(store, user, password):
+    """A code for the web panel to show; the bot turns it into a link."""
+    if user["telegram_id"]:
+        return refused("already_linked", "حساب شما از قبل به تلگرام وصل است")
+    if not telegram_ready(store):
+        return refused("no_bot", "اتصال به تلگرام فعلاً راه نیفتاده")
+    wrong = password_again(user, password)
+    if wrong:
+        return wrong
+    ok, _ = THROTTLE.check("link:%d" % user["id"], 10, 3600)
+    if not ok:
+        return refused("slow_down", "کد زیاد گرفته‌اید؛ کمی بعد دوباره")
+    THROTTLE.hit("link:%d" % user["id"])
+    code = "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
+    new_code(store, user["id"], "link", code, LINK_MINUTES)
+    return {"ok": True, "code": code, "minutes": LINK_MINUTES,
+            "bot_link": store.setting("bot_link")}
+
+
+def unlink_telegram(store, user, password):
+    """Take the Telegram account off a web account - a customer who changed
+    theirs, before linking the new one.
+
+    Only an account that has its own way in: one opened through the bot has
+    nothing but Telegram, and without it nobody could sign in to it again.
+    """
+    if not user["telegram_id"]:
+        return refused("not_linked", "این حساب به تلگرام وصل نیست")
+    if not user["username"] or not user["password_hash"]:
+        return refused("telegram_only", "این حساب فقط با تلگرام کار می‌کند و جدا "
+                                        "کردنش یعنی دیگر کسی واردش نمی‌شود")
+    wrong = password_again(user, password)
+    if wrong:
+        return wrong
+    store.run("UPDATE users SET telegram_id = NULL WHERE id = ?", (user["id"],))
+    store.run("DELETE FROM user_codes WHERE user_id = ?", (user["id"],))
+    print("user %d unlinked from telegram %d" % (user["id"], user["telegram_id"]),
+          flush=True)
+    return {"ok": True, "message": "تلگرام از حساب جدا شد"}
+
+
+def empty_bot_account(store, user):
+    """An account the bot opened and nothing ever happened on: no web login, no
+    plan, no address, no receipt, no ticket."""
+    if user["username"] or user["password_hash"] or user["plan_id"]:
+        return False
+    if user["status"] != "pending" or user["used_bytes"]:
+        return False
+    for table in ("ips", "transactions", "tickets"):
+        if store.one("SELECT 1 FROM %s WHERE user_id = ?" % table, (user["id"],)):
+            return False
+    return True
+
+
+# Letters and digits nobody misreads when a password is copied out of a chat.
+PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+LOGIN_MINUTES = 10
+
+
+def new_password():
+    """Three groups of four - easy to copy, and about 59 bits."""
+    return "-".join("".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(4))
+                    for _ in range(3))
+
+
+def give_credentials(store, user, username, name):
+    """A web sign-in for an account that came through the bot: the name and
+    username the customer chose, and a password made here."""
+    if user["username"]:
+        return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
+    wanted = normal_username(username)
+    if not wanted:
+        return refused("bad_username", "نام کاربری ۳ تا ۳۲ حرف انگلیسی، عدد، نقطه، خط تیره "
+                                       "یا زیرخط باشد")
+    if store.user_by_username(wanted):
+        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
+    password = new_password()
+    salt = secrets.token_hex(16)
+    try:
+        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
+                  " password_salt = ?, must_change_password = 0 WHERE id = ?",
+                  (wanted, name, hash_password(password, salt), salt, user["id"]))
+    except sqlite3.IntegrityError:
+        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+    log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
+    return {"ok": True, "username": wanted, "password": password,
+            "panel_url": store.setting("customer_panel_url")}
+
+
+def fresh_password(store, user):
+    """A new random password for a bot account's web sign-in; everybody signed
+    in with the old one is out."""
+    if not user["username"]:
+        return refused("no_username", "این حساب هنوز نام کاربری ندارد")
+    password = new_password()
+    store.set_password(user["id"], password)
+    store.run("DELETE FROM panel_sessions WHERE user_id = ?", (user["id"],))
+    log(INFO, "user #%d got a new password through the bot" % user["id"])
+    return {"ok": True, "username": user["username"], "password": password,
+            "panel_url": store.setting("customer_panel_url")}
+
+
+def login_link(store, user):
+    """A one-time address that signs the customer in to their web page - to
+    register the address of the connection they open it on."""
+    base = store.setting("customer_panel_url")
+    if not base:
+        return refused("no_panel", "آدرس پنل مشتری هنوز معلوم نیست؛ چند دقیقه دیگر")
+    token = secrets.token_urlsafe(24)
+    new_code(store, user["id"], "login", token, LOGIN_MINUTES)
+    return {"ok": True, "url": base + "go/" + token, "minutes": LOGIN_MINUTES}
+
+
+def use_login_link(store, token):
+    """Trade a one-time link for a session. It works once, and not late."""
+    token = (token or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token):
+        return refused("bad_link", "این لینک درست نیست")
+    for row in store.q("SELECT user_id, code_hash, expires_at FROM user_codes"
+                       " WHERE kind = 'login'"):
+        if not hmac.compare_digest(row["code_hash"],
+                                   code_hash(row["user_id"], "login", token)):
+            continue
+        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'login'",
+                  (row["user_id"],))
+        ends = parse_ts(row["expires_at"])
+        if not ends or datetime.now(timezone.utc) >= ends:
+            return refused("link_expired", "این لینک منقضی شده؛ از ربات یکی تازه بگیرید")
+        log(INFO, "user #%d signed in with a one-time link" % row["user_id"])
+        return {"ok": True, "session": store.open_session(row["user_id"])}
+    return refused("bad_link", "این لینک درست نیست یا قبلاً استفاده شده")
+
+
+def link_telegram(store, tg, code):
+    """The bot says: this Telegram account sent this code."""
+    code = (code or "").strip().lower()
+    if not re.match(r"^[a-z0-9]{8}$", code):
+        return refused("bad_code", "کد اتصال درست نیست")
+    for row in store.q("SELECT user_id, code_hash, expires_at FROM user_codes"
+                       " WHERE kind = 'link'"):
+        if not hmac.compare_digest(row["code_hash"], code_hash(row["user_id"], "link", code)):
+            continue
+        ends = parse_ts(row["expires_at"])
+        if not ends or datetime.now(timezone.utc) >= ends:
+            return refused("code_expired", "کد اتصال منقضی شده؛ یکی تازه بگیرید")
+        other = store.user_by_telegram(tg)
+        if other and other["id"] != row["user_id"] and empty_bot_account(store, other):
+            # Somebody who opened the bot before linking gets a bot account
+            # with nothing in it; it must not stand in the way of the account
+            # they actually use.
+            store.run("DELETE FROM users WHERE id = ?", (other["id"],))
+            log(INFO, "removed empty bot account #%d so telegram %d can link to #%d"
+                % (other["id"], tg, row["user_id"]))
+            other = None
+        if other and other["id"] != row["user_id"]:
+            return refused("telegram_in_use", "این تلگرام به حساب دیگری وصل است؛ "
+                                              "با پشتیبانی تماس بگیرید")
+        store.run("UPDATE users SET telegram_id = ? WHERE id = ?", (tg, row["user_id"]))
+        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'link'",
+                  (row["user_id"],))
+        print("user %d linked to telegram %d" % (row["user_id"], tg), flush=True)
+        return {"ok": True, "user_id": row["user_id"],
+                "message": "حساب شما به تلگرام وصل شد"}
+    return refused("bad_code", "کد اتصال درست نیست")
+
+
+def reset_request(store, username, ip):
+    """Send a reset code through the bot. The answer is the same whether the
+    name exists, is linked, or neither: the page must not tell a stranger
+    which names have accounts."""
+    same = {"ok": True, "message": "اگر این حساب به تلگرام وصل باشد، کد شش‌رقمی "
+                                   "به تلگرامتان فرستاده شد؛ %d دقیقه اعتبار دارد."
+                                   % RESET_MINUTES}
+    ok, wait = THROTTLE.check("resetip:%s" % ip, 10, 3600)
+    if not ok:
+        return refused("slow_down", "درخواست زیاد بوده؛ %d دقیقه دیگر."
+                       % max(1, wait // 60))
+    THROTTLE.hit("resetip:%s" % ip)
+    username = normal_username(username)
+    user = store.user_by_username(username) if username else None
+    if not user or not user["telegram_id"] or not telegram_ready(store):
+        log(INFO, "reset asked for %r from %s: no linked account" % (username, ip))
+        return same
+    ok, _ = THROTTLE.check("reset:%d" % user["id"], 3, 3600)
+    if not ok:
+        return same
+    THROTTLE.hit("reset:%d" % user["id"])
+    code = "%06d" % secrets.randbelow(10 ** 6)
+    new_code(store, user["id"], "reset", code, RESET_MINUTES)
+    emit(store, user, "password.reset_code", {
+        "code": code, "minutes": RESET_MINUTES,
+        "text": "کد بازیابی رمز پنل: %s\n\n%d دقیقه اعتبار دارد. اگر خودتان درخواست "
+                "نکرده‌اید، این پیام را نادیده بگیرید." % (code, RESET_MINUTES)})
+    log(INFO, "reset code for user #%d sent through the bot (asked from %s)"
+        % (user["id"], ip))
+    return same
+
+
+def reset_confirm(store, username, code, password, ip):
+    """Six digits and a new password; a signed-in session when they match."""
+    wrong = refused("bad_code", "کد درست نیست یا منقضی شده")
+    ok, wait = THROTTLE.check("resetip:%s" % ip, 10, 3600)
+    if not ok:
+        return refused("slow_down", "تلاش زیاد بوده؛ %d دقیقه دیگر." % max(1, wait // 60))
+    if len(password or "") < 8:
+        return refused("weak_password", "رمز تازه باید دست‌کم ۸ نویسه باشد")
+    username = normal_username(username)
+    user = store.user_by_username(username) if username else None
+    row = store.one("SELECT * FROM user_codes WHERE user_id = ? AND kind = 'reset'",
+                    (user["id"],)) if user else None
+    if not row:
+        THROTTLE.hit("resetip:%s" % ip)
+        return wrong
+    ends = parse_ts(row["expires_at"])
+    if not ends or datetime.now(timezone.utc) >= ends or row["attempts"] >= RESET_TRIES:
+        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'reset'", (user["id"],))
+        return wrong
+    if not hmac.compare_digest(row["code_hash"],
+                               code_hash(user["id"], "reset", str(code or ""))):
+        store.run("UPDATE user_codes SET attempts = attempts + 1 WHERE user_id = ?"
+                  " AND kind = 'reset'", (user["id"],))
+        THROTTLE.hit("resetip:%s" % ip)
+        return wrong
+    store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'reset'", (user["id"],))
+    store.set_password(user["id"], password)
+    # Whoever else was signed in - perhaps the reason for the reset - is out.
+    store.run("DELETE FROM panel_sessions WHERE user_id = ?", (user["id"],))
+    log(INFO, "user #%d reset their password with a Telegram code from %s"
+        % (user["id"], ip))
+    return {"ok": True, "session": store.open_session(user["id"]),
+            "message": "رمز تازه ذخیره شد و وارد شدید"}
+
+
+# ---------------------------------------------------------------- webhooks
+# How often the worker looks for something to send, how long one delivery may
+# take, and how it backs off: 30s, 1m, 2m ... up to an hour between tries, for
+# about a day in all. A bot that is down for longer than that has missed
+# news, not lost state - the API still says how every account stands.
+WEBHOOK_TICK = 5
+WEBHOOK_TIMEOUT = 10
+WEBHOOK_MAX_TRIES = 30
+WEBHOOK_KEEP_DAYS = 7
+
+
+def emit(store, user, event, data):
+    """Queue something for every bot that asked to be told.
+
+    Only for an account a bot can reach - one with a Telegram id. Nothing is
+    sent here; the worker does that.
+    """
+    if not user["telegram_id"]:
+        return
+    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+                   " AND COALESCE(webhook_url, '') != ''")
+    if not keys:
+        return
+    stamp = now()
+    payload = json.dumps({"event": event, "created_at": stamp,
+                          "telegram_id": user["telegram_id"], "user_id": user["id"],
+                          "data": data}, ensure_ascii=False)
+    for k in keys:
+        store.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+                  " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
+
+
+def webhook_signature(secret, stamp, body):
+    """t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<body>">. The time is in it
+    so a bot can refuse an old message replayed at it."""
+    mac = hmac.new(secret.encode("utf-8"), ("%d." % stamp).encode() + body,
+                   hashlib.sha256).hexdigest()
+    return "t=%d,v1=%s" % (stamp, mac)
+
+
+def webhook_backoff(attempts):
+    return min(3600, 30 * 2 ** max(0, attempts - 1))
+
+
+def deliver_one(store, row, key, opener=None):
+    """Send one queued message. True when the bot took it (any 2xx)."""
+    event = json.loads(row["payload"])
+    event["id"] = row["id"]
+    body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(key["webhook_url"], data=body, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("User-Agent", "doctor-dns")
+    req.add_header("X-DoctorDNS-Event", row["event"])
+    req.add_header("X-DoctorDNS-Delivery", str(row["id"]))
+    req.add_header("X-DoctorDNS-Signature",
+                   webhook_signature(key["webhook_secret"] or "", int(time.time()), body))
+    try:
+        res = (opener or urllib.request.urlopen)(req, timeout=WEBHOOK_TIMEOUT)
+        code = res.status
+        res.close()
+        error = None if 200 <= code < 300 else "HTTP %d" % code
+    except urllib.error.HTTPError as e:
+        error = "HTTP %d" % e.code
+    except Exception as e:
+        error = repr(e)[:200]
+    if error is None:
+        store.run("UPDATE webhook_outbox SET delivered_at = ?, attempts = attempts + 1,"
+                  " last_error = NULL WHERE id = ?", (now(), row["id"]))
+        return True
+    tries = row["attempts"] + 1
+    nxt = datetime.now(timezone.utc) + timedelta(seconds=webhook_backoff(tries))
+    store.run("UPDATE webhook_outbox SET attempts = ?, next_at = ?, last_error = ?"
+              " WHERE id = ?", (tries, nxt.isoformat(timespec="seconds"), error, row["id"]))
+    if tries in (1, WEBHOOK_MAX_TRIES):
+        log(WARN, "webhook #%d (%s) to key %d failed%s: %s"
+            % (row["id"], row["event"], row["token_id"],
+               " for the last time" if tries == WEBHOOK_MAX_TRIES else "", error))
+    return False
+
+
+def deliver_due(store, opener=None):
+    """One pass: everything due, oldest first. The number delivered."""
+    rows = store.q("SELECT * FROM webhook_outbox WHERE delivered_at IS NULL"
+                   " AND attempts < ? AND next_at <= ? ORDER BY id LIMIT 50",
+                   (WEBHOOK_MAX_TRIES, now()))
+    sent = 0
+    for row in rows:
+        key = store.one("SELECT * FROM api_tokens WHERE id = ?", (row["token_id"],))
+        # A key revoked, or its webhook taken away, since this was queued: the
+        # operator has stopped wanting that bot told anything.
+        if not key or key["revoked_at"] or not key["webhook_url"]:
+            store.run("UPDATE webhook_outbox SET attempts = ?, last_error = ?"
+                      " WHERE id = ?", (WEBHOOK_MAX_TRIES, "key revoked or no webhook",
+                                        row["id"]))
+            continue
+        sent += deliver_one(store, row, key, opener)
+    return sent
+
+
+def prune_webhooks(store):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=WEBHOOK_KEEP_DAYS)
+              ).isoformat(timespec="seconds")
+    store.run("DELETE FROM webhook_outbox WHERE created_at < ?"
+              " AND (delivered_at IS NOT NULL OR attempts >= ?)",
+              (cutoff, WEBHOOK_MAX_TRIES))
+
+
+def webhook_worker(store):
+    tick = 0
+    while True:
+        try:
+            if tick % 12 == 0:
+                daily_report_due(store)
+            deliver_due(store)
+            if tick % 720 == 0:
+                prune_webhooks(store)
+        except Exception as e:
+            log(WARN, "webhook worker: %r" % e)
+        tick += 1
+        time.sleep(WEBHOOK_TICK)
+
+
+# ------------------------------------------------------- the admin, by bot
+# What the admin panel does to money and accounts, for a bot holding a key
+# with admin rights. The admin panel is another process with its own copy of
+# these rules; tools/test-admin-bot.py holds the two to the same answers, so
+# a receipt approved from a phone does exactly what one approved at a desk
+# does.
+# When the day's report goes out, in UTC: 05:30 is nine in the morning in Iran.
+DAILY_REPORT_UTC = (5, 30)
+
+
+def apply_plan(store, uid, plan_id, stamp=None):
+    """The admin panel's Store.apply_plan, word for word in effect: the same
+    plan while it runs is a renewal, anything else starts fresh, and a
+    suspended account stays suspended."""
+    stamp = stamp or datetime.now(timezone.utc)
+    with store.lock:
+        user = store.db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        plan = store.db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not user or not plan:
+            return None
+        ends = parse_ts(user["expires_at"])
+        renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
+                    and user["status"] in ("active", "over_quota"))
+        if renewing:
+            until = ends + timedelta(days=plan["days"])
+            quota = (user["quota_bytes"] + plan["quota_bytes"]
+                     if plan["quota_bytes"] and user["quota_bytes"] else 0)
+            used = user["used_bytes"]
+        else:
+            until = stamp + timedelta(days=plan["days"])
+            quota = plan["quota_bytes"]
+            used = 0
+        store.db.execute(
+            "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
+            " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
+            " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
+            " status = CASE WHEN status = 'suspended' THEN 'suspended'"
+            " ELSE 'active' END WHERE id = ?",
+            (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
+             until.isoformat(timespec="seconds"), uid))
+        store.db.commit()
+    return ("پلن «%s» تمدید شد تا %s" if renewing
+            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+
+
+def plan_event(store, uid):
+    row = store.one("SELECT u.expires_at, u.quota_bytes, p.id AS pid, p.name"
+                    " FROM users u LEFT JOIN plans p ON p.id = u.plan_id"
+                    " WHERE u.id = ?", (uid,))
+    if not row:
+        return {}
+    return {"plan": {"id": row["pid"], "name": row["name"]} if row["pid"] else None,
+            "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
+
+
+def decide_receipt(store, tid, to):
+    """Approve or reject a pending receipt, once - the admin panel's
+    receipt-decide."""
+    if to not in ("approved", "rejected"):
+        return refused("bad_decision", "تصمیم باید approve یا reject باشد")
+    row = store.one("SELECT user_id, plan_id, status FROM transactions WHERE id = ?", (tid,))
+    if not row:
+        return refused("receipt_not_found", "این رسید پیدا نشد")
+    if row["status"] != "pending":
+        return refused("already_decided", "این رسید قبلاً بررسی شده")
+    cur = store.run("UPDATE transactions SET status = ?, decided_at = ?,"
+                    " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+                    (to, now(), tid))
+    if not cur.rowcount:
+        return refused("already_decided", "این رسید قبلاً بررسی شده")
+    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+    if to == "rejected":
+        emit(store, user, "receipt.rejected", {
+            "receipt_id": tid,
+            "text": "رسید پرداخت شما تأیید نشد. اگر فکر می‌کنید اشتباهی شده، "
+                    "با پشتیبانی در تماس باشید."})
+        return {"ok": True, "message": "رسید رد شد"}
+    done = apply_plan(store, row["user_id"], row["plan_id"]) if row["plan_id"] else None
+    if done:
+        log(INFO, "receipt #%d approved by bot: user #%d, plan #%d"
+            % (tid, row["user_id"], row["plan_id"]))
+        emit(store, user, "receipt.approved",
+             dict(plan_event(store, row["user_id"]), receipt_id=tid,
+                  text="رسید پرداخت شما تأیید شد. %s" % done))
+        return {"ok": True, "message": "رسید تأیید شد؛ %s" % done}
+    emit(store, user, "receipt.approved", {
+        "receipt_id": tid,
+        "text": "رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود."})
+    return {"ok": True, "message": "رسید تأیید شد؛ سهمیه و زمان را خودتان بگذارید",
+            "needs_hand": True}
+
+
+def admin_ticket_reply(store, tid, body):
+    """The operator answering a ticket - the admin panel's ticket-reply."""
+    ticket = store.one("SELECT * FROM tickets WHERE id = ?", (tid,))
+    if not ticket:
+        return refused("ticket_not_found", "این تیکت پیدا نشد")
+    text = ticket_text(body, "body", TICKET_BODY_MAX)
+    if not text:
+        return refused("body_required", "متن جواب را بنویسید")
+    blob, kind = ticket_image(body)
+    if isinstance(blob, dict):
+        return blob
+    stamp = now()
+    store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
+              " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+              (tid, text, blob, kind, stamp))
+    store.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
+              (stamp, tid))
+    user = store.one("SELECT * FROM users WHERE id = ?", (ticket["user_id"],))
+    emit(store, user, "ticket.answered", {
+        "ticket_id": tid, "subject": ticket["subject"], "body": text,
+        "has_image": bool(blob),
+        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+    return {"ok": True, "message": "جواب فرستاده شد"}
+
+
+def who_label(user):
+    return (user["first_name"] or user["username"] or user["phone"]
+            or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
+                else "#%d" % user["id"]))
+
+
+def emit_admin(store, event, data):
+    """Tell the operator's bots - keys with admin rights - that something
+    waits for them. No customer is addressed: telegram_id is empty."""
+    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+                   " AND scope = 'admin' AND COALESCE(webhook_url, '') != ''")
+    if not keys:
+        return
+    stamp = now()
+    payload = json.dumps({"event": event, "created_at": stamp, "telegram_id": None,
+                          "user_id": data.get("user_id"), "audience": "admin",
+                          "data": data}, ensure_ascii=False)
+    for k in keys:
+        store.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+                  " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
+
+
+def admin_stats(store):
+    """The numbers an operator looks at in the morning."""
+    stamp = datetime.now(timezone.utc)
+    today = stamp.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(
+        timespec="seconds")
+    week = (stamp - timedelta(days=7)).isoformat(timespec="seconds")
+    soon = (stamp + timedelta(days=EXPIRING_DAYS)).isoformat(timespec="seconds")
+    one = lambda sql, args=(): store.one(sql, args)[0] or 0
+    by_status = {r["status"]: r["c"] for r in store.q(
+        "SELECT status, count(*) c FROM users GROUP BY status")}
+    return {
+        "users": sum(by_status.values()),
+        "by_status": by_status,
+        "new_today": one("SELECT count(*) FROM users WHERE created_at >= ?", (today,)),
+        "receipts_pending": one("SELECT count(*) FROM transactions WHERE status = 'pending'"),
+        "approved_today": one("SELECT count(*) FROM transactions WHERE status = 'approved'"
+                              " AND decided_at >= ?", (today,)),
+        "income_today": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
+                            " AND decided_at >= ?", (today,)),
+        "income_7d": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
+                         " AND decided_at >= ?", (week,)),
+        "tickets_open": one("SELECT count(*) FROM tickets WHERE status = 'open'"),
+        "trials_today": one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
+        "expiring_soon": one("SELECT count(*) FROM users WHERE status = 'active'"
+                             " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
+        "used_bytes": one("SELECT sum(used_bytes) FROM users"),
+    }
+
+
+def daily_report_text(s):
+    return ("گزارش روزانه\n"
+            "کاربران: %d (فعال %d، در انتظار پلن %d)\n"
+            "ثبت‌نام امروز: %d\n"
+            "رسید در انتظار: %d\n"
+            "تأیید شدهٔ امروز: %d — %s تومان\n"
+            "درآمد ۷ روز: %s تومان\n"
+            "تیکت منتظر جواب: %d\n"
+            "تست رایگان امروز: %d\n"
+            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود"
+            % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
+               s["new_today"], s["receipts_pending"], s["approved_today"],
+               format(s["income_today"], ","), format(s["income_7d"], ","),
+               s["tickets_open"], s["trials_today"], s["expiring_soon"]))
+
+
+def daily_report_due(store, stamp=None):
+    """Queue the day's report once, after its hour. The date it went out is
+    kept in settings, so a restart does not send it twice."""
+    stamp = stamp or datetime.now(timezone.utc)
+    if (stamp.hour, stamp.minute) < DAILY_REPORT_UTC:
+        return False
+    day = stamp.strftime("%Y-%m-%d")
+    if store.setting("daily_report_sent") == day:
+        return False
+    store.set_setting("daily_report_sent", day)
+    s = admin_stats(store)
+    emit_admin(store, "report.daily", dict(s, text=daily_report_text(s)))
+    return True
+
+
 def enforce_quotas(store):
     """Reset, warn and cut off. Called after every sync.
 
@@ -1158,7 +2276,23 @@ def enforce_quotas(store):
                           (u["id"],))
                 print("expired: user %d after %s" % (u["id"], human(used)),
                       flush=True)
+                emit(store, u, "plan.expired", {
+                    "expires_at": u["expires_at"],
+                    "text": "دورهٔ سرویس شما تمام شد. برای ادامه، پلن را تمدید کنید."})
             continue
+
+        # A few days' notice, once. The bit goes when the account is given
+        # more time, so the next term is announced too.
+        if (due and u["status"] == "active" and not (u["warned"] & WARNED_EXPIRING)
+                and due - stamp <= timedelta(days=EXPIRING_DAYS)):
+            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+                      (WARNED_EXPIRING, u["id"]))
+            left = max(1, int((due - stamp).total_seconds() // 86400) + 1)
+            emit(store, u, "plan.expiring", {
+                "expires_at": u["expires_at"], "days_left": left,
+                "text": "دورهٔ سرویس شما %s تمام می‌شود. برای قطع نشدن، زودتر تمدید کنید."
+                        % ("امروز" if (due - stamp).total_seconds() < 86400
+                           else "%d روز دیگر" % left)})
 
         # Monthly plans roll over on their own date rather than on the 1st, so
         # a user who joins on the 20th gets a full month.
@@ -1181,15 +2315,29 @@ def enforce_quotas(store):
             store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
             print("over quota: user %d at %s of %s"
                   % (u["id"], human(used), human(quota)), flush=True)
+            emit(store, u, "quota.exhausted", {
+                "quota_bytes": quota, "used_bytes": used,
+                "text": "حجم سرویس شما تمام شد و سرویس قطع است. برای ادامه، پلن را تمدید "
+                        "کنید."})
             continue
 
         # Record each threshold as it is crossed, once. The bit is what makes
         # it once - a sync runs every thirty seconds - and it is what the
         # customer's own page reads to decide whether to warn them.
-        for fraction, bit in THRESHOLDS:
-            if used >= quota * fraction and not (u["warned"] & bit):
-                store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
-                          (bit, u["id"]))
+        crossed = [(fraction, bit) for fraction, bit in THRESHOLDS
+                   if used >= quota * fraction and not (u["warned"] & bit)]
+        for fraction, bit in crossed:
+            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+                      (bit, u["id"]))
+        # One message for the highest line crossed: an account that jumps
+        # past both in one sync gets "95%", not two messages at once.
+        if crossed:
+            percent = int(round(crossed[-1][0] * 100))
+            emit(store, u, "quota.warning", {
+                "percent": percent, "quota_bytes": quota, "used_bytes": used,
+                "remaining_bytes": max(0, quota - used),
+                "text": "بیش از %d٪ حجم سرویس شما مصرف شده؛ %s مانده."
+                        % (percent, human_fa(max(0, quota - used)))})
 
 
 # ------------------------------------------------------------------ logging
@@ -1369,6 +2517,13 @@ class API(http.server.BaseHTTPRequestHandler):
             }
             who = self.relay_name(body)
             self.store.fold_counters(who, clean)
+            # Where customers sign in, so a bot can send them there. Only a
+            # plain https address; the relay knows its own domain, nobody
+            # has to type it twice.
+            url = str(body.get("panel_url") or "")
+            if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
+                    self.store.setting("customer_panel_url") != url:
+                self.store.set_setting("customer_panel_url", url)
             # The relay names itself by the address it connected from, so a
             # second relay appears on its own without any configuration.
             self.store.record_metrics(who, body.get("host") or {})
@@ -1395,9 +2550,6 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra,
                                     "templates": self.store.template_names(),
-                                    # Written under the sign-in form, for
-                                    # whoever has forgotten their password.
-                                    "support": self.store.setting("support_contact"),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----
@@ -1415,8 +2567,61 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, self.do_user_password(body))
         if self.path == "/user-password-first":
             return self.reply(200, self.do_user_password_first(body))
+        if self.path.startswith("/user-ticket"):
+            return self.reply(200, self.do_user_ticket(self.path, body))
+        if self.path == "/user-link-code":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            return self.reply(200, link_code(self.store, user, body.get("password")))
+        if self.path == "/user-trial":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            res = take_trial(self.store, user)
+            res.pop("error", None)
+            return self.reply(200, res)
+        if self.path == "/user-unlink-telegram":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            return self.reply(200, unlink_telegram(self.store, user, body.get("password")))
+        # Before signing in, like /user-password-login: no session to check.
+        if self.path == "/user-login-link":
+            res = use_login_link(self.store, body.get("token"))
+            res.pop("error", None)
+            return self.reply(200, res)
+        if self.path == "/user-reset-request":
+            return self.reply(200, reset_request(self.store, body.get("username"),
+                                                 body.get("ip", "")))
+        if self.path == "/user-reset-confirm":
+            return self.reply(200, reset_confirm(self.store, body.get("username"),
+                                                 body.get("code"), body.get("password"),
+                                                 body.get("ip", "")))
 
         return self.reply(404, {"error": "no such endpoint"})
+
+    def do_user_ticket(self, path, body):
+        """Tickets for the relay's customer panel - the same functions the bot
+        API calls, so both ways in keep the same rules."""
+        user = self._session_user(body.get("session"))
+        if not user:
+            return {"ok": False, "message": "نشست معتبر نیست"}
+        if self._must_choose(user):
+            return self._must_choose(user)
+        if path == "/user-tickets":
+            return {"ok": True, "tickets": ticket_list(self.store, user)}
+        if path == "/user-ticket-new":
+            return ticket_open(self.store, user, body)
+        if path == "/user-ticket":
+            return ticket_get(self.store, user, body.get("id"))
+        if path == "/user-ticket-reply":
+            return ticket_reply(self.store, user, body.get("id"), body)
+        if path == "/user-ticket-close":
+            return ticket_close(self.store, user, body.get("id"))
+        if path == "/user-ticket-image":
+            return ticket_picture(self.store, user, body.get("message_id"))
+        return {"ok": False, "message": "چنین کاری نیست"}
 
     def relay_name(self, body):
         """Which relay this sync is from.
@@ -1481,6 +2686,9 @@ class API(http.server.BaseHTTPRequestHandler):
                                " بنویسید یا وارد شوید"}
         THROTTLE.hit("signup:%s" % ip)
         print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
+        emit_admin(self.store, "user.created", {
+            "user_id": user["id"], "via": "web",
+            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
         return {"ok": True, "session": self.store.open_session(user["id"]),
                 "message": "حساب ساخته شد"}
 
@@ -1598,42 +2806,10 @@ class API(http.server.BaseHTTPRequestHandler):
         if self._must_choose(user):
             return self._must_choose(user)
 
-        kind = (body.get("content_type") or "").split(";")[0].strip().lower()
-        if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
-            return {"ok": False,
-                    "message": "فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود"}
-        try:
-            blob = base64.b64decode(body.get("data") or "", validate=True)
-        except Exception:
-            return {"ok": False, "message": "فایل خراب بود، دوباره بفرستید"}
-        if not blob:
-            return {"ok": False, "message": "فایل خالی بود"}
-        if len(blob) > MAX_RECEIPT:
-            return {"ok": False, "message": "فایل بزرگ‌تر از %s است"
-                    % human(MAX_RECEIPT)}
-
-        # One pending receipt per customer. A second one replaces the first
-        # rather than queueing: somebody who sends three photographs of the
-        # same slip means the last one, and the operator should not have to
-        # work out which.
-        self.store.run(
-            "DELETE FROM transactions WHERE user_id = ? AND status = 'pending'",
-            (user["id"],))
-        try:
-            amount = max(0, int(body.get("amount") or 0))
-        except (TypeError, ValueError):
-            amount = 0
-        self.store.run(
-            "INSERT INTO transactions"
-            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
-            "  status, created_at)"
-            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?)",
-            (user["id"], amount, blob, kind,
-             (body.get("note") or "").strip()[:200], now()))
-        print("receipt from user %d: %s, %s"
-              % (user["id"], kind, human(len(blob))), flush=True)
-        return {"ok": True,
-                "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+        res = create_receipt(self.store, user, body)
+        res.pop("error", None)
+        res.pop("receipt_id", None)
+        return res
 
     def do_user_claim(self, body):
         """Register the address the browser is coming from, for a user who is
@@ -1649,20 +2825,9 @@ class API(http.server.BaseHTTPRequestHandler):
         return self.do_claim_register(user["id"], ip)
 
     def do_claim_register(self, user_id, ip):
-        owner = self.store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
-        if owner and owner["user_id"] != user_id:
-            return {"ok": False, "message": "این آی‌پی به حساب دیگری ثبت شده است"}
-        user = self.store.one("SELECT * FROM users WHERE id = ?", (user_id,))
-        existing = self.store.user_ips(user_id)
-        # One active address per account, with as many changes as they like.
-        # Replacing rather than adding is what makes that true.
-        if existing and len(existing) >= user["max_ips"]:
-            for old in existing[: len(existing) - user["max_ips"] + 1]:
-                self.store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
-        self.store.run(
-            "INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
-            (user_id, ip, now()))
-        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+        res = register_ip(self.store, user_id, ip)
+        res.pop("error", None)
+        return res
 
     def do_user_info(self, body):
         user = self._session_user(body.get("session"))
@@ -1673,6 +2838,12 @@ class API(http.server.BaseHTTPRequestHandler):
                              (user["template_id"],)) if user["template_id"] else None
         if not tpl:
             tpl = self.store.one("SELECT name FROM templates WHERE is_default = 1")
+        mine = self.store.one("SELECT name FROM plans WHERE id = ?",
+                              (user["plan_id"],)) if user["plan_id"] else None
+        waiting = self.store.one(
+            "SELECT t.created_at, p.name FROM transactions t"
+            " LEFT JOIN plans p ON p.id = t.plan_id"
+            " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
         return {
             "ok": True,
             "name": user["first_name"] or user["username"] or "",
@@ -1691,6 +2862,24 @@ class API(http.server.BaseHTTPRequestHandler):
             "warned": user["warned"] or 0,
             "seen_ip": body.get("ip", ""),
             "must_change": bool(user["must_change_password"]),
+            # What can be bought, and what this account already holds - the
+            # page warns before a different plan replaces it.
+            "plans": self.store.plans_for_sale(),
+            "trial": trial_view(self.store, user),
+            "pay_text": self.store.setting("pay_text"),
+            "plan_id": user["plan_id"],
+            "plan_name": mine["name"] if mine else "",
+            # Tickets with a reply the customer has not answered, for the
+            # badge on their page.
+            "telegram_linked": bool(user["telegram_id"]),
+            "telegram_required": telegram_required(self.store, user),
+            "telegram_ready": telegram_ready(self.store),
+            "tickets_answered": self.store.one(
+                "SELECT count(*) c FROM tickets WHERE user_id = ?"
+                " AND status = 'answered'", (user["id"],))["c"],
+            "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
+                                 "plan": waiting["name"] or ""}
+                                if waiting else None),
         }
 
 
@@ -1708,6 +2897,754 @@ def make_api_server(ctx, port=None):
     return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
 
 
+# ---------------------------------------------------------------- bot API
+# A second door into the same database, for a sales bot - the operator's own
+# or somebody else's. It lives here rather than in a process of its own so
+# that there is one writer and one set of rules: a receipt sent by a bot is
+# checked by the same function as one sent from the web panel.
+#
+# Its own port, because 8443 is walled off to the relays and a bot can be
+# anywhere. Its own keys, made and revoked in the admin panel, because the
+# relays' secret must never leave the relays. Customers are named by their
+# Telegram id: Telegram vouches for that, and the bot is trusted to pass it on
+# honestly - which is why a key is as strong as the admin password.
+BOT_API_PORT = 8445
+ADMIN_CONFIG = "/etc/smart-dns/admin.env"
+VERSION_FILE = "/var/lib/smart-dns/version"
+# A receipt at its largest, base64-encoded, plus the JSON around it.
+BOT_BODY_MAX = MAX_RECEIPT * 4 // 3 + 64 * 1024
+# Requests per key per minute. Far above what a bot serving people needs, and
+# low enough that one stuck in a loop cannot starve the relays' sync.
+BOT_RATE = (300, 60)
+# Wrong keys per address before it is made to wait: guessing a 256-bit key is
+# hopeless anyway, but there is no reason to let anybody try at full speed.
+BOT_BAD_KEYS = (20, 300)
+IDEMPOTENCY_DAYS = 7
+BOT_THROTTLE = Throttle()
+IDEMPOTENCY_LOCK = threading.Lock()
+
+
+def token_hash(token):
+    # The keys are 256 random bits, so a plain hash is enough: there is no
+    # dictionary to run against them, and the check stays one lookup.
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def public_ipv4(s):
+    """An address a customer's line can actually have - not a LAN address,
+    not loopback, which a bot passing on what somebody typed could send."""
+    try:
+        addr = ipaddress.ip_address((s or "").strip())
+    except ValueError:
+        return False
+    return addr.version == 4 and addr.is_global
+
+
+def user_view(store, user, relays):
+    """An account as the bot sees it.
+
+    `unlimited` only means something while the status is active: a pending
+    account also has quota_bytes 0, and it gets nothing at all.
+    """
+    plan = store.one("SELECT id, name FROM plans WHERE id = ?",
+                     (user["plan_id"],)) if user["plan_id"] else None
+    tpl = store.one("SELECT name FROM templates WHERE id = ?",
+                    (user["template_id"],)) if user["template_id"] else None
+    if not tpl:
+        tpl = store.one("SELECT name FROM templates WHERE is_default = 1")
+    waiting = store.one(
+        "SELECT t.id, t.created_at, t.amount, p.name FROM transactions t"
+        " LEFT JOIN plans p ON p.id = t.plan_id"
+        " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
+    quota, used = user["quota_bytes"], user["used_bytes"]
+    return {
+        "id": user["id"],
+        "telegram_id": user["telegram_id"],
+        "name": user["first_name"] or "",
+        "username": user["username"],
+        "panel_url": store.setting("customer_panel_url") or None,
+        "status": user["status"],
+        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
+        "template": tpl["name"] if tpl else "",
+        "unlimited": not quota,
+        "quota_bytes": quota,
+        "used_bytes": used,
+        "remaining_bytes": None if not quota else max(0, quota - used),
+        "speed_kbps": user["speed_kbps"] or 0,
+        "expires_at": user["expires_at"],
+        "ips": [r["ip"] for r in store.user_ips(user["id"])],
+        "max_ips": user["max_ips"],
+        "wallet": user["wallet"],
+        # What to put in the console or router: the relays, which is where a
+        # customer's DNS has to point.
+        "dns": list(relays),
+        "trial": trial_view(store, user),
+        "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
+                                      " AND status = 'answered'", (user["id"],))["c"],
+        "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
+                             "amount": waiting["amount"],
+                             "plan": waiting["name"]} if waiting else None),
+    }
+
+
+def admin_user_view(store, user, relays):
+    """An account as the operator sees it: the customer's view, and who they
+    are."""
+    return dict(user_view(store, user, relays), username=user["username"],
+                phone=user["phone"], created_at=user["created_at"],
+                label=who_label(user))
+
+
+def admin_receipt(store, row):
+    return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+            "created_at": row["created_at"], "decided_at": row["decided_at"],
+            "has_image": bool(row["has_image"]),
+            "plan": {"id": row["plan_id"], "name": row["plan_name"]}
+            if row["plan_id"] else None,
+            "user": {"id": row["user_id"], "label": who_label(dict(row, id=row["uid"])),
+                     "telegram_id": row["telegram_id"]}}
+
+
+RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.created_at, t.decided_at, t.plan_id,"
+                " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
+                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
+                " FROM transactions t JOIN users u ON u.id = t.user_id"
+                " LEFT JOIN plans p ON p.id = t.plan_id")
+
+
+class AdminAPI:
+    """The admin endpoints, mixed into BotAPI. Every action is logged with the
+    key that did it, the way the admin panel logs its own."""
+
+    def admin_log(self, what):
+        log(INFO, "bot-api admin (key %r): %s" % (self._key["name"], what))
+
+    def api_admin_stats(self, body):
+        s = admin_stats(self.store)
+        return 200, dict({"ok": True, "text": daily_report_text(s)}, **s)
+
+    def api_admin_receipts(self, body):
+        which = (self.query.get("status") or ["pending"])[0]
+        if which == "all":
+            rows = self.store.q(RECEIPT_ROWS + " ORDER BY t.id DESC LIMIT 50")
+        elif which in ("pending", "approved", "rejected"):
+            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ? ORDER BY t.id"
+                                + (" DESC" if which != "pending" else "") + " LIMIT 50",
+                                (which,))
+        else:
+            return 400, refused("bad_status", "status یکی از pending، approved، "
+                                              "rejected یا all است")
+        return 200, {"ok": True, "receipts": [admin_receipt(self.store, r) for r in rows]}
+
+    def api_admin_receipt_image(self, body, rid):
+        row = self.store.one("SELECT receipt_blob, receipt_type FROM transactions"
+                             " WHERE id = ?", (int(rid),))
+        if not row or row["receipt_blob"] is None:
+            return 404, refused("image_not_found", "عکس این رسید نیست (یا بعد از "
+                                                   "تصمیم پاک شده)")
+        return 200, {"ok": True, "content_type": row["receipt_type"],
+                     "data": base64.b64encode(bytes(row["receipt_blob"])).decode("ascii")}
+
+    def api_admin_decide(self, body, rid, verb):
+        res = decide_receipt(self.store, int(rid),
+                             "approved" if verb == "approve" else "rejected")
+        if not res["ok"]:
+            return {"receipt_not_found": 404, "already_decided": 409}.get(
+                res["error"], 400), res
+        self.admin_log("receipt #%s %s" % (rid, verb))
+        row = self.store.one(RECEIPT_ROWS + " WHERE t.id = ?", (int(rid),))
+        return 200, dict(res, receipt=admin_receipt(self.store, row))
+
+    def api_admin_users(self, body):
+        q = (self.query.get("q") or [""])[0].strip()[:64]
+        if not q:
+            rows = self.store.q("SELECT * FROM users ORDER BY id DESC LIMIT 20")
+        else:
+            like = "%" + q.replace("%", "").replace("_", "") + "%"
+            rows = self.store.q(
+                "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
+                " WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+                " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
+                " OR i.ip = ? ORDER BY u.id DESC LIMIT 20", (like, like, like, q, q, q))
+        return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
+                                           for r in rows]}
+
+    def admin_target(self, uid):
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (int(uid),))
+        if not user:
+            return None, (404, refused("user_not_found", "این کاربر پیدا نشد"))
+        return user, None
+
+    def api_admin_user(self, body, uid):
+        user, err = self.admin_target(uid)
+        if err:
+            return err
+        return 200, {"ok": True, "user": admin_user_view(self.store, user, self.relays)}
+
+    def api_admin_status(self, body, uid):
+        user, err = self.admin_target(uid)
+        if err:
+            return err
+        to = str(body.get("status") or "")
+        if to not in ("active", "suspended"):
+            return 400, refused("bad_status", "status باید active یا suspended باشد")
+        # As the admin panel's button does: back to active clears the warnings
+        # it crossed while it was blocked.
+        self.store.run("UPDATE users SET status = ?, warned = CASE WHEN ? = 'active'"
+                       " THEN 0 ELSE warned END WHERE id = ?", (to, to, user["id"]))
+        self.admin_log("user #%d -> %s" % (user["id"], to))
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, {"ok": True, "message": "کاربر مسدود شد" if to == "suspended"
+                     else "کاربر برگشت", "user": admin_user_view(self.store, user, self.relays)}
+
+    def api_admin_plan(self, body, uid):
+        user, err = self.admin_target(uid)
+        if err:
+            return err
+        try:
+            pid = int(body.get("plan_id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        done = apply_plan(self.store, user["id"], pid)
+        if not done:
+            return 404, refused("plan_not_found", "این پلن پیدا نشد")
+        self.admin_log("plan #%d given to user #%d" % (pid, user["id"]))
+        emit(self.store, user, "plan.activated", dict(plan_event(self.store, user["id"]),
+                                                      text=done))
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, {"ok": True, "message": done,
+                     "user": admin_user_view(self.store, user, self.relays)}
+
+    def api_admin_tickets(self, body):
+        which = (self.query.get("status") or ["open"])[0]
+        if which not in ("open", "answered", "closed", "all"):
+            return 400, refused("bad_status", "status یکی از open، answered، closed "
+                                              "یا all است")
+        rows = self.store.q(
+            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
+            " FROM tickets t JOIN users u ON u.id = t.user_id"
+            + ("" if which == "all" else " WHERE t.status = ?")
+            + " ORDER BY t.updated_at DESC LIMIT 50", () if which == "all" else (which,))
+        return 200, {"ok": True, "tickets": [
+            {"id": r["id"], "subject": r["subject"], "status": r["status"],
+             "created_at": r["created_at"], "updated_at": r["updated_at"],
+             "messages": r["n"],
+             "user": {"id": r["user_id"], "label": who_label(dict(r, id=r["user_id"])),
+                      "telegram_id": r["telegram_id"]}} for r in rows]}
+
+    def api_admin_ticket(self, body, tid):
+        t = self.store.one("SELECT * FROM tickets WHERE id = ?", (int(tid),))
+        if not t:
+            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
+        owner = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+        res = ticket_get(self.store, owner, t["id"])
+        res["ticket"]["user"] = {"id": owner["id"], "label": who_label(owner),
+                                 "telegram_id": owner["telegram_id"]}
+        return 200, res
+
+    def api_admin_reply(self, body, tid):
+        res = admin_ticket_reply(self.store, int(tid), body)
+        if not res["ok"]:
+            return {"ticket_not_found": 404, "too_big": 413}.get(res["error"], 400), res
+        self.admin_log("replied to ticket #%s" % tid)
+        return self.api_admin_ticket(body, tid)
+
+    def api_admin_close(self, body, tid):
+        cur = self.store.run("UPDATE tickets SET status = 'closed', updated_at = ?"
+                             " WHERE id = ?", (now(), int(tid)))
+        if not cur.rowcount:
+            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
+        self.admin_log("closed ticket #%s" % tid)
+        return 200, {"ok": True, "message": "تیکت بسته شد"}
+
+
+class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
+    """JSON in, JSON out, under /api/v1. Every answer has "ok"; a refusal
+    also has "error", a code for the bot, and "message", Persian for the
+    customer."""
+    server_version = "smartdns"
+    protocol_version = "HTTP/1.0"
+    store = None
+    relays = ()
+
+    ROUTES = [
+        ("GET", re.compile(r"/api/v1/?$"), "ping"),
+        ("GET", re.compile(r"/api/v1/plans$"), "list_plans"),
+        ("POST", re.compile(r"/api/v1/users$"), "create_user"),
+        ("POST", re.compile(r"/api/v1/link$"), "link"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})$"), "get_user"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/ips$"), "add_ip"),
+        ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/ips/([0-9.]{7,15})$"),
+         "remove_ip"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets$"), "list_tickets"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets$"), "open_ticket"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})$"), "get_ticket"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages$"),
+         "reply_ticket"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/close$"),
+         "close_ticket"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages/"
+                           r"(\d{1,12})/image$"), "ticket_image"),
+        # The operator's own, for a key with admin rights only.
+        ("GET", re.compile(r"/api/v1/admin/stats$"), "admin_stats"),
+        ("GET", re.compile(r"/api/v1/admin/receipts$"), "admin_receipts"),
+        ("GET", re.compile(r"/api/v1/admin/receipts/(\d{1,12})/image$"),
+         "admin_receipt_image"),
+        ("POST", re.compile(r"/api/v1/admin/receipts/(\d{1,12})/(approve|reject)$"),
+         "admin_decide"),
+        ("GET", re.compile(r"/api/v1/admin/users$"), "admin_users"),
+        ("GET", re.compile(r"/api/v1/admin/users/(\d{1,12})$"), "admin_user"),
+        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/status$"), "admin_status"),
+        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/plan$"), "admin_plan"),
+        ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
+        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
+        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
+        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/close$"), "admin_close"),
+    ]
+
+    def log_message(self, fmt, *args):
+        log(INFO, "bot-api %s from %s" % (fmt % args, self.client_address[0]))
+
+    def parse_request(self):
+        self._t0 = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120]
+        log_access(self, "bot-api", code, path, getattr(self, "_who", ""))
+
+    def reply(self, code, obj, headers=None):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.handle_api("GET")
+
+    def do_POST(self):
+        self.handle_api("POST")
+
+    def do_DELETE(self):
+        self.handle_api("DELETE")
+
+    # -- the door --------------------------------------------------------
+    def key(self):
+        """The key this request came with, or None. Revoked keys are no key."""
+        given = self.headers.get("Authorization", "")
+        if not given.startswith("Bearer "):
+            return None
+        return self.store.one("SELECT * FROM api_tokens WHERE token_hash = ?"
+                              " AND revoked_at IS NULL",
+                              (token_hash(given[7:].strip()),))
+
+    def handle_api(self, method):
+        ip = self.client_address[0]
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/api/v1"):
+            return self.reply(404, refused("not_found", "چنین آدرسی نیست"))
+        ok, wait = BOT_THROTTLE.check("bad:" + ip, *BOT_BAD_KEYS)
+        if not ok:
+            return self.reply(429, refused("slow_down", "کمی صبر کنید"),
+                              {"Retry-After": str(wait)})
+        key = self.key()
+        if not key:
+            BOT_THROTTLE.hit("bad:" + ip)
+            return self.reply(401, refused("unauthorized", "کلید API معتبر نیست"))
+        self._who = "key:%s" % key["name"]
+        allowed = [a.strip() for a in (key["allow_ips"] or "").split(",") if a.strip()]
+        if allowed and ip not in allowed:
+            log(WARN, "bot-api: key %r used from %s, which it is not allowed from"
+                % (key["name"], ip))
+            return self.reply(403, refused("ip_not_allowed",
+                                           "این کلید از این آدرس پذیرفته نمی‌شود"))
+        # Money and accounts: only a key made with admin rights.
+        if path.startswith("/api/v1/admin") and (key["scope"] or "customer") != "admin":
+            return self.reply(403, refused("admin_only",
+                                           "این کلید دسترسی ادمین ندارد"))
+        self._key = key
+        self.query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        ok, wait = BOT_THROTTLE.check("key:%d" % key["id"], *BOT_RATE)
+        if not ok:
+            return self.reply(429, refused("slow_down", "درخواست‌ها زیاد است؛ کمی صبر کنید"),
+                              {"Retry-After": str(wait)})
+        BOT_THROTTLE.hit("key:%d" % key["id"])
+        # Once a minute is plenty to answer "is this key still in use?".
+        seen = parse_ts(key["last_used_at"])
+        if not seen or (datetime.now(timezone.utc) - seen).total_seconds() > 60:
+            self.store.run("UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                           (now(), key["id"]))
+
+        match = None
+        for want, pattern, name in self.ROUTES:
+            m = pattern.match(path)
+            if m and want == method:
+                match = (name, m.groups())
+                break
+            if m:
+                match = match or ("", ())
+        if not match:
+            return self.reply(404, refused("not_found", "چنین آدرسی نیست"))
+        if not match[0]:
+            return self.reply(405, refused("method_not_allowed", "این کار با این روش نمی‌شود"))
+
+        body, raw = {}, b""
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                return self.reply(400, refused("bad_request", "طول درخواست معلوم نیست"))
+            if length > BOT_BODY_MAX:
+                # Read it off the wire before answering, up to a point: a client
+                # still sending when the connection closes sees a reset, not
+                # this answer, and a bot that only says "connection reset"
+                # leaves its operator guessing. Past four times the limit it is
+                # not a mistake worth the bandwidth.
+                if length <= 4 * BOT_BODY_MAX:
+                    left = length
+                    while left > 0:
+                        chunk = self.rfile.read(min(left, 65536))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                return self.reply(413, refused("too_big", "درخواست بیش از حد بزرگ است"))
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except (UnicodeDecodeError, ValueError):
+                return self.reply(400, refused("bad_json", "بدنهٔ درخواست JSON درستی نیست"))
+            if not isinstance(body, dict):
+                return self.reply(400, refused("bad_json", "بدنهٔ درخواست باید یک شیء JSON باشد"))
+
+        run = lambda: getattr(self, "api_" + match[0])(body, *match[1])
+        idem = (self.headers.get("Idempotency-Key") or "").strip()
+        if method != "POST" or not idem:
+            code, obj = run()
+            return self.reply(code, obj)
+        if len(idem) > 100:
+            return self.reply(400, refused("bad_idempotency_key",
+                                           "Idempotency-Key حداکثر ۱۰۰ نویسه"))
+        fingerprint = "%s %s %s" % (method, path, hashlib.sha256(raw).hexdigest())
+        # Held across the work itself, so two copies arriving together cannot
+        # both find nothing stored and both act.
+        with IDEMPOTENCY_LOCK:
+            seen = self.store.one("SELECT * FROM api_idempotency"
+                                  " WHERE token_id = ? AND key = ?", (key["id"], idem))
+            if seen:
+                if seen["request"] != fingerprint:
+                    return self.reply(422, refused(
+                        "idempotency_key_reused",
+                        "این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته"))
+                return self.reply(seen["status"], json.loads(seen["response"]),
+                                  {"Idempotent-Replayed": "true"})
+            code, obj = run()
+            if code < 500:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=IDEMPOTENCY_DAYS)
+                          ).isoformat(timespec="seconds")
+                self.store.run("DELETE FROM api_idempotency WHERE created_at < ?",
+                               (cutoff,))
+                self.store.run("INSERT INTO api_idempotency (token_id, key, request,"
+                               " status, response, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                               (key["id"], idem, fingerprint, code,
+                                json.dumps(obj, ensure_ascii=False), now()))
+        return self.reply(code, obj)
+
+    # -- what it does ----------------------------------------------------
+    def customer(self, tg):
+        user = self.store.user_by_telegram(int(tg))
+        if not user:
+            return None, (404, refused("user_not_found",
+                                       "کاربری با این آیدی تلگرام نیست"))
+        return user, None
+
+    def api_ping(self, body):
+        try:
+            with open(VERSION_FILE) as fh:
+                version = fh.read().strip()[:20]
+        except OSError:
+            version = ""
+        return 200, {"ok": True, "version": version}
+
+    def api_list_plans(self, body):
+        # Where to pay travels with what there is to buy.
+        return 200, {"ok": True, "plans": self.store.plans_for_sale(),
+                     "pay_text": self.store.setting("pay_text")}
+
+    def api_create_user(self, body):
+        try:
+            tg = int(body.get("telegram_id"))
+        except (TypeError, ValueError):
+            tg = 0
+        if not 0 < tg < 10 ** 20:
+            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
+        user = self.store.user_by_telegram(tg)
+        created = not user
+        if created:
+            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
+            # No username: that column is what a customer signs in to the web
+            # panel with, and a Telegram handle there could collide with one.
+            user = self.store.create_user(tg, None, name or None)
+            print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
+                  flush=True)
+            emit_admin(self.store, "user.created", {
+                "user_id": user["id"], "via": "bot",
+                "text": "مشتری تازه از ربات: %s" % who_label(user)})
+        return (201 if created else 200), {
+            "ok": True, "created": created,
+            "user": user_view(self.store, user, self.relays)}
+
+    def api_link(self, body):
+        try:
+            tg = int(body.get("telegram_id"))
+        except (TypeError, ValueError):
+            tg = 0
+        if not 0 < tg < 10 ** 20:
+            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
+        res = link_telegram(self.store, tg, body.get("code"))
+        if not res["ok"]:
+            return {"telegram_in_use": 409}.get(res["error"], 400), res
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (res["user_id"],))
+        return 200, {"ok": True, "message": res["message"],
+                     "user": user_view(self.store, user, self.relays)}
+
+    def api_get_user(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return 200, {"ok": True, "user": user_view(self.store, user, self.relays)}
+
+    def api_add_ip(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        ip = str(body.get("ip") or "").strip()
+        if not public_ipv4(ip):
+            return 400, refused("bad_ip", "آی‌پی نامعتبر است؛ آی‌پی عمومی اینترنت "
+                                          "مشتری لازم است")
+        res = register_ip(self.store, user["id"], ip)
+        if not res["ok"]:
+            return 409, res
+        return 200, {"ok": True, "message": res["message"],
+                     "user": user_view(self.store, user, self.relays)}
+
+    def api_remove_ip(self, body, tg, ip):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        cur = self.store.run("DELETE FROM ips WHERE user_id = ? AND ip = ?",
+                             (user["id"], ip))
+        if not cur.rowcount:
+            return 404, refused("ip_not_found", "این آی‌پی روی این حساب نیست")
+        return 200, {"ok": True, "message": "آی‌پی %s حذف شد" % ip,
+                     "user": user_view(self.store, user, self.relays)}
+
+    def api_add_receipt(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = create_receipt(self.store, user, body)
+        if not res["ok"]:
+            return {"too_big": 413, "plan_not_on_sale": 409}.get(res["error"], 400), res
+        return 201, {"ok": True, "message": res["message"],
+                     "receipt": self.receipt(res["receipt_id"])}
+
+    def api_credentials(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
+        if not res["ok"]:
+            return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
+        return 200, res
+
+    def api_password(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = fresh_password(self.store, user)
+        return (200 if res["ok"] else 409), res
+
+    def api_login_link(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = login_link(self.store, user)
+        return (200 if res["ok"] else 503), res
+
+    def api_trial(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = take_trial(self.store, user)
+        if not res["ok"]:
+            return {"trial_none": 404, "trial_used": 409, "trial_running": 409}.get(
+                res["error"], 400), res
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, dict(res, user=user_view(self.store, user, self.relays))
+
+    def receipt(self, rid):
+        r = self.store.one(
+            "SELECT t.id, t.amount, t.status, t.created_at, t.decided_at,"
+            " t.plan_id, p.name FROM transactions t"
+            " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (rid,))
+        return {"id": r["id"], "amount": r["amount"], "status": r["status"],
+                "plan": ({"id": r["plan_id"], "name": r["name"]}
+                         if r["plan_id"] else None),
+                "created_at": r["created_at"], "decided_at": r["decided_at"]}
+
+    def api_list_receipts(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        rows = self.store.q("SELECT id FROM transactions WHERE user_id = ?"
+                            " ORDER BY id DESC LIMIT 20", (user["id"],))
+        return 200, {"ok": True, "receipts": [self.receipt(r["id"]) for r in rows]}
+
+    # -- tickets ---------------------------------------------------------
+    TICKET_CODES = {"ticket_not_found": 404, "image_not_found": 404,
+                    "too_big": 413, "too_many_tickets": 409, "slow_down": 429}
+
+    def ticket_answer(self, res, ok_code=200):
+        if not res["ok"]:
+            return self.TICKET_CODES.get(res.get("error"), 400), res
+        return ok_code, res
+
+    def api_list_tickets(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return 200, {"ok": True, "tickets": ticket_list(self.store, user)}
+
+    def api_open_ticket(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = ticket_open(self.store, user, body)
+        if res["ok"]:
+            res = dict(ticket_get(self.store, user, res["ticket_id"]), message=res["message"])
+        return self.ticket_answer(res, 201)
+
+    def api_get_ticket(self, body, tg, tid):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return self.ticket_answer(ticket_get(self.store, user, tid))
+
+    def api_reply_ticket(self, body, tg, tid):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = ticket_reply(self.store, user, tid, body)
+        if res["ok"]:
+            res = dict(ticket_get(self.store, user, tid), message=res["message"])
+        return self.ticket_answer(res, 201)
+
+    def api_close_ticket(self, body, tg, tid):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return self.ticket_answer(ticket_close(self.store, user, tid))
+
+    def api_ticket_image(self, body, tg, tid, mid):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        # The ticket in the address has to be the message's own, as well as
+        # the customer's.
+        if not self.store.one("SELECT 1 FROM ticket_messages WHERE id = ? AND ticket_id = ?",
+                              (int(mid), int(tid))):
+            return 404, refused("image_not_found", "این عکس پیدا نشد")
+        return self.ticket_answer(ticket_picture(self.store, user, mid))
+
+
+class BotServer(TLSServer):
+    """The bot API's server, which picks up a renewed certificate by itself.
+
+    The bot checks this certificate like any https client does, so it is the
+    admin panel's real one rather than the relays' self-signed pair - and that
+    one is renewed every couple of months while this process runs for longer.
+    Looked at once per connection: a stat is nothing next to a handshake.
+    """
+
+    def __init__(self, addr, cert, key):
+        self.cert, self.key, self.stamp, self.failed = cert, key, None, None
+        ctx = None
+        if cert:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            self.stamp = self.cert_stamp()
+        super().__init__(addr, BotAPI, ctx)
+
+    def cert_stamp(self):
+        # Both files: renewal moves the two links one after the other, and a
+        # load between the moves pairs a new certificate with the old key.
+        return (os.stat(self.cert).st_mtime, os.stat(self.key).st_mtime)
+
+    def finish_request(self, request, client_address):
+        if self.cert:
+            try:
+                stamp = self.cert_stamp()
+            except OSError:
+                stamp = self.stamp
+            if stamp not in (self.stamp, self.failed):
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx.load_cert_chain(self.cert, self.key)
+                    self.ctx, self.stamp, self.failed = ctx, stamp, None
+                    log(INFO, "bot-api: loaded the renewed certificate")
+                except (OSError, ssl.SSLError) as e:
+                    # Once per change, and the old context stays in use.
+                    self.failed = stamp
+                    log(WARN, "bot-api: could not load the renewed certificate "
+                        "yet: %r" % e)
+        return super().finish_request(request, client_address)
+
+
+def bot_api_cert():
+    """The admin panel's certificate when there is one, else the relays'."""
+    try:
+        with open(ADMIN_CONFIG) as fh:
+            conf = dict(l.strip().split("=", 1) for l in fh
+                        if "=" in l and not l.lstrip().startswith("#"))
+    except OSError:
+        conf = {}
+    cert, key = conf.get("ADMIN_CERT", ""), conf.get("ADMIN_KEY", "")
+    if cert and key and os.path.exists(cert) and os.path.exists(key):
+        return cert, key
+    return CERT, KEY
+
+
+def serve_bot_api(cfg, store):
+    port = int(cfg.get("BOT_API_PORT") or BOT_API_PORT)
+    if not port:
+        print("bot api: switched off (BOT_API_PORT=0)", flush=True)
+        return
+    BotAPI.store = store
+    BotAPI.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+    cert, key = bot_api_cert()
+    try:
+        server = BotServer(("0.0.0.0", port), cert, key)
+    except OSError as e:
+        log(ERROR, "bot api could not start on :%d: %r" % (port, e))
+        return
+    print("bot api up on :%d with %s" % (port, cert), flush=True)
+    server.serve_forever()
+
+
 def watch_self(store):
     """Sample this machine's own health.
 
@@ -1716,12 +3653,20 @@ def watch_self(store):
     missing from the panel.
     """
     health = Health()
+    tick = 0
     while True:
         try:
             store.record_metrics("exit", health.sample())
             store.prune_metrics()
         except Exception as e:
             log(WARN, "self health failed: %r" % e)
+        # Housekeeping that needs no hurry rides along, once an hour.
+        if tick % 120 == 0:
+            try:
+                prune_ticket_images(store)
+            except Exception as e:
+                log(WARN, "ticket picture pruning failed: %r" % e)
+        tick += 1
         time.sleep(30)
 
 
@@ -1747,6 +3692,8 @@ def main():
 
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
+    threading.Thread(target=serve_bot_api, args=(cfg, store), daemon=True).start()
+    threading.Thread(target=webhook_worker, args=(store,), daemon=True).start()
     print("panel up: api on :%d" % API_PORT, flush=True)
     # In the foreground now. The Telegram loop used to be what kept this
     # process alive and the API rode along on a daemon thread behind it; with

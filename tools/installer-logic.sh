@@ -232,6 +232,7 @@ tunnel_port_problem() {
         53) echo "dns" ;;
         80|443) echo "the proxy" ;;
         8443) echo "the sync API and the customer panel" ;;
+        8445) echo "the bot API" ;;
         8446) echo "the exit's route to Google over IPv6" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
@@ -571,6 +572,13 @@ uninstall() {
         systemctl disable "$svc" >/dev/null 2>&1 || true
         info "stopped and disabled $svc"
     done
+    # The Telegram bot is switched on from the admin panel, not by this script,
+    # so it is not on the list above - and it holds the bot's token.
+    if systemctl is-enabled --quiet doctor-dns-bot.service 2>/dev/null             || [ -f /etc/doctor-dns-bot.env ]; then
+        systemctl disable --now doctor-dns-bot.service >/dev/null 2>&1 || true
+        rm -f /etc/doctor-dns-bot.env
+        info "stopped the Telegram bot and removed its settings"
+    fi
 
     step "Removing files this install created"
     local f
@@ -1560,6 +1568,7 @@ EOF
                     warn "    80    the proxy, and how certificates are proved"
                     warn "   443    the proxy"
                     warn "  8443    the sync API the relays connect to"
+                    warn "  8445    the bot API"
                     warn "  8446    the exit's own route to Google over IPv6"
                     warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
@@ -1584,9 +1593,10 @@ EOF
                 *[!0-9]*|"") die "the admin port must be a number" ;;
                 22) die "port 22 is ssh" ;;
                 8443) die "port 8443 is the sync API the relays connect to" ;;
+                8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
-    another. 22, 53, 80, 443, 8443 and 8446 are all taken." ;;
+    another. 22, 53, 80, 443, 8443, 8445 and 8446 are all taken." ;;
                 "${TUNNEL_PORT:-none}") die "port $ADMIN_PORT carries the tunnel - pick another" ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
@@ -1631,6 +1641,14 @@ EOF
         chmod +x /usr/local/bin/smartdns-operators
         payload OPERATORS_SERVICE > /etc/systemd/system/smartdns-operators.service
         payload OPERATORS_TIMER   > /etc/systemd/system/smartdns-operators.timer
+        # The sample Telegram bot. Put here, switched off: the admin panel's
+        # bot page sets it up and turns it on. One that is already set up is
+        # restarted below, so an upgrade reaches it too.
+        note_file /usr/local/bin/doctor-dns-bot
+        note_file /etc/systemd/system/doctor-dns-bot.service
+        payload BOT > /usr/local/bin/doctor-dns-bot
+        chmod +x /usr/local/bin/doctor-dns-bot
+        payload BOT_SERVICE > /etc/systemd/system/doctor-dns-bot.service
         systemctl daemon-reload
         enable_service smartdns-admin.service
         enable_service smartdns-operators.timer
@@ -1640,6 +1658,7 @@ EOF
         [ -s /var/lib/smart-dns/operators.json ] \
             || systemctl start --no-block smartdns-operators.service >/dev/null 2>&1 || true
         systemctl restart smartdns-admin.service
+        systemctl try-restart doctor-dns-bot.service >/dev/null 2>&1 || true
         sleep 2
         if systemctl is-active --quiet smartdns-admin.service; then
             info "admin panel running"

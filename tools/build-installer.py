@@ -67,6 +67,8 @@ PAYLOADS = [
     ("OPERATORS", "templates/smartdns-operators"),
     ("OPERATORS_SERVICE", "templates/smartdns-operators.service"),
     ("OPERATORS_TIMER", "templates/smartdns-operators.timer"),
+    ("BOT", "examples/telegram-bot/bot.py"),
+    ("BOT_SERVICE", "examples/telegram-bot/doctor-dns-bot.service"),
     ("FONT_LICENSE", "common/fonts/OFL.txt"),
     ("DOMAINS", "domains/domains.txt"),
     ("SERVICES", "domains/services.json"),
