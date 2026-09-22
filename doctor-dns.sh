@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -1649,6 +1649,9 @@ EOF
         payload BOT > /usr/local/bin/doctor-dns-bot
         chmod +x /usr/local/bin/doctor-dns-bot
         payload BOT_SERVICE > /etc/systemd/system/doctor-dns-bot.service
+        note_file /usr/local/bin/smartdns-bot-logs
+        payload SMARTDNS_BOT_LOGS > /usr/local/bin/smartdns-bot-logs
+        chmod +x /usr/local/bin/smartdns-bot-logs
         systemctl daemon-reload
         enable_service smartdns-admin.service
         enable_service smartdns-operators.timer
@@ -3629,6 +3632,24 @@ exit 0
 #);
 #CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(delivered_at, next_at);
 #
+#-- Each relay's recent logs, as it last sent them, for the admin panel's logs
+#-- page. One row per relay, replaced each time: only the latest is worth
+#-- reading, and it must not grow.
+#CREATE TABLE IF NOT EXISTS relay_logs (
+#    relay TEXT PRIMARY KEY,
+#    at    TEXT NOT NULL,
+#    text  TEXT NOT NULL
+#);
+#
+#-- What smartdns-watch saw on each relay, for the admin panel's request of the
+#-- same id. Only the latest request is kept.
+#CREATE TABLE IF NOT EXISTS watch_results (
+#    relay  TEXT PRIMARY KEY,
+#    job_id TEXT NOT NULL,
+#    at     TEXT NOT NULL,
+#    text   TEXT NOT NULL
+#);
+#
 #-- The answer already given to a request that carried an Idempotency-Key. A
 #-- bot that sends the same request twice - a retry after a timeout, a user
 #-- tapping twice - gets the first answer back instead of a second action.
@@ -3688,6 +3709,8 @@ exit 0
 #    # 'customer' acts for customers; 'admin' may also approve receipts and
 #    # manage accounts - the operator's own bot.
 #    ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
+#    # The tunnel's own lines, apart from the rest of a relay's log.
+#    ("relay_logs", "tunnel", "TEXT"),
 #    # A free trial: given with one tap, never bought.
 #    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
 #    # When this account had its trial; one per account.
@@ -5547,6 +5570,26 @@ exit 0
 #    return True
 #
 #
+## How long after it is asked for a watch is still handed to the relays: a
+## relay that was down when it was asked should not start one an hour later.
+#WATCH_FRESH = 600
+#
+#
+#def watch_job(store):
+#    """The admin panel's current request to run smartdns-watch, while fresh."""
+#    try:
+#        job = json.loads(store.setting("watch_job") or "null")
+#    except ValueError:
+#        return None
+#    if not isinstance(job, dict):
+#        return None
+#    asked = parse_ts(job.get("asked_at"))
+#    if not asked or (datetime.now(timezone.utc) - asked).total_seconds() > WATCH_FRESH:
+#        return None
+#    return {"id": job.get("id"), "target": job.get("target") or "",
+#            "seconds": job.get("seconds") or 60}
+#
+#
 #def enforce_quotas(store):
 #    """Reset, warn and cut off. Called after every sync.
 #
@@ -5816,6 +5859,19 @@ exit 0
 #            }
 #            who = self.relay_name(body)
 #            self.store.fold_counters(who, clean)
+#            # The relay's own recent logs, now and then, for the logs page.
+#            if isinstance(body.get("logs"), str):
+#                tunnel = body.get("tunnel_logs")
+#                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel)"
+#                               " VALUES (?, ?, ?, ?)",
+#                               (who, now(), body["logs"][-40000:],
+#                                tunnel[-20000:] if isinstance(tunnel, str) else None))
+#            # What smartdns-watch saw, when the admin panel asked for it.
+#            done = body.get("watch_result")
+#            if isinstance(done, dict) and isinstance(done.get("text"), str):
+#                self.store.run("INSERT OR REPLACE INTO watch_results (relay, job_id, at, text)"
+#                               " VALUES (?, ?, ?, ?)", (who, str(done.get("id"))[:40], now(),
+#                                                        done["text"][-40000:]))
 #            # Where customers sign in, so a bot can send them there. Only a
 #            # plain https address; the relay knows its own domain, nobody
 #            # has to type it twice.
@@ -5849,6 +5905,7 @@ exit 0
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
 #                                    "templates": self.store.template_names(),
+#                                    "watch": watch_job(self.store),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -7840,6 +7897,88 @@ exit 0
 #          % allowed_count, flush=True)
 #
 #
+## The relay's own recent logs, sent to the panel now and then so the operator
+## can read them in the admin panel without logging in to this machine. Every
+## few minutes rather than every sync: a log is read by a person, not a
+## program, and it need not cost the link anything the rest of the time.
+#LOG_EVERY = 300
+#LOG_LINES = 150
+#LOG_MAX = 40000
+#LOG_UNITS = ("smartdns-sync", "dnsmasq", "nginx", "coturn", "epic-pin",
+#             "smartdns-acl-save", "smartdns-dns@*")
+## The tunnel's own lines go separately: the operator looking for why the link
+## to the exit dropped should not have to find them among DNS and nginx.
+#TUNNEL_UNIT = "smartdns-tunnel"
+#LOG_SENT = [0.0]
+#
+## smartdns-watch run on the panel's request: which request was done last, and
+## what it saw, waiting to go back with the next sync.
+#WATCH = "/usr/local/bin/smartdns-watch"
+#WATCH_DONE = {"id": None, "result": None}
+#WATCH_MAX = 40000
+#
+#
+#def recent_logs(units=LOG_UNITS, lines=LOG_LINES):
+#    """The last lines of this relay's parts, with the sync secret masked -
+#    the same parts `smartdns-logs` shows. Customers' addresses stay: they are
+#    what the logs are about, and the panel has them already."""
+#    args = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short-iso"]
+#    for unit in units:
+#        args += ["-u", unit]
+#    try:
+#        text = subprocess.run(args, capture_output=True, text=True, timeout=20).stdout
+#    except Exception as e:
+#        return "journalctl: %s" % e
+#    # nginx turning strangers away is the gate working, not news.
+#    text = "\n".join(l for l in text.splitlines() if "access forbidden by rule" not in l)
+#    secret = CFG.get("SYNC_SECRET") or ""
+#    if secret:
+#        text = text.replace(secret, "<secret>")
+#    return text[-LOG_MAX:]
+#
+#
+#def run_watch(job):
+#    """Run smartdns-watch for the panel, for as long as it asked, and keep
+#    what it printed for the next sync. In its own thread: it takes minutes,
+#    and the syncs must go on meanwhile."""
+#    target = str(job.get("target") or "")
+#    try:
+#        seconds = max(10, min(300, int(job.get("seconds") or 60)))
+#    except (TypeError, ValueError):
+#        seconds = 60
+#    if target and not re.fullmatch(r"[A-Za-z0-9._@-]{1,40}", target):
+#        WATCH_DONE["result"] = {"id": job["id"], "text": "not a customer or address: %r"
+#                                % target[:40]}
+#        return
+#    # timeout(1) ends it with SIGTERM, which smartdns-watch turns into its
+#    # summary line - a kill would lose that.
+#    cmd = ["timeout", str(seconds), WATCH] + ([target] if target else [])
+#    try:
+#        r = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 30)
+#        text = (r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")).strip()
+#    except Exception as e:
+#        text = "smartdns-watch: %s" % e
+#    if len(text) > WATCH_MAX:
+#        text = "... (only the end)\n" + text[-WATCH_MAX:]
+#    WATCH_DONE["result"] = {"id": job["id"], "text": text or "(nothing seen)"}
+#
+#
+#def start_watch(job):
+#    """A request from the panel, once per request."""
+#    if not isinstance(job, dict) or not job.get("id") or job["id"] == WATCH_DONE["id"]:
+#        return False
+#    WATCH_DONE["id"] = job["id"]
+#    threading.Thread(target=run_watch, args=(job,), daemon=True).start()
+#    return True
+#
+#
+#def logs_due(clock=time.monotonic):
+#    if clock() - LOG_SENT[0] < LOG_EVERY and LOG_SENT[0]:
+#        return False
+#    LOG_SENT[0] = clock()
+#    return True
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -7856,8 +7995,22 @@ exit 0
 #    # Where this relay's customer panel is, so the panel can send people to it.
 #    url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
 #           if CFG.get("PANEL_DOMAIN") else "")
-#    answer = post("/sync", {"counters": counters, "host": host,
-#                            "relay": CFG["SELF_IP"], "panel_url": url})
+#    payload = {"counters": counters, "host": host, "relay": CFG["SELF_IP"],
+#               "panel_url": url}
+#    if logs_due():
+#        payload["logs"] = recent_logs()
+#        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+#    finished = WATCH_DONE["result"]
+#    if finished:
+#        payload["watch_result"] = finished
+#    answer = post("/sync", payload)
+#    # Delivered: the panel has it, so it is not sent again.
+#    if finished and WATCH_DONE["result"] is finished:
+#        WATCH_DONE["result"] = None
+#    try:
+#        start_watch(answer.get("watch"))
+#    except Exception as e:
+#        log(WARN, "watch not started: %s" % e)
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
@@ -10366,6 +10519,86 @@ exit 0
 #    return res["result"].get("username") or "", None
 #
 #
+#BOT_LOG_LINES = 200
+#
+#
+#def bot_journal(lines):
+#    """The bot's last lines from the journal, the token masked - this page is
+#    for looking at, and a screenshot of it may well be sent to somebody."""
+#    try:
+#        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", str(lines), "-o",
+#                            "short-iso", "--no-pager"], capture_output=True, text=True,
+#                           timeout=15)
+#        text = r.stdout
+#    except Exception as e:
+#        return "journalctl: %s" % e
+#    token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+#    return text.replace(token, "<token>") if token else text
+#
+#
+#def ago(ts):
+#    """"3 دقیقه پیش" - how old a relay's last word is."""
+#    when = parse_ts(ts)
+#    if not when:
+#        return "نامعلوم"
+#    secs = max(0, int((datetime.now(timezone.utc) - when).total_seconds()))
+#    if secs < 90:
+#        return "همین الان"
+#    if secs < 3600:
+#        return "%d دقیقه پیش" % (secs // 60)
+#    if secs < 86400:
+#        return "%d ساعت پیش" % (secs // 3600)
+#    return "%d روز پیش" % (secs // 86400)
+#
+#
+#def watch_card(pre):
+#    """Asking the relays to run smartdns-watch, and what they saw."""
+#    p = CFG["ADMIN_PATH"]
+#    try:
+#        job = json.loads(STORE.one("SELECT value FROM settings WHERE key = 'watch_job'")
+#                         ["value"] or "null")
+#    except (TypeError, ValueError):
+#        job = None
+#    out = ["<div id='watch'></div><div class='card'><h2>دامنه‌هایی که مشتری باز می‌کند "
+#           "<span class='muted'>(smartdns-watch)</span></h2>"
+#           "<p class='muted'>برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را "
+#           "انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار "
+#           "نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت "
+#           "(اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه "
+#           "کنید)، «filtered» یعنی فیلتر خود ایران است.</p>"
+#           "<form method='post' action='/%s/watch-start' class='row'>"
+#           "<input name='target' dir='ltr' placeholder='نام کاربری یا آی‌پی (خالی = همه)'"
+#           " maxlength='40' style='min-width:220px'>"
+#           "<select name='seconds'><option value='60'>۱ دقیقه</option>"
+#           "<option value='120' selected>۲ دقیقه</option>"
+#           "<option value='300'>۵ دقیقه</option></select>"
+#           "<button>شروع</button></form>" % p]
+#    if job:
+#        asked = parse_ts(job.get("asked_at"))
+#        age = (datetime.now(timezone.utc) - asked).total_seconds() if asked else 1e9
+#        results = STORE.q("SELECT * FROM watch_results WHERE job_id = ? ORDER BY relay",
+#                          (job.get("id"),))
+#        waiting = age < int(job.get("seconds") or 60) + 120 and not results
+#        out.append("<p>درخواست برای <b>%s</b>، %d ثانیه — %s%s</p>" % (
+#            html.escape(job.get("target") or "همهٔ مشتری‌ها"), int(job.get("seconds") or 60),
+#            html.escape(ago(job.get("asked_at"))),
+#            " · <span class='warn'>در حال ضبط؛ این صفحه خودش تازه می‌شود</span>"
+#            if waiting else ""))
+#        for r in results:
+#            out.append("<p class='muted'>سرور ایران <code>%s</code> — %s</p>%s"
+#                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
+#                          pre(r["text"])))
+#        if not results and not waiting:
+#            out.append("<p class='muted'>جوابی از سرورهای ایران نیامد. سرور ایران باید "
+#                       "روی نسخهٔ تازه باشد.</p>")
+#        if waiting:
+#            out.append("<script>setTimeout(function(){location.reload()},15000)</script>")
+#    out.append("</div>")
+#    return "".join(out)
+#
+## -- actions ----------------------------------------------------------
+#
+#
 #def bot_state():
 #    """(installed, set up, running, a line of what it last said)."""
 #    installed = os.path.exists(BOT_BIN)
@@ -10378,6 +10611,9 @@ exit 0
 #        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", "3", "-o", "cat",
 #                            "--no-pager"], capture_output=True, text=True, timeout=10)
 #        last = r.stdout.strip()
+#        token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+#        if token:
+#            last = last.replace(token, "<token>")
 #    except Exception:
 #        pass
 #    return installed, configured, running, last
@@ -11600,6 +11836,16 @@ exit 0
 #
 #    def bot_page(self):
 #        p = CFG["ADMIN_PATH"]
+#        if urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("log"):
+#            return ("<div class='card'><h2>لاگ ربات — %d خط آخر</h2>"
+#                    "<p><a href='/%s/bot'>برگشت به ربات</a> · <a href='/%s/bot?log=1'>تازه کردن</a>"
+#                    "</p><pre dir='ltr' style='white-space:pre-wrap;font-size:12px;"
+#                    "max-height:70vh;overflow:auto'>%s</pre>"
+#                    "<p class='muted'>روی سرور هم: <code>sudo smartdns-bot-logs</code> "
+#                    "(با <code>-f</code> زنده، با <code>-e</code> فقط خطاها). توکن ربات همه‌جا "
+#                    "با &lt;token&gt; پوشانده می‌شود.</p></div>"
+#                    % (BOT_LOG_LINES, p, p,
+#                       html.escape(bot_journal(BOT_LOG_LINES).strip() or "هنوز چیزی نیست")))
 #        installed, configured, running, last = bot_state()
 #        env = read_env(BOT_ENV)
 #        name = STORE.one("SELECT value FROM settings WHERE key = 'bot_username'")
@@ -11622,9 +11868,10 @@ exit 0
 #                       "<form method='post' action='/%s/bot-power'><input type='hidden'"
 #                       " name='to' value='%s'><button class='ghost'>%s</button></form>"
 #                       "<form method='post' action='/%s/bot-test'>"
-#                       "<button class='ghost'>ارسال پیام آزمایشی</button></form></div>"
+#                       "<button class='ghost'>ارسال پیام آزمایشی</button></form>"
+#                       "<a class='dl' href='/%s/bot?log=1'>نمایش لاگ کامل</a></div>"
 #                       % (p, "off" if running else "on",
-#                          "خاموش کردن" if running else "روشن کردن", p))
+#                          "خاموش کردن" if running else "روشن کردن", p, p))
 #        else:
 #            out.append("<p>یک ربات تلگرام برای مشتری‌ها و خودتان: خرید پلن و فرستادن رسید، "
 #                       "ثبت آی‌پی، تیکت، و برای شما رسید تازه با دکمهٔ تأیید. همه‌چیز روی "
@@ -12081,8 +12328,25 @@ exit 0
 #        return "".join(out)
 #
 #    def logs(self):
-#        out = []
-#        for unit in ("smartdns-panel", "smartdns-admin"):
+#        """Everything in one place: this machine's two services, the bot if
+#        there is one, and what each relay last sent of its own."""
+#        token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+#        box = ("<pre dir='ltr' style='overflow-x:auto;font-size:12px;color:var(--dim);"
+#               "white-space:pre-wrap;max-height:60vh;overflow-y:auto'>%s</pre>")
+#
+#        def pre(text):
+#            # The bot's token, masked wherever it might turn up on this page.
+#            return box % html.escape(text.replace(token, "<token>") if token else text)
+#        out = ["<div class='card'><p class='muted'>پرش به: <a href='#watch'>دامنه‌های "
+#               "مشتری</a> · <a href='#exit'>سرور خارج</a> · <a href='#bot'>ربات</a> · "
+#               "<a href='#relays'>سرورهای ایران</a></p></div>"]
+#        out.append(watch_card(pre))
+#        out.append("<div id='exit'></div>")
+#        units = [("smartdns-panel", "پنل و API — سرور خارج"),
+#                 ("smartdns-admin", "پنل ادمین — سرور خارج")]
+#        if os.path.exists("/etc/systemd/system/smartdns-tunnel.service"):
+#            units.append(("smartdns-tunnel", "تونل — سرور خارج"))
+#        for unit, label in units:
 #            try:
 #                txt = subprocess.run(
 #                    ["journalctl", "-u", unit, "-n", "60", "--no-pager",
@@ -12090,12 +12354,37 @@ exit 0
 #                    timeout=20).stdout
 #            except Exception as e:
 #                txt = str(e)
-#            out.append("<div class='card'><h2>%s</h2><pre style='overflow-x:auto;"
-#                       "font-size:12px;color:var(--dim);white-space:pre-wrap'>%s</pre>"
-#                       "</div>" % (unit, html.escape(txt or "(چیزی نیست)")))
+#            out.append("<div class='card'><h2>%s <span class='muted'>(%s)</span></h2>%s</div>"
+#                       % (label, unit, pre(txt or "(چیزی نیست)")))
+#
+#        out.append("<div id='bot'></div><div class='card'><h2>ربات تلگرام "
+#                   "<span class='muted'>(doctor-dns-bot)</span></h2>")
+#        if read_env(BOT_ENV).get("BOT_TOKEN"):
+#            out.append(pre(bot_journal(60).strip() or "(چیزی نیست)"))
+#            out.append("<p class='muted'><a href='/%s/bot?log=1'>۲۰۰ خط آخر</a> · توکن "
+#                       "پوشانده شده است.</p>" % CFG["ADMIN_PATH"])
+#        else:
+#            out.append("<p class='muted'>ربات راه‌اندازی نشده (صفحهٔ «ربات»).</p>")
+#        out.append("</div>")
+#
+#        out.append("<div id='relays'></div>")
+#        rows = STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+#        if not rows:
+#            out.append("<div class='card'><h2>سرورهای ایران</h2><p class='muted'>هنوز لاگی "
+#                       "نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ "
+#                       "سرورهای قدیمی‌تر بعد از ارتقا.</p></div>")
+#        for r in rows:
+#            out.append("<div class='card'><h2>سرور ایران <code>%s</code></h2>"
+#                       "<p class='muted'>آخرین بار %s — هر ۵ دقیقه تازه می‌شود. DNS، "
+#                       "همگام‌سازی، پنل مشتری، nginx، STUN و تونل. روی خود سرور: "
+#                       "<code>sudo smartdns-logs</code></p>%s</div>"
+#                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
+#                          pre(r["text"] or "(چیزی نیست)")))
+#            if r["tunnel"] and r["tunnel"].strip():
+#                out.append("<div class='card'><h2>تونل — سرور ایران <code>%s</code></h2>%s</div>"
+#                           % (html.escape(r["relay"]), pre(r["tunnel"])))
 #        return "".join(out)
 #
-#    # -- actions ----------------------------------------------------------
 #    def action(self, rest, params):
 #        one = lambda k, d="": self.one(params, k, d)
 #
@@ -12355,6 +12644,20 @@ exit 0
 #                return self.redirect("tickets?m=!این تیکت پیدا نشد")
 #            return self.redirect("tickets?t=%d&m=%s" % (
 #                tid, "تیکت بسته شد" if to == "closed" else "تیکت دوباره باز شد"))
+#
+#        if rest == "watch-start":
+#            target = one("target").strip()
+#            if target and not re.fullmatch(r"[A-Za-z0-9._@-]{1,40}", target):
+#                return self.redirect("logs?m=!نام کاربری یا آی‌پی درست نیست")
+#            seconds = one("seconds")
+#            seconds = int(seconds) if seconds in ("60", "120", "300") else 120
+#            job = {"id": secrets.token_hex(6), "target": target, "seconds": seconds,
+#                   "asked_at": now()}
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('watch_job', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      (json.dumps(job),))
+#            return self.redirect("logs?m=درخواست رفت؛ تا ۳۰ ثانیه دیگر سرورهای ایران شروع "
+#                                 "می‌کنند. از مشتری بخواهید سرویس را باز کند")
 #
 #        if rest == "bot-setup":
 #            if not os.path.exists(BOT_BIN):
@@ -14407,6 +14710,9 @@ exit 0
 #        'more lines per part   (smartdns-logs -n)|ask "lines per part" && run smartdns-logs -n "$REPLY"'
 #        'one file to send, secrets masked   (smartdns-logs --report)|run smartdns-logs --report'
 #    )
+#    [ "$role" = exit ] && [ -x /usr/local/bin/smartdns-bot-logs ] && items+=(
+#        'logs of the Telegram bot   (smartdns-bot-logs)|run smartdns-bot-logs'
+#    )
 #    [ "$role" = relay ] && items+=(
 #        'what this relay is doing   (smartdns status)|run smartdns status'
 #        'the names a customer asks for, live   (smartdns-watch)|watch_customer'
@@ -15679,6 +15985,76 @@ exit 0
 #[Install]
 #WantedBy=multi-user.target
 #__END_BOT_SERVICE__
+
+#__BEGIN_SMARTDNS_BOT_LOGS__
+##!/bin/bash
+## smartdns-bot-logs - what the Telegram bot has been doing.
+##
+## usage: smartdns-bot-logs          whether it runs, and its last 100 lines
+##        smartdns-bot-logs -e       only what went wrong
+##        smartdns-bot-logs -f       follow it live (ctrl-c to stop)
+##        smartdns-bot-logs -n 500   more lines (default 100)
+##
+## The bot's token is replaced by <token> wherever it turns up, so what this
+## prints can be copied into a chat asking for help.
+#set -uo pipefail
+#
+## Variables only so a test can point them somewhere else; nothing else sets them.
+#BOT_ENV="${SMARTDNS_BOT_ENV:-/etc/doctor-dns-bot.env}"
+#UNIT=doctor-dns-bot
+#
+#n=100
+#follow=no
+#errors=no
+#while [ $# -gt 0 ]; do
+#    case "$1" in
+#        -e|--errors) errors=yes ;;
+#        -f|--follow) follow=yes ;;
+#        -n) shift; n="${1:-}" ;;
+#        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+#        *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
+#    esac
+#    shift
+#done
+#case "$n" in ''|*[!0-9]*) echo "-n wants a number of lines" >&2; exit 1 ;; esac
+#[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-bot-logs" >&2; exit 1; }
+#
+#token="$(sed -n 's/^BOT_TOKEN=//p' "$BOT_ENV" 2>/dev/null | head -1)"
+#
+## Plain string replacement, not a pattern: a token is letters, digits, ':' and
+## '-', and nothing in it should be read as anything else.
+#mask() {
+#    awk -v t="$token" '{
+#        if (length(t)) while ((i = index($0, t)) > 0)
+#            $0 = substr($0, 1, i - 1) "<token>" substr($0, i + length(t))
+#        print; fflush()
+#    }'
+#}
+#
+## The bot prints its troubles in words rather than with a log level, so "only
+## what went wrong" is these words.
+#trouble() {
+#    if [ "$errors" = yes ]; then
+#        grep -iE --line-buffered 'fail|could not|error|traceback|refused|getupdates:|missing'
+#    else
+#        cat
+#    fi
+#}
+#
+#if [ "$follow" = yes ]; then
+#    journalctl -u "$UNIT" -f -n 20 --no-pager -o short-iso | mask | trouble
+#    exit 0
+#fi
+#
+#if [ -z "$token" ]; then
+#    echo "the Telegram bot is not set up on this machine - admin panel, Bot page"
+#else
+#    state="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+#    echo "Telegram bot: ${state:-unknown}"
+#fi
+#echo
+#journalctl -u "$UNIT" -n "$n" --no-pager -o short-iso | mask | trouble || true
+#__END_SMARTDNS_BOT_LOGS__
 
 #__BEGIN_FONT_LICENSE__
 #Copyright 2015 The Vazirmatn Project Authors (https://github.com/rastikerdar/vazirmatn)
