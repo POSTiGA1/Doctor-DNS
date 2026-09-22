@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.5.7"
+VERSION="0.6.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -232,6 +232,7 @@ tunnel_port_problem() {
         53) echo "dns" ;;
         80|443) echo "the proxy" ;;
         8443) echo "the sync API and the customer panel" ;;
+        8445) echo "the bot API" ;;
         8446) echo "the exit's route to Google over IPv6" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
@@ -571,6 +572,13 @@ uninstall() {
         systemctl disable "$svc" >/dev/null 2>&1 || true
         info "stopped and disabled $svc"
     done
+    # The Telegram bot is switched on from the admin panel, not by this script,
+    # so it is not on the list above - and it holds the bot's token.
+    if systemctl is-enabled --quiet doctor-dns-bot.service 2>/dev/null             || [ -f /etc/doctor-dns-bot.env ]; then
+        systemctl disable --now doctor-dns-bot.service >/dev/null 2>&1 || true
+        rm -f /etc/doctor-dns-bot.env
+        info "stopped the Telegram bot and removed its settings"
+    fi
 
     step "Removing files this install created"
     local f
@@ -1560,6 +1568,7 @@ EOF
                     warn "    80    the proxy, and how certificates are proved"
                     warn "   443    the proxy"
                     warn "  8443    the sync API the relays connect to"
+                    warn "  8445    the bot API"
                     warn "  8446    the exit's own route to Google over IPv6"
                     warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
@@ -1584,9 +1593,10 @@ EOF
                 *[!0-9]*|"") die "the admin port must be a number" ;;
                 22) die "port 22 is ssh" ;;
                 8443) die "port 8443 is the sync API the relays connect to" ;;
+                8445) die "port 8445 is the bot API" ;;
                 8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
-    another. 22, 53, 80, 443, 8443 and 8446 are all taken." ;;
+    another. 22, 53, 80, 443, 8443, 8445 and 8446 are all taken." ;;
                 "${TUNNEL_PORT:-none}") die "port $ADMIN_PORT carries the tunnel - pick another" ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
@@ -1631,6 +1641,14 @@ EOF
         chmod +x /usr/local/bin/smartdns-operators
         payload OPERATORS_SERVICE > /etc/systemd/system/smartdns-operators.service
         payload OPERATORS_TIMER   > /etc/systemd/system/smartdns-operators.timer
+        # The sample Telegram bot. Put here, switched off: the admin panel's
+        # bot page sets it up and turns it on. One that is already set up is
+        # restarted below, so an upgrade reaches it too.
+        note_file /usr/local/bin/doctor-dns-bot
+        note_file /etc/systemd/system/doctor-dns-bot.service
+        payload BOT > /usr/local/bin/doctor-dns-bot
+        chmod +x /usr/local/bin/doctor-dns-bot
+        payload BOT_SERVICE > /etc/systemd/system/doctor-dns-bot.service
         systemctl daemon-reload
         enable_service smartdns-admin.service
         enable_service smartdns-operators.timer
@@ -1640,6 +1658,7 @@ EOF
         [ -s /var/lib/smart-dns/operators.json ] \
             || systemctl start --no-block smartdns-operators.service >/dev/null 2>&1 || true
         systemctl restart smartdns-admin.service
+        systemctl try-restart doctor-dns-bot.service >/dev/null 2>&1 || true
         sleep 2
         if systemctl is-active --quiet smartdns-admin.service; then
             info "admin panel running"
@@ -3306,6 +3325,7 @@ exit 0
 #import hmac
 #import html
 #import http.server
+#import ipaddress
 #import json
 #import os
 #import re
@@ -3503,6 +3523,124 @@ exit 0
 #    uptime     INTEGER
 #);
 #CREATE INDEX IF NOT EXISTS metrics_host_at ON metrics(host, at);
+#
+#-- What is for sale. A plan is a template for a number of days with an
+#-- allowance and a price, so buying one decides everything a customer gets and
+#-- approving the receipt is the whole of the operator's work.
+#--
+#-- quota_bytes 0 is unlimited, as everywhere else, and it is only ever written
+#-- from an explicit "unlimited" tick: an empty box must not become a plan that
+#-- gives away everything. price is in tomans. A plan that is switched off is
+#-- no longer offered, but whoever holds it keeps it to the end of their term.
+#CREATE TABLE IF NOT EXISTS plans (
+#    id          INTEGER PRIMARY KEY,
+#    name        TEXT NOT NULL,
+#    template_id INTEGER NOT NULL REFERENCES templates(id),
+#    days        INTEGER NOT NULL,
+#    quota_bytes INTEGER NOT NULL DEFAULT 0,
+#    price       INTEGER NOT NULL DEFAULT 0,
+#    speed_kbps  INTEGER NOT NULL DEFAULT 0,
+#    note        TEXT,
+#    active      INTEGER NOT NULL DEFAULT 1,
+#    created_at  TEXT NOT NULL
+#);
+#
+#-- Support tickets. status is whose turn it is: 'open' waits for the operator,
+#-- 'answered' for the customer, 'closed' for nobody. Either side can close a
+#-- ticket, and a customer writing into a closed one opens it again.
+#CREATE TABLE IF NOT EXISTS tickets (
+#    id         INTEGER PRIMARY KEY,
+#    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    subject    TEXT NOT NULL,
+#    status     TEXT NOT NULL DEFAULT 'open',
+#    created_at TEXT NOT NULL,
+#    updated_at TEXT NOT NULL
+#);
+#CREATE INDEX IF NOT EXISTS tickets_user ON tickets(user_id);
+#
+#-- One row per message. The picture, when there is one, lives here like a
+#-- receipt does, so one backup is the whole story; it is dropped a while after
+#-- the ticket is closed, leaving the words.
+#CREATE TABLE IF NOT EXISTS ticket_messages (
+#    id         INTEGER PRIMARY KEY,
+#    ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+#    from_admin INTEGER NOT NULL DEFAULT 0,
+#    body       TEXT NOT NULL,
+#    image_blob BLOB,
+#    image_type TEXT,
+#    created_at TEXT NOT NULL
+#);
+#CREATE INDEX IF NOT EXISTS ticket_messages_ticket ON ticket_messages(ticket_id);
+#
+#-- Who has had the free trial, by Telegram account. Its own table rather than a
+#-- column on users, so it outlives the account: deleting an account, or taking
+#-- Telegram off it, must not make that Telegram account new again.
+#CREATE TABLE IF NOT EXISTS trial_log (
+#    telegram_id INTEGER PRIMARY KEY,
+#    user_id     INTEGER,
+#    plan_id     INTEGER,
+#    created_at  TEXT NOT NULL
+#);
+#
+#-- Short-lived codes: 'link' ties a web account to the Telegram account that
+#-- sends the code to the bot; 'reset' is the six digits that bot hands the
+#-- customer to choose a new password. One of each per account at a time, a new
+#-- one replacing the old; only a hash is kept.
+#CREATE TABLE IF NOT EXISTS user_codes (
+#    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    kind       TEXT NOT NULL,
+#    code_hash  TEXT NOT NULL,
+#    expires_at TEXT NOT NULL,
+#    attempts   INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (user_id, kind)
+#);
+#
+#-- Keys for the bot API, made in the admin panel. Only a hash is kept: the key
+#-- is shown once when it is made and cannot be read back, only replaced. A key
+#-- speaks for every customer at once - the bot says which one by Telegram id -
+#-- so it is as strong as the admin password, and revoking is one click.
+#-- allow_ips, when set, is the only addresses the key is accepted from.
+#CREATE TABLE IF NOT EXISTS api_tokens (
+#    id           INTEGER PRIMARY KEY,
+#    name         TEXT NOT NULL,
+#    token_hash   TEXT UNIQUE NOT NULL,
+#    allow_ips    TEXT,
+#    created_at   TEXT NOT NULL,
+#    last_used_at TEXT,
+#    revoked_at   TEXT
+#);
+#
+#-- Things the panel tells a bot, waiting to be delivered. Written wherever
+#-- the thing happens - the admin approving a receipt, a sync finding somebody
+#-- out of allowance - and sent by one worker in the panel, never inside the
+#-- request that caused it: a bot that is down or slow must not make the
+#-- operator's click hang. One row per key with a webhook, so each bot has its
+#-- own retries.
+#CREATE TABLE IF NOT EXISTS webhook_outbox (
+#    id           INTEGER PRIMARY KEY,
+#    token_id     INTEGER NOT NULL,
+#    event        TEXT NOT NULL,
+#    payload      TEXT NOT NULL,
+#    created_at   TEXT NOT NULL,
+#    attempts     INTEGER NOT NULL DEFAULT 0,
+#    next_at      TEXT NOT NULL,
+#    delivered_at TEXT,
+#    last_error   TEXT
+#);
+#CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(delivered_at, next_at);
+#
+#-- The answer already given to a request that carried an Idempotency-Key. A
+#-- bot that sends the same request twice - a retry after a timeout, a user
+#-- tapping twice - gets the first answer back instead of a second action.
+#CREATE TABLE IF NOT EXISTS api_idempotency (
+#    token_id   INTEGER NOT NULL,
+#    key        TEXT NOT NULL,
+#    request    TEXT NOT NULL,
+#    status     INTEGER NOT NULL,
+#    response   TEXT NOT NULL,
+#    created_at TEXT NOT NULL,
+#    PRIMARY KEY (token_id, key)
+#);
 #"""
 #
 #METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
@@ -3538,6 +3676,22 @@ exit 0
 #    ("transactions", "receipt_blob", "BLOB"),
 #    ("transactions", "receipt_type", "TEXT"),
 #    ("transactions", "note", "TEXT"),
+#    # Which plan the account is on, and which one a receipt is paying for.
+#    # Null for everything from before plans, and for an account whose
+#    # allowance was set by hand.
+#    ("users", "plan_id", "INTEGER"),
+#    ("transactions", "plan_id", "INTEGER"),
+#    # Where a bot wants to be told things, and the secret its messages are
+#    # signed with. Kept readable, unlike the key: the panel has to sign with it.
+#    ("api_tokens", "webhook_url", "TEXT"),
+#    ("api_tokens", "webhook_secret", "TEXT"),
+#    # 'customer' acts for customers; 'admin' may also approve receipts and
+#    # manage accounts - the operator's own bot.
+#    ("api_tokens", "scope", "TEXT NOT NULL DEFAULT 'customer'"),
+#    # A free trial: given with one tap, never bought.
+#    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
+#    # When this account had its trial; one per account.
+#    ("users", "trial_at", "TEXT"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -3584,6 +3738,10 @@ exit 0
 ## Fractions of the quota at which the user is warned, and the bit each one
 ## sets in users.warned.
 #THRESHOLDS = [(0.80, 1), (0.95, 2)]
+## Set in users.warned once the bot has been told the term ends soon. Cleared
+## with the other bits whenever the account is given more.
+#WARNED_EXPIRING = 4
+#EXPIRING_DAYS = 3
 #
 #IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
 #
@@ -3717,6 +3875,15 @@ exit 0
 #    for unit in ("B", "KB", "MB", "GB", "TB"):
 #        if n < 1024 or unit == "TB":
 #            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+#        n /= 1024
+#
+#
+#def human_fa(n):
+#    """A size as a customer reads it, in the messages a bot passes on."""
+#    n = float(n)
+#    for unit in ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"):
+#        if n < 1024 or unit == "ترابایت":
+#            return ("%d %s" if unit == "بایت" else "%.1f %s") % (n, unit)
 #        n /= 1024
 #
 #
@@ -3999,6 +4166,23 @@ exit 0
 #             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
 #                 timespec="seconds")))
 #        return token
+#
+#    def plans_for_sale(self):
+#        """The plans a customer may buy, grouped the way they are shown: by
+#        template, then cheapest first."""
+#        return [dict(r) for r in self.q(
+#            "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
+#            " p.note, t.name AS template FROM plans p"
+#            " JOIN templates t ON t.id = p.template_id"
+#            " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+#
+#    def trial_plan(self):
+#        """The free trial on offer, if the operator made one."""
+#        row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
+#                       " t.name AS template FROM plans p JOIN templates t"
+#                       " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
+#                       " ORDER BY p.id LIMIT 1")
+#        return dict(row) if row else None
 #
 #    def user_ips(self, user_id):
 #        return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
@@ -4410,6 +4594,959 @@ exit 0
 #
 #
 ## ------------------------------------------------------------------ quota
+#def refused(error, message):
+#    return {"ok": False, "error": error, "message": message}
+#
+#
+#def telegram_required(store, user):
+#    """Whether this customer must link Telegram before buying.
+#
+#    Only while a bot is there to link to - otherwise the rule would lock
+#    every web customer out of paying, with no way to comply."""
+#    return (store.setting("require_telegram") == "1" and not user["telegram_id"]
+#            and telegram_ready(store))
+#
+#
+#def trial_offer(store, user):
+#    """(the trial plan, None) when this customer may take it now, else
+#    (the plan or None, why not): 'none' - there is no trial; 'telegram' - link
+#    Telegram first; 'used' - this account or this Telegram account had one;
+#    'running' - a plan is running, and a trial would end it."""
+#    plan = store.trial_plan()
+#    if not plan:
+#        return None, "none"
+#    if user["trial_at"]:
+#        return plan, "used"
+#    if not user["telegram_id"]:
+#        return plan, "telegram"
+#    if store.one("SELECT 1 FROM trial_log WHERE telegram_id = ?", (user["telegram_id"],)):
+#        return plan, "used"
+#    # Whatever the account has, while it is running - a plan, or an allowance
+#    # set by hand - a trial would replace it, and it is the customer's.
+#    if user["status"] in ("active", "over_quota"):
+#        return plan, "running"
+#    return plan, None
+#
+#
+#TRIAL_WHY = {"none": "تست رایگانی تعریف نشده",
+#             "telegram": "برای تست رایگان، اول حسابتان را به تلگرام وصل کنید",
+#             "used": "تست رایگان را قبلاً گرفته‌اید",
+#             "running": "الان پلن فعال دارید؛ تست رایگان برای وقتی است که پلنی ندارید"}
+#
+#
+#def trial_view(store, user):
+#    """What the customer's page and the bot show about the trial."""
+#    plan, why = trial_offer(store, user)
+#    if not plan or why == "used":
+#        return None
+#    return {"plan": plan, "available": why is None,
+#            "why": TRIAL_WHY.get(why) if why else None}
+#
+#
+#def take_trial(store, user):
+#    plan, why = trial_offer(store, user)
+#    if why:
+#        return refused("trial_" + why, TRIAL_WHY[why])
+#    # The Telegram account is written down first, under its primary key: two
+#    # taps at once cannot both get through.
+#    try:
+#        store.run("INSERT INTO trial_log (telegram_id, user_id, plan_id, created_at)"
+#                  " VALUES (?, ?, ?, ?)", (user["telegram_id"], user["id"], plan["id"], now()))
+#    except sqlite3.IntegrityError:
+#        return refused("trial_used", TRIAL_WHY["used"])
+#    store.run("UPDATE users SET trial_at = ? WHERE id = ?", (now(), user["id"]))
+#    done = apply_plan(store, user["id"], plan["id"])
+#    log(INFO, "free trial for user #%d (telegram %d): %s"
+#        % (user["id"], user["telegram_id"], done))
+#    emit_admin(store, "trial.started", {
+#        "user_id": user["id"], "plan": {"id": plan["id"], "name": plan["name"]},
+#        "text": "🎁 تست رایگان گرفت: %s" % who_label(user)})
+#    return {"ok": True, "message": "🎁 تست رایگان فعال شد. %s" % done}
+#
+#
+#def create_receipt(store, user, body):
+#    """Record a photograph of a payment slip against a customer.
+#
+#    One function for every way in - the web panel through a relay, and a bot
+#    through the API - so a rule about what a receipt may be cannot hold on one
+#    and not the other. Nothing about the account changes here: this records a
+#    claim, and the operator decides what it is worth.
+#    """
+#    # One account per person, as far as one Telegram account per person goes:
+#    # the operator can ask that buying wait until Telegram is linked.
+#    if telegram_required(store, user):
+#        return refused("telegram_required", "برای خرید، اول حسابتان را به تلگرام "
+#                                            "وصل کنید")
+#    kind = (body.get("content_type") or "").split(";")[0].strip().lower()
+#    if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
+#        return refused("bad_type", "فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود")
+#    try:
+#        blob = base64.b64decode(body.get("data") or "", validate=True)
+#    except Exception:
+#        return refused("bad_file", "فایل خراب بود، دوباره بفرستید")
+#    if not blob:
+#        return refused("empty_file", "فایل خالی بود")
+#    if len(blob) > MAX_RECEIPT:
+#        return refused("too_big", "فایل بزرگ‌تر از %s است" % human(MAX_RECEIPT))
+#
+#    # What the receipt pays for. Once there is anything on sale a receipt has
+#    # to name one of those plans, or the operator is back to guessing what a
+#    # sum of money was meant to buy. The price comes from the plan, never from
+#    # the form.
+#    try:
+#        amount = max(0, int(body.get("amount") or 0))
+#    except (TypeError, ValueError):
+#        amount = 0
+#    plan = None
+#    try:
+#        wanted = int(body.get("plan_id") or 0)
+#    except (TypeError, ValueError):
+#        wanted = 0
+#    if wanted:
+#        plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1"
+#                         " AND is_trial = 0", (wanted,))
+#        if not plan:
+#            return refused("plan_not_on_sale",
+#                           "این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید")
+#        amount = plan["price"]
+#    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"):
+#        return refused("plan_required", "اول پلنی را که خریده‌اید انتخاب کنید")
+#
+#    # One pending receipt per customer. A second one replaces the first rather
+#    # than queueing: somebody who sends three photographs of the same slip
+#    # means the last one, and the operator should not have to work out which.
+#    with store.lock:
+#        store.db.execute("DELETE FROM transactions WHERE user_id = ?"
+#                         " AND status = 'pending'", (user["id"],))
+#        cur = store.db.execute(
+#            "INSERT INTO transactions"
+#            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
+#            "  status, created_at, plan_id)"
+#            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, ?)",
+#            (user["id"], amount, blob, kind,
+#             (body.get("note") or "").strip()[:200], now(),
+#             plan["id"] if plan else None))
+#        store.db.commit()
+#    print("receipt from user %d: %s, %s%s"
+#          % (user["id"], kind, human(len(blob)),
+#             ", plan %d" % plan["id"] if plan else ""), flush=True)
+#    emit_admin(store, "receipt.submitted", {
+#        "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
+#        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
+#        "text": "رسید تازه از %s%s — %s تومان"
+#                % (who_label(user), " برای «%s»" % plan["name"] if plan else "",
+#                   format(amount, ","))})
+#    return {"ok": True, "receipt_id": cur.lastrowid,
+#            "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+#
+#
+#def register_ip(store, user_id, ip):
+#    """Put an address on an account - the web panel's button and the API's
+#    call both land here."""
+#    owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+#    if owner and owner["user_id"] != user_id:
+#        return refused("ip_taken", "این آی‌پی به حساب دیگری ثبت شده است")
+#    user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
+#    existing = store.user_ips(user_id)
+#    # One active address per account, with as many changes as they like.
+#    # Replacing rather than adding is what makes that true.
+#    if existing and len(existing) >= user["max_ips"]:
+#        for old in existing[: len(existing) - user["max_ips"] + 1]:
+#            if old["ip"] != ip:
+#                store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
+#    store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
+#              (user_id, ip, now()))
+#    return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+#
+#
+## ----------------------------------------------------------------- tickets
+## The limits are about one customer filling the operator's queue, not about
+## storage: a ticket is a conversation, and nobody needs more than a few open.
+#TICKET_OPEN_MAX = 3
+#TICKET_BODY_MAX = 2000
+#TICKET_SUBJECT_MAX = 80
+## Messages from one customer per hour, across all their tickets.
+#TICKET_RATE = (20, 3600)
+## Pictures in a closed ticket are dropped after this long; the words stay.
+#TICKET_IMAGE_DAYS = 30
+#TICKET_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
+#
+#
+#def ticket_image(body):
+#    """(blob, type) for an optional picture in a request, (None, None) for
+#    none, or a refusal."""
+#    data = body.get("image_data") or ""
+#    if not data:
+#        return None, None
+#    kind = (body.get("image_type") or "").split(";")[0].strip().lower()
+#    if kind not in TICKET_IMAGE_TYPES:
+#        return refused("bad_type", "فقط عکس (JPG، PNG یا WEBP) قبول می‌شود"), None
+#    try:
+#        blob = base64.b64decode(data, validate=True)
+#    except Exception:
+#        return refused("bad_file", "عکس خراب بود، دوباره بفرستید"), None
+#    if not blob:
+#        return None, None
+#    if len(blob) > MAX_RECEIPT:
+#        return refused("too_big", "عکس بزرگ‌تر از %s است" % human(MAX_RECEIPT)), None
+#    return blob, kind
+#
+#
+#def ticket_text(body, field, limit):
+#    text = unicodedata.normalize("NFC", str(body.get(field) or ""))
+#    # Keep line breaks, drop other control characters a client might send.
+#    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
+#    return text.strip()[:limit]
+#
+#
+#def ticket_rate_ok(user):
+#    ok, _ = THROTTLE.check("ticket:%d" % user["id"], *TICKET_RATE)
+#    if ok:
+#        THROTTLE.hit("ticket:%d" % user["id"])
+#    return ok
+#
+#
+#def ticket_open(store, user, body):
+#    """A new ticket with its first message."""
+#    subject = ticket_text(body, "subject", TICKET_SUBJECT_MAX)
+#    text = ticket_text(body, "body", TICKET_BODY_MAX)
+#    if not subject:
+#        return refused("subject_required", "موضوع تیکت را بنویسید")
+#    if not text:
+#        return refused("body_required", "متن پیام را بنویسید")
+#    blob, kind = ticket_image(body)
+#    if isinstance(blob, dict):
+#        return blob
+#    waiting = store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
+#                        " AND status != 'closed'", (user["id"],))["c"]
+#    if waiting >= TICKET_OPEN_MAX:
+#        return refused("too_many_tickets",
+#                       "%d تیکت باز دارید؛ در همان‌ها بنویسید یا یکی را ببندید"
+#                       % TICKET_OPEN_MAX)
+#    if not ticket_rate_ok(user):
+#        return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
+#    stamp = now()
+#    with store.lock:
+#        cur = store.db.execute("INSERT INTO tickets (user_id, subject, status,"
+#                               " created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
+#                               (user["id"], subject, stamp, stamp))
+#        tid = cur.lastrowid
+#        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+#                         (tid, text, blob, kind, stamp))
+#        store.db.commit()
+#    print("ticket #%d opened by user %d" % (tid, user["id"]), flush=True)
+#    emit_admin(store, "ticket.opened", {
+#        "ticket_id": tid, "user_id": user["id"], "subject": subject, "body": text,
+#        "text": "تیکت تازه از %s: «%s»\n\n%s" % (who_label(user), subject, text)})
+#    return {"ok": True, "ticket_id": tid,
+#            "message": "تیکت ثبت شد؛ جواب همین‌جا می‌آید"}
+#
+#
+#def ticket_row(store, user, tid):
+#    try:
+#        tid = int(tid)
+#    except (TypeError, ValueError):
+#        return None
+#    # Always by owner as well as by number: a customer guessing numbers
+#    # must not read somebody else's conversation.
+#    return store.one("SELECT * FROM tickets WHERE id = ? AND user_id = ?",
+#                     (tid, user["id"]))
+#
+#
+#def ticket_reply(store, user, tid, body):
+#    ticket = ticket_row(store, user, tid)
+#    if not ticket:
+#        return refused("ticket_not_found", "این تیکت پیدا نشد")
+#    text = ticket_text(body, "body", TICKET_BODY_MAX)
+#    if not text:
+#        return refused("body_required", "متن پیام را بنویسید")
+#    blob, kind = ticket_image(body)
+#    if isinstance(blob, dict):
+#        return blob
+#    if not ticket_rate_ok(user):
+#        return refused("slow_down", "پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید")
+#    stamp = now()
+#    with store.lock:
+#        store.db.execute("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                         " image_blob, image_type, created_at) VALUES (?, 0, ?, ?, ?, ?)",
+#                         (ticket["id"], text, blob, kind, stamp))
+#        # Whatever it was, it is the operator's turn now - a closed ticket
+#        # written into is open again.
+#        store.db.execute("UPDATE tickets SET status = 'open', updated_at = ?"
+#                         " WHERE id = ?", (stamp, ticket["id"]))
+#        store.db.commit()
+#    emit_admin(store, "ticket.message", {
+#        "ticket_id": ticket["id"], "user_id": user["id"], "subject": ticket["subject"],
+#        "body": text,
+#        "text": "پیام تازه از %s در تیکت «%s»:\n\n%s"
+#                % (who_label(user), ticket["subject"], text)})
+#    return {"ok": True, "ticket_id": ticket["id"], "message": "پیام فرستاده شد"}
+#
+#
+#def ticket_close(store, user, tid):
+#    ticket = ticket_row(store, user, tid)
+#    if not ticket:
+#        return refused("ticket_not_found", "این تیکت پیدا نشد")
+#    store.run("UPDATE tickets SET status = 'closed', updated_at = ? WHERE id = ?",
+#              (now(), ticket["id"]))
+#    return {"ok": True, "ticket_id": ticket["id"], "message": "تیکت بسته شد"}
+#
+#
+#def ticket_list(store, user):
+#    return [dict(r) for r in store.q(
+#        "SELECT t.id, t.subject, t.status, t.created_at, t.updated_at,"
+#        " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS messages"
+#        " FROM tickets t WHERE t.user_id = ?"
+#        " ORDER BY CASE t.status WHEN 'answered' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,"
+#        " t.updated_at DESC LIMIT 50", (user["id"],))]
+#
+#
+#def ticket_get(store, user, tid):
+#    ticket = ticket_row(store, user, tid)
+#    if not ticket:
+#        return refused("ticket_not_found", "این تیکت پیدا نشد")
+#    messages = [{"id": m["id"], "from": "admin" if m["from_admin"] else "customer",
+#                 "body": m["body"], "has_image": bool(m["has_image"]),
+#                 "created_at": m["created_at"]}
+#                for m in store.q("SELECT id, from_admin, body, created_at,"
+#                                 " image_blob IS NOT NULL AS has_image"
+#                                 " FROM ticket_messages WHERE ticket_id = ?"
+#                                 " ORDER BY id", (ticket["id"],))]
+#    return {"ok": True, "ticket": {
+#        "id": ticket["id"], "subject": ticket["subject"], "status": ticket["status"],
+#        "created_at": ticket["created_at"], "updated_at": ticket["updated_at"],
+#        "messages": messages}}
+#
+#
+#def ticket_picture(store, user, mid):
+#    """A message's picture, for its own customer only."""
+#    try:
+#        mid = int(mid)
+#    except (TypeError, ValueError):
+#        mid = 0
+#    row = store.one("SELECT m.image_blob, m.image_type FROM ticket_messages m"
+#                    " JOIN tickets t ON t.id = m.ticket_id"
+#                    " WHERE m.id = ? AND t.user_id = ?", (mid, user["id"]))
+#    if not row or row["image_blob"] is None:
+#        return refused("image_not_found", "این عکس پیدا نشد")
+#    return {"ok": True, "image_type": row["image_type"],
+#            "image_data": base64.b64encode(bytes(row["image_blob"])).decode("ascii")}
+#
+#
+#def prune_ticket_images(store):
+#    cutoff = (datetime.now(timezone.utc) - timedelta(days=TICKET_IMAGE_DAYS)
+#              ).isoformat(timespec="seconds")
+#    store.run("UPDATE ticket_messages SET image_blob = NULL, image_type = NULL"
+#              " WHERE image_blob IS NOT NULL AND ticket_id IN (SELECT id FROM tickets"
+#              " WHERE status = 'closed' AND updated_at < ?)", (cutoff,))
+#
+#
+## ------------------------------------------------ Telegram link and reset
+## Linking: the web panel shows a code, the customer sends it to the bot, and
+## the bot tells the panel which Telegram account sent it. From then on a
+## forgotten password is six digits the bot delivers - there is no SMS here,
+## and Telegram is the one channel every customer already has.
+#LINK_MINUTES = 15
+#RESET_MINUTES = 10
+#RESET_TRIES = 5
+## Letters nobody misreads when copying from one app to another.
+#LINK_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+#
+#
+#def code_hash(user_id, kind, code):
+#    # The user and the kind go into it, so a code is only ever good for the
+#    # one account and the one purpose it was made for.
+#    return hashlib.sha256(("%s:%s:%s" % (user_id, kind, code.strip().lower()))
+#                          .encode("utf-8")).hexdigest()
+#
+#
+#def new_code(store, user_id, kind, code, minutes):
+#    store.run("INSERT OR REPLACE INTO user_codes (user_id, kind, code_hash, expires_at,"
+#              " attempts) VALUES (?, ?, ?, ?, 0)",
+#              (user_id, kind, code_hash(user_id, kind, code),
+#               (datetime.now(timezone.utc) + timedelta(minutes=minutes))
+#               .isoformat(timespec="seconds")))
+#
+#
+#def telegram_ready(store):
+#    """Whether any bot is listening - without one, a code has no way out."""
+#    return bool(store.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
+#                          " AND COALESCE(webhook_url, '') != ''"))
+#
+#
+#def password_again(user, password):
+#    """The account's password, asked for again before anything that decides
+#    who can get into it. A session alone can be a borrowed phone, and a
+#    Telegram account linked from one would let its holder reset the password
+#    whenever they liked. None when it matches, else the refusal."""
+#    if not user["password_hash"]:
+#        return refused("no_password", "این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید")
+#    if check_password(user, password or ""):
+#        THROTTLE.clear("pw:%d" % user["id"])
+#        return None
+#    ok, wait = THROTTLE.check("pw:%d" % user["id"], limit=8, window=900)
+#    if not ok:
+#        return refused("slow_down", "تلاش زیاد بوده. %d دقیقه دیگر." % max(1, wait // 60))
+#    THROTTLE.hit("pw:%d" % user["id"])
+#    return refused("wrong_password", "رمز فعلی درست نیست")
+#
+#
+#def link_code(store, user, password):
+#    """A code for the web panel to show; the bot turns it into a link."""
+#    if user["telegram_id"]:
+#        return refused("already_linked", "حساب شما از قبل به تلگرام وصل است")
+#    if not telegram_ready(store):
+#        return refused("no_bot", "اتصال به تلگرام فعلاً راه نیفتاده")
+#    wrong = password_again(user, password)
+#    if wrong:
+#        return wrong
+#    ok, _ = THROTTLE.check("link:%d" % user["id"], 10, 3600)
+#    if not ok:
+#        return refused("slow_down", "کد زیاد گرفته‌اید؛ کمی بعد دوباره")
+#    THROTTLE.hit("link:%d" % user["id"])
+#    code = "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
+#    new_code(store, user["id"], "link", code, LINK_MINUTES)
+#    return {"ok": True, "code": code, "minutes": LINK_MINUTES,
+#            "bot_link": store.setting("bot_link")}
+#
+#
+#def unlink_telegram(store, user, password):
+#    """Take the Telegram account off a web account - a customer who changed
+#    theirs, before linking the new one.
+#
+#    Only an account that has its own way in: one opened through the bot has
+#    nothing but Telegram, and without it nobody could sign in to it again.
+#    """
+#    if not user["telegram_id"]:
+#        return refused("not_linked", "این حساب به تلگرام وصل نیست")
+#    if not user["username"] or not user["password_hash"]:
+#        return refused("telegram_only", "این حساب فقط با تلگرام کار می‌کند و جدا "
+#                                        "کردنش یعنی دیگر کسی واردش نمی‌شود")
+#    wrong = password_again(user, password)
+#    if wrong:
+#        return wrong
+#    store.run("UPDATE users SET telegram_id = NULL WHERE id = ?", (user["id"],))
+#    store.run("DELETE FROM user_codes WHERE user_id = ?", (user["id"],))
+#    print("user %d unlinked from telegram %d" % (user["id"], user["telegram_id"]),
+#          flush=True)
+#    return {"ok": True, "message": "تلگرام از حساب جدا شد"}
+#
+#
+#def empty_bot_account(store, user):
+#    """An account the bot opened and nothing ever happened on: no web login, no
+#    plan, no address, no receipt, no ticket."""
+#    if user["username"] or user["password_hash"] or user["plan_id"]:
+#        return False
+#    if user["status"] != "pending" or user["used_bytes"]:
+#        return False
+#    for table in ("ips", "transactions", "tickets"):
+#        if store.one("SELECT 1 FROM %s WHERE user_id = ?" % table, (user["id"],)):
+#            return False
+#    return True
+#
+#
+## Letters and digits nobody misreads when a password is copied out of a chat.
+#PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+#LOGIN_MINUTES = 10
+#
+#
+#def new_password():
+#    """Three groups of four - easy to copy, and about 59 bits."""
+#    return "-".join("".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(4))
+#                    for _ in range(3))
+#
+#
+#def give_credentials(store, user, username, name):
+#    """A web sign-in for an account that came through the bot: the name and
+#    username the customer chose, and a password made here."""
+#    if user["username"]:
+#        return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
+#    wanted = normal_username(username)
+#    if not wanted:
+#        return refused("bad_username", "نام کاربری ۳ تا ۳۲ حرف انگلیسی، عدد، نقطه، خط تیره "
+#                                       "یا زیرخط باشد")
+#    if store.user_by_username(wanted):
+#        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+#    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
+#    password = new_password()
+#    salt = secrets.token_hex(16)
+#    try:
+#        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
+#                  " password_salt = ?, must_change_password = 0 WHERE id = ?",
+#                  (wanted, name, hash_password(password, salt), salt, user["id"]))
+#    except sqlite3.IntegrityError:
+#        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+#    log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
+#    return {"ok": True, "username": wanted, "password": password,
+#            "panel_url": store.setting("customer_panel_url")}
+#
+#
+#def fresh_password(store, user):
+#    """A new random password for a bot account's web sign-in; everybody signed
+#    in with the old one is out."""
+#    if not user["username"]:
+#        return refused("no_username", "این حساب هنوز نام کاربری ندارد")
+#    password = new_password()
+#    store.set_password(user["id"], password)
+#    store.run("DELETE FROM panel_sessions WHERE user_id = ?", (user["id"],))
+#    log(INFO, "user #%d got a new password through the bot" % user["id"])
+#    return {"ok": True, "username": user["username"], "password": password,
+#            "panel_url": store.setting("customer_panel_url")}
+#
+#
+#def login_link(store, user):
+#    """A one-time address that signs the customer in to their web page - to
+#    register the address of the connection they open it on."""
+#    base = store.setting("customer_panel_url")
+#    if not base:
+#        return refused("no_panel", "آدرس پنل مشتری هنوز معلوم نیست؛ چند دقیقه دیگر")
+#    token = secrets.token_urlsafe(24)
+#    new_code(store, user["id"], "login", token, LOGIN_MINUTES)
+#    return {"ok": True, "url": base + "go/" + token, "minutes": LOGIN_MINUTES}
+#
+#
+#def use_login_link(store, token):
+#    """Trade a one-time link for a session. It works once, and not late."""
+#    token = (token or "").strip()
+#    if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token):
+#        return refused("bad_link", "این لینک درست نیست")
+#    for row in store.q("SELECT user_id, code_hash, expires_at FROM user_codes"
+#                       " WHERE kind = 'login'"):
+#        if not hmac.compare_digest(row["code_hash"],
+#                                   code_hash(row["user_id"], "login", token)):
+#            continue
+#        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'login'",
+#                  (row["user_id"],))
+#        ends = parse_ts(row["expires_at"])
+#        if not ends or datetime.now(timezone.utc) >= ends:
+#            return refused("link_expired", "این لینک منقضی شده؛ از ربات یکی تازه بگیرید")
+#        log(INFO, "user #%d signed in with a one-time link" % row["user_id"])
+#        return {"ok": True, "session": store.open_session(row["user_id"])}
+#    return refused("bad_link", "این لینک درست نیست یا قبلاً استفاده شده")
+#
+#
+#def link_telegram(store, tg, code):
+#    """The bot says: this Telegram account sent this code."""
+#    code = (code or "").strip().lower()
+#    if not re.match(r"^[a-z0-9]{8}$", code):
+#        return refused("bad_code", "کد اتصال درست نیست")
+#    for row in store.q("SELECT user_id, code_hash, expires_at FROM user_codes"
+#                       " WHERE kind = 'link'"):
+#        if not hmac.compare_digest(row["code_hash"], code_hash(row["user_id"], "link", code)):
+#            continue
+#        ends = parse_ts(row["expires_at"])
+#        if not ends or datetime.now(timezone.utc) >= ends:
+#            return refused("code_expired", "کد اتصال منقضی شده؛ یکی تازه بگیرید")
+#        other = store.user_by_telegram(tg)
+#        if other and other["id"] != row["user_id"] and empty_bot_account(store, other):
+#            # Somebody who opened the bot before linking gets a bot account
+#            # with nothing in it; it must not stand in the way of the account
+#            # they actually use.
+#            store.run("DELETE FROM users WHERE id = ?", (other["id"],))
+#            log(INFO, "removed empty bot account #%d so telegram %d can link to #%d"
+#                % (other["id"], tg, row["user_id"]))
+#            other = None
+#        if other and other["id"] != row["user_id"]:
+#            return refused("telegram_in_use", "این تلگرام به حساب دیگری وصل است؛ "
+#                                              "با پشتیبانی تماس بگیرید")
+#        store.run("UPDATE users SET telegram_id = ? WHERE id = ?", (tg, row["user_id"]))
+#        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'link'",
+#                  (row["user_id"],))
+#        print("user %d linked to telegram %d" % (row["user_id"], tg), flush=True)
+#        return {"ok": True, "user_id": row["user_id"],
+#                "message": "حساب شما به تلگرام وصل شد"}
+#    return refused("bad_code", "کد اتصال درست نیست")
+#
+#
+#def reset_request(store, username, ip):
+#    """Send a reset code through the bot. The answer is the same whether the
+#    name exists, is linked, or neither: the page must not tell a stranger
+#    which names have accounts."""
+#    same = {"ok": True, "message": "اگر این حساب به تلگرام وصل باشد، کد شش‌رقمی "
+#                                   "به تلگرامتان فرستاده شد؛ %d دقیقه اعتبار دارد."
+#                                   % RESET_MINUTES}
+#    ok, wait = THROTTLE.check("resetip:%s" % ip, 10, 3600)
+#    if not ok:
+#        return refused("slow_down", "درخواست زیاد بوده؛ %d دقیقه دیگر."
+#                       % max(1, wait // 60))
+#    THROTTLE.hit("resetip:%s" % ip)
+#    username = normal_username(username)
+#    user = store.user_by_username(username) if username else None
+#    if not user or not user["telegram_id"] or not telegram_ready(store):
+#        log(INFO, "reset asked for %r from %s: no linked account" % (username, ip))
+#        return same
+#    ok, _ = THROTTLE.check("reset:%d" % user["id"], 3, 3600)
+#    if not ok:
+#        return same
+#    THROTTLE.hit("reset:%d" % user["id"])
+#    code = "%06d" % secrets.randbelow(10 ** 6)
+#    new_code(store, user["id"], "reset", code, RESET_MINUTES)
+#    emit(store, user, "password.reset_code", {
+#        "code": code, "minutes": RESET_MINUTES,
+#        "text": "کد بازیابی رمز پنل: %s\n\n%d دقیقه اعتبار دارد. اگر خودتان درخواست "
+#                "نکرده‌اید، این پیام را نادیده بگیرید." % (code, RESET_MINUTES)})
+#    log(INFO, "reset code for user #%d sent through the bot (asked from %s)"
+#        % (user["id"], ip))
+#    return same
+#
+#
+#def reset_confirm(store, username, code, password, ip):
+#    """Six digits and a new password; a signed-in session when they match."""
+#    wrong = refused("bad_code", "کد درست نیست یا منقضی شده")
+#    ok, wait = THROTTLE.check("resetip:%s" % ip, 10, 3600)
+#    if not ok:
+#        return refused("slow_down", "تلاش زیاد بوده؛ %d دقیقه دیگر." % max(1, wait // 60))
+#    if len(password or "") < 8:
+#        return refused("weak_password", "رمز تازه باید دست‌کم ۸ نویسه باشد")
+#    username = normal_username(username)
+#    user = store.user_by_username(username) if username else None
+#    row = store.one("SELECT * FROM user_codes WHERE user_id = ? AND kind = 'reset'",
+#                    (user["id"],)) if user else None
+#    if not row:
+#        THROTTLE.hit("resetip:%s" % ip)
+#        return wrong
+#    ends = parse_ts(row["expires_at"])
+#    if not ends or datetime.now(timezone.utc) >= ends or row["attempts"] >= RESET_TRIES:
+#        store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'reset'", (user["id"],))
+#        return wrong
+#    if not hmac.compare_digest(row["code_hash"],
+#                               code_hash(user["id"], "reset", str(code or ""))):
+#        store.run("UPDATE user_codes SET attempts = attempts + 1 WHERE user_id = ?"
+#                  " AND kind = 'reset'", (user["id"],))
+#        THROTTLE.hit("resetip:%s" % ip)
+#        return wrong
+#    store.run("DELETE FROM user_codes WHERE user_id = ? AND kind = 'reset'", (user["id"],))
+#    store.set_password(user["id"], password)
+#    # Whoever else was signed in - perhaps the reason for the reset - is out.
+#    store.run("DELETE FROM panel_sessions WHERE user_id = ?", (user["id"],))
+#    log(INFO, "user #%d reset their password with a Telegram code from %s"
+#        % (user["id"], ip))
+#    return {"ok": True, "session": store.open_session(user["id"]),
+#            "message": "رمز تازه ذخیره شد و وارد شدید"}
+#
+#
+## ---------------------------------------------------------------- webhooks
+## How often the worker looks for something to send, how long one delivery may
+## take, and how it backs off: 30s, 1m, 2m ... up to an hour between tries, for
+## about a day in all. A bot that is down for longer than that has missed
+## news, not lost state - the API still says how every account stands.
+#WEBHOOK_TICK = 5
+#WEBHOOK_TIMEOUT = 10
+#WEBHOOK_MAX_TRIES = 30
+#WEBHOOK_KEEP_DAYS = 7
+#
+#
+#def emit(store, user, event, data):
+#    """Queue something for every bot that asked to be told.
+#
+#    Only for an account a bot can reach - one with a Telegram id. Nothing is
+#    sent here; the worker does that.
+#    """
+#    if not user["telegram_id"]:
+#        return
+#    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+#                   " AND COALESCE(webhook_url, '') != ''")
+#    if not keys:
+#        return
+#    stamp = now()
+#    payload = json.dumps({"event": event, "created_at": stamp,
+#                          "telegram_id": user["telegram_id"], "user_id": user["id"],
+#                          "data": data}, ensure_ascii=False)
+#    for k in keys:
+#        store.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                  " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
+#
+#
+#def webhook_signature(secret, stamp, body):
+#    """t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<body>">. The time is in it
+#    so a bot can refuse an old message replayed at it."""
+#    mac = hmac.new(secret.encode("utf-8"), ("%d." % stamp).encode() + body,
+#                   hashlib.sha256).hexdigest()
+#    return "t=%d,v1=%s" % (stamp, mac)
+#
+#
+#def webhook_backoff(attempts):
+#    return min(3600, 30 * 2 ** max(0, attempts - 1))
+#
+#
+#def deliver_one(store, row, key, opener=None):
+#    """Send one queued message. True when the bot took it (any 2xx)."""
+#    event = json.loads(row["payload"])
+#    event["id"] = row["id"]
+#    body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+#    req = urllib.request.Request(key["webhook_url"], data=body, method="POST")
+#    req.add_header("Content-Type", "application/json; charset=utf-8")
+#    req.add_header("User-Agent", "doctor-dns")
+#    req.add_header("X-DoctorDNS-Event", row["event"])
+#    req.add_header("X-DoctorDNS-Delivery", str(row["id"]))
+#    req.add_header("X-DoctorDNS-Signature",
+#                   webhook_signature(key["webhook_secret"] or "", int(time.time()), body))
+#    try:
+#        res = (opener or urllib.request.urlopen)(req, timeout=WEBHOOK_TIMEOUT)
+#        code = res.status
+#        res.close()
+#        error = None if 200 <= code < 300 else "HTTP %d" % code
+#    except urllib.error.HTTPError as e:
+#        error = "HTTP %d" % e.code
+#    except Exception as e:
+#        error = repr(e)[:200]
+#    if error is None:
+#        store.run("UPDATE webhook_outbox SET delivered_at = ?, attempts = attempts + 1,"
+#                  " last_error = NULL WHERE id = ?", (now(), row["id"]))
+#        return True
+#    tries = row["attempts"] + 1
+#    nxt = datetime.now(timezone.utc) + timedelta(seconds=webhook_backoff(tries))
+#    store.run("UPDATE webhook_outbox SET attempts = ?, next_at = ?, last_error = ?"
+#              " WHERE id = ?", (tries, nxt.isoformat(timespec="seconds"), error, row["id"]))
+#    if tries in (1, WEBHOOK_MAX_TRIES):
+#        log(WARN, "webhook #%d (%s) to key %d failed%s: %s"
+#            % (row["id"], row["event"], row["token_id"],
+#               " for the last time" if tries == WEBHOOK_MAX_TRIES else "", error))
+#    return False
+#
+#
+#def deliver_due(store, opener=None):
+#    """One pass: everything due, oldest first. The number delivered."""
+#    rows = store.q("SELECT * FROM webhook_outbox WHERE delivered_at IS NULL"
+#                   " AND attempts < ? AND next_at <= ? ORDER BY id LIMIT 50",
+#                   (WEBHOOK_MAX_TRIES, now()))
+#    sent = 0
+#    for row in rows:
+#        key = store.one("SELECT * FROM api_tokens WHERE id = ?", (row["token_id"],))
+#        # A key revoked, or its webhook taken away, since this was queued: the
+#        # operator has stopped wanting that bot told anything.
+#        if not key or key["revoked_at"] or not key["webhook_url"]:
+#            store.run("UPDATE webhook_outbox SET attempts = ?, last_error = ?"
+#                      " WHERE id = ?", (WEBHOOK_MAX_TRIES, "key revoked or no webhook",
+#                                        row["id"]))
+#            continue
+#        sent += deliver_one(store, row, key, opener)
+#    return sent
+#
+#
+#def prune_webhooks(store):
+#    cutoff = (datetime.now(timezone.utc) - timedelta(days=WEBHOOK_KEEP_DAYS)
+#              ).isoformat(timespec="seconds")
+#    store.run("DELETE FROM webhook_outbox WHERE created_at < ?"
+#              " AND (delivered_at IS NOT NULL OR attempts >= ?)",
+#              (cutoff, WEBHOOK_MAX_TRIES))
+#
+#
+#def webhook_worker(store):
+#    tick = 0
+#    while True:
+#        try:
+#            if tick % 12 == 0:
+#                daily_report_due(store)
+#            deliver_due(store)
+#            if tick % 720 == 0:
+#                prune_webhooks(store)
+#        except Exception as e:
+#            log(WARN, "webhook worker: %r" % e)
+#        tick += 1
+#        time.sleep(WEBHOOK_TICK)
+#
+#
+## ------------------------------------------------------- the admin, by bot
+## What the admin panel does to money and accounts, for a bot holding a key
+## with admin rights. The admin panel is another process with its own copy of
+## these rules; tools/test-admin-bot.py holds the two to the same answers, so
+## a receipt approved from a phone does exactly what one approved at a desk
+## does.
+## When the day's report goes out, in UTC: 05:30 is nine in the morning in Iran.
+#DAILY_REPORT_UTC = (5, 30)
+#
+#
+#def apply_plan(store, uid, plan_id, stamp=None):
+#    """The admin panel's Store.apply_plan, word for word in effect: the same
+#    plan while it runs is a renewal, anything else starts fresh, and a
+#    suspended account stays suspended."""
+#    stamp = stamp or datetime.now(timezone.utc)
+#    with store.lock:
+#        user = store.db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+#        plan = store.db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+#        if not user or not plan:
+#            return None
+#        ends = parse_ts(user["expires_at"])
+#        renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
+#                    and user["status"] in ("active", "over_quota"))
+#        if renewing:
+#            until = ends + timedelta(days=plan["days"])
+#            quota = (user["quota_bytes"] + plan["quota_bytes"]
+#                     if plan["quota_bytes"] and user["quota_bytes"] else 0)
+#            used = user["used_bytes"]
+#        else:
+#            until = stamp + timedelta(days=plan["days"])
+#            quota = plan["quota_bytes"]
+#            used = 0
+#        store.db.execute(
+#            "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
+#            " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
+#            " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
+#            " status = CASE WHEN status = 'suspended' THEN 'suspended'"
+#            " ELSE 'active' END WHERE id = ?",
+#            (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
+#             until.isoformat(timespec="seconds"), uid))
+#        store.db.commit()
+#    return ("پلن «%s» تمدید شد تا %s" if renewing
+#            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+#
+#
+#def plan_event(store, uid):
+#    row = store.one("SELECT u.expires_at, u.quota_bytes, p.id AS pid, p.name"
+#                    " FROM users u LEFT JOIN plans p ON p.id = u.plan_id"
+#                    " WHERE u.id = ?", (uid,))
+#    if not row:
+#        return {}
+#    return {"plan": {"id": row["pid"], "name": row["name"]} if row["pid"] else None,
+#            "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
+#
+#
+#def decide_receipt(store, tid, to):
+#    """Approve or reject a pending receipt, once - the admin panel's
+#    receipt-decide."""
+#    if to not in ("approved", "rejected"):
+#        return refused("bad_decision", "تصمیم باید approve یا reject باشد")
+#    row = store.one("SELECT user_id, plan_id, status FROM transactions WHERE id = ?", (tid,))
+#    if not row:
+#        return refused("receipt_not_found", "این رسید پیدا نشد")
+#    if row["status"] != "pending":
+#        return refused("already_decided", "این رسید قبلاً بررسی شده")
+#    cur = store.run("UPDATE transactions SET status = ?, decided_at = ?,"
+#                    " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+#                    (to, now(), tid))
+#    if not cur.rowcount:
+#        return refused("already_decided", "این رسید قبلاً بررسی شده")
+#    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+#    if to == "rejected":
+#        emit(store, user, "receipt.rejected", {
+#            "receipt_id": tid,
+#            "text": "رسید پرداخت شما تأیید نشد. اگر فکر می‌کنید اشتباهی شده، "
+#                    "با پشتیبانی در تماس باشید."})
+#        return {"ok": True, "message": "رسید رد شد"}
+#    done = apply_plan(store, row["user_id"], row["plan_id"]) if row["plan_id"] else None
+#    if done:
+#        log(INFO, "receipt #%d approved by bot: user #%d, plan #%d"
+#            % (tid, row["user_id"], row["plan_id"]))
+#        emit(store, user, "receipt.approved",
+#             dict(plan_event(store, row["user_id"]), receipt_id=tid,
+#                  text="رسید پرداخت شما تأیید شد. %s" % done))
+#        return {"ok": True, "message": "رسید تأیید شد؛ %s" % done}
+#    emit(store, user, "receipt.approved", {
+#        "receipt_id": tid,
+#        "text": "رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود."})
+#    return {"ok": True, "message": "رسید تأیید شد؛ سهمیه و زمان را خودتان بگذارید",
+#            "needs_hand": True}
+#
+#
+#def admin_ticket_reply(store, tid, body):
+#    """The operator answering a ticket - the admin panel's ticket-reply."""
+#    ticket = store.one("SELECT * FROM tickets WHERE id = ?", (tid,))
+#    if not ticket:
+#        return refused("ticket_not_found", "این تیکت پیدا نشد")
+#    text = ticket_text(body, "body", TICKET_BODY_MAX)
+#    if not text:
+#        return refused("body_required", "متن جواب را بنویسید")
+#    blob, kind = ticket_image(body)
+#    if isinstance(blob, dict):
+#        return blob
+#    stamp = now()
+#    store.run("INSERT INTO ticket_messages (ticket_id, from_admin, body, image_blob,"
+#              " image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+#              (tid, text, blob, kind, stamp))
+#    store.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
+#              (stamp, tid))
+#    user = store.one("SELECT * FROM users WHERE id = ?", (ticket["user_id"],))
+#    emit(store, user, "ticket.answered", {
+#        "ticket_id": tid, "subject": ticket["subject"], "body": text,
+#        "has_image": bool(blob),
+#        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+#    return {"ok": True, "message": "جواب فرستاده شد"}
+#
+#
+#def who_label(user):
+#    return (user["first_name"] or user["username"] or user["phone"]
+#            or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
+#                else "#%d" % user["id"]))
+#
+#
+#def emit_admin(store, event, data):
+#    """Tell the operator's bots - keys with admin rights - that something
+#    waits for them. No customer is addressed: telegram_id is empty."""
+#    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+#                   " AND scope = 'admin' AND COALESCE(webhook_url, '') != ''")
+#    if not keys:
+#        return
+#    stamp = now()
+#    payload = json.dumps({"event": event, "created_at": stamp, "telegram_id": None,
+#                          "user_id": data.get("user_id"), "audience": "admin",
+#                          "data": data}, ensure_ascii=False)
+#    for k in keys:
+#        store.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                  " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
+#
+#
+#def admin_stats(store):
+#    """The numbers an operator looks at in the morning."""
+#    stamp = datetime.now(timezone.utc)
+#    today = stamp.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(
+#        timespec="seconds")
+#    week = (stamp - timedelta(days=7)).isoformat(timespec="seconds")
+#    soon = (stamp + timedelta(days=EXPIRING_DAYS)).isoformat(timespec="seconds")
+#    one = lambda sql, args=(): store.one(sql, args)[0] or 0
+#    by_status = {r["status"]: r["c"] for r in store.q(
+#        "SELECT status, count(*) c FROM users GROUP BY status")}
+#    return {
+#        "users": sum(by_status.values()),
+#        "by_status": by_status,
+#        "new_today": one("SELECT count(*) FROM users WHERE created_at >= ?", (today,)),
+#        "receipts_pending": one("SELECT count(*) FROM transactions WHERE status = 'pending'"),
+#        "approved_today": one("SELECT count(*) FROM transactions WHERE status = 'approved'"
+#                              " AND decided_at >= ?", (today,)),
+#        "income_today": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
+#                            " AND decided_at >= ?", (today,)),
+#        "income_7d": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
+#                         " AND decided_at >= ?", (week,)),
+#        "tickets_open": one("SELECT count(*) FROM tickets WHERE status = 'open'"),
+#        "trials_today": one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
+#        "expiring_soon": one("SELECT count(*) FROM users WHERE status = 'active'"
+#                             " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
+#        "used_bytes": one("SELECT sum(used_bytes) FROM users"),
+#    }
+#
+#
+#def daily_report_text(s):
+#    return ("گزارش روزانه\n"
+#            "کاربران: %d (فعال %d، در انتظار پلن %d)\n"
+#            "ثبت‌نام امروز: %d\n"
+#            "رسید در انتظار: %d\n"
+#            "تأیید شدهٔ امروز: %d — %s تومان\n"
+#            "درآمد ۷ روز: %s تومان\n"
+#            "تیکت منتظر جواب: %d\n"
+#            "تست رایگان امروز: %d\n"
+#            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود"
+#            % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
+#               s["new_today"], s["receipts_pending"], s["approved_today"],
+#               format(s["income_today"], ","), format(s["income_7d"], ","),
+#               s["tickets_open"], s["trials_today"], s["expiring_soon"]))
+#
+#
+#def daily_report_due(store, stamp=None):
+#    """Queue the day's report once, after its hour. The date it went out is
+#    kept in settings, so a restart does not send it twice."""
+#    stamp = stamp or datetime.now(timezone.utc)
+#    if (stamp.hour, stamp.minute) < DAILY_REPORT_UTC:
+#        return False
+#    day = stamp.strftime("%Y-%m-%d")
+#    if store.setting("daily_report_sent") == day:
+#        return False
+#    store.set_setting("daily_report_sent", day)
+#    s = admin_stats(store)
+#    emit_admin(store, "report.daily", dict(s, text=daily_report_text(s)))
+#    return True
+#
+#
 #def enforce_quotas(store):
 #    """Reset, warn and cut off. Called after every sync.
 #
@@ -4438,7 +5575,23 @@ exit 0
 #                          (u["id"],))
 #                print("expired: user %d after %s" % (u["id"], human(used)),
 #                      flush=True)
+#                emit(store, u, "plan.expired", {
+#                    "expires_at": u["expires_at"],
+#                    "text": "دورهٔ سرویس شما تمام شد. برای ادامه، پلن را تمدید کنید."})
 #            continue
+#
+#        # A few days' notice, once. The bit goes when the account is given
+#        # more time, so the next term is announced too.
+#        if (due and u["status"] == "active" and not (u["warned"] & WARNED_EXPIRING)
+#                and due - stamp <= timedelta(days=EXPIRING_DAYS)):
+#            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+#                      (WARNED_EXPIRING, u["id"]))
+#            left = max(1, int((due - stamp).total_seconds() // 86400) + 1)
+#            emit(store, u, "plan.expiring", {
+#                "expires_at": u["expires_at"], "days_left": left,
+#                "text": "دورهٔ سرویس شما %s تمام می‌شود. برای قطع نشدن، زودتر تمدید کنید."
+#                        % ("امروز" if (due - stamp).total_seconds() < 86400
+#                           else "%d روز دیگر" % left)})
 #
 #        # Monthly plans roll over on their own date rather than on the 1st, so
 #        # a user who joins on the 20th gets a full month.
@@ -4461,15 +5614,29 @@ exit 0
 #            store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
 #            print("over quota: user %d at %s of %s"
 #                  % (u["id"], human(used), human(quota)), flush=True)
+#            emit(store, u, "quota.exhausted", {
+#                "quota_bytes": quota, "used_bytes": used,
+#                "text": "حجم سرویس شما تمام شد و سرویس قطع است. برای ادامه، پلن را تمدید "
+#                        "کنید."})
 #            continue
 #
 #        # Record each threshold as it is crossed, once. The bit is what makes
 #        # it once - a sync runs every thirty seconds - and it is what the
 #        # customer's own page reads to decide whether to warn them.
-#        for fraction, bit in THRESHOLDS:
-#            if used >= quota * fraction and not (u["warned"] & bit):
-#                store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
-#                          (bit, u["id"]))
+#        crossed = [(fraction, bit) for fraction, bit in THRESHOLDS
+#                   if used >= quota * fraction and not (u["warned"] & bit)]
+#        for fraction, bit in crossed:
+#            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+#                      (bit, u["id"]))
+#        # One message for the highest line crossed: an account that jumps
+#        # past both in one sync gets "95%", not two messages at once.
+#        if crossed:
+#            percent = int(round(crossed[-1][0] * 100))
+#            emit(store, u, "quota.warning", {
+#                "percent": percent, "quota_bytes": quota, "used_bytes": used,
+#                "remaining_bytes": max(0, quota - used),
+#                "text": "بیش از %d٪ حجم سرویس شما مصرف شده؛ %s مانده."
+#                        % (percent, human_fa(max(0, quota - used)))})
 #
 #
 ## ------------------------------------------------------------------ logging
@@ -4649,6 +5816,13 @@ exit 0
 #            }
 #            who = self.relay_name(body)
 #            self.store.fold_counters(who, clean)
+#            # Where customers sign in, so a bot can send them there. Only a
+#            # plain https address; the relay knows its own domain, nobody
+#            # has to type it twice.
+#            url = str(body.get("panel_url") or "")
+#            if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
+#                    self.store.setting("customer_panel_url") != url:
+#                self.store.set_setting("customer_panel_url", url)
 #            # The relay names itself by the address it connected from, so a
 #            # second relay appears on its own without any configuration.
 #            self.store.record_metrics(who, body.get("host") or {})
@@ -4675,9 +5849,6 @@ exit 0
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
 #                                    "templates": self.store.template_names(),
-#                                    # Written under the sign-in form, for
-#                                    # whoever has forgotten their password.
-#                                    "support": self.store.setting("support_contact"),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -4695,8 +5866,61 @@ exit 0
 #            return self.reply(200, self.do_user_password(body))
 #        if self.path == "/user-password-first":
 #            return self.reply(200, self.do_user_password_first(body))
+#        if self.path.startswith("/user-ticket"):
+#            return self.reply(200, self.do_user_ticket(self.path, body))
+#        if self.path == "/user-link-code":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            return self.reply(200, link_code(self.store, user, body.get("password")))
+#        if self.path == "/user-trial":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            res = take_trial(self.store, user)
+#            res.pop("error", None)
+#            return self.reply(200, res)
+#        if self.path == "/user-unlink-telegram":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            return self.reply(200, unlink_telegram(self.store, user, body.get("password")))
+#        # Before signing in, like /user-password-login: no session to check.
+#        if self.path == "/user-login-link":
+#            res = use_login_link(self.store, body.get("token"))
+#            res.pop("error", None)
+#            return self.reply(200, res)
+#        if self.path == "/user-reset-request":
+#            return self.reply(200, reset_request(self.store, body.get("username"),
+#                                                 body.get("ip", "")))
+#        if self.path == "/user-reset-confirm":
+#            return self.reply(200, reset_confirm(self.store, body.get("username"),
+#                                                 body.get("code"), body.get("password"),
+#                                                 body.get("ip", "")))
 #
 #        return self.reply(404, {"error": "no such endpoint"})
+#
+#    def do_user_ticket(self, path, body):
+#        """Tickets for the relay's customer panel - the same functions the bot
+#        API calls, so both ways in keep the same rules."""
+#        user = self._session_user(body.get("session"))
+#        if not user:
+#            return {"ok": False, "message": "نشست معتبر نیست"}
+#        if self._must_choose(user):
+#            return self._must_choose(user)
+#        if path == "/user-tickets":
+#            return {"ok": True, "tickets": ticket_list(self.store, user)}
+#        if path == "/user-ticket-new":
+#            return ticket_open(self.store, user, body)
+#        if path == "/user-ticket":
+#            return ticket_get(self.store, user, body.get("id"))
+#        if path == "/user-ticket-reply":
+#            return ticket_reply(self.store, user, body.get("id"), body)
+#        if path == "/user-ticket-close":
+#            return ticket_close(self.store, user, body.get("id"))
+#        if path == "/user-ticket-image":
+#            return ticket_picture(self.store, user, body.get("message_id"))
+#        return {"ok": False, "message": "چنین کاری نیست"}
 #
 #    def relay_name(self, body):
 #        """Which relay this sync is from.
@@ -4761,6 +5985,9 @@ exit 0
 #                               " بنویسید یا وارد شوید"}
 #        THROTTLE.hit("signup:%s" % ip)
 #        print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
+#        emit_admin(self.store, "user.created", {
+#            "user_id": user["id"], "via": "web",
+#            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
 #        return {"ok": True, "session": self.store.open_session(user["id"]),
 #                "message": "حساب ساخته شد"}
 #
@@ -4878,42 +6105,10 @@ exit 0
 #        if self._must_choose(user):
 #            return self._must_choose(user)
 #
-#        kind = (body.get("content_type") or "").split(";")[0].strip().lower()
-#        if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
-#            return {"ok": False,
-#                    "message": "فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود"}
-#        try:
-#            blob = base64.b64decode(body.get("data") or "", validate=True)
-#        except Exception:
-#            return {"ok": False, "message": "فایل خراب بود، دوباره بفرستید"}
-#        if not blob:
-#            return {"ok": False, "message": "فایل خالی بود"}
-#        if len(blob) > MAX_RECEIPT:
-#            return {"ok": False, "message": "فایل بزرگ‌تر از %s است"
-#                    % human(MAX_RECEIPT)}
-#
-#        # One pending receipt per customer. A second one replaces the first
-#        # rather than queueing: somebody who sends three photographs of the
-#        # same slip means the last one, and the operator should not have to
-#        # work out which.
-#        self.store.run(
-#            "DELETE FROM transactions WHERE user_id = ? AND status = 'pending'",
-#            (user["id"],))
-#        try:
-#            amount = max(0, int(body.get("amount") or 0))
-#        except (TypeError, ValueError):
-#            amount = 0
-#        self.store.run(
-#            "INSERT INTO transactions"
-#            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
-#            "  status, created_at)"
-#            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?)",
-#            (user["id"], amount, blob, kind,
-#             (body.get("note") or "").strip()[:200], now()))
-#        print("receipt from user %d: %s, %s"
-#              % (user["id"], kind, human(len(blob))), flush=True)
-#        return {"ok": True,
-#                "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+#        res = create_receipt(self.store, user, body)
+#        res.pop("error", None)
+#        res.pop("receipt_id", None)
+#        return res
 #
 #    def do_user_claim(self, body):
 #        """Register the address the browser is coming from, for a user who is
@@ -4929,20 +6124,9 @@ exit 0
 #        return self.do_claim_register(user["id"], ip)
 #
 #    def do_claim_register(self, user_id, ip):
-#        owner = self.store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
-#        if owner and owner["user_id"] != user_id:
-#            return {"ok": False, "message": "این آی‌پی به حساب دیگری ثبت شده است"}
-#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user_id,))
-#        existing = self.store.user_ips(user_id)
-#        # One active address per account, with as many changes as they like.
-#        # Replacing rather than adding is what makes that true.
-#        if existing and len(existing) >= user["max_ips"]:
-#            for old in existing[: len(existing) - user["max_ips"] + 1]:
-#                self.store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
-#        self.store.run(
-#            "INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
-#            (user_id, ip, now()))
-#        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+#        res = register_ip(self.store, user_id, ip)
+#        res.pop("error", None)
+#        return res
 #
 #    def do_user_info(self, body):
 #        user = self._session_user(body.get("session"))
@@ -4953,6 +6137,12 @@ exit 0
 #                             (user["template_id"],)) if user["template_id"] else None
 #        if not tpl:
 #            tpl = self.store.one("SELECT name FROM templates WHERE is_default = 1")
+#        mine = self.store.one("SELECT name FROM plans WHERE id = ?",
+#                              (user["plan_id"],)) if user["plan_id"] else None
+#        waiting = self.store.one(
+#            "SELECT t.created_at, p.name FROM transactions t"
+#            " LEFT JOIN plans p ON p.id = t.plan_id"
+#            " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
 #        return {
 #            "ok": True,
 #            "name": user["first_name"] or user["username"] or "",
@@ -4971,6 +6161,24 @@ exit 0
 #            "warned": user["warned"] or 0,
 #            "seen_ip": body.get("ip", ""),
 #            "must_change": bool(user["must_change_password"]),
+#            # What can be bought, and what this account already holds - the
+#            # page warns before a different plan replaces it.
+#            "plans": self.store.plans_for_sale(),
+#            "trial": trial_view(self.store, user),
+#            "pay_text": self.store.setting("pay_text"),
+#            "plan_id": user["plan_id"],
+#            "plan_name": mine["name"] if mine else "",
+#            # Tickets with a reply the customer has not answered, for the
+#            # badge on their page.
+#            "telegram_linked": bool(user["telegram_id"]),
+#            "telegram_required": telegram_required(self.store, user),
+#            "telegram_ready": telegram_ready(self.store),
+#            "tickets_answered": self.store.one(
+#                "SELECT count(*) c FROM tickets WHERE user_id = ?"
+#                " AND status = 'answered'", (user["id"],))["c"],
+#            "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
+#                                 "plan": waiting["name"] or ""}
+#                                if waiting else None),
 #        }
 #
 #
@@ -4988,6 +6196,754 @@ exit 0
 #    return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
 #
 #
+## ---------------------------------------------------------------- bot API
+## A second door into the same database, for a sales bot - the operator's own
+## or somebody else's. It lives here rather than in a process of its own so
+## that there is one writer and one set of rules: a receipt sent by a bot is
+## checked by the same function as one sent from the web panel.
+##
+## Its own port, because 8443 is walled off to the relays and a bot can be
+## anywhere. Its own keys, made and revoked in the admin panel, because the
+## relays' secret must never leave the relays. Customers are named by their
+## Telegram id: Telegram vouches for that, and the bot is trusted to pass it on
+## honestly - which is why a key is as strong as the admin password.
+#BOT_API_PORT = 8445
+#ADMIN_CONFIG = "/etc/smart-dns/admin.env"
+#VERSION_FILE = "/var/lib/smart-dns/version"
+## A receipt at its largest, base64-encoded, plus the JSON around it.
+#BOT_BODY_MAX = MAX_RECEIPT * 4 // 3 + 64 * 1024
+## Requests per key per minute. Far above what a bot serving people needs, and
+## low enough that one stuck in a loop cannot starve the relays' sync.
+#BOT_RATE = (300, 60)
+## Wrong keys per address before it is made to wait: guessing a 256-bit key is
+## hopeless anyway, but there is no reason to let anybody try at full speed.
+#BOT_BAD_KEYS = (20, 300)
+#IDEMPOTENCY_DAYS = 7
+#BOT_THROTTLE = Throttle()
+#IDEMPOTENCY_LOCK = threading.Lock()
+#
+#
+#def token_hash(token):
+#    # The keys are 256 random bits, so a plain hash is enough: there is no
+#    # dictionary to run against them, and the check stays one lookup.
+#    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+#
+#
+#def public_ipv4(s):
+#    """An address a customer's line can actually have - not a LAN address,
+#    not loopback, which a bot passing on what somebody typed could send."""
+#    try:
+#        addr = ipaddress.ip_address((s or "").strip())
+#    except ValueError:
+#        return False
+#    return addr.version == 4 and addr.is_global
+#
+#
+#def user_view(store, user, relays):
+#    """An account as the bot sees it.
+#
+#    `unlimited` only means something while the status is active: a pending
+#    account also has quota_bytes 0, and it gets nothing at all.
+#    """
+#    plan = store.one("SELECT id, name FROM plans WHERE id = ?",
+#                     (user["plan_id"],)) if user["plan_id"] else None
+#    tpl = store.one("SELECT name FROM templates WHERE id = ?",
+#                    (user["template_id"],)) if user["template_id"] else None
+#    if not tpl:
+#        tpl = store.one("SELECT name FROM templates WHERE is_default = 1")
+#    waiting = store.one(
+#        "SELECT t.id, t.created_at, t.amount, p.name FROM transactions t"
+#        " LEFT JOIN plans p ON p.id = t.plan_id"
+#        " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
+#    quota, used = user["quota_bytes"], user["used_bytes"]
+#    return {
+#        "id": user["id"],
+#        "telegram_id": user["telegram_id"],
+#        "name": user["first_name"] or "",
+#        "username": user["username"],
+#        "panel_url": store.setting("customer_panel_url") or None,
+#        "status": user["status"],
+#        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
+#        "template": tpl["name"] if tpl else "",
+#        "unlimited": not quota,
+#        "quota_bytes": quota,
+#        "used_bytes": used,
+#        "remaining_bytes": None if not quota else max(0, quota - used),
+#        "speed_kbps": user["speed_kbps"] or 0,
+#        "expires_at": user["expires_at"],
+#        "ips": [r["ip"] for r in store.user_ips(user["id"])],
+#        "max_ips": user["max_ips"],
+#        "wallet": user["wallet"],
+#        # What to put in the console or router: the relays, which is where a
+#        # customer's DNS has to point.
+#        "dns": list(relays),
+#        "trial": trial_view(store, user),
+#        "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
+#                                      " AND status = 'answered'", (user["id"],))["c"],
+#        "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
+#                             "amount": waiting["amount"],
+#                             "plan": waiting["name"]} if waiting else None),
+#    }
+#
+#
+#def admin_user_view(store, user, relays):
+#    """An account as the operator sees it: the customer's view, and who they
+#    are."""
+#    return dict(user_view(store, user, relays), username=user["username"],
+#                phone=user["phone"], created_at=user["created_at"],
+#                label=who_label(user))
+#
+#
+#def admin_receipt(store, row):
+#    return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+#            "created_at": row["created_at"], "decided_at": row["decided_at"],
+#            "has_image": bool(row["has_image"]),
+#            "plan": {"id": row["plan_id"], "name": row["plan_name"]}
+#            if row["plan_id"] else None,
+#            "user": {"id": row["user_id"], "label": who_label(dict(row, id=row["uid"])),
+#                     "telegram_id": row["telegram_id"]}}
+#
+#
+#RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.created_at, t.decided_at, t.plan_id,"
+#                " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
+#                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
+#                " FROM transactions t JOIN users u ON u.id = t.user_id"
+#                " LEFT JOIN plans p ON p.id = t.plan_id")
+#
+#
+#class AdminAPI:
+#    """The admin endpoints, mixed into BotAPI. Every action is logged with the
+#    key that did it, the way the admin panel logs its own."""
+#
+#    def admin_log(self, what):
+#        log(INFO, "bot-api admin (key %r): %s" % (self._key["name"], what))
+#
+#    def api_admin_stats(self, body):
+#        s = admin_stats(self.store)
+#        return 200, dict({"ok": True, "text": daily_report_text(s)}, **s)
+#
+#    def api_admin_receipts(self, body):
+#        which = (self.query.get("status") or ["pending"])[0]
+#        if which == "all":
+#            rows = self.store.q(RECEIPT_ROWS + " ORDER BY t.id DESC LIMIT 50")
+#        elif which in ("pending", "approved", "rejected"):
+#            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ? ORDER BY t.id"
+#                                + (" DESC" if which != "pending" else "") + " LIMIT 50",
+#                                (which,))
+#        else:
+#            return 400, refused("bad_status", "status یکی از pending، approved، "
+#                                              "rejected یا all است")
+#        return 200, {"ok": True, "receipts": [admin_receipt(self.store, r) for r in rows]}
+#
+#    def api_admin_receipt_image(self, body, rid):
+#        row = self.store.one("SELECT receipt_blob, receipt_type FROM transactions"
+#                             " WHERE id = ?", (int(rid),))
+#        if not row or row["receipt_blob"] is None:
+#            return 404, refused("image_not_found", "عکس این رسید نیست (یا بعد از "
+#                                                   "تصمیم پاک شده)")
+#        return 200, {"ok": True, "content_type": row["receipt_type"],
+#                     "data": base64.b64encode(bytes(row["receipt_blob"])).decode("ascii")}
+#
+#    def api_admin_decide(self, body, rid, verb):
+#        res = decide_receipt(self.store, int(rid),
+#                             "approved" if verb == "approve" else "rejected")
+#        if not res["ok"]:
+#            return {"receipt_not_found": 404, "already_decided": 409}.get(
+#                res["error"], 400), res
+#        self.admin_log("receipt #%s %s" % (rid, verb))
+#        row = self.store.one(RECEIPT_ROWS + " WHERE t.id = ?", (int(rid),))
+#        return 200, dict(res, receipt=admin_receipt(self.store, row))
+#
+#    def api_admin_users(self, body):
+#        q = (self.query.get("q") or [""])[0].strip()[:64]
+#        if not q:
+#            rows = self.store.q("SELECT * FROM users ORDER BY id DESC LIMIT 20")
+#        else:
+#            like = "%" + q.replace("%", "").replace("_", "") + "%"
+#            rows = self.store.q(
+#                "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
+#                " WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+#                " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
+#                " OR i.ip = ? ORDER BY u.id DESC LIMIT 20", (like, like, like, q, q, q))
+#        return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
+#                                           for r in rows]}
+#
+#    def admin_target(self, uid):
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (int(uid),))
+#        if not user:
+#            return None, (404, refused("user_not_found", "این کاربر پیدا نشد"))
+#        return user, None
+#
+#    def api_admin_user(self, body, uid):
+#        user, err = self.admin_target(uid)
+#        if err:
+#            return err
+#        return 200, {"ok": True, "user": admin_user_view(self.store, user, self.relays)}
+#
+#    def api_admin_status(self, body, uid):
+#        user, err = self.admin_target(uid)
+#        if err:
+#            return err
+#        to = str(body.get("status") or "")
+#        if to not in ("active", "suspended"):
+#            return 400, refused("bad_status", "status باید active یا suspended باشد")
+#        # As the admin panel's button does: back to active clears the warnings
+#        # it crossed while it was blocked.
+#        self.store.run("UPDATE users SET status = ?, warned = CASE WHEN ? = 'active'"
+#                       " THEN 0 ELSE warned END WHERE id = ?", (to, to, user["id"]))
+#        self.admin_log("user #%d -> %s" % (user["id"], to))
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, {"ok": True, "message": "کاربر مسدود شد" if to == "suspended"
+#                     else "کاربر برگشت", "user": admin_user_view(self.store, user, self.relays)}
+#
+#    def api_admin_plan(self, body, uid):
+#        user, err = self.admin_target(uid)
+#        if err:
+#            return err
+#        try:
+#            pid = int(body.get("plan_id") or 0)
+#        except (TypeError, ValueError):
+#            pid = 0
+#        done = apply_plan(self.store, user["id"], pid)
+#        if not done:
+#            return 404, refused("plan_not_found", "این پلن پیدا نشد")
+#        self.admin_log("plan #%d given to user #%d" % (pid, user["id"]))
+#        emit(self.store, user, "plan.activated", dict(plan_event(self.store, user["id"]),
+#                                                      text=done))
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, {"ok": True, "message": done,
+#                     "user": admin_user_view(self.store, user, self.relays)}
+#
+#    def api_admin_tickets(self, body):
+#        which = (self.query.get("status") or ["open"])[0]
+#        if which not in ("open", "answered", "closed", "all"):
+#            return 400, refused("bad_status", "status یکی از open، answered، closed "
+#                                              "یا all است")
+#        rows = self.store.q(
+#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+#            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
+#            " FROM tickets t JOIN users u ON u.id = t.user_id"
+#            + ("" if which == "all" else " WHERE t.status = ?")
+#            + " ORDER BY t.updated_at DESC LIMIT 50", () if which == "all" else (which,))
+#        return 200, {"ok": True, "tickets": [
+#            {"id": r["id"], "subject": r["subject"], "status": r["status"],
+#             "created_at": r["created_at"], "updated_at": r["updated_at"],
+#             "messages": r["n"],
+#             "user": {"id": r["user_id"], "label": who_label(dict(r, id=r["user_id"])),
+#                      "telegram_id": r["telegram_id"]}} for r in rows]}
+#
+#    def api_admin_ticket(self, body, tid):
+#        t = self.store.one("SELECT * FROM tickets WHERE id = ?", (int(tid),))
+#        if not t:
+#            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
+#        owner = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+#        res = ticket_get(self.store, owner, t["id"])
+#        res["ticket"]["user"] = {"id": owner["id"], "label": who_label(owner),
+#                                 "telegram_id": owner["telegram_id"]}
+#        return 200, res
+#
+#    def api_admin_reply(self, body, tid):
+#        res = admin_ticket_reply(self.store, int(tid), body)
+#        if not res["ok"]:
+#            return {"ticket_not_found": 404, "too_big": 413}.get(res["error"], 400), res
+#        self.admin_log("replied to ticket #%s" % tid)
+#        return self.api_admin_ticket(body, tid)
+#
+#    def api_admin_close(self, body, tid):
+#        cur = self.store.run("UPDATE tickets SET status = 'closed', updated_at = ?"
+#                             " WHERE id = ?", (now(), int(tid)))
+#        if not cur.rowcount:
+#            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
+#        self.admin_log("closed ticket #%s" % tid)
+#        return 200, {"ok": True, "message": "تیکت بسته شد"}
+#
+#
+#class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
+#    """JSON in, JSON out, under /api/v1. Every answer has "ok"; a refusal
+#    also has "error", a code for the bot, and "message", Persian for the
+#    customer."""
+#    server_version = "smartdns"
+#    protocol_version = "HTTP/1.0"
+#    store = None
+#    relays = ()
+#
+#    ROUTES = [
+#        ("GET", re.compile(r"/api/v1/?$"), "ping"),
+#        ("GET", re.compile(r"/api/v1/plans$"), "list_plans"),
+#        ("POST", re.compile(r"/api/v1/users$"), "create_user"),
+#        ("POST", re.compile(r"/api/v1/link$"), "link"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})$"), "get_user"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/ips$"), "add_ip"),
+#        ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/ips/([0-9.]{7,15})$"),
+#         "remove_ip"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets$"), "list_tickets"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets$"), "open_ticket"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})$"), "get_ticket"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages$"),
+#         "reply_ticket"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/close$"),
+#         "close_ticket"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages/"
+#                           r"(\d{1,12})/image$"), "ticket_image"),
+#        # The operator's own, for a key with admin rights only.
+#        ("GET", re.compile(r"/api/v1/admin/stats$"), "admin_stats"),
+#        ("GET", re.compile(r"/api/v1/admin/receipts$"), "admin_receipts"),
+#        ("GET", re.compile(r"/api/v1/admin/receipts/(\d{1,12})/image$"),
+#         "admin_receipt_image"),
+#        ("POST", re.compile(r"/api/v1/admin/receipts/(\d{1,12})/(approve|reject)$"),
+#         "admin_decide"),
+#        ("GET", re.compile(r"/api/v1/admin/users$"), "admin_users"),
+#        ("GET", re.compile(r"/api/v1/admin/users/(\d{1,12})$"), "admin_user"),
+#        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/status$"), "admin_status"),
+#        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/plan$"), "admin_plan"),
+#        ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
+#        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
+#        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
+#        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/close$"), "admin_close"),
+#    ]
+#
+#    def log_message(self, fmt, *args):
+#        log(INFO, "bot-api %s from %s" % (fmt % args, self.client_address[0]))
+#
+#    def parse_request(self):
+#        self._t0 = time.monotonic()
+#        return super().parse_request()
+#
+#    def log_request(self, code="-", size="-"):
+#        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120]
+#        log_access(self, "bot-api", code, path, getattr(self, "_who", ""))
+#
+#    def reply(self, code, obj, headers=None):
+#        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+#        self.send_response(code)
+#        self.send_header("Content-Type", "application/json; charset=utf-8")
+#        self.send_header("Content-Length", str(len(body)))
+#        self.send_header("Cache-Control", "no-store")
+#        for k, v in (headers or {}).items():
+#            self.send_header(k, v)
+#        self.end_headers()
+#        self.wfile.write(body)
+#
+#    def do_GET(self):
+#        self.handle_api("GET")
+#
+#    def do_POST(self):
+#        self.handle_api("POST")
+#
+#    def do_DELETE(self):
+#        self.handle_api("DELETE")
+#
+#    # -- the door --------------------------------------------------------
+#    def key(self):
+#        """The key this request came with, or None. Revoked keys are no key."""
+#        given = self.headers.get("Authorization", "")
+#        if not given.startswith("Bearer "):
+#            return None
+#        return self.store.one("SELECT * FROM api_tokens WHERE token_hash = ?"
+#                              " AND revoked_at IS NULL",
+#                              (token_hash(given[7:].strip()),))
+#
+#    def handle_api(self, method):
+#        ip = self.client_address[0]
+#        path = urllib.parse.urlparse(self.path).path
+#        if not path.startswith("/api/v1"):
+#            return self.reply(404, refused("not_found", "چنین آدرسی نیست"))
+#        ok, wait = BOT_THROTTLE.check("bad:" + ip, *BOT_BAD_KEYS)
+#        if not ok:
+#            return self.reply(429, refused("slow_down", "کمی صبر کنید"),
+#                              {"Retry-After": str(wait)})
+#        key = self.key()
+#        if not key:
+#            BOT_THROTTLE.hit("bad:" + ip)
+#            return self.reply(401, refused("unauthorized", "کلید API معتبر نیست"))
+#        self._who = "key:%s" % key["name"]
+#        allowed = [a.strip() for a in (key["allow_ips"] or "").split(",") if a.strip()]
+#        if allowed and ip not in allowed:
+#            log(WARN, "bot-api: key %r used from %s, which it is not allowed from"
+#                % (key["name"], ip))
+#            return self.reply(403, refused("ip_not_allowed",
+#                                           "این کلید از این آدرس پذیرفته نمی‌شود"))
+#        # Money and accounts: only a key made with admin rights.
+#        if path.startswith("/api/v1/admin") and (key["scope"] or "customer") != "admin":
+#            return self.reply(403, refused("admin_only",
+#                                           "این کلید دسترسی ادمین ندارد"))
+#        self._key = key
+#        self.query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        ok, wait = BOT_THROTTLE.check("key:%d" % key["id"], *BOT_RATE)
+#        if not ok:
+#            return self.reply(429, refused("slow_down", "درخواست‌ها زیاد است؛ کمی صبر کنید"),
+#                              {"Retry-After": str(wait)})
+#        BOT_THROTTLE.hit("key:%d" % key["id"])
+#        # Once a minute is plenty to answer "is this key still in use?".
+#        seen = parse_ts(key["last_used_at"])
+#        if not seen or (datetime.now(timezone.utc) - seen).total_seconds() > 60:
+#            self.store.run("UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+#                           (now(), key["id"]))
+#
+#        match = None
+#        for want, pattern, name in self.ROUTES:
+#            m = pattern.match(path)
+#            if m and want == method:
+#                match = (name, m.groups())
+#                break
+#            if m:
+#                match = match or ("", ())
+#        if not match:
+#            return self.reply(404, refused("not_found", "چنین آدرسی نیست"))
+#        if not match[0]:
+#            return self.reply(405, refused("method_not_allowed", "این کار با این روش نمی‌شود"))
+#
+#        body, raw = {}, b""
+#        if method == "POST":
+#            try:
+#                length = int(self.headers.get("Content-Length") or 0)
+#            except ValueError:
+#                length = -1
+#            if length < 0:
+#                return self.reply(400, refused("bad_request", "طول درخواست معلوم نیست"))
+#            if length > BOT_BODY_MAX:
+#                # Read it off the wire before answering, up to a point: a client
+#                # still sending when the connection closes sees a reset, not
+#                # this answer, and a bot that only says "connection reset"
+#                # leaves its operator guessing. Past four times the limit it is
+#                # not a mistake worth the bandwidth.
+#                if length <= 4 * BOT_BODY_MAX:
+#                    left = length
+#                    while left > 0:
+#                        chunk = self.rfile.read(min(left, 65536))
+#                        if not chunk:
+#                            break
+#                        left -= len(chunk)
+#                return self.reply(413, refused("too_big", "درخواست بیش از حد بزرگ است"))
+#            raw = self.rfile.read(length) if length else b""
+#            try:
+#                body = json.loads(raw.decode("utf-8")) if raw else {}
+#            except (UnicodeDecodeError, ValueError):
+#                return self.reply(400, refused("bad_json", "بدنهٔ درخواست JSON درستی نیست"))
+#            if not isinstance(body, dict):
+#                return self.reply(400, refused("bad_json", "بدنهٔ درخواست باید یک شیء JSON باشد"))
+#
+#        run = lambda: getattr(self, "api_" + match[0])(body, *match[1])
+#        idem = (self.headers.get("Idempotency-Key") or "").strip()
+#        if method != "POST" or not idem:
+#            code, obj = run()
+#            return self.reply(code, obj)
+#        if len(idem) > 100:
+#            return self.reply(400, refused("bad_idempotency_key",
+#                                           "Idempotency-Key حداکثر ۱۰۰ نویسه"))
+#        fingerprint = "%s %s %s" % (method, path, hashlib.sha256(raw).hexdigest())
+#        # Held across the work itself, so two copies arriving together cannot
+#        # both find nothing stored and both act.
+#        with IDEMPOTENCY_LOCK:
+#            seen = self.store.one("SELECT * FROM api_idempotency"
+#                                  " WHERE token_id = ? AND key = ?", (key["id"], idem))
+#            if seen:
+#                if seen["request"] != fingerprint:
+#                    return self.reply(422, refused(
+#                        "idempotency_key_reused",
+#                        "این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته"))
+#                return self.reply(seen["status"], json.loads(seen["response"]),
+#                                  {"Idempotent-Replayed": "true"})
+#            code, obj = run()
+#            if code < 500:
+#                cutoff = (datetime.now(timezone.utc) - timedelta(days=IDEMPOTENCY_DAYS)
+#                          ).isoformat(timespec="seconds")
+#                self.store.run("DELETE FROM api_idempotency WHERE created_at < ?",
+#                               (cutoff,))
+#                self.store.run("INSERT INTO api_idempotency (token_id, key, request,"
+#                               " status, response, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+#                               (key["id"], idem, fingerprint, code,
+#                                json.dumps(obj, ensure_ascii=False), now()))
+#        return self.reply(code, obj)
+#
+#    # -- what it does ----------------------------------------------------
+#    def customer(self, tg):
+#        user = self.store.user_by_telegram(int(tg))
+#        if not user:
+#            return None, (404, refused("user_not_found",
+#                                       "کاربری با این آیدی تلگرام نیست"))
+#        return user, None
+#
+#    def api_ping(self, body):
+#        try:
+#            with open(VERSION_FILE) as fh:
+#                version = fh.read().strip()[:20]
+#        except OSError:
+#            version = ""
+#        return 200, {"ok": True, "version": version}
+#
+#    def api_list_plans(self, body):
+#        # Where to pay travels with what there is to buy.
+#        return 200, {"ok": True, "plans": self.store.plans_for_sale(),
+#                     "pay_text": self.store.setting("pay_text")}
+#
+#    def api_create_user(self, body):
+#        try:
+#            tg = int(body.get("telegram_id"))
+#        except (TypeError, ValueError):
+#            tg = 0
+#        if not 0 < tg < 10 ** 20:
+#            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
+#        user = self.store.user_by_telegram(tg)
+#        created = not user
+#        if created:
+#            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
+#            # No username: that column is what a customer signs in to the web
+#            # panel with, and a Telegram handle there could collide with one.
+#            user = self.store.create_user(tg, None, name or None)
+#            print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
+#                  flush=True)
+#            emit_admin(self.store, "user.created", {
+#                "user_id": user["id"], "via": "bot",
+#                "text": "مشتری تازه از ربات: %s" % who_label(user)})
+#        return (201 if created else 200), {
+#            "ok": True, "created": created,
+#            "user": user_view(self.store, user, self.relays)}
+#
+#    def api_link(self, body):
+#        try:
+#            tg = int(body.get("telegram_id"))
+#        except (TypeError, ValueError):
+#            tg = 0
+#        if not 0 < tg < 10 ** 20:
+#            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
+#        res = link_telegram(self.store, tg, body.get("code"))
+#        if not res["ok"]:
+#            return {"telegram_in_use": 409}.get(res["error"], 400), res
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (res["user_id"],))
+#        return 200, {"ok": True, "message": res["message"],
+#                     "user": user_view(self.store, user, self.relays)}
+#
+#    def api_get_user(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return 200, {"ok": True, "user": user_view(self.store, user, self.relays)}
+#
+#    def api_add_ip(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        ip = str(body.get("ip") or "").strip()
+#        if not public_ipv4(ip):
+#            return 400, refused("bad_ip", "آی‌پی نامعتبر است؛ آی‌پی عمومی اینترنت "
+#                                          "مشتری لازم است")
+#        res = register_ip(self.store, user["id"], ip)
+#        if not res["ok"]:
+#            return 409, res
+#        return 200, {"ok": True, "message": res["message"],
+#                     "user": user_view(self.store, user, self.relays)}
+#
+#    def api_remove_ip(self, body, tg, ip):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        cur = self.store.run("DELETE FROM ips WHERE user_id = ? AND ip = ?",
+#                             (user["id"], ip))
+#        if not cur.rowcount:
+#            return 404, refused("ip_not_found", "این آی‌پی روی این حساب نیست")
+#        return 200, {"ok": True, "message": "آی‌پی %s حذف شد" % ip,
+#                     "user": user_view(self.store, user, self.relays)}
+#
+#    def api_add_receipt(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = create_receipt(self.store, user, body)
+#        if not res["ok"]:
+#            return {"too_big": 413, "plan_not_on_sale": 409}.get(res["error"], 400), res
+#        return 201, {"ok": True, "message": res["message"],
+#                     "receipt": self.receipt(res["receipt_id"])}
+#
+#    def api_credentials(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
+#        if not res["ok"]:
+#            return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
+#        return 200, res
+#
+#    def api_password(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = fresh_password(self.store, user)
+#        return (200 if res["ok"] else 409), res
+#
+#    def api_login_link(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = login_link(self.store, user)
+#        return (200 if res["ok"] else 503), res
+#
+#    def api_trial(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = take_trial(self.store, user)
+#        if not res["ok"]:
+#            return {"trial_none": 404, "trial_used": 409, "trial_running": 409}.get(
+#                res["error"], 400), res
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, dict(res, user=user_view(self.store, user, self.relays))
+#
+#    def receipt(self, rid):
+#        r = self.store.one(
+#            "SELECT t.id, t.amount, t.status, t.created_at, t.decided_at,"
+#            " t.plan_id, p.name FROM transactions t"
+#            " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (rid,))
+#        return {"id": r["id"], "amount": r["amount"], "status": r["status"],
+#                "plan": ({"id": r["plan_id"], "name": r["name"]}
+#                         if r["plan_id"] else None),
+#                "created_at": r["created_at"], "decided_at": r["decided_at"]}
+#
+#    def api_list_receipts(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        rows = self.store.q("SELECT id FROM transactions WHERE user_id = ?"
+#                            " ORDER BY id DESC LIMIT 20", (user["id"],))
+#        return 200, {"ok": True, "receipts": [self.receipt(r["id"]) for r in rows]}
+#
+#    # -- tickets ---------------------------------------------------------
+#    TICKET_CODES = {"ticket_not_found": 404, "image_not_found": 404,
+#                    "too_big": 413, "too_many_tickets": 409, "slow_down": 429}
+#
+#    def ticket_answer(self, res, ok_code=200):
+#        if not res["ok"]:
+#            return self.TICKET_CODES.get(res.get("error"), 400), res
+#        return ok_code, res
+#
+#    def api_list_tickets(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return 200, {"ok": True, "tickets": ticket_list(self.store, user)}
+#
+#    def api_open_ticket(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = ticket_open(self.store, user, body)
+#        if res["ok"]:
+#            res = dict(ticket_get(self.store, user, res["ticket_id"]), message=res["message"])
+#        return self.ticket_answer(res, 201)
+#
+#    def api_get_ticket(self, body, tg, tid):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return self.ticket_answer(ticket_get(self.store, user, tid))
+#
+#    def api_reply_ticket(self, body, tg, tid):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = ticket_reply(self.store, user, tid, body)
+#        if res["ok"]:
+#            res = dict(ticket_get(self.store, user, tid), message=res["message"])
+#        return self.ticket_answer(res, 201)
+#
+#    def api_close_ticket(self, body, tg, tid):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return self.ticket_answer(ticket_close(self.store, user, tid))
+#
+#    def api_ticket_image(self, body, tg, tid, mid):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        # The ticket in the address has to be the message's own, as well as
+#        # the customer's.
+#        if not self.store.one("SELECT 1 FROM ticket_messages WHERE id = ? AND ticket_id = ?",
+#                              (int(mid), int(tid))):
+#            return 404, refused("image_not_found", "این عکس پیدا نشد")
+#        return self.ticket_answer(ticket_picture(self.store, user, mid))
+#
+#
+#class BotServer(TLSServer):
+#    """The bot API's server, which picks up a renewed certificate by itself.
+#
+#    The bot checks this certificate like any https client does, so it is the
+#    admin panel's real one rather than the relays' self-signed pair - and that
+#    one is renewed every couple of months while this process runs for longer.
+#    Looked at once per connection: a stat is nothing next to a handshake.
+#    """
+#
+#    def __init__(self, addr, cert, key):
+#        self.cert, self.key, self.stamp, self.failed = cert, key, None, None
+#        ctx = None
+#        if cert:
+#            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#            ctx.load_cert_chain(cert, key)
+#            self.stamp = self.cert_stamp()
+#        super().__init__(addr, BotAPI, ctx)
+#
+#    def cert_stamp(self):
+#        # Both files: renewal moves the two links one after the other, and a
+#        # load between the moves pairs a new certificate with the old key.
+#        return (os.stat(self.cert).st_mtime, os.stat(self.key).st_mtime)
+#
+#    def finish_request(self, request, client_address):
+#        if self.cert:
+#            try:
+#                stamp = self.cert_stamp()
+#            except OSError:
+#                stamp = self.stamp
+#            if stamp not in (self.stamp, self.failed):
+#                try:
+#                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#                    ctx.load_cert_chain(self.cert, self.key)
+#                    self.ctx, self.stamp, self.failed = ctx, stamp, None
+#                    log(INFO, "bot-api: loaded the renewed certificate")
+#                except (OSError, ssl.SSLError) as e:
+#                    # Once per change, and the old context stays in use.
+#                    self.failed = stamp
+#                    log(WARN, "bot-api: could not load the renewed certificate "
+#                        "yet: %r" % e)
+#        return super().finish_request(request, client_address)
+#
+#
+#def bot_api_cert():
+#    """The admin panel's certificate when there is one, else the relays'."""
+#    try:
+#        with open(ADMIN_CONFIG) as fh:
+#            conf = dict(l.strip().split("=", 1) for l in fh
+#                        if "=" in l and not l.lstrip().startswith("#"))
+#    except OSError:
+#        conf = {}
+#    cert, key = conf.get("ADMIN_CERT", ""), conf.get("ADMIN_KEY", "")
+#    if cert and key and os.path.exists(cert) and os.path.exists(key):
+#        return cert, key
+#    return CERT, KEY
+#
+#
+#def serve_bot_api(cfg, store):
+#    port = int(cfg.get("BOT_API_PORT") or BOT_API_PORT)
+#    if not port:
+#        print("bot api: switched off (BOT_API_PORT=0)", flush=True)
+#        return
+#    BotAPI.store = store
+#    BotAPI.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+#    cert, key = bot_api_cert()
+#    try:
+#        server = BotServer(("0.0.0.0", port), cert, key)
+#    except OSError as e:
+#        log(ERROR, "bot api could not start on :%d: %r" % (port, e))
+#        return
+#    print("bot api up on :%d with %s" % (port, cert), flush=True)
+#    server.serve_forever()
+#
+#
 #def watch_self(store):
 #    """Sample this machine's own health.
 #
@@ -4996,12 +6952,20 @@ exit 0
 #    missing from the panel.
 #    """
 #    health = Health()
+#    tick = 0
 #    while True:
 #        try:
 #            store.record_metrics("exit", health.sample())
 #            store.prune_metrics()
 #        except Exception as e:
 #            log(WARN, "self health failed: %r" % e)
+#        # Housekeeping that needs no hurry rides along, once an hour.
+#        if tick % 120 == 0:
+#            try:
+#                prune_ticket_images(store)
+#            except Exception as e:
+#                log(WARN, "ticket picture pruning failed: %r" % e)
+#        tick += 1
 #        time.sleep(30)
 #
 #
@@ -5027,6 +6991,8 @@ exit 0
 #
 #    signal.signal(signal.SIGTERM, bye)
 #    signal.signal(signal.SIGINT, bye)
+#    threading.Thread(target=serve_bot_api, args=(cfg, store), daemon=True).start()
+#    threading.Thread(target=webhook_worker, args=(store,), daemon=True).start()
 #    print("panel up: api on :%d" % API_PORT, flush=True)
 #    # In the foreground now. The Telegram loop used to be what kept this
 #    # process alive and the API rode along on a daemon thread behind it; with
@@ -5434,38 +7400,6 @@ exit 0
 #        fh.write(text)
 #    os.replace(tmp, TEMPLATE_NAMES)
 #    return True
-#
-#
-## What the operator wants written under the sign-in form, so a customer who
-## has forgotten their password knows whom to ask.
-#SUPPORT_FILE = "/var/lib/smart-dns/support.json"
-#
-#
-#def save_support(value):
-#    """Keep the support contact the panel sent. Returns whether it changed."""
-#    if value is None:
-#        return False      # an older panel, which does not send one
-#    text = json.dumps({"contact": str(value)[:64]}, ensure_ascii=False) + "\n"
-#    try:
-#        with open(SUPPORT_FILE, encoding="utf-8") as fh:
-#            if fh.read() == text:
-#                return False
-#    except OSError:
-#        pass
-#    os.makedirs(os.path.dirname(SUPPORT_FILE), exist_ok=True)
-#    tmp = SUPPORT_FILE + ".tmp"
-#    with open(tmp, "w", encoding="utf-8") as fh:
-#        fh.write(text)
-#    os.replace(tmp, SUPPORT_FILE)
-#    return True
-#
-#
-#def support_contact():
-#    try:
-#        with open(SUPPORT_FILE, encoding="utf-8") as fh:
-#            return str(json.load(fh).get("contact") or "")[:64]
-#    except (OSError, ValueError, AttributeError):
-#        return ""
 #
 #
 ## Who each allowed address belongs to, as the panel knows them. Only
@@ -5919,8 +7853,11 @@ exit 0
 #    # This relay names itself. Through the tunnel the request arrives at the
 #    # exit from its own loopback, and the address it came from would no longer
 #    # say which relay sent it - usage is counted per relay.
+#    # Where this relay's customer panel is, so the panel can send people to it.
+#    url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
+#           if CFG.get("PANEL_DOMAIN") else "")
 #    answer = post("/sync", {"counters": counters, "host": host,
-#                            "relay": CFG["SELF_IP"]})
+#                            "relay": CFG["SELF_IP"], "panel_url": url})
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
@@ -5929,10 +7866,6 @@ exit 0
 #        save_user_names(answer.get("allowed"))
 #    except Exception as e:
 #        log(WARN, "user names not saved: %s" % e)
-#    try:
-#        save_support(answer.get("support"))
-#    except Exception as e:
-#        log(WARN, "support contact not saved: %s" % e)
 #
 #    names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
 #    want = set(names)
@@ -6095,6 +8028,32 @@ exit 0
 #.dns .k{color:var(--muted);font-size:12px;margin-bottom:8px}
 #.dns .big{margin:0}
 #.dns .note{margin-top:12px}
+#textarea{width:100%;padding:12px;font:inherit;background:var(--bg);color:var(--fg);
+# border:1px solid var(--line2);border-radius:10px;resize:vertical}
+#textarea:focus{outline:0;border-color:var(--btn)}
+#.tickets{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+#a.tk{display:block;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
+# color:var(--fg);text-decoration:none;font-size:13px}
+#a.tk .s{font-weight:600;margin-left:8px}
+#a.tk small{display:block;color:var(--muted);margin-top:2px}
+#.thread{display:flex;flex-direction:column;gap:10px;margin:16px 0}
+#.thread>div{max-width:88%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);
+# font-size:14px}
+#.thread .msg-customer{align-self:flex-start;background:var(--bg)}
+#.thread .msg-admin{align-self:flex-end;background:var(--good-bg);border-color:var(--btn)}
+#.thread .meta{font-size:11px;color:var(--muted);margin-bottom:4px}
+#.thread .text{white-space:pre-wrap;word-break:break-word;line-height:1.8}
+#.thread img{display:block;max-width:100%;max-height:300px;margin-top:8px;border-radius:8px}
+#.pay{white-space:pre-wrap;margin:10px 0;padding:10px 12px;border:1px dashed var(--btn);
+# border-radius:10px;font-size:13px;line-height:1.9}
+#.plans .t{color:var(--muted);font-size:12px;margin:14px 0 4px}
+#label.plan{display:flex;gap:10px;align-items:flex-start;margin:6px 0;padding:10px 12px;
+# border:1px solid var(--line);border-radius:10px;cursor:pointer;color:var(--fg);
+# font-size:13px;line-height:1.8}
+#label.plan:has(input:checked){border-color:var(--btn)}
+#label.plan input{width:auto;margin:5px 0 0;accent-color:var(--btn)}
+#label.plan .p{font-weight:600}
+#label.plan small{color:var(--muted)}
 #.dns input[type=file]{width:100%;padding:10px;font-size:12px;
 # border:1px dashed var(--line2);background:transparent;margin-bottom:4px}
 #details.pw{margin-top:16px;border:1px solid var(--line);border-radius:12px;
@@ -6244,9 +8203,95 @@ exit 0
 #
 #
 #def forgot_line():
-#    contact = support_contact()
-#    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ به پشتیبانی پیام دهید%s</p>"
-#            % ((": <b dir='ltr'>%s</b>" % html.escape(contact)) if contact else "."))
+#    return ("<p class='alt'>رمز را فراموش کرده‌اید؟ <a href='/forgot'>بازیابی با "
+#            "تلگرام</a></p>")
+#
+#
+#def go_page(token):
+#    """The one-time link's page: it hands the link back by POST."""
+#    return ("<div class='icon'>🔗</div><h1>ورود به حساب</h1>"
+#            "<form method='post' action='/go' id='go'>"
+#            "<input type='hidden' name='token' value='%s'>"
+#            "<button>ورود و ثبت آی‌پی</button></form>"
+#            "<p class='note'>این صفحه را با همان اینترنتی باز کنید که می‌خواهید سرویس "
+#            "رویش کار کند.</p>"
+#            "<script>document.getElementById('go').submit()</script>"
+#            % html.escape(token, quote=True))
+#
+#
+#def forgot_page(banner=""):
+#    """Step one of a forgotten password: which account."""
+#    return (banner +
+#            "<div class='icon'>🔑</div><h1>بازیابی رمز</h1>"
+#            "<p class='sub'>اگر حسابتان به تلگرام وصل باشد، یک کد شش‌رقمی به تلگرامتان "
+#            "می‌فرستیم.</p>"
+#            "<form method='post' action='/forgot'>"
+#            "<label>نام کاربری</label>"
+#            "<input name='username' required maxlength='32' autocapitalize='none' "
+#            "spellcheck='false' autocomplete='username'>"
+#            "<button>فرستادن کد</button></form>"
+#            "<p class='alt'><a href='/login'>برگشت به ورود</a></p>")
+#
+#
+#def forgot_code_page(username, banner=""):
+#    """Step two: the six digits from Telegram, and the new password."""
+#    return (banner +
+#            "<div class='icon'>✉️</div><h1>کد را وارد کنید</h1>"
+#            "<p class='sub'>کد شش‌رقمی‌ای که در تلگرام گرفتید، و رمز تازه.</p>"
+#            "<form method='post' action='/forgot-code'>"
+#            "<input type='hidden' name='username' value='%s'>"
+#            "<label>کد</label>"
+#            "<input name='code' required maxlength='6' inputmode='numeric' "
+#            "autocomplete='one-time-code' dir='ltr'>"
+#            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+#            "<input name='new' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<label>تکرار رمز تازه</label>"
+#            "<input name='again' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<button>ذخیره و ورود</button></form>"
+#            "<p class='alt'>کد نرسید؟ <a href='/forgot'>دوباره بفرستید</a></p>"
+#            % html.escape(username, quote=True))
+#
+#
+#def telegram_box(info):
+#    """Linking this account to Telegram, which is what makes a forgotten
+#    password something the customer can fix alone."""
+#    ask = ("<label>رمز فعلی حساب</label><input name='password' type='password' "
+#           "required autocomplete='current-password'>")
+#    if info.get("telegram_linked"):
+#        return ("<p class='note'>✅ حساب شما به تلگرام وصل است؛ اگر رمز را فراموش "
+#                "کنید، از صفحهٔ ورود با کد تلگرام بازیابی‌اش می‌کنید.</p>"
+#                "<details class='pw'><summary>تلگرامتان عوض شده؟ جدا کردن تلگرام"
+#                "</summary><form method='post' action='/telegram-unlink'>%s"
+#                "<button class='ghost'>جدا کردن تلگرام</button></form>"
+#                "<p class='note'>بعد از جدا کردن، می‌توانید تلگرام تازه را وصل کنید."
+#                "</p></details>" % ask)
+#    if not info.get("telegram_ready"):
+#        return ""
+#    return ("<details class='pw'%s><summary>اتصال حساب به تلگرام</summary>"
+#            "<form method='post' action='/telegram-link'>%s"
+#            "<button class='ghost'>گرفتن کد اتصال</button></form>"
+#            "<p class='note'>با اتصال به تلگرام، اگر رمز را فراموش کنید خودتان با یک "
+#            "کد بازیابی‌اش می‌کنید.</p></details>"
+#            % (" open" if info.get("open") else "", ask))
+#
+#
+#def link_code_page(res):
+#    code, minutes = res["code"], res.get("minutes", 15)
+#    bot = res.get("bot_link") or ""
+#    deep = ""
+#    if bot.startswith("https://t.me/"):
+#        deep = ("<a class='btn' href='%s?start=link_%s' target='_blank' rel='noopener'>"
+#                "باز کردن ربات و اتصال</a>" % (html.escape(bot, quote=True),
+#                                                html.escape(code)))
+#    return ("<div class='icon'>🔗</div><h1>اتصال به تلگرام</h1>"
+#            "<p class='sub'>این کد را برای ربات ما بفرستید. %d دقیقه اعتبار دارد.</p>"
+#            "<div class='big'>%s</div>%s"
+#            "<p class='note'>ربات جواب می‌دهد که حساب وصل شد. بعد از آن اگر رمز را "
+#            "فراموش کنید، از صفحهٔ ورود کد بازیابی به همین تلگرام می‌آید.</p>"
+#            "<p class='alt'><a href='/'>برگشت به حساب</a></p>"
+#            % (minutes, html.escape(code), deep))
 #
 #
 #def choose_password_page(banner=""):
@@ -6356,6 +8401,123 @@ exit 0
 #        return ("<div class='msg warnbox'>دورهٔ شما در <b>%s</b> "
 #                "تمام می‌شود.</div>" % html.escape(ends))
 #    return ""
+#
+#
+## Digits as a Persian keyboard types them, for the reset code.
+#FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+#
+#TICKET_STATES = {"open": ("منتظر جواب پشتیبانی", "warn"),
+#                 "answered": ("جواب آمده", "ok"),
+#                 "closed": ("بسته", "")}
+#TICKET_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp")
+#NOT_NOW = ("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
+#           "<p class='sub'>چند دقیقه دیگر دوباره.</p>")
+#
+#
+#def support_box(info):
+#    """The way to the tickets, with a word when there is a reply waiting."""
+#    answered = info.get("tickets_answered") or 0
+#    return ("<a class='btn ghost' href='/tickets'>پشتیبانی و تیکت‌ها%s</a>"
+#            % (" — <span class='ok'>%d جواب تازه</span>" % answered if answered else ""))
+#
+#
+#def plan_line(p):
+#    """One plan as the customer reads it: what they get and what it costs."""
+#    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
+#        else "حجم نامحدود"
+#    bits = [size, "%d روز" % p["days"]]
+#    if p.get("speed_kbps"):
+#        bits.append("تا %g مگابیت" % (p["speed_kbps"] / 1000.0))
+#    return "%s · %s تومان" % ("، ".join(bits), format(p["price"], ","))
+#
+#
+#def pay_box(info):
+#    """Where to send the money, as the operator wrote it in the admin panel."""
+#    text = (info.get("pay_text") or "").strip()
+#    if not text:
+#        return ""
+#    return "<div class='pay'>💳 %s</div>" % html.escape(text)
+#
+#
+#def trial_box(info):
+#    """The free trial, when the operator offers one and this customer has not
+#    had it: a button, or what stands in the way."""
+#    trial = info.get("trial")
+#    if not trial:
+#        return ""
+#    p = trial["plan"]
+#    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] else "نامحدود"
+#    what = "%s — %s، %d روز%s" % (html.escape(p["name"]), size, p["days"],
+#                                  "، " + html.escape(p["note"]) if p.get("note") else "")
+#    if trial.get("available"):
+#        return ("<div class='dns'><div class='k'>🎁 تست رایگان</div>"
+#                "<p class='note' style='margin-top:0'>%s. یک بار، با یک کلیک، بدون رسید.</p>"
+#                "<form method='post' action='/trial'><button>دریافت تست رایگان</button>"
+#                "</form></div>" % what)
+#    return ("<div class='dns'><div class='k'>🎁 تست رایگان</div>"
+#            "<p class='note' style='margin-top:0'>%s.<br>%s</p></div>"
+#            % (what, html.escape(trial.get("why") or "")))
+#
+#
+#def receipt_box(info):
+#    """Paying: pick what you are paying for, then send the slip.
+#
+#    With plans on sale the choice is required, and it comes first - the price
+#    the customer transfers is the plan's. Grouped by template, because that is
+#    the difference a customer cares about: which services it opens. Holding a
+#    plan and picking another replaces it from the moment it is approved, and
+#    they are told so here, before they pay, not after.
+#    """
+#    plans = info.get("plans") or []
+#    held = info.get("plan_id")
+#    out = ["<div class='dns'><div class='k'>خرید یا تمدید</div>"]
+#    if info.get("telegram_required"):
+#        # The operator asks for Telegram first; the way to it is right here.
+#        return ("<div class='dns'><div class='k'>خرید یا تمدید</div>"
+#                "<div class='msg warnbox'>برای خرید یا تمدید، اول حسابتان را به تلگرام "
+#                "وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.</div>%s</div>"
+#                % telegram_box(dict(info, telegram_ready=True, open=True)))
+#    waiting = info.get("receipt_waiting")
+#    if waiting:
+#        out.append("<div class='msg warnbox'>رسید شما%s از %s در انتظار بررسی است."
+#                   " رسید تازه جای آن را می‌گیرد.</div>"
+#                   % (" برای «%s»" % html.escape(waiting["plan"])
+#                      if waiting.get("plan") else "", html.escape(waiting["at"])))
+#    out.append("<form method='post' action='/receipt' enctype='multipart/form-data'>")
+#    if plans:
+#        out.append("<p class='note' style='margin-top:0'>پلن را انتخاب کنید، مبلغش "
+#                   "را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار "
+#                   "روی حسابتان فعال می‌شود.</p>" + pay_box(info) + "<div class='plans'>")
+#        group = None
+#        for p in plans:
+#            if p["template"] != group:
+#                group = p["template"]
+#                out.append("<div class='t'>%s</div>" % html.escape(group))
+#            mine = p["id"] == held
+#            out.append(
+#                "<label class='plan'><input type='radio' name='plan' value='%d'"
+#                " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
+#                % (p["id"], " checked" if mine else "", html.escape(p["name"]),
+#                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
+#                   html.escape(plan_line(p)),
+#                   "<br><small>%s</small>" % html.escape(p["note"])
+#                   if p.get("note") else ""))
+#        out.append("</div>")
+#        if held:
+#            out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
+#                       "باقی‌مانده‌تان اضافه می‌کند. <b>پلن دیگری</b> که انتخاب کنید "
+#                       "از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین "
+#                       "می‌رود.</p>")
+#        out.append("<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>")
+#    else:
+#        out.append("<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید "
+#                   "تا مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ "
+#                   "مگابایت. اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.</p>"
+#                   + pay_box(info))
+#    out.append("<input type='file' name='file' required "
+#               "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+#               "<button class='ghost'>فرستادن رسید</button></form></div>")
+#    return "".join(out)
 #
 #
 #def dns_box():
@@ -6551,6 +8713,30 @@ exit 0
 #            return self.send("", 303, {"Location": "/",
 #                                       "Set-Cookie": "sdu=; Path=/; Max-Age=0"})
 #
+#        if path.startswith("/go/"):
+#            # Not signed in here: a link preview fetching this address must
+#            # not use the link up. The page posts it back, by itself in a
+#            # browser and with a button without script.
+#            token = path[4:]
+#            if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token):
+#                return self.redirect("/login", "این لینک درست نیست", bad=True)
+#            return self.send_html(go_page(token))
+#        if path == "/forgot":
+#            return self.send_html(forgot_page(self.banner()))
+#        if path == "/forgot-code":
+#            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#            return self.send_html(forgot_code_page((q.get("u") or [""])[0][:32],
+#                                                   self.banner()))
+#
+#        if path in ("/tickets", "/ticket", "/ticket-image"):
+#            if not self.session():
+#                return self.redirect("/login")
+#            if path == "/tickets":
+#                return self.tickets_page()
+#            if path == "/ticket":
+#                return self.ticket_page()
+#            return self.ticket_image()
+#
 #        if path != "/":
 #            return self.send_html("<div class='icon'>❔</div><h1>صفحه پیدا نشد</h1>", 404)
 #        return self.dashboard()
@@ -6597,6 +8783,93 @@ exit 0
 #                "Location": "/" if res.get("must_change") else "/register-ip",
 #                "Set-Cookie": self.cookie_for(res["session"])})
 #
+#        if path == "/go":
+#            form = self.form()
+#            try:
+#                res = post("/user-login-link", {"token": form.get("token", "")})
+#            except Exception as e:
+#                log(ERROR, "panel: login link failed: %s" % e)
+#                return self.redirect("/login", "الان نشد، چند دقیقه دیگر", bad=True)
+#            if not res.get("ok"):
+#                return self.redirect("/login", res.get("message", ""), bad=True)
+#            return self.send("", 303, {"Location": "/register-ip",
+#                                       "Set-Cookie": self.cookie_for(res["session"])})
+#
+#        if path == "/forgot":
+#            form = self.form()
+#            username = (form.get("username") or "").strip()[:32]
+#            try:
+#                res = post("/user-reset-request", {"username": username,
+#                                                   "ip": self.client_ip()})
+#            except Exception as e:
+#                log(ERROR, "panel: reset request failed: %s" % e)
+#                return self.redirect("/forgot", "الان نشد، چند دقیقه دیگر", bad=True)
+#            if not res.get("ok"):
+#                return self.redirect("/forgot", res.get("message", ""), bad=True)
+#            return self.redirect("/forgot-code?u=" + urllib.parse.quote(username),
+#                                 res.get("message", ""))
+#
+#        if path == "/forgot-code":
+#            form = self.form()
+#            username = (form.get("username") or "").strip()[:32]
+#            back = "/forgot-code?u=" + urllib.parse.quote(username)
+#            if form.get("new") != form.get("again"):
+#                return self.redirect(back, "دو رمز یکی نیستند", bad=True)
+#            code = (form.get("code") or "").strip().translate(FA_DIGITS)
+#            try:
+#                res = post("/user-reset-confirm", {"username": username, "code": code,
+#                                                   "password": form.get("new", ""),
+#                                                   "ip": self.client_ip()})
+#            except Exception as e:
+#                log(ERROR, "panel: reset confirm failed: %s" % e)
+#                return self.redirect(back, "الان نشد، چند دقیقه دیگر", bad=True)
+#            if not res.get("ok"):
+#                return self.redirect(back, res.get("message", ""), bad=True)
+#            return self.send("", 303, {
+#                "Location": "/?m=" + urllib.parse.quote(res.get("message", "")),
+#                "Set-Cookie": self.cookie_for(res["session"])})
+#
+#        if path == "/telegram-link":
+#            if not self.session():
+#                return self.redirect("/login")
+#            form = self.form()
+#            try:
+#                res = post("/user-link-code", {"session": self.session(),
+#                                               "password": form.get("password", "")})
+#            except Exception as e:
+#                log(ERROR, "panel: link code failed: %s" % e)
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            if not res.get("ok"):
+#                return self.redirect("/", res.get("message", ""), bad=True)
+#            return self.send_html(link_code_page(res))
+#
+#        if path == "/trial":
+#            if not self.session():
+#                return self.redirect("/login")
+#            try:
+#                res = post("/user-trial", {"session": self.session()})
+#            except Exception as e:
+#                log(ERROR, "panel: trial failed: %s" % e)
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
+#        if path == "/telegram-unlink":
+#            if not self.session():
+#                return self.redirect("/login")
+#            form = self.form()
+#            try:
+#                res = post("/user-unlink-telegram", {"session": self.session(),
+#                                                     "password": form.get("password", "")})
+#            except Exception as e:
+#                log(ERROR, "panel: unlink failed: %s" % e)
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
+#        if path in ("/ticket-new", "/ticket-reply", "/ticket-close"):
+#            if not self.session():
+#                return self.redirect("/login")
+#            return self.ticket_post(path)
+#
 #        if path == "/password-first":
 #            if not self.session():
 #                return self.redirect("/")
@@ -6640,11 +8913,18 @@ exit 0
 #                blob, kind = self.upload("file")
 #            except ValueError as e:
 #                return self.redirect("/", str(e), bad=True)
+#            # Which plan it pays for. Not checked here: the panel decides
+#            # whether that plan is on sale, and whether one was needed at all.
+#            try:
+#                plan = int(self.upload("plan")[0].strip() or 0)
+#            except ValueError:
+#                plan = 0
 #            try:
 #                res = post("/user-receipt", {
 #                    "session": self.session(),
 #                    "content_type": kind,
 #                    "data": base64.b64encode(blob).decode("ascii"),
+#                    "plan_id": plan,
 #                })
 #            except Exception as e:
 #                log(ERROR, "panel: receipt failed: %s" % e)
@@ -6673,6 +8953,145 @@ exit 0
 #            res = {"ok": False, "message": "الان نشد"}
 #        return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
+#    # -- tickets ------------------------------------------------------------
+#    def ask_panel(self, endpoint, payload):
+#        """One call to the panel on the customer's behalf; None when it could
+#        not be made, so the page can say "not now" rather than fall over."""
+#        payload = dict(payload, session=self.session())
+#        try:
+#            return post(endpoint, payload)
+#        except Exception as e:
+#            log(ERROR, "panel: %s failed: %s" % (endpoint, e))
+#            return None
+#
+#    def ticket_id(self, name="id"):
+#        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        raw = (q.get(name) or [""])[0]
+#        return int(raw) if raw.isdigit() else 0
+#
+#    def tickets_page(self):
+#        res = self.ask_panel("/user-tickets", {})
+#        if res is None:
+#            return self.send_html(NOT_NOW, 502)
+#        if not res.get("ok"):
+#            return self.redirect("/", res.get("message", ""), bad=True)
+#        body = ["<h1>پشتیبانی</h1>", "<div class='sub'>%s</div>" % html.escape(brand()),
+#                self.banner()]
+#        tickets = res.get("tickets") or []
+#        if tickets:
+#            body.append("<div class='tickets'>")
+#            for t in tickets:
+#                label, cls = TICKET_STATES.get(t["status"], (t["status"], ""))
+#                body.append("<a class='tk' href='/ticket?id=%d'><span class='s'>%s</span>"
+#                            "<span class='%s'>%s</span><small>%s · %d پیام</small></a>"
+#                            % (t["id"], html.escape(t["subject"]), cls, label,
+#                               html.escape(t["updated_at"][:16].replace("T", " ")),
+#                               t["messages"]))
+#            body.append("</div>")
+#        else:
+#            body.append("<p class='note'>هنوز تیکتی نفرستاده‌اید.</p>")
+#        body.append(
+#            "<div class='dns'><div class='k'>تیکت تازه</div>"
+#            "<form method='post' action='/ticket-new' enctype='multipart/form-data'>"
+#            "<label>موضوع</label><input name='subject' required maxlength='80'>"
+#            "<label>پیام</label><textarea name='body' rows='5' required maxlength='2000'>"
+#            "</textarea>"
+#            "<label>عکس (اختیاری، مثلاً اسکرین‌شات خطا)</label>"
+#            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
+#            "<button>فرستادن تیکت</button></form></div>")
+#        body.append("<p class='alt'><a href='/'>برگشت به حساب</a></p>")
+#        return self.send_html("".join(body))
+#
+#    def ticket_page(self):
+#        res = self.ask_panel("/user-ticket", {"id": self.ticket_id()})
+#        if res is None:
+#            return self.send_html(NOT_NOW, 502)
+#        if not res.get("ok"):
+#            return self.redirect("/tickets", res.get("message", ""), bad=True)
+#        t = res["ticket"]
+#        label, cls = TICKET_STATES.get(t["status"], (t["status"], ""))
+#        body = ["<h1>%s</h1>" % html.escape(t["subject"]),
+#                "<div class='sub'><span class='%s'>%s</span></div>" % (cls, label),
+#                self.banner(), "<div class='thread'>"]
+#        for m in t["messages"]:
+#            pic = ("<a href='/ticket-image?img=%d' target='_blank'>"
+#                   "<img src='/ticket-image?img=%d' alt='عکس'></a>" % (m["id"], m["id"])
+#                   if m.get("has_image") else "")
+#            body.append("<div class='msg-%s'><div class='meta'>%s · %s</div>"
+#                        "<div class='text'>%s</div>%s</div>"
+#                        % ("admin" if m["from"] == "admin" else "customer",
+#                           "پشتیبانی" if m["from"] == "admin" else "شما",
+#                           html.escape(m["created_at"][:16].replace("T", " ")),
+#                           html.escape(m["body"]), pic))
+#        body.append("</div>")
+#        body.append(
+#            "<form method='post' action='/ticket-reply' enctype='multipart/form-data'>"
+#            "<input type='hidden' name='id' value='%d'>"
+#            "<label>%s</label><textarea name='body' rows='4' required maxlength='2000'>"
+#            "</textarea><label>عکس (اختیاری)</label>"
+#            "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
+#            "<button>فرستادن</button></form>"
+#            % (t["id"], "پیام تازه — تیکت دوباره باز می‌شود"
+#               if t["status"] == "closed" else "پیام تازه"))
+#        if t["status"] != "closed":
+#            body.append("<form method='post' action='/ticket-close'>"
+#                        "<input type='hidden' name='id' value='%d'>"
+#                        "<button class='ghost'>مشکلم حل شد، تیکت را ببند</button></form>"
+#                        % t["id"])
+#        body.append("<p class='alt'><a href='/tickets'>همهٔ تیکت‌ها</a> · "
+#                    "<a href='/'>حساب</a></p>")
+#        return self.send_html("".join(body))
+#
+#    def ticket_image(self):
+#        res = self.ask_panel("/user-ticket-image", {"message_id": self.ticket_id("img")})
+#        if not res or not res.get("ok") or res.get("image_type") not in TICKET_IMAGE_TYPES:
+#            return self.send_html("<div class='icon'>❔</div><h1>عکس پیدا نشد</h1>", 404)
+#        try:
+#            blob = base64.b64decode(res["image_data"])
+#        except Exception:
+#            return self.send_html("<div class='icon'>❔</div><h1>عکس پیدا نشد</h1>", 404)
+#        return self.send(blob, 200, {"Content-Type": res["image_type"],
+#                                     "Cache-Control": "private, max-age=3600",
+#                                     "X-Content-Type-Options": "nosniff"})
+#
+#    def ticket_post(self, path):
+#        form = self.form()
+#        if form.get("too_big"):
+#            return self.redirect("/tickets", "فایل خیلی بزرگ است", bad=True)
+#        multipart = "multipart/form-data" in (self.headers.get("Content-Type") or "")
+#
+#        def field(name):
+#            if not multipart:
+#                return form.get(name, "")
+#            try:
+#                return self.upload(name)[0].decode("utf-8", "replace")
+#            except ValueError:
+#                return ""
+#
+#        tid = field("id").strip()
+#        tid = int(tid) if tid.isdigit() else 0
+#        payload = {"id": tid, "subject": field("subject"),
+#                   "body": field("body").replace("\r\n", "\n")}
+#        if multipart:
+#            try:
+#                blob, kind = self.upload("image")
+#            except ValueError:
+#                blob, kind = b"", ""
+#            if blob:
+#                payload["image_data"] = base64.b64encode(blob).decode("ascii")
+#                payload["image_type"] = kind
+#        endpoint = {"/ticket-new": "/user-ticket-new", "/ticket-reply": "/user-ticket-reply",
+#                    "/ticket-close": "/user-ticket-close"}[path]
+#        res = self.ask_panel(endpoint, payload)
+#        if res is None:
+#            back = "/ticket?id=%d" % tid if tid else "/tickets"
+#            return self.redirect(back, "الان نشد، چند دقیقه دیگر", bad=True)
+#        if not res.get("ok"):
+#            back = "/ticket?id=%d" % tid if tid else "/tickets"
+#            return self.redirect(back, res.get("message", ""), bad=True)
+#        return self.redirect("/ticket?id=%d" % res.get("ticket_id", tid),
+#                             res.get("message", ""))
+#
 #    def dashboard(self):
 #        token = self.session()
 #        if not token:
@@ -6695,7 +9114,10 @@ exit 0
 #
 #        used, quota = info["used"], info["quota"]
 #        seen = info.get("seen_ip") or self.client_ip()
-#        rows = [("پلن", html.escape(info.get("plan") or "-")),
+#        rows = []
+#        if info.get("plan_name"):
+#            rows.append(("پلن", html.escape(info["plan_name"])))
+#        rows += [("قالب", html.escape(info.get("plan") or "-")),
 #                ("آی‌پی ثبت‌شده", "<code>%s</code>" % html.escape(info["ip"] or "ثبت نشده")),
 #                ("مصرف", human_fa(used))]
 #        if quota:
@@ -6752,15 +9174,11 @@ exit 0
 #                "<p class='note'>آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و "
 #                "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
 #        body.append(manual_ip_box("/"))
-#        body.append(
-#            "<div class='dns'><div class='k'>ارسال رسید پرداخت</div>"
-#            "<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید تا "
-#            "مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ مگابایت. "
-#            "اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.</p>"
-#            "<form method='post' action='/receipt' enctype='multipart/form-data'>"
-#            "<input type='file' name='file' required "
-#            "accept='image/jpeg,image/png,image/webp,application/pdf'>"
-#            "<button class='ghost'>فرستادن رسید</button></form></div>")
+#        body.append(trial_box(info))
+#        body.append(receipt_box(info))
+#        body.append(support_box(info))
+#        if not info.get("telegram_required"):
+#            body.append(telegram_box(info))
 #        body.append(
 #            "<details class='pw'><summary>تغییر رمز عبور</summary>"
 #            "<form method='post' action='/password'>"
@@ -6831,7 +9249,51 @@ exit 0
 #        self.ctx = ctx
 #        super().__init__(addr, handler)
 #
+#    # The certificate to reload when it is renewed; None for a context made
+#    # once and kept, which is what the tests hand in.
+#    cert = key = None
+#    stamp = failed = None
+#
+#    def follow(self, cert, key):
+#        """Pick up a renewed certificate by itself.
+#
+#        Renewal writes new files and moves the live/ links, and nothing tells
+#        this process: it would go on serving the old certificate from memory
+#        until it expired in every visitor's browser. So each connection looks
+#        at the files first - a stat is nothing next to a handshake. Both
+#        files, because the two links do not move at once: loading between the
+#        two moves pairs a new certificate with the old key and fails, and the
+#        old context stays in use until the second one lands.
+#        """
+#        self.cert, self.key = cert, key
+#        self.stamp = self.cert_stamp()
+#
+#    def cert_stamp(self):
+#        return (os.stat(self.cert).st_mtime, os.stat(self.key).st_mtime)
+#
+#    def reload_if_renewed(self):
+#        if not self.cert:
+#            return
+#        try:
+#            stamp = self.cert_stamp()
+#        except OSError:
+#            return
+#        if stamp == self.stamp or stamp == self.failed:
+#            return
+#        try:
+#            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#            ctx.load_cert_chain(self.cert, self.key)
+#        except (OSError, ssl.SSLError) as e:
+#            # Once per change, not once per visitor.
+#            self.failed = stamp
+#            log(WARN, "could not load the renewed certificate yet, still serving "
+#                "the old one: %r" % e)
+#            return
+#        self.ctx, self.stamp, self.failed = ctx, stamp, None
+#        log(INFO, "loaded the renewed certificate %s" % self.cert)
+#
 #    def finish_request(self, request, client_address):
+#        self.reload_if_renewed()
 #        if self.ctx is None:      # plain http, for tests only
 #            return super().finish_request(request, client_address)
 #        request.settimeout(HANDSHAKE_TIMEOUT)
@@ -6871,6 +9333,7 @@ exit 0
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #    ctx.load_cert_chain(cert, key)
 #    httpd = make_panel_server(ctx)
+#    httpd.follow(cert, key)
 #    print("sync up: every %ds to %s, panel on https://%s:%d/"
 #          % (INTERVAL, CFG["PANEL_HOST"], CFG["PANEL_DOMAIN"], PANEL_TLS_PORT),
 #          flush=True)
@@ -7125,7 +9588,9 @@ exit 0
 #import threading
 #import time
 #import traceback
+#import urllib.error
 #import urllib.parse
+#import urllib.request
 #from datetime import datetime, timedelta, timezone
 #
 #CONFIG = "/etc/smart-dns/admin.env"
@@ -7205,7 +9670,7 @@ exit 0
 ## Ports that belong to the service itself. Moving the panel onto one of them
 ## takes down the thing it exists to administer.
 #RESERVED_PORTS = {53: "DNS", 80: "HTTP", 443: "HTTPS",
-#                  8443: "the relays' sync API",
+#                  8443: "the relays' sync API", 8445: "the bot API",
 #                  8446: "the exit's route to Google over IPv6", 22: "SSH"}
 #
 #
@@ -7277,6 +9742,54 @@ exit 0
 #            cur = self.db.execute(sql, args)
 #            self.db.commit()
 #            return cur
+#
+#    def apply_plan(self, uid, plan_id, stamp=None):
+#        """Give an account a plan; a sentence saying what happened, or None
+#        when there is no such account or plan.
+#
+#        The same plan again, while it is still running, is a renewal: the
+#        days go on after the ones that are left and the allowance on top of
+#        what is left, so paying early loses nothing. Anything else starts
+#        fresh from now - a different plan, or one that has already run out -
+#        and what was left of the old one is gone, which the customer was told
+#        before they paid. A suspended account stays suspended: a receipt is
+#        not the operator changing their mind about a block.
+#        """
+#        stamp = stamp or datetime.now(timezone.utc)
+#        with self.lock:
+#            user = self.db.execute("SELECT * FROM users WHERE id = ?",
+#                                   (uid,)).fetchone()
+#            plan = self.db.execute("SELECT * FROM plans WHERE id = ?",
+#                                   (plan_id,)).fetchone()
+#            if not user or not plan:
+#                return None
+#            ends = parse_ts(user["expires_at"])
+#            renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
+#                        and user["status"] in ("active", "over_quota"))
+#            if renewing:
+#                until = ends + timedelta(days=plan["days"])
+#                # Unlimited stays unlimited; otherwise the new allowance goes
+#                # on top of the old, and the usage already counted stays
+#                # counted against the total.
+#                quota = (user["quota_bytes"] + plan["quota_bytes"]
+#                         if plan["quota_bytes"] and user["quota_bytes"] else 0)
+#                used = user["used_bytes"]
+#            else:
+#                until = stamp + timedelta(days=plan["days"])
+#                quota = plan["quota_bytes"]
+#                used = 0
+#            self.db.execute(
+#                "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
+#                " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
+#                " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
+#                " status = CASE WHEN status = 'suspended' THEN 'suspended'"
+#                " ELSE 'active' END WHERE id = ?",
+#                (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
+#                 until.isoformat(timespec="seconds"), uid))
+#            self.db.commit()
+#        return ("پلن «%s» تمدید شد تا %s" if renewing
+#                else "پلن «%s» فعال شد تا %s") % (plan["name"],
+#                                                  until.strftime("%Y-%m-%d"))
 #
 #    def delete_user(self, uid):
 #        """Delete an account and everything that is only its; the addresses
@@ -7538,6 +10051,15 @@ exit 0
 #.receipt .who{font-size:14px;font-weight:600;margin-bottom:10px}
 #.receipt img{max-width:100%;max-height:420px;border-radius:8px;
 # border:1px solid var(--line);display:block}
+#.receipt .bought{font-size:13px;margin:-4px 0 10px}
+#.thread{display:flex;flex-direction:column;gap:10px;margin:14px 0 18px}
+#.thread>div{max-width:80%;padding:10px 14px;border-radius:12px;border:1px solid var(--line)}
+#.thread .msg-customer{align-self:flex-start;background:var(--bg)}
+#.thread .msg-admin{align-self:flex-end;background:var(--good-bg);border-color:var(--btn)}
+#.thread .meta{font-size:11px;color:var(--muted);margin-bottom:4px}
+#.thread .text{white-space:pre-wrap;word-break:break-word}
+#.thread img{display:block;max-width:100%;max-height:320px;margin-top:8px;border-radius:8px}
+#tr.off td{opacity:.55}
 #td.acts{white-space:nowrap}
 #td.acts form{display:inline}
 #td.acts button{padding:6px 10px;font-size:12px;margin-right:4px}
@@ -7694,6 +10216,22 @@ exit 0
 #OPERATORS = Operators(OPERATORS_FILE)
 #
 #
+## Persian and Arabic digits, as a phone keyboard types them, and the
+## separators people put in a price.
+#DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫", "01234567890123456789.",
+#                       ",،٬ ")
+#
+#
+#def number(raw):
+#    """A number typed into a form, in any of the digits people use; None when
+#    it is not one."""
+#    try:
+#        value = float((raw or "").strip().translate(DIGITS))
+#    except ValueError:
+#        return None
+#    return value if value == value and abs(value) != float("inf") else None
+#
+#
 ## Letters and digits nobody misreads when a password is read out or copied
 ## from a chat: no 0/o, no 1/l/i.
 #TEMP_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
@@ -7703,6 +10241,194 @@ exit 0
 #    """Three groups of four - easy to pass on, and about 59 bits."""
 #    return "-".join("".join(secrets.choice(TEMP_ALPHABET) for _ in range(4))
 #                    for _ in range(3))
+#
+#
+#BOT_API_PORT = 8445
+## Card number, name, a line or two of instructions.
+#PAY_TEXT_MAX = 500
+#
+#TICKET_STATES = {"open": ("منتظر جواب شما", "warn"),
+#                 "answered": ("جواب داده شد", "ok"),
+#                 "closed": ("بسته", "muted")}
+## Kept in step with the panel, which drops them: this page only says so.
+#TICKET_IMAGE_DAYS = 30
+#TICKET_BODY_MAX = 2000
+## The admin's own picture, the same ceiling a customer's has.
+#TICKET_IMAGE_MAX = 4 * 1024 * 1024
+#
+#
+#def emit(event, user_id, data):
+#    """Queue something for every bot with a webhook - the panel's worker sends
+#    it. The same as the panel's own emit(), for what happens on this side."""
+#    try:
+#        user = STORE.one("SELECT id, telegram_id FROM users WHERE id = ?", (user_id,))
+#        if not user or not user["telegram_id"]:
+#            return
+#        keys = STORE.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+#                       " AND COALESCE(webhook_url, '') != ''")
+#        stamp = now()
+#        payload = json.dumps({"event": event, "created_at": stamp,
+#                              "telegram_id": user["telegram_id"], "user_id": user["id"],
+#                              "data": data}, ensure_ascii=False)
+#        for k in keys:
+#            STORE.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                      " next_at) VALUES (?, ?, ?, ?, ?)",
+#                      (k["id"], event, payload, stamp, stamp))
+#    except Exception as e:
+#        # Telling a bot is never worth failing the operator's click over.
+#        log(WARN, "could not queue %s for user #%s: %r" % (event, user_id, e))
+#
+#
+#def plan_event(uid):
+#    """What a bot needs to say about a plan that has just been put on."""
+#    row = STORE.one("SELECT u.expires_at, u.quota_bytes, p.id AS pid, p.name"
+#                    " FROM users u LEFT JOIN plans p ON p.id = u.plan_id"
+#                    " WHERE u.id = ?", (uid,))
+#    if not row:
+#        return {}
+#    return {"plan": {"id": row["pid"], "name": row["name"]} if row["pid"] else None,
+#            "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
+#
+#
+#def webhook_url_ok(url):
+#    """https to anywhere, or plain http only to this machine itself - a bot
+#    on the same server."""
+#    try:
+#        u = urllib.parse.urlparse(url)
+#    except ValueError:
+#        return False
+#    if not u.hostname or u.username or u.password:
+#        return False
+#    if u.scheme == "https":
+#        return True
+#    return u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1")
+#
+#
+#def ticket_who(row):
+#    return "%s · %s" % (row["first_name"] or "", row["username"] or row["phone"]
+#                        or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
+#                            else "#%d" % row["user_id"]))
+#
+#
+#def image_kind(blob):
+#    """What a picture really is, from its first bytes - not what the browser
+#    said it was."""
+#    if blob[:3] == b"\xff\xd8\xff":
+#        return "image/jpeg"
+#    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+#        return "image/png"
+#    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+#        return "image/webp"
+#    return None
+#
+#
+## The sample bot, which the installer puts on the exit and this panel sets up.
+#BOT_BIN = "/usr/local/bin/doctor-dns-bot"
+#BOT_ENV = "/etc/doctor-dns-bot.env"
+#BOT_UNIT = "doctor-dns-bot"
+#BOT_LISTEN = "127.0.0.1:18990"
+#TELEGRAM_API = "https://api.telegram.org"
+#
+#
+#def read_env(path):
+#    try:
+#        with open(path, encoding="utf-8") as fh:
+#            return dict(l.rstrip("\n").split("=", 1) for l in fh
+#                        if "=" in l and not l.lstrip().startswith("#"))
+#    except OSError:
+#        return {}
+#
+#
+#def write_env(path, values):
+#    """Written whole, then moved into place, readable by root alone: it holds
+#    the bot's token and the key that speaks for every customer."""
+#    tmp = path + ".tmp"
+#    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+#    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+#        for k, v in values.items():
+#            fh.write("%s=%s\n" % (k, str(v).replace("\n", "\\n")))
+#    os.replace(tmp, path)
+#
+#
+#def bot_getme(token):
+#    """Ask Telegram who this token is: (username, None) or (None, why)."""
+#    try:
+#        with urllib.request.urlopen("%s/bot%s/getMe" % (TELEGRAM_API, token),
+#                                    timeout=15) as r:
+#            res = json.loads(r.read())
+#    except urllib.error.HTTPError as e:
+#        return None, ("تلگرام این توکن را نمی‌شناسد" if e.code in (401, 404)
+#                      else "تلگرام جواب نداد (HTTP %d)" % e.code)
+#    except Exception as e:
+#        return None, "به تلگرام نرسیدیم: %s" % str(e)[:80]
+#    if not res.get("ok"):
+#        return None, "تلگرام این توکن را نمی‌شناسد"
+#    return res["result"].get("username") or "", None
+#
+#
+#def bot_state():
+#    """(installed, set up, running, a line of what it last said)."""
+#    installed = os.path.exists(BOT_BIN)
+#    configured = bool(read_env(BOT_ENV).get("BOT_TOKEN"))
+#    running = False
+#    last = ""
+#    try:
+#        running = subprocess.run(["systemctl", "is-active", "--quiet", BOT_UNIT],
+#                                 timeout=10).returncode == 0
+#        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", "3", "-o", "cat",
+#                            "--no-pager"], capture_output=True, text=True, timeout=10)
+#        last = r.stdout.strip()
+#    except Exception:
+#        pass
+#    return installed, configured, running, last
+#
+#
+#def bot_api_url():
+#    """Where a bot reaches the API: this panel's own name, on the API's port."""
+#    port = BOT_API_PORT
+#    try:
+#        with open("/etc/smart-dns/panel.env") as fh:
+#            for line in fh:
+#                if line.startswith("BOT_API_PORT="):
+#                    port = int(line.split("=", 1)[1].strip() or port)
+#    except (OSError, ValueError):
+#        pass
+#    return "https://%s:%d/api/v1/" % (panel_host(), port)
+#
+#
+#def api_key_card(name, key):
+#    return ("<div class='card'><h2>کلید API «%s»</h2>"
+#            "<p class='onetime'><code>%s</code></p>"
+#            "<p>این کلید را در تنظیمات ربات بگذارید. <b>فقط همین یک بار</b> نشان داده "
+#            "می‌شود و بعداً خوانده نمی‌شود؛ اگر گمش کردید، یکی تازه بسازید و این را "
+#            "باطل کنید.</p>"
+#            "<ul class='muted'>"
+#            "<li>ربات با این کلید به جای همهٔ مشتری‌ها کار می‌کند، پس مثل رمز پنل از "
+#            "آن نگهداری کنید.</li>"
+#            "<li>آدرس API: <code>%s</code></li>"
+#            "<li>ربات کلید را در سرآیند <code>Authorization: Bearer ...</code> "
+#            "می‌فرستد.</li>"
+#            "<li>این صفحه را رفرش نکنید: رفرش یک کلید تازهٔ دیگر می‌سازد.</li></ul>"
+#            "<p><a href='/%s/api'>برگشت به API</a></p></div>"
+#            % (html.escape(name), html.escape(key), html.escape(bot_api_url()),
+#               html.escape(CFG["ADMIN_PATH"])))
+#
+#
+## The panel gives up on a message after this many tries; the page only says so.
+#WEBHOOK_MAX_TRIES = 30
+#
+#
+#def webhook_secret_card(name, url, secret):
+#    return ("<div class='card'><h2>رمز امضای webhook «%s»</h2>"
+#            "<p class='onetime'><code>%s</code></p>"
+#            "<p>این رمز را در تنظیمات ربات بگذارید. <b>فقط همین یک بار</b> نشان داده "
+#            "می‌شود؛ اگر گمش کردید، آدرس را دوباره ذخیره کنید تا رمز تازه بسازد.</p>"
+#            "<ul class='muted'><li>خبرها به <code>%s</code> فرستاده می‌شوند.</li>"
+#            "<li>هر خبر سرآیند <code>X-DoctorDNS-Signature</code> دارد؛ ربات با این رمز "
+#            "چکش می‌کند که از طرف پنل آمده باشد. راهنما: docs/bot-api.md</li></ul>"
+#            "<p><a href='/%s/api'>برگشت به API</a></p></div>"
+#            % (html.escape(name), html.escape(secret), html.escape(url),
+#               html.escape(CFG["ADMIN_PATH"])))
 #
 #
 #def temp_password_card(name, password):
@@ -7731,11 +10457,84 @@ exit 0
 #    return "<br><span class='muted'>%s</span>" % html.escape(name or "سایر")
 #
 #
+#def plan_fields(form, tpls, plan=None):
+#    """The inputs of one plan, bound to the form with that id - a row of
+#    the table or the new-plan card use the same ones."""
+#    plan = plan or {}
+#    tid = plan.get("template_id")
+#    sel = "".join("<option value='%d'%s>%s</option>"
+#                  % (t["id"], " selected" if t["id"] == tid else "",
+#                     html.escape(t["name"])) for t in tpls)
+#    quota = plan.get("quota_bytes")
+#    unlimited = plan and not quota
+#    kbps = plan.get("speed_kbps") or 0
+#    return (
+#        "<td><input form='%s' name='name' value='%s' size='12' required"
+#        " maxlength='60' placeholder='مثلاً گیمینگ ماهانه'></td>"
+#        "<td><select form='%s' name='template_id'>%s</select></td>"
+#        "<td><input form='%s' name='days' value='%s' size='3' required"
+#        " inputmode='numeric' placeholder='۳۰'></td>"
+#        "<td><input form='%s' name='quota_gb' value='%s' size='4'"
+#        " inputmode='decimal' placeholder='گیگ'>"
+#        "<label style='display:inline;margin-right:6px'>"
+#        "<input form='%s' type='checkbox' name='unlimited' value='1'%s>"
+#        " نامحدود</label></td>"
+#        "<td><input form='%s' name='price' value='%s' size='7'"
+#        " inputmode='numeric' placeholder='تومان'>"
+#        "<label style='display:block;margin-top:4px' title='رایگان، با یک کلیک، هر "
+#        "تلگرام و هر حساب یک بار'><input form='%s' type='checkbox' name='trial' value='1'%s>"
+#        " 🎁 تست رایگان</label></td>"
+#        "<td><input form='%s' name='speed_mb' value='%s' size='3'"
+#        " inputmode='decimal' title='مگابیت بر ثانیه؛ خالی یا ۰ یعنی بی‌حد'></td>"
+#        "<td><input form='%s' name='note' value='%s' size='14' maxlength='120'"
+#        " placeholder='اختیاری'></td>"
+#        % (form, html.escape(plan.get("name") or "", quote=True),
+#           form, sel,
+#           form, plan.get("days") or "",
+#           form, ("%g" % (quota / GB)) if quota else "",
+#           form, " checked" if unlimited else "",
+#           form, plan.get("price") if plan else "",
+#           form, " checked" if plan.get("is_trial") else "",
+#           form, ("%g" % (kbps / 1000.0)) if kbps else "",
+#           form, html.escape(plan.get("note") or "", quote=True)))
+#
+#
+#def plan_cell(user, plans):
+#    """Under the template: the plan this account is on, and a way to give
+#    it one by hand - for somebody who paid in cash, or a gift."""
+#    if not plans:
+#        return ""
+#    held = next((x["name"] for x in plans if x["id"] == user["plan_id"]), "")
+#    opts = "".join("<option value='%d'>%s%s</option>"
+#                   % (x["id"], html.escape(x["name"]),
+#                      "" if x["active"] else " (خاموش)") for x in plans)
+#    return ("<div class='muted'>%s</div>"
+#            "<form method='post' action='/%s/user-plan' class='row'"
+#            " onsubmit='return confirm(\"این پلن به این کاربر داده شود؟ همان پلن "
+#            "تمدید می‌شود و پلن دیگر از همین حالا از نو شروع می‌شود.\")'>"
+#            "<input type='hidden' name='id' value='%d'>"
+#            "<select name='plan_id' required><option value=''>دادن پلن…</option>"
+#            "%s</select><button class='ghost'>اعمال</button></form>"
+#            % ("پلن: " + html.escape(held) if held else "بدون پلن",
+#               CFG["ADMIN_PATH"], user["id"], opts))
+#
+#
+#def tickets_waiting():
+#    """Tickets whose turn it is here, for the count beside the menu item."""
+#    try:
+#        return STORE.one("SELECT count(*) c FROM tickets WHERE status = 'open'")["c"]
+#    except Exception:
+#        return 0
+#
+#
 #def page(title, body, cfg, active="", msg=None, msg_kind="good"):
 #    nav = ""
+#    waiting = tickets_waiting()
 #    for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
-#                        ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
-#                        ("settings", "تنظیمات"), ("logs", "لاگ")):
+#                        ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
+#                        ("plans", "پلن‌ها"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
+#                        ("bot", "ربات"), ("api", "API"), ("settings", "تنظیمات"),
+#                        ("logs", "لاگ")):
 #        cls = " class='on'" if active == path else ""
 #        nav += "<a href='/%s/%s'%s>%s</a>" % (cfg["ADMIN_PATH"], path, cls, label)
 #    banner = ""
@@ -7878,7 +10677,51 @@ exit 0
 #        self.ctx = ctx
 #        super().__init__(addr, handler)
 #
+#    # The certificate to reload when it is renewed; None for a context made
+#    # once and kept, which is what the tests hand in.
+#    cert = key = None
+#    stamp = failed = None
+#
+#    def follow(self, cert, key):
+#        """Pick up a renewed certificate by itself.
+#
+#        Renewal writes new files and moves the live/ links, and nothing tells
+#        this process: it would go on serving the old certificate from memory
+#        until it expired in every visitor's browser. So each connection looks
+#        at the files first - a stat is nothing next to a handshake. Both
+#        files, because the two links do not move at once: loading between the
+#        two moves pairs a new certificate with the old key and fails, and the
+#        old context stays in use until the second one lands.
+#        """
+#        self.cert, self.key = cert, key
+#        self.stamp = self.cert_stamp()
+#
+#    def cert_stamp(self):
+#        return (os.stat(self.cert).st_mtime, os.stat(self.key).st_mtime)
+#
+#    def reload_if_renewed(self):
+#        if not self.cert:
+#            return
+#        try:
+#            stamp = self.cert_stamp()
+#        except OSError:
+#            return
+#        if stamp == self.stamp or stamp == self.failed:
+#            return
+#        try:
+#            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#            ctx.load_cert_chain(self.cert, self.key)
+#        except (OSError, ssl.SSLError) as e:
+#            # Once per change, not once per visitor.
+#            self.failed = stamp
+#            log(WARN, "could not load the renewed certificate yet, still serving "
+#                "the old one: %r" % e)
+#            return
+#        self.ctx, self.stamp, self.failed = ctx, stamp, None
+#        log(INFO, "loaded the renewed certificate %s" % self.cert)
+#
 #    def finish_request(self, request, client_address):
+#        self.reload_if_renewed()
 #        if self.ctx is None:
 #            return super().finish_request(request, client_address)
 #        request.settimeout(HANDSHAKE_TIMEOUT)
@@ -8058,8 +10901,11 @@ exit 0
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
 #            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
-#            " length(t.receipt_blob) AS size"
+#            " u.plan_id AS holds, length(t.receipt_blob) AS size,"
+#            " p.name AS plan_name, p.days AS plan_days,"
+#            " p.quota_bytes AS plan_quota"
 #            " FROM transactions t JOIN users u ON u.id = t.user_id"
+#            " LEFT JOIN plans p ON p.id = t.plan_id"
 #            " ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,"
 #            " t.created_at DESC LIMIT 100")
 #        pending = [r for r in rows if r["status"] == "pending"]
@@ -8070,9 +10916,22 @@ exit 0
 #            who = (r["first_name"] or "") + " · " + (
 #                r["username"] or r["phone"]
 #                or str(r["telegram_id"] or "#%d" % r["user_id"]))
+#            if r["plan_name"]:
+#                bought = ("<div class='bought'>پلن «%s» · %s · %s روز · %s تومان"
+#                          "<span class='muted'> — %s</span></div>"
+#                          % (html.escape(r["plan_name"]),
+#                             human(r["plan_quota"]) if r["plan_quota"] else "نامحدود",
+#                             r["plan_days"], format(r["amount"], ","),
+#                             "تمدید همان پلن" if r["holds"] == r["plan_id"]
+#                             else "با تأیید، خودکار فعال می‌شود"))
+#            elif r["plan_id"]:
+#                bought = ("<div class='bought bad'>پلنی که انتخاب کرده بود حذف شده؛ "
+#                          "بعد از تأیید، سهمیه و زمان را خودتان بگذارید</div>")
+#            else:
+#                bought = ""
 #            out.append(
 #                "<div class='receipt'>"
-#                "<div class='who'>%s<span class='muted'> · %s · %s</span></div>"
+#                "<div class='who'>%s<span class='muted'> · %s · %s</span></div>%s"
 #                "<a href='/%s/receipt/%d' target='_blank'>"
 #                "<img src='/%s/receipt/%d' alt='رسید'></a>"
 #                "<div class='row' style='margin-top:10px'>"
@@ -8087,23 +10946,25 @@ exit 0
 #                "<a class='muted' href='/%s/users'>ویرایش حساب این کاربر ←</a>"
 #                "</div></div>"
 #                % (html.escape(who), html.escape(r["created_at"][:16]),
-#                   human(r["size"] or 0),
+#                   human(r["size"] or 0), bought,
 #                   p, r["id"], p, r["id"], p, r["id"], p, r["id"], p))
-#        out.append("<p class='muted'>تأیید یا رد فقط تصمیم را ثبت می‌کند و عکس "
-#                   "را پاک می‌کند؛ سهمیه و زمان را خودتان در صفحهٔ کاربران "
-#                   "می‌گذارید.</p></div>")
+#        out.append("<p class='muted'>با تأیید، پلنی که مشتری انتخاب کرده خودکار "
+#                   "روی حسابش می‌نشیند: قالب، حجم، مدت و سرعتش. رسیدِ بدون پلن فقط "
+#                   "ثبت می‌شود و سهمیه و زمان را خودتان در صفحهٔ کاربران می‌گذارید. "
+#                   "عکس رسید بعد از تصمیم پاک می‌شود.</p></div>")
 #
 #        decided = [r for r in rows if r["status"] != "pending"]
 #        if decided:
 #            out.append("<div class='card'><h2>تصمیم‌های قبلی</h2>"
-#                       "<table><tr><th>کاربر</th><th>رسید</th><th>تصمیم</th>"
-#                       "<th>تاریخ</th></tr>")
+#                       "<table><tr><th>کاربر</th><th>رسید</th><th>پلن</th>"
+#                       "<th>تصمیم</th><th>تاریخ</th></tr>")
 #            for r in decided[:40]:
-#                out.append("<tr><td>%s</td><td>%s</td><td class='%s'>%s</td>"
-#                           "<td>%s</td></tr>"
+#                out.append("<tr><td>%s</td><td>%s</td><td>%s</td>"
+#                           "<td class='%s'>%s</td><td>%s</td></tr>"
 #                           % (html.escape((r["first_name"] or "") + " · " +
 #                                          (r["username"] or r["phone"] or "")),
 #                              html.escape(r["created_at"][:16]),
+#                              html.escape(r["plan_name"] or "-"),
 #                              "ok" if r["status"] == "approved" else "bad",
 #                              "تأیید شد" if r["status"] == "approved" else "رد شد",
 #                              html.escape((r["decided_at"] or "")[:16])))
@@ -8326,6 +11187,8 @@ exit 0
 #            return self.send_backup()
 #        if rest.startswith("receipt/"):
 #            return self.send_receipt(rest.split("/", 1)[1])
+#        if rest.startswith("ticket-image/"):
+#            return self.send_ticket_image(rest.split("/", 1)[1])
 #        try:
 #            return self.view(rest)
 #        except Exception as e:
@@ -8390,8 +11253,12 @@ exit 0
 #        pages = {"": ("پنل مدیریت", self.home), "index": ("پنل مدیریت", self.home),
 #                 "users": ("کاربران", self.users),
 #                 "receipts": ("رسیدها", self.receipts),
+#                 "plans": ("پلن‌ها", self.plans),
+#                 "tickets": ("تیکت‌ها", self.tickets),
 #                 "templates": ("قالب‌ها", self.templates),
 #                 "domains": ("دامنه‌ها", self.domains),
+#                 "api": ("API ربات", self.api_keys),
+#                 "bot": ("ربات تلگرام", self.bot_page),
 #                 "settings": ("تنظیمات", self.settings),
 #                 "restore": ("بازگردانی", self.restore_page),
 #                 "logs": ("لاگ", self.logs)}
@@ -8443,6 +11310,8 @@ exit 0
 #        return "".join(out)
 #
 #    def users(self):
+#        plans = STORE.q("SELECT id, name, active FROM plans"
+#                        " ORDER BY active DESC, template_id, price")
 #        tpls = STORE.q("SELECT * FROM templates ORDER BY id")
 #        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
 #        did = default["id"] if default else 0
@@ -8482,8 +11351,21 @@ exit 0
 #            # Only an account with a username signs in on the web, so only
 #            # such an account has a password worth replacing.
 #            reset = ""
+#            # Only a web account can lose its Telegram: one opened through the
+#            # bot has no other way in.
+#            if r["username"] and r["telegram_id"]:
+#                reset += (
+#                    "<form method='post' action='/%s/user-unlink-telegram'"
+#                    " onsubmit='return confirm(%s)'>"
+#                    "<input type='hidden' name='id' value='%d'>"
+#                    "<button class='ghost' title='تلگرام %s'>جدا کردن تلگرام</button>"
+#                    "</form>"
+#                    % (p, html.escape(json.dumps(
+#                        "تلگرام «%s» جدا شود؟ بعد از آن بازیابی رمز با تلگرام کار "
+#                        "نمی‌کند تا دوباره وصل کند." % who, ensure_ascii=False),
+#                        quote=True), r["id"], r["telegram_id"]))
 #            if r["username"]:
-#                reset = (
+#                reset += (
 #                    "<form method='post' action='/%s/user-password-reset'"
 #                    " onsubmit='return confirm(%s)'>"
 #                    "<input type='hidden' name='id' value='%d'>"
@@ -8506,7 +11388,7 @@ exit 0
 #                "<td><form method='post' action='/%s/user-template'>"
 #                "<input type='hidden' name='id' value='%d'>"
 #                "<select name='template_id' onchange='this.form.submit()'>%s</select>"
-#                "</form></td>"
+#                "</form>%s</td>"
 #                "<td class='%s'>%s</td>"
 #                "<td class='acts'><button form='u%d' title='ذخیره'>ثبت</button>"
 #                "<form method='post' action='/%s/user-status'>"
@@ -8533,7 +11415,7 @@ exit 0
 #                   human(r["used_bytes"]),
 #                   r["id"], p, r["id"], r["id"], r["id"], quota_gb,
 #                   r["id"], speed_mb, r["id"], left,
-#                   p, r["id"], sel, cls, html.escape(label),
+#                   p, r["id"], sel, plan_cell(r, plans), cls, html.escape(label),
 #                   r["id"],
 #                   p, r["id"],
 #                   "active" if r["status"] == "suspended" else "suspended",
@@ -8551,6 +11433,358 @@ exit 0
 #                   "از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای "
 #                   "باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه "
 #                   "دیگر روی رله‌ها اعمال می‌شود.</p></div>")
+#        return "".join(out)
+#
+#    def plans(self):
+#        tpls = STORE.q("SELECT id, name FROM templates ORDER BY id")
+#        rows = STORE.q("SELECT p.*, (SELECT count(*) FROM users u"
+#                       " WHERE u.plan_id = p.id) AS holders FROM plans p"
+#                       " ORDER BY p.active DESC, p.template_id, p.price, p.id")
+#        p = CFG["ADMIN_PATH"]
+#        head = ("<tr><th>نام</th><th>قالب</th><th>روز</th><th>حجم (گیگ)</th>"
+#                "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>توضیح برای مشتری</th>"
+#                "<th>%s</th><th></th></tr>")
+#        out = ["<div class='card'><h2>پلن‌ها (%d)</h2>" % len(rows)]
+#        if not rows:
+#            out.append("<p class='muted'>هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، "
+#                       "مشتری رسید را بدون انتخاب پلن می‌فرستد و سهمیه را خودتان "
+#                       "می‌گذارید.</p>")
+#        else:
+#            out.append("<table>" + head % "مشتری")
+#            for r in rows:
+#                form = "p%d" % r["id"]
+#                ask = html.escape(json.dumps("پلن «%s» حذف شود؟" % r["name"],
+#                                             ensure_ascii=False), quote=True)
+#                out.append(
+#                    "<tr%s>%s<td>%d</td><td class='acts'>"
+#                    "<form id='%s' method='post' action='/%s/plan-save'>"
+#                    "<input type='hidden' name='id' value='%d'></form>"
+#                    "<button form='%s'>ذخیره</button>"
+#                    "<form method='post' action='/%s/plan-active'>"
+#                    "<input type='hidden' name='id' value='%d'>"
+#                    "<input type='hidden' name='to' value='%d'>"
+#                    "<button class='ghost' title='%s'>%s</button></form>"
+#                    "<form method='post' action='/%s/plan-delete'"
+#                    " onsubmit='return confirm(%s)'>"
+#                    "<input type='hidden' name='id' value='%d'>"
+#                    "<button class='del'>حذف</button></form></td></tr>"
+#                    % ("" if r["active"] else " class='off'",
+#                       plan_fields(form, tpls, dict(r)), r["holders"],
+#                       form, p, r["id"], form,
+#                       p, r["id"], 0 if r["active"] else 1,
+#                       "دیگر فروخته نشود؛ دارندگانش تا آخر دوره می‌مانند"
+#                       if r["active"] else "دوباره فروخته شود",
+#                       "خاموش" if r["active"] else "روشن",
+#                       p, ask, r["id"]))
+#            out.append("</table>")
+#        out.append("</div>")
+#        out.append("<div class='card'><h2>پلن تازه</h2>"
+#                   "<form id='pnew' method='post' action='/%s/plan-save'></form>"
+#                   "<table>%s<tr>%s<td></td><td><button form='pnew'>ساختن</button>"
+#                   "</td></tr></table>"
+#                   "<p class='muted'>هر پلن یعنی یک قالب، برای چند روز، با یک حجم و "
+#                   "یک قیمت. مشتری در پنل خودش پلن را انتخاب می‌کند و رسید "
+#                   "می‌فرستد؛ با تأیید رسید همه‌چیز خودکار روی حسابش می‌نشیند. "
+#                   "خرید دوبارهٔ همان پلن پیش از تمام شدنش تمدید است: روزها و حجم "
+#                   "روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو "
+#                   "شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از "
+#                   "خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ "
+#                   "حجم پذیرفته نمی‌شود.</p><p class='muted'>🎁 «تست رایگان»: فروخته "
+#                   "نمی‌شود؛ مشتری با یک کلیک می‌گیردش، در پنل خودش یا ربات. شرطش "
+#                   "تلگرامِ وصل‌شده است، و هر تلگرام و هر حساب فقط یک بار. کسی که همین "
+#                   "حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. "
+#                   "یک پلن تست در یک زمان.</p></div>"
+#                   % (p, head % "", plan_fields("pnew", tpls)))
+#        return "".join(out)
+#
+#    def queue_bot_test(self, key_id, wait=0):
+#        """A test message for the bot. `wait` gives a bot that is only now
+#        starting the moment it needs to listen, so the first try reaches it."""
+#        stamp = now()
+#        due = (datetime.now(timezone.utc) + timedelta(seconds=wait)).isoformat(
+#            timespec="seconds")
+#        STORE.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                  " next_at) VALUES (?, 'ping', ?, ?, ?)",
+#                  (key_id, json.dumps({"event": "ping", "created_at": stamp,
+#                                       "telegram_id": None, "user_id": None,
+#                                       "audience": "admin",
+#                                       "data": {"text": "✅ ربات به پنل وصل است."}},
+#                                      ensure_ascii=False), stamp, due))
+#
+#    def send_ticket_image(self, ident):
+#        row = STORE.one("SELECT image_blob, image_type FROM ticket_messages WHERE id = ?",
+#                        (int(ident) if ident.isdigit() else 0,))
+#        if not row or row["image_blob"] is None:
+#            return self.send("<h1>404</h1>", 404)
+#        return self.send(bytes(row["image_blob"]), 200, {
+#            "Content-Type": row["image_type"] or "application/octet-stream",
+#            "Content-Disposition": "inline; filename=ticket-%s" % ident})
+#
+#    def tickets(self):
+#        wanted = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t")
+#        if wanted and wanted[0].isdigit():
+#            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
+#                            " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
+#                            " WHERE t.id = ?", (int(wanted[0]),))
+#            if row:
+#                return self.ticket_page(row)
+#        p = CFG["ADMIN_PATH"]
+#        rows = STORE.q(
+#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+#            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
+#            " FROM tickets t JOIN users u ON u.id = t.user_id"
+#            " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
+#            " t.updated_at DESC LIMIT 200")
+#        waiting = sum(1 for r in rows if r["status"] == "open")
+#        out = ["<div class='card'><h2>تیکت‌ها%s</h2>"
+#               % (" — %d منتظر جواب شما" % waiting if waiting else "")]
+#        if not rows:
+#            out.append("<p class='muted'>تیکتی نیامده. مشتری‌ها از پنل خودشان یا از "
+#                       "ربات تیکت می‌فرستند.</p></div>")
+#            return "".join(out)
+#        out.append("<table><tr><th>#</th><th>مشتری</th><th>موضوع</th><th>پیام</th>"
+#                   "<th>وضعیت</th><th>آخرین تغییر</th></tr>")
+#        for r in rows:
+#            out.append("<tr%s><td>%d</td><td>%s</td><td><a href='/%s/tickets?t=%d'>%s</a>"
+#                       "</td><td>%d</td><td class='%s'>%s</td><td class='muted'>%s</td></tr>"
+#                       % (" class='off'" if r["status"] == "closed" else "", r["id"],
+#                          html.escape(ticket_who(r)), p, r["id"], html.escape(r["subject"]),
+#                          r["n"], TICKET_STATES[r["status"]][1],
+#                          TICKET_STATES[r["status"]][0],
+#                          html.escape(r["updated_at"][:16].replace("T", " "))))
+#        out.append("</table></div>")
+#        return "".join(out)
+#
+#    def ticket_page(self, t):
+#        p = CFG["ADMIN_PATH"]
+#        msgs = STORE.q("SELECT id, from_admin, body, created_at,"
+#                       " image_blob IS NOT NULL AS has_image FROM ticket_messages"
+#                       " WHERE ticket_id = ? ORDER BY id", (t["id"],))
+#        label, cls = TICKET_STATES[t["status"]]
+#        out = ["<div class='card'><h2>#%d · %s</h2>"
+#               "<p>%s · <span class='%s'>%s</span> · "
+#               "<a href='/%s/users'>حساب این مشتری ←</a></p><div class='thread'>"
+#               % (t["id"], html.escape(t["subject"]), html.escape(ticket_who(t)),
+#                  cls, label, p)]
+#        for m in msgs:
+#            pic = ("<a href='/%s/ticket-image/%d' target='_blank'>"
+#                   "<img src='/%s/ticket-image/%d' alt='عکس'></a>"
+#                   % (p, m["id"], p, m["id"])) if m["has_image"] else ""
+#            out.append("<div class='msg-%s'><div class='meta'>%s · %s</div>"
+#                       "<div class='text'>%s</div>%s</div>"
+#                       % ("admin" if m["from_admin"] else "customer",
+#                          "شما" if m["from_admin"] else "مشتری",
+#                          html.escape(m["created_at"][:16].replace("T", " ")),
+#                          html.escape(m["body"]), pic))
+#        out.append("</div>")
+#        out.append("<form method='post' action='/%s/ticket-reply'"
+#                   " enctype='multipart/form-data'>"
+#                   "<input type='hidden' name='id' value='%d'>"
+#                   "<div class='f'><label>جواب</label>"
+#                   "<textarea name='body' rows='4' required maxlength='2000'"
+#                   " style='width:100%%'></textarea></div>"
+#                   "<div class='f'><label>عکس (اختیاری)</label>"
+#                   "<input type='file' name='image' accept='image/jpeg,image/png,image/webp'>"
+#                   "</div><button>فرستادن جواب</button></form>" % (p, t["id"]))
+#        to = "open" if t["status"] == "closed" else "closed"
+#        out.append("<form method='post' action='/%s/ticket-status' style='margin-top:12px'>"
+#                   "<input type='hidden' name='id' value='%d'>"
+#                   "<input type='hidden' name='to' value='%s'>"
+#                   "<button class='ghost'>%s</button></form>"
+#                   "<p class='muted'>مشتری جواب را در پنل خودش یا در ربات می‌بیند. اگر "
+#                   "در تیکت بسته بنویسد، دوباره باز می‌شود. عکس‌های تیکت بسته %d روز "
+#                   "بعد پاک می‌شوند؛ متن می‌ماند.</p></div>"
+#                   % (p, t["id"], to, "باز کردن دوباره" if to == "open" else "بستن تیکت",
+#                      TICKET_IMAGE_DAYS))
+#        return "".join(out)
+#
+#    def bot_page(self):
+#        p = CFG["ADMIN_PATH"]
+#        installed, configured, running, last = bot_state()
+#        env = read_env(BOT_ENV)
+#        name = STORE.one("SELECT value FROM settings WHERE key = 'bot_username'")
+#        name = name["value"] if name and name["value"] else ""
+#        out = ["<div class='card'><h2>ربات تلگرام</h2>"]
+#        if not installed:
+#            out.append("<p class='bad'>فایل ربات روی این سرور نیست. نصب‌کننده را یک بار دیگر "
+#                       "روی همین سرور اجرا کنید تا اضافه شود.</p></div>")
+#            return "".join(out)
+#        if configured:
+#            out.append("<p>ربات%s: %s</p>" % (
+#                " <a href='https://t.me/%s' target='_blank' rel='noopener'>@%s</a>"
+#                % (html.escape(name), html.escape(name)) if name else "",
+#                "<span class='ok'>روشن</span>" if running else "<span class='bad'>خاموش</span>"))
+#            if last:
+#                out.append("<p class='muted'>آخرین پیام‌های ربات:</p><pre dir='ltr' "
+#                           "style='white-space:pre-wrap;font-size:12px'>%s</pre>"
+#                           % html.escape(last[-600:]))
+#            out.append("<div class='row'>"
+#                       "<form method='post' action='/%s/bot-power'><input type='hidden'"
+#                       " name='to' value='%s'><button class='ghost'>%s</button></form>"
+#                       "<form method='post' action='/%s/bot-test'>"
+#                       "<button class='ghost'>ارسال پیام آزمایشی</button></form></div>"
+#                       % (p, "off" if running else "on",
+#                          "خاموش کردن" if running else "روشن کردن", p))
+#        else:
+#            out.append("<p>یک ربات تلگرام برای مشتری‌ها و خودتان: خرید پلن و فرستادن رسید، "
+#                       "ثبت آی‌پی، تیکت، و برای شما رسید تازه با دکمهٔ تأیید. همه‌چیز روی "
+#                       "همین سرور است.</p>")
+#        out.append("</div>")
+#        token = env.get("BOT_TOKEN", "")
+#        out.append(
+#            "<div class='card'><h2>%s</h2>"
+#            "<ol class='muted'>"
+#            "<li>در تلگرام به <b>@BotFather</b> بروید، <code>/newbot</code> بزنید و توکن را "
+#            "بگیرید.</li>"
+#            "<li>ربات تازه را در تلگرام باز کنید و <b>Start</b> را بزنید؛ وگرنه ربات "
+#            "نمی‌تواند به شما پیام بدهد.</li>"
+#            "<li>آیدی عددی تلگرام خودتان را از <b>@userinfobot</b> بگیرید.</li></ol>"
+#            "<form method='post' action='/%s/bot-setup'>"
+#            "<div class='f'><label>توکن ربات%s</label>"
+#            "<input name='token' dir='ltr' autocomplete='off' style='width:100%%'"
+#            " placeholder='123456789:AA...'%s></div>"
+#            "<div class='f'><label>آیدی عددی تلگرام شما (چند تا با ویرگول)</label>"
+#            "<input name='admins' dir='ltr' value='%s' placeholder='123456789'></div>"
+#            "<div class='f'><label>متن راهنما (اختیاری، زیر «راهنما» در ربات)</label>"
+#            "<input name='support' value='%s' maxlength='200' style='width:100%%'></div>"
+#            "<button>%s</button></form>"
+#            "<p class='muted'>شماره کارت را در تنظیمات ← «اطلاعات پرداخت» بنویسید؛ ربات از "
+#            "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد (صفحهٔ API)، "
+#            "آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را "
+#            "روشن می‌کند.</p></div>"
+#            % ("تنظیمات ربات" if configured else "راه‌اندازی",
+#               p, " (فعلی: ...%s — خالی بگذارید تا همین بماند)" % html.escape(token[-4:])
+#               if token else "", "" if token else " required",
+#               html.escape(env.get("ADMIN_IDS", ""), quote=True),
+#               html.escape(env.get("SUPPORT_TEXT", "").replace("\\n", " "), quote=True),
+#               "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات"))
+#        return "".join(out)
+#
+#    def api_keys(self):
+#        p = CFG["ADMIN_PATH"]
+#        rows = STORE.q("SELECT * FROM api_tokens ORDER BY revoked_at IS NOT NULL, id DESC")
+#        out = ["<div class='card'><h2>API ربات</h2>"
+#               "<p>ربات فروش (مال خودتان یا کس دیگری) از این در به پنل وصل می‌شود: "
+#               "ثبت‌نام مشتری با آیدی تلگرام، دیدن حساب، ثبت آی‌پی، دیدن پلن‌ها و "
+#               "فرستادن رسید. رسیدها مثل همیشه در صفحهٔ رسیدها منتظر تأیید شما "
+#               "می‌مانند.</p>"
+#               "<p>آدرس: <code>%s</code></p>"
+#               "<p class='muted'>راهنمای کامل دستورها: "
+#               "<a href='https://github.com/mehdi047/doctor-dns/blob/main/docs/bot-api.md'"
+#               " target='_blank' rel='noopener'>docs/bot-api.md</a>. "
+#               "پورت ۸۴۴۵ را اگر فایروال سرور یا دیتاسنتر دارد باز کنید.</p></div>"
+#               % html.escape(bot_api_url())]
+#        out.append("<div class='card'><h2>کلیدها</h2>")
+#        if not rows:
+#            out.append("<p class='muted'>هنوز کلیدی نساخته‌اید.</p>")
+#        else:
+#            out.append("<table><tr><th>نام</th><th>دسترسی</th><th>ساخته شده</th>"
+#                       "<th>آخرین استفاده</th><th>فقط از آدرس</th><th>وضعیت</th>"
+#                       "<th></th></tr>")
+#            for r in rows:
+#                live = not r["revoked_at"]
+#                ask = html.escape(json.dumps(
+#                    "کلید «%s» باطل شود؟ رباتی که با آن کار می‌کند فوراً قطع می‌شود."
+#                    % r["name"], ensure_ascii=False), quote=True)
+#                out.append(
+#                    "<tr%s><td>%s</td><td>%s</td><td class='muted'>%s</td>"
+#                    "<td class='muted'>%s</td><td><code>%s</code></td><td class='%s'>%s</td>"
+#                    "<td class='acts'>%s</td></tr>"
+#                    % ("" if live else " class='off'", html.escape(r["name"]),
+#                       "<span class='warn'>ادمین</span>" if r["scope"] == "admin"
+#                       else "مشتری",
+#                       html.escape(r["created_at"][:16].replace("T", " ")),
+#                       html.escape((r["last_used_at"] or "هرگز")[:16].replace("T", " ")),
+#                       html.escape(r["allow_ips"] or "همه"),
+#                       "ok" if live else "bad", "فعال" if live else "باطل شده",
+#                       ("<form method='post' action='/%s/api-key-revoke'"
+#                        " onsubmit='return confirm(%s)'>"
+#                        "<input type='hidden' name='id' value='%d'>"
+#                        "<button class='del'>باطل کردن</button></form>"
+#                        % (p, ask, r["id"])) if live else ""))
+#            out.append("</table>")
+#        out.append("</div>")
+#        live = [r for r in rows if not r["revoked_at"]]
+#        if live:
+#            out.append("<div class='card'><h2>خبر دادن به ربات (webhook)</h2>"
+#                       "<p>پنل به این آدرس ربات خبر می‌دهد: تأیید یا رد رسید، جواب "
+#                       "تیکت، ۸۰٪ و ۹۵٪ حجم، تمام شدن حجم، نزدیک شدن و تمام شدن دوره. "
+#                       "هر خبر یک متن فارسی آماده دارد که ربات می‌تواند عیناً برای "
+#                       "مشتری بفرستد.</p><table><tr><th>کلید</th><th>آدرس ربات</th>"
+#                       "<th></th></tr>")
+#            for r in live:
+#                out.append(
+#                    "<tr><td>%s</td><td><form id='w%d' method='post'"
+#                    " action='/%s/api-webhook-save'><input type='hidden' name='id'"
+#                    " value='%d'></form><input form='w%d' name='url' value='%s' dir='ltr'"
+#                    " size='34' placeholder='https://bot.example.com/doctor-dns'></td>"
+#                    "<td class='acts'><button form='w%d'>ذخیره</button>%s</td></tr>"
+#                    % (html.escape(r["name"]), r["id"], p, r["id"], r["id"],
+#                       html.escape(r["webhook_url"] or "", quote=True), r["id"],
+#                       ("<form method='post' action='/%s/api-webhook-test'>"
+#                        "<input type='hidden' name='id' value='%d'>"
+#                        "<button class='ghost'>ارسال آزمایشی</button></form>"
+#                        "<form method='post' action='/%s/api-webhook-save'>"
+#                        "<input type='hidden' name='id' value='%d'>"
+#                        "<input type='hidden' name='url' value=''>"
+#                        "<button class='del'>حذف</button></form>"
+#                        % (p, r["id"], p, r["id"])) if r["webhook_url"] else ""))
+#            bot = STORE.one("SELECT value FROM settings WHERE key = 'bot_link'")
+#            out.append("</table><form method='post' action='/%s/bot-link-save'"
+#                       " class='row' style='margin-top:12px'>"
+#                       "<label style='margin:0'>آدرس ربات برای مشتری‌ها</label>"
+#                       "<input name='link' value='%s' dir='ltr' size='30'"
+#                       " placeholder='https://t.me/MyBot'><button class='ghost'>ذخیره"
+#                       "</button></form><p class='muted'>با این آدرس، دکمهٔ «اتصال به "
+#                       "تلگرام» در پنل مشتری ربات را مستقیم باز می‌کند و کد اتصال را "
+#                       "خودش می‌فرستد (<code>/start link_...</code>).</p>"
+#                       % (p, html.escape(bot["value"] if bot and bot["value"] else "",
+#                                         quote=True)))
+#            out.append("<p class='muted'>آدرس باید https باشد (یا http روی همین "
+#                       "سرور). با ذخیرهٔ آدرس تازه، یک رمز امضا یک بار نشان داده می‌شود "
+#                       "تا ربات مطمئن شود خبر از طرف این پنل است. اگر ربات در دسترس "
+#                       "نباشد، خبر تا حدود یک روز دوباره فرستاده می‌شود.</p>")
+#            recent = STORE.q("SELECT o.*, k.name FROM webhook_outbox o"
+#                             " LEFT JOIN api_tokens k ON k.id = o.token_id"
+#                             " ORDER BY o.id DESC LIMIT 15")
+#            if recent:
+#                out.append("<table><tr><th>خبر</th><th>ربات</th><th>زمان</th>"
+#                           "<th>وضعیت</th></tr>")
+#                for o in recent:
+#                    if o["delivered_at"]:
+#                        state = "<span class='ok'>رسید</span>"
+#                    elif o["attempts"] >= WEBHOOK_MAX_TRIES:
+#                        state = "<span class='bad'>نرسید</span> <span class='muted'>%s</span>" \
+#                            % html.escape(o["last_error"] or "")
+#                    elif o["attempts"]:
+#                        state = ("<span class='warn'>تلاش دوباره (%d)</span> "
+#                                 "<span class='muted'>%s</span>"
+#                                 % (o["attempts"], html.escape(o["last_error"] or "")))
+#                    else:
+#                        state = "<span class='muted'>در صف</span>"
+#                    out.append("<tr><td><code>%s</code></td><td>%s</td>"
+#                               "<td class='muted'>%s</td><td>%s</td></tr>"
+#                               % (html.escape(o["event"]), html.escape(o["name"] or "-"),
+#                                  html.escape(o["created_at"][:16].replace("T", " ")),
+#                                  state))
+#                out.append("</table>")
+#            out.append("</div>")
+#        out.append("<div class='card'><h2>کلید تازه</h2>"
+#                   "<form method='post' action='/%s/api-key-new'>"
+#                   "<div class='f'><label>نام (برای خودتان، مثلاً «ربات فروش»)</label>"
+#                   "<input name='name' required maxlength='40'></div>"
+#                   "<div class='f'><label>فقط از این آدرس‌ها (اختیاری، با ویرگول جدا)"
+#                   "</label><input name='allow_ips' maxlength='200' dir='ltr'"
+#                   " placeholder='مثلاً 203.0.113.7'></div>"
+#                   "<div class='f'><label style='display:inline'>"
+#                   "<input type='checkbox' name='admin' value='1'> دسترسی ادمین</label>"
+#                   "<div class='muted'>ربات با این کلید رسید تأیید یا رد می‌کند، کاربر مسدود "
+#                   "می‌کند، پلن می‌دهد و به تیکت جواب می‌دهد، و رسید و تیکت تازه و گزارش "
+#                   "روزانه را خبر می‌گیرد. فقط برای ربات خودتان.</div></div>"
+#                   "<button>ساختن کلید</button></form>"
+#                   "<p class='muted'>اگر آی‌پی سرور ربات ثابت است، آن را بنویسید: کلیدی "
+#                   "که لو برود از جای دیگر کار نمی‌کند. برای کلید ادمین این کار را حتماً "
+#                   "بکنید.</p></div>" % p)
 #        return "".join(out)
 #
 #    def templates(self):
@@ -8784,17 +12018,32 @@ exit 0
 #            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
 #            "تأیید می‌خواهد.</p></div>" % (p, p))
 #
-#        support = STORE.one("SELECT value FROM settings WHERE key = 'support_contact'")
-#        out.append("<div class='card'><h2>پشتیبانی</h2>"
-#                   "<form method='post' action='/%s/support-save' class='row'>"
-#                   "<input name='contact' value='%s' maxlength='64' "
-#                   "placeholder='@your_support' style='min-width:240px;direction:ltr'>"
-#                   "<button class='ghost'>ذخیره</button></form>"
-#                   "<p class='muted'>زیر فرم ورود مشتری‌ها نوشته می‌شود: «رمز را "
-#                   "فراموش کرده‌اید؟ به پشتیبانی پیام دهید» و بعد همین آیدی یا "
-#                   "شماره. خالی باشد، همان جمله بدون آیدی می‌آید.</p></div>"
-#                   % (p, html.escape(support["value"] if support else "",
-#                                     quote=True)))
+#        need = STORE.one("SELECT value FROM settings WHERE key = 'require_telegram'")
+#        bot = STORE.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
+#                        " AND COALESCE(webhook_url, '') != ''")
+#        on = bool(need and need["value"] == "1")
+#        out.append("<div class='card'><h2>تلگرام اجباری</h2>"
+#                   "<form method='post' action='/%s/telegram-required'>"
+#                   "<label style='display:inline'><input type='checkbox' name='on' value='1'%s>"
+#                   " مشتری‌های پنل وب برای خرید و تمدید باید تلگرامشان را به ربات وصل کنند"
+#                   "</label> <button class='ghost'>ذخیره</button></form>"
+#                   "<p class='muted'>هر تلگرام فقط به یک حساب وصل می‌شود، پس هر کس به سختی "
+#                   "بیش از یک حساب می‌سازد. سرویس کسی قطع نمی‌شود؛ فقط خرید تازه و تمدید "
+#                   "منتظر وصل شدن می‌ماند. تیکت آزاد است.</p>%s</div>"
+#                   % (p, " checked" if on else "",
+#                      "" if bot else "<p class='bad'>هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ "
+#                      "تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.</p>"))
+#
+#        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
+#        out.append("<div class='card'><h2>اطلاعات پرداخت</h2>"
+#                   "<form method='post' action='/%s/pay-save'>"
+#                   "<textarea name='text' rows='3' maxlength='%d' style='width:100%%'"
+#                   " placeholder='مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید'>"
+#                   "%s</textarea><button class='ghost' style='margin-top:8px'>ذخیره</button>"
+#                   "</form><p class='muted'>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و "
+#                   "در ربات همین را می‌بیند: کجا و به نام چه کسی واریز کند. عوض کردنش "
+#                   "فوراً همه‌جا عوض می‌شود.</p></div>"
+#                   % (p, PAY_TEXT_MAX, html.escape(pay["value"] if pay else "")))
 #
 #        out.append("<div class='card'><h2>آدرس این پنل</h2>"
 #                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
@@ -8929,14 +12178,348 @@ exit 0
 #            to = one("to")
 #            if to not in ("approved", "rejected"):
 #                return self.redirect("receipts?m=!تصمیم نامعتبر")
+#            row = STORE.one("SELECT user_id, plan_id, status FROM transactions"
+#                            " WHERE id = ?", (tid,))
+#            # Only once. A second click - a double tap, the back button - on a
+#            # receipt already decided must not renew the plan a second time.
+#            if not row or row["status"] != "pending":
+#                return self.redirect("receipts?m=!این رسید قبلاً بررسی شده")
 #            # The image goes with the decision. It was evidence for a judgement
 #            # that has now been made, and keeping every customer's bank slip
 #            # for ever is a liability rather than a record.
-#            STORE.run("UPDATE transactions SET status = ?, decided_at = ?,"
-#                      " receipt_blob = NULL WHERE id = ?", (to, now(), tid))
-#            return self.redirect(
-#                "receipts?m=%s" % ("رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید"
-#                                   if to == "approved" else "رسید رد شد"))
+#            cur = STORE.run("UPDATE transactions SET status = ?, decided_at = ?,"
+#                            " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+#                            (to, now(), tid))
+#            if not cur.rowcount:
+#                return self.redirect("receipts?m=!این رسید قبلاً بررسی شده")
+#            if to == "rejected":
+#                emit("receipt.rejected", row["user_id"], {
+#                    "receipt_id": tid,
+#                    "text": "رسید پرداخت شما تأیید نشد. اگر فکر می‌کنید اشتباهی شده، "
+#                            "با پشتیبانی در تماس باشید."})
+#                return self.redirect("receipts?m=رسید رد شد")
+#            if row["plan_id"]:
+#                done = STORE.apply_plan(row["user_id"], row["plan_id"])
+#                if done:
+#                    log(INFO, "receipt #%d approved: user #%d, plan #%d"
+#                        % (tid, row["user_id"], row["plan_id"]))
+#                    emit("receipt.approved", row["user_id"],
+#                         dict(plan_event(row["user_id"]), receipt_id=tid,
+#                              text="رسید پرداخت شما تأیید شد. %s" % done))
+#                    return self.redirect("receipts?m=رسید تأیید شد؛ %s" % done)
+#                emit("receipt.approved", row["user_id"], {
+#                    "receipt_id": tid,
+#                    "text": "رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود."})
+#                return self.redirect("receipts?m=!رسید تأیید شد ولی آن پلن دیگر "
+#                                     "نیست؛ سهمیه و زمان را در صفحهٔ کاربران بگذارید")
+#            emit("receipt.approved", row["user_id"], {
+#                "receipt_id": tid,
+#                "text": "رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود."})
+#            return self.redirect("receipts?m=رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید")
+#
+#        if rest == "plan-save":
+#            pid = int(one("id") or 0)
+#            name = one("name").strip()[:60]
+#            if not name:
+#                return self.redirect("plans?m=!اسم پلن لازم است")
+#            tid = int(one("template_id") or 0)
+#            if not STORE.one("SELECT 1 FROM templates WHERE id = ?", (tid,)):
+#                return self.redirect("plans?m=!قالب پلن پیدا نشد")
+#            days = number(one("days"))
+#            if days is None or days != int(days) or not 1 <= days <= 3650:
+#                return self.redirect("plans?m=!مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰")
+#            # Unlimited only when it is ticked. An empty or zero box is a
+#            # mistake to point out, not a plan that gives away everything.
+#            if one("unlimited"):
+#                quota = 0
+#            else:
+#                gb = number(one("quota_gb"))
+#                if gb is None or gb <= 0:
+#                    return self.redirect("plans?m=!حجم را به گیگ بنویسید، یا تیک "
+#                                         "«نامحدود» را بزنید")
+#                quota = int(gb * GB)
+#            trial = one("trial") == "1"
+#            # A trial is given, not sold: whatever was typed as its price.
+#            price = 0 if trial else number(one("price"))
+#            if price is None or price < 0 or price != int(price):
+#                return self.redirect("plans?m=!قیمت باید عدد درست باشد، به تومان")
+#            # One on offer at a time: two would leave a customer to pick the
+#            # bigger one, and "one trial" would mean nothing.
+#            if trial and STORE.one("SELECT 1 FROM plans WHERE is_trial = 1 AND active = 1"
+#                                   " AND id != ?", (pid,)):
+#                return self.redirect("plans?m=!یک پلن تست رایگانِ روشن دیگر هست؛ اول آن را "
+#                                     "خاموش کنید")
+#            speed = number(one("speed_mb") or "0")
+#            if speed is None or speed < 0:
+#                return self.redirect("plans?m=!سرعت باید عدد باشد؛ خالی یعنی بی‌حد")
+#            values = (name, tid, int(days), quota, int(price), int(speed * 1000),
+#                      one("note").strip()[:120], 1 if trial else 0)
+#            if pid:
+#                cur = STORE.run("UPDATE plans SET name = ?, template_id = ?, days = ?,"
+#                                " quota_bytes = ?, price = ?, speed_kbps = ?, note = ?,"
+#                                " is_trial = ? WHERE id = ?", values + (pid,))
+#                if not cur.rowcount:
+#                    return self.redirect("plans?m=!این پلن پیدا نشد")
+#                # Those who hold it keep what they bought; the change is for the
+#                # next purchase or renewal.
+#                return self.redirect("plans?m=پلن ذخیره شد؛ برای خریدهای بعدی")
+#            STORE.run("INSERT INTO plans (name, template_id, days, quota_bytes, price,"
+#                      " speed_kbps, note, is_trial, active, created_at)"
+#                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)", values + (now(),))
+#            return self.redirect("plans?m=%s" % (
+#                "پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش"
+#                if trial else "پلن ساخته شد و در پنل مشتری دیده می‌شود"))
+#
+#        if rest == "plan-active":
+#            to = 1 if one("to") == "1" else 0
+#            row = STORE.one("SELECT is_trial FROM plans WHERE id = ?", (int(one("id") or 0),))
+#            if to and row and row["is_trial"] and STORE.one(
+#                    "SELECT 1 FROM plans WHERE is_trial = 1 AND active = 1 AND id != ?",
+#                    (int(one("id") or 0),)):
+#                return self.redirect("plans?m=!یک پلن تست رایگانِ روشن دیگر هست؛ اول آن را "
+#                                     "خاموش کنید")
+#            STORE.run("UPDATE plans SET active = ? WHERE id = ?",
+#                      (to, int(one("id") or 0)))
+#            return self.redirect("plans?m=%s" % (
+#                "پلن دوباره فروخته می‌شود" if to else
+#                "پلن دیگر فروخته نمی‌شود؛ کسانی که دارندش تا آخر دوره می‌مانند"))
+#
+#        if rest == "plan-delete":
+#            pid = int(one("id") or 0)
+#            # Deleting a plan somebody holds would leave their account naming
+#            # nothing, and their renewal starting from scratch. Switching it off
+#            # does what the operator wants without either.
+#            if STORE.one("SELECT 1 FROM users WHERE plan_id = ?", (pid,)):
+#                return self.redirect("plans?m=!این پلن مشتری دارد؛ به جای حذف، "
+#                                     "خاموشش کنید")
+#            if STORE.one("SELECT 1 FROM transactions WHERE plan_id = ?"
+#                         " AND status = 'pending'", (pid,)):
+#                return self.redirect("plans?m=!رسیدی برای این پلن در انتظار است؛ "
+#                                     "اول آن را بررسی کنید")
+#            STORE.run("DELETE FROM plans WHERE id = ?", (pid,))
+#            return self.redirect("plans?m=پلن حذف شد")
+#
+#        if rest == "ticket-reply":
+#            # Multipart, for the picture, so the text fields come out of the
+#            # same body as the file does.
+#            raw = getattr(self, "raw_body", None)
+#            ctype = self.headers.get("Content-Type") if raw is not None else None
+#
+#            def field(name):
+#                if raw is None:
+#                    return one(name)
+#                try:
+#                    return parse_upload(raw, ctype, name).decode("utf-8", "replace")
+#                except ValueError:
+#                    return ""
+#
+#            tid = int(field("id") or 0) if field("id").strip().isdigit() else 0
+#            text = field("body").replace("\r\n", "\n").strip()[:TICKET_BODY_MAX]
+#            if not STORE.one("SELECT 1 FROM tickets WHERE id = ?", (tid,)):
+#                return self.redirect("tickets?m=!این تیکت پیدا نشد")
+#            if not text:
+#                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید" % tid)
+#            blob = kind = None
+#            if raw is not None:
+#                try:
+#                    blob = parse_upload(raw, ctype, "image") or None
+#                except ValueError:
+#                    blob = None
+#            if blob:
+#                if len(blob) > TICKET_IMAGE_MAX:
+#                    return self.redirect("tickets?t=%d&m=!عکس بزرگ‌تر از ۴ مگابایت است" % tid)
+#                kind = image_kind(blob)
+#                if not kind:
+#                    return self.redirect("tickets?t=%d&m=!فقط عکس JPG، PNG یا WEBP" % tid)
+#            stamp = now()
+#            STORE.run("INSERT INTO ticket_messages (ticket_id, from_admin, body,"
+#                      " image_blob, image_type, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+#                      (tid, text, blob, kind, stamp))
+#            STORE.run("UPDATE tickets SET status = 'answered', updated_at = ? WHERE id = ?",
+#                      (stamp, tid))
+#            ticket = STORE.one("SELECT user_id, subject FROM tickets WHERE id = ?", (tid,))
+#            emit("ticket.answered", ticket["user_id"], {
+#                "ticket_id": tid, "subject": ticket["subject"], "body": text,
+#                "has_image": bool(blob),
+#                "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
+#            return self.redirect("tickets?t=%d&m=جواب فرستاده شد" % tid)
+#
+#        if rest == "ticket-status":
+#            tid = int(one("id") or 0)
+#            to = one("to")
+#            if to not in ("open", "closed"):
+#                return self.redirect("tickets?m=!وضعیت نامعتبر")
+#            cur = STORE.run("UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
+#                            (to, now(), tid))
+#            if not cur.rowcount:
+#                return self.redirect("tickets?m=!این تیکت پیدا نشد")
+#            return self.redirect("tickets?t=%d&m=%s" % (
+#                tid, "تیکت بسته شد" if to == "closed" else "تیکت دوباره باز شد"))
+#
+#        if rest == "bot-setup":
+#            if not os.path.exists(BOT_BIN):
+#                return self.redirect("bot?m=!فایل ربات روی این سرور نیست؛ نصب‌کننده را "
+#                                     "دوباره اجرا کنید")
+#            env = read_env(BOT_ENV)
+#            token = one("token").strip() or env.get("BOT_TOKEN", "")
+#            if not re.fullmatch(r"\d{5,15}:[A-Za-z0-9_-]{30,50}", token):
+#                return self.redirect("bot?m=!توکن درست نیست؛ از @BotFather کپی کنید")
+#            admins = ",".join(re.findall(r"\d{4,15}", one("admins")))
+#            if not admins:
+#                return self.redirect("bot?m=!آیدی عددی تلگرام خودتان را بنویسید")
+#            username, why = bot_getme(token)
+#            if why:
+#                return self.redirect("bot?m=!%s" % why)
+#            # The key the bot speaks with. The one it already has, if it is
+#            # still good - only a hash is kept here, so a key cannot be read
+#            # back, only reused from the bot's own file or made anew.
+#            key = env.get("API_KEY", "")
+#            row = STORE.one("SELECT * FROM api_tokens WHERE token_hash = ? AND revoked_at"
+#                            " IS NULL", (hashlib.sha256(key.encode("utf-8")).hexdigest(),)) \
+#                if key else None
+#            if not row:
+#                key = "dd_" + secrets.token_urlsafe(32)
+#                STORE.run("INSERT INTO api_tokens (name, token_hash, created_at, scope)"
+#                          " VALUES (?, ?, ?, 'admin')",
+#                          ("ربات تلگرام @%s" % username,
+#                           hashlib.sha256(key.encode("utf-8")).hexdigest(), now()))
+#                row = STORE.one("SELECT * FROM api_tokens WHERE token_hash = ?",
+#                                (hashlib.sha256(key.encode("utf-8")).hexdigest(),))
+#            secret = row["webhook_secret"] or "whsec_" + secrets.token_urlsafe(24)
+#            STORE.run("UPDATE api_tokens SET webhook_url = ?, webhook_secret = ?, scope = 'admin'"
+#                      " WHERE id = ?", ("http://%s/" % BOT_LISTEN, secret, row["id"]))
+#            for k, v in (("bot_link", "https://t.me/%s" % username),
+#                         ("bot_username", username)):
+#                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, v))
+#            write_env(BOT_ENV, {
+#                "BOT_TOKEN": token, "API_URL": bot_api_url().rstrip("/"), "API_KEY": key,
+#                "WEBHOOK_SECRET": secret, "LISTEN": BOT_LISTEN, "ADMIN_IDS": admins,
+#                "PAY_TEXT": "", "SUPPORT_TEXT": " ".join(one("support").split())[:200]})
+#            systemctl("enable", BOT_UNIT)
+#            started = systemctl("restart", BOT_UNIT)
+#            log(INFO, "telegram bot @%s set up for admin(s) %s" % (username, admins))
+#            if started:
+#                self.queue_bot_test(row["id"], wait=10)
+#            return self.redirect("bot?m=%s" % (
+#                "ربات @%s روشن شد؛ یک پیام آزمایشی به تلگرامتان رفت" % username if started
+#                else "!تنظیمات ذخیره شد ولی ربات روشن نشد؛ پیام‌های پایین صفحه را ببینید"))
+#
+#        if rest == "bot-power":
+#            on = one("to") == "on"
+#            if on and not read_env(BOT_ENV).get("BOT_TOKEN"):
+#                return self.redirect("bot?m=!اول ربات را راه‌اندازی کنید")
+#            ok = systemctl("enable" if on else "disable", "--now", BOT_UNIT)
+#            return self.redirect("bot?m=%s%s" % (
+#                "" if ok else "!", ("ربات روشن شد" if on else "ربات خاموش شد") if ok
+#                else "نشد؛ پیام‌های ربات را ببینید"))
+#
+#        if rest == "bot-test":
+#            env = read_env(BOT_ENV)
+#            row = STORE.one("SELECT id FROM api_tokens WHERE token_hash = ? AND revoked_at"
+#                            " IS NULL", (hashlib.sha256(env.get("API_KEY", "").encode(
+#                                "utf-8")).hexdigest(),))
+#            if not row:
+#                return self.redirect("bot?m=!ربات راه‌اندازی نشده")
+#            self.queue_bot_test(row["id"])
+#            return self.redirect("bot?m=پیام آزمایشی در صف است؛ چند ثانیه دیگر در تلگرام")
+#
+#        if rest == "api-key-new":
+#            name = one("name").strip()[:40]
+#            if not name:
+#                return self.redirect("api?m=!یک نام برای کلید بنویسید")
+#            allowed = []
+#            for a in one("allow_ips").replace("،", ",").split(","):
+#                a = a.strip()
+#                if not a:
+#                    continue
+#                try:
+#                    allowed.append(str(ipaddress.ip_address(a)))
+#                except ValueError:
+#                    return self.redirect("api?m=!«%s» آی‌پی درستی نیست" % a[:40])
+#            key = "dd_" + secrets.token_urlsafe(32)
+#            scope = "admin" if one("admin") == "1" else "customer"
+#            STORE.run("INSERT INTO api_tokens (name, token_hash, allow_ips, created_at,"
+#                      " scope) VALUES (?, ?, ?, ?, ?)",
+#                      (name, hashlib.sha256(key.encode("utf-8")).hexdigest(),
+#                       ",".join(allowed) or None, now(), scope))
+#            log(INFO, "bot API key %r made%s%s" % (
+#                name, " with admin rights" if scope == "admin" else "",
+#                " for %s" % ",".join(allowed) if allowed else ""))
+#            # On this page and nowhere else, like a temporary password.
+#            return self.send(page("کلید API", api_key_card(name, key), CFG, "api"))
+#
+#        if rest == "api-webhook-save":
+#            kid = int(one("id") or 0)
+#            key = STORE.one("SELECT * FROM api_tokens WHERE id = ? AND revoked_at IS NULL",
+#                            (kid,))
+#            if not key:
+#                return self.redirect("api?m=!این کلید پیدا نشد")
+#            url = one("url").strip()
+#            if not url:
+#                STORE.run("UPDATE api_tokens SET webhook_url = NULL WHERE id = ?", (kid,))
+#                return self.redirect("api?m=خبر دادن به این ربات خاموش شد")
+#            if len(url) > 300 or not webhook_url_ok(url):
+#                return self.redirect("api?m=!آدرس باید با https:// شروع شود "
+#                                     "(یا http فقط روی همین سرور)")
+#            if url == key["webhook_url"] and key["webhook_secret"]:
+#                return self.redirect("api?m=همان آدرس قبلی است؛ چیزی عوض نشد")
+#            # A new secret with every new address: whoever had the old one has
+#            # no business with messages going somewhere else.
+#            secret = "whsec_" + secrets.token_urlsafe(24)
+#            STORE.run("UPDATE api_tokens SET webhook_url = ?, webhook_secret = ?"
+#                      " WHERE id = ?", (url, secret, kid))
+#            log(INFO, "webhook for key %r set to %s" % (key["name"], url))
+#            return self.send(page("رمز امضای webhook", webhook_secret_card(
+#                key["name"], url, secret), CFG, "api"))
+#
+#        if rest == "api-webhook-test":
+#            kid = int(one("id") or 0)
+#            key = STORE.one("SELECT * FROM api_tokens WHERE id = ? AND revoked_at IS NULL"
+#                            " AND COALESCE(webhook_url, '') != ''", (kid,))
+#            if not key:
+#                return self.redirect("api?m=!این کلید آدرس ربات ندارد")
+#            stamp = now()
+#            STORE.run("INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                      " next_at) VALUES (?, 'ping', ?, ?, ?)",
+#                      (kid, json.dumps({"event": "ping", "created_at": stamp,
+#                                        "telegram_id": None, "user_id": None,
+#                                        "data": {"text": "آزمایش از پنل doctor-dns"}},
+#                                       ensure_ascii=False), stamp, stamp))
+#            return self.redirect("api?m=خبر آزمایشی در صف است؛ چند ثانیه دیگر وضعیتش "
+#                                 "پایین همین صفحه دیده می‌شود")
+#
+#        if rest == "api-key-revoke":
+#            cur = STORE.run("UPDATE api_tokens SET revoked_at = ? WHERE id = ?"
+#                            " AND revoked_at IS NULL", (now(), int(one("id") or 0)))
+#            if not cur.rowcount:
+#                return self.redirect("api?m=!این کلید پیدا نشد یا قبلاً باطل شده")
+#            return self.redirect("api?m=کلید باطل شد؛ رباتی که با آن کار می‌کرد قطع شد")
+#
+#        if rest == "user-unlink-telegram":
+#            uid = int(one("id") or 0)
+#            user = STORE.one("SELECT * FROM users WHERE id = ?", (uid,))
+#            if not user:
+#                return self.redirect("users?m=!این کاربر پیدا نشد")
+#            if not user["telegram_id"]:
+#                return self.redirect("users?m=!این حساب به تلگرام وصل نیست")
+#            if not user["username"] or not user["password_hash"]:
+#                return self.redirect("users?m=!این حساب فقط با تلگرام کار می‌کند؛ جدا "
+#                                     "کردنش یعنی دیگر کسی واردش نمی‌شود")
+#            STORE.run("UPDATE users SET telegram_id = NULL WHERE id = ?", (uid,))
+#            STORE.run("DELETE FROM user_codes WHERE user_id = ?", (uid,))
+#            log(INFO, "telegram %s unlinked from user #%d" % (user["telegram_id"], uid))
+#            return self.redirect("users?m=تلگرام از حساب جدا شد؛ مشتری می‌تواند "
+#                                 "تلگرام تازه را وصل کند")
+#
+#        if rest == "user-plan":
+#            uid, pid = int(one("id") or 0), int(one("plan_id") or 0)
+#            done = STORE.apply_plan(uid, pid)
+#            if not done:
+#                return self.redirect("users?m=!کاربر یا پلن پیدا نشد")
+#            log(INFO, "plan #%d given to user #%d by hand" % (pid, uid))
+#            emit("plan.activated", uid, dict(plan_event(uid), text=done))
+#            return self.redirect("users?m=%s" % done)
 #
 #        if rest == "user-status":
 #            uid = int(one("id") or 0)
@@ -9048,6 +12631,11 @@ exit 0
 #            row = STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))
 #            if not row or row["is_default"]:
 #                return self.redirect("templates?m=!قالب پیش‌فرض حذف نمی‌شود")
+#            # A plan sells this template; without it the plan would sell
+#            # nothing. The operator decides what becomes of those plans first.
+#            if STORE.one("SELECT 1 FROM plans WHERE template_id = ?", (tid,)):
+#                return self.redirect("templates?m=!پلن‌هایی این قالب را می‌فروشند؛ "
+#                                     "اول آن‌ها را حذف کنید یا قالبشان را عوض کنید")
 #            # Move anyone on it back to the default first, so nobody is left
 #            # pointing at a template that no longer exists.
 #            default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
@@ -9135,15 +12723,34 @@ exit 0
 #                                  temp_password_card(user["username"], password),
 #                                  CFG, "users"))
 #
-#        if rest == "support-save":
-#            contact = " ".join(one("contact").split())
-#            if len(contact) > 64:
-#                return self.redirect("settings?m=!حداکثر ۶۴ نویسه")
-#            STORE.run("INSERT INTO settings (key, value) VALUES ('support_contact', ?)"
+#        if rest == "bot-link-save":
+#            link = one("link").strip()
+#            if link and not re.match(r"^https://t\.me/[A-Za-z0-9_]{5,32}$", link):
+#                return self.redirect("api?m=!آدرس ربات باید مثل https://t.me/MyBot باشد")
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('bot_link', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (link,))
+#            return self.redirect("api?m=%s" % ("آدرس ربات ذخیره شد" if link
+#                                               else "آدرس ربات برداشته شد"))
+#
+#        if rest == "telegram-required":
+#            on = one("on") == "1"
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('require_telegram', ?)"
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-#                      (contact,))
-#            return self.redirect("settings?m=ذخیره شد؛ تا ۳۰ ثانیه دیگر زیر "
-#                                 "فرم ورود مشتری‌ها می‌آید")
+#                      ("1" if on else "",))
+#            log(INFO, "telegram %s for buying" % ("required" if on else "optional"))
+#            return self.redirect("settings?m=%s" % (
+#                "از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد" if on
+#                else "وصل کردن تلگرام دیگر اجباری نیست"))
+#
+#        if rest == "pay-save":
+#            text = one("text").replace("\r\n", "\n").strip()
+#            if len(text) > PAY_TEXT_MAX:
+#                return self.redirect("settings?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('pay_text', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (text,))
+#            return self.redirect("settings?m=%s" % (
+#                "اطلاعات پرداخت ذخیره شد؛ در پنل مشتری و ربات دیده می‌شود" if text
+#                else "اطلاعات پرداخت پاک شد"))
 #
 #        if rest == "password":
 #            new = one("password")
@@ -9221,6 +12828,7 @@ exit 0
 #        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #        ctx.load_cert_chain(cert, key)
 #        httpd = make_admin_server(ctx, port)
+#        httpd.follow(cert, key)
 #        scheme = "https"
 #    else:
 #        # Refuse rather than silently serve a login form in the clear: the
@@ -9357,6 +12965,7 @@ exit 0
 #    case "$new" in
 #        53|80|443) die "port $new is the service's own - pick another" ;;
 #        8443) die "port 8443 is the sync API the relays talk to" ;;
+#        8445) die "port 8445 is the bot API" ;;
 #        8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
 #        22) die "port 22 is ssh" ;;
 #    esac
@@ -11312,6 +14921,764 @@ exit 0
 #[Install]
 #WantedBy=timers.target
 #__END_OPERATORS_TIMER__
+
+#__BEGIN_BOT__
+##!/usr/bin/env python3
+#"""doctor-dns sample Telegram bot.
+#
+#A working bot on top of the panel's bot API - for customers, and for the
+#operator when their Telegram id is in ADMIN_IDS. Plain Python 3, nothing to
+#install. It talks to Telegram by long polling, so it needs no public address
+#of its own, and it listens on 127.0.0.1 for what the panel tells it.
+#
+#Run it where Telegram is reachable - the exit server is the natural place.
+#Settings come from the environment (see bot.env.example):
+#
+#    BOT_TOKEN        from @BotFather
+#    API_URL          https://<panel domain>:8445/api/v1
+#    API_KEY          a key from the admin panel's API page; with admin rights
+#                     if ADMIN_IDS is set
+#    WEBHOOK_SECRET   the key's webhook signing secret (whsec_...)
+#    LISTEN           where the panel's messages arrive, default 127.0.0.1:18990
+#    ADMIN_IDS        Telegram ids of the operator, comma separated (optional)
+#    PAY_TEXT         how to pay, only if the admin panel's "payment details"
+#                     (Settings) is empty - that one wins
+#    SUPPORT_TEXT     shown under "help" (optional)
+#"""
+#import base64
+#import hashlib
+#import hmac
+#import http.server
+#import json
+#import os
+#import queue
+#import re
+#import secrets
+#import sys
+#import threading
+#import time
+#import traceback
+#import urllib.error
+#import urllib.parse
+#import urllib.request
+#
+#try:
+#    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+#except Exception:
+#    pass
+#
+#
+#def log(msg):
+#    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+#
+#
+## ---------------------------------------------------------------- settings
+#def settings(env=os.environ):
+#    cfg = {
+#        "token": env.get("BOT_TOKEN", "").strip(),
+#        "api": env.get("API_URL", "").strip().rstrip("/"),
+#        "key": env.get("API_KEY", "").strip(),
+#        "secret": env.get("WEBHOOK_SECRET", "").strip(),
+#        "listen": env.get("LISTEN", "127.0.0.1:18990").strip(),
+#        "admins": {int(x) for x in re.findall(r"\d+", env.get("ADMIN_IDS", ""))},
+#        "pay": env.get("PAY_TEXT", "").strip().replace("\\n", "\n"),
+#        "support": env.get("SUPPORT_TEXT", "").strip().replace("\\n", "\n"),
+#        "telegram": env.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/"),
+#    }
+#    missing = [k for k in ("token", "api", "key") if not cfg[k]]
+#    if missing:
+#        sys.exit("missing settings: %s (see bot.env.example)"
+#                 % ", ".join({"token": "BOT_TOKEN", "api": "API_URL", "key": "API_KEY"}[m]
+#                             for m in missing))
+#    return cfg
+#
+#
+## The buttons of the customer's keyboard.
+#B_ACCOUNT = "📊 حساب من"
+#B_BUY = "🛒 خرید / تمدید"
+#B_IP = "🌐 ثبت آی‌پی"
+#B_SUPPORT = "🎫 پشتیبانی"
+#B_HELP = "❓ راهنما"
+#B_WEB = "🔑 پنل وب"
+#B_CANCEL = "انصراف"
+#MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_SUPPORT], [B_WEB, B_HELP]],
+#        "resize_keyboard": True}
+#CANCEL = {"keyboard": [[B_CANCEL]], "resize_keyboard": True}
+#STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال ✅",
+#          "over_quota": "حجم تمام شده ⛔", "expired": "دوره تمام شده ⛔",
+#          "suspended": "مسدود ⛔"}
+#MAX_FILE = 4 * 1024 * 1024
+#
+#
+#def size_fa(n):
+#    n = float(n or 0)
+#    for unit in ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"):
+#        if n < 1024 or unit == "ترابایت":
+#            return ("%d %s" if unit == "بایت" else "%.1f %s") % (n, unit)
+#        n /= 1024
+#
+#
+#def image_type(blob):
+#    if blob[:3] == b"\xff\xd8\xff":
+#        return "image/jpeg"
+#    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+#        return "image/png"
+#    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+#        return "image/webp"
+#    if blob[:5] == b"%PDF-":
+#        return "application/pdf"
+#    return None
+#
+#
+#class ApiError(Exception):
+#    def __init__(self, status, body):
+#        self.status, self.body = status, body
+#        super().__init__(body.get("message") or body.get("error") or "HTTP %d" % status)
+#
+#
+## ------------------------------------------------------------ the two APIs
+#class Panel:
+#    """The panel's bot API."""
+#
+#    def __init__(self, cfg):
+#        self.base, self.key = cfg["api"], cfg["key"]
+#
+#    def call(self, method, path, body=None, idem=None):
+#        req = urllib.request.Request(self.base + path, method=method,
+#                                     data=json.dumps(body).encode() if body is not None
+#                                     else None)
+#        req.add_header("Authorization", "Bearer " + self.key)
+#        req.add_header("Content-Type", "application/json")
+#        if idem:
+#            req.add_header("Idempotency-Key", idem)
+#        try:
+#            with urllib.request.urlopen(req, timeout=30) as r:
+#                return json.loads(r.read())
+#        except urllib.error.HTTPError as e:
+#            try:
+#                body = json.loads(e.read())
+#            except ValueError:
+#                body = {"message": "پنل جواب درستی نداد (HTTP %d)" % e.code}
+#            raise ApiError(e.code, body)
+#
+#
+#class Telegram:
+#    def __init__(self, cfg):
+#        self.base = "%s/bot%s/" % (cfg["telegram"], cfg["token"])
+#        self.files = "%s/file/bot%s/" % (cfg["telegram"], cfg["token"])
+#
+#    def call(self, method, http_timeout=30, **params):
+#        data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
+#        req = urllib.request.Request(self.base + method, data=data,
+#                                     headers={"Content-Type": "application/json"})
+#        try:
+#            with urllib.request.urlopen(req, timeout=http_timeout) as r:
+#                res = json.loads(r.read())
+#        except urllib.error.HTTPError as e:
+#            res = json.loads(e.read() or b"{}")
+#        if not res.get("ok"):
+#            raise RuntimeError("telegram %s: %s" % (method, res.get("description")))
+#        return res.get("result")
+#
+#    def send(self, chat, text, markup=None):
+#        return self.call("sendMessage", chat_id=chat, text=text[:4000], reply_markup=markup,
+#                         link_preview_options={"is_disabled": True})
+#
+#    def photo(self, chat, blob, caption, markup=None):
+#        """sendPhoto needs a real upload, so this one is multipart."""
+#        boundary = secrets.token_hex(16)
+#        parts = []
+#        for name, value in (("chat_id", str(chat)), ("caption", caption[:1000]),
+#                            ("reply_markup", json.dumps(markup) if markup else None)):
+#            if value is not None:
+#                parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+#                              % (boundary, name, value)).encode())
+#        parts.append(('--%s\r\nContent-Disposition: form-data; name="photo"; '
+#                      'filename="receipt"\r\nContent-Type: application/octet-stream\r\n\r\n'
+#                      % boundary).encode() + blob + b"\r\n")
+#        parts.append(("--%s--\r\n" % boundary).encode())
+#        req = urllib.request.Request(self.base + "sendPhoto", data=b"".join(parts),
+#                                     headers={"Content-Type": "multipart/form-data; boundary="
+#                                              + boundary})
+#        try:
+#            with urllib.request.urlopen(req, timeout=60) as r:
+#                return json.loads(r.read()).get("result")
+#        except urllib.error.HTTPError:
+#            # A PDF, or something Telegram will not show as a photo: say it in words.
+#            return self.send(chat, caption + "\n\n(فایل رسید عکس نبود؛ در پنل ببینید)", markup)
+#
+#    def download(self, file_id):
+#        info = self.call("getFile", file_id=file_id)
+#        if (info.get("file_size") or 0) > MAX_FILE:
+#            raise ValueError("فایل بزرگ‌تر از ۴ مگابایت است")
+#        with urllib.request.urlopen(self.files + info["file_path"], timeout=60) as r:
+#            return r.read(MAX_FILE + 1)
+#
+#
+## ------------------------------------------------------------------ the bot
+#class Bot:
+#    def __init__(self, cfg, panel=None, telegram=None):
+#        self.cfg = cfg
+#        self.panel = panel or Panel(cfg)
+#        self.tg = telegram or Telegram(cfg)
+#        self.state = {}          # chat id -> (what we wait for, details)
+#        self.known = set()       # telegram ids the panel already has an account for
+#        self.seen = []           # recent webhook ids, so a repeat is dropped
+#        self.lock = threading.Lock()
+#
+#    # -- helpers ------------------------------------------------------------
+#    def is_admin(self, uid):
+#        return uid in self.cfg["admins"]
+#
+#    def say(self, chat, text, markup=None):
+#        try:
+#            self.tg.send(chat, text, markup)
+#        except Exception as e:
+#            log("could not send to %s: %s" % (chat, e))
+#
+#    def account(self, sender):
+#        """The customer's account, opened on first use. Not on /start: a
+#        customer arriving to link a web account must not get a second one."""
+#        uid = sender["id"]
+#        if uid not in self.known:
+#            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#            self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
+#            self.known.add(uid)
+#        return self.panel.call("GET", "/users/%d" % uid)["user"]
+#
+#    # -- updates from Telegram ------------------------------------------------
+#    def handle(self, update):
+#        try:
+#            if "callback_query" in update:
+#                return self.on_button(update["callback_query"])
+#            msg = update.get("message")
+#            if msg and msg.get("chat", {}).get("type") == "private":
+#                return self.on_message(msg)
+#        except ApiError as e:
+#            chat = (update.get("message") or update.get("callback_query", {}).get("message")
+#                    or {}).get("chat", {}).get("id")
+#            if chat:
+#                self.say(chat, "⚠️ " + str(e))
+#        except Exception:
+#            log("update failed:\n" + traceback.format_exc())
+#
+#    def on_message(self, msg):
+#        chat, sender = msg["chat"]["id"], msg["from"]
+#        text = (msg.get("text") or "").strip()
+#        if text == B_CANCEL or text == "/cancel":
+#            self.state.pop(chat, None)
+#            return self.say(chat, "لغو شد.", MENU)
+#        if text.startswith("/start"):
+#            return self.on_start(chat, sender, text)
+#        if self.is_admin(sender["id"]) and text in ("/stats", "/receipts"):
+#            return self.admin_command(chat, text)
+#
+#        waiting, extra = self.state.get(chat, (None, None))
+#        if waiting == "onb_name":
+#            return self.got_name(chat, sender, text)
+#        if waiting == "onb_user":
+#            return self.got_username(chat, sender, text, extra)
+#        if text in (B_ACCOUNT, B_BUY, B_IP, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
+#            return
+#        if waiting == "ip":
+#            return self.got_ip(chat, sender, text)
+#        if waiting == "receipt":
+#            return self.got_receipt(chat, sender, msg, extra)
+#        if waiting == "ticket_subject" and text:
+#            self.state[chat] = ("ticket_body", text[:80])
+#            return self.say(chat, "متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):",
+#                            CANCEL)
+#        if waiting == "ticket_body":
+#            return self.got_ticket(chat, sender, msg, subject=extra)
+#        if waiting == "ticket_reply":
+#            return self.got_ticket(chat, sender, msg, ticket=extra)
+#        if waiting == "admin_reply" and self.is_admin(sender["id"]):
+#            return self.admin_reply(chat, msg, extra)
+#
+#        if text == B_ACCOUNT:
+#            return self.show_account(chat, sender)
+#        if text == B_BUY:
+#            return self.show_plans(chat, sender)
+#        if text == B_IP:
+#            return self.ip_help(chat, sender)
+#        if text == B_WEB:
+#            return self.show_web(chat, sender)
+#        if text == B_SUPPORT:
+#            return self.show_tickets(chat, sender)
+#        if text == B_HELP:
+#            return self.say(chat, self.help_text(), MENU)
+#        return self.say(chat, "از دکمه‌های پایین استفاده کنید.", MENU)
+#
+#    def on_start(self, chat, sender, text):
+#        self.state.pop(chat, None)
+#        arg = text.split(" ", 1)[1].strip() if " " in text else ""
+#        if arg.startswith("link_"):
+#            try:
+#                res = self.panel.call("POST", "/link", {"telegram_id": sender["id"],
+#                                                        "code": arg[5:]})
+#                self.known.add(sender["id"])
+#                return self.say(chat, "✅ " + res["message"] + "\nحالا اگر رمز پنل را فراموش "
+#                                "کنید، کد بازیابی همین‌جا می‌آید.", MENU)
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ " + str(e), MENU)
+#        return self.say(chat, "سلام! 👋 به ربات خوش آمدید.\n\n" + self.help_text(), MENU)
+#
+#    # -- a web sign-in for everybody who comes through the bot ----------------
+#    def ready(self, chat, sender):
+#        """True when the account has its web sign-in. Otherwise the two
+#        questions start, and whatever was pressed waits until they are done."""
+#        u = self.account(sender)
+#        if u.get("username"):
+#            return True
+#        tg_name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#        self.state[chat] = ("onb_name", None)
+#        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nاسمتان چیست؟",
+#                 {"keyboard": [[tg_name[:60]]] if tg_name else [[B_CANCEL]],
+#                  "resize_keyboard": True, "one_time_keyboard": True})
+#        return False
+#
+#    def got_name(self, chat, sender, text):
+#        if not text or text == B_CANCEL:
+#            self.state.pop(chat, None)
+#            return self.say(chat, "هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.", MENU)
+#        self.state[chat] = ("onb_user", text[:60])
+#        self.say(chat, "یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید "
+#                 "(حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
+#
+#    def got_username(self, chat, sender, text, name):
+#        try:
+#            res = self.panel.call("POST", "/users/%d/credentials" % sender["id"],
+#                                  {"username": text, "name": name})
+#        except ApiError as e:
+#            if e.body.get("error") == "has_username":
+#                self.state.pop(chat, None)
+#                return self.show_web(chat, sender)
+#            return self.say(chat, "⚠️ %s" % e, CANCEL)
+#        self.state.pop(chat, None)
+#        self.say(chat, "✅ حساب پنل شما ساخته شد\n\n%sنام کاربری: %s\nرمز: %s\n\nاین را "
+#                 "نگه دارید؛ رمز را در پنل هر وقت خواستید عوض کنید."
+#                 % ("آدرس: %s\n" % res["panel_url"] if res.get("panel_url") else "",
+#                    res["username"], res["password"]), MENU)
+#        self.ip_help(chat, sender)
+#
+#    def login_button(self, sender):
+#        try:
+#            res = self.panel.call("POST", "/users/%d/login-link" % sender["id"])
+#        except ApiError:
+#            return None
+#        return res
+#
+#    def ip_help(self, chat, sender):
+#        """Registering the address is easiest from the web page, which sees it
+#        by itself: a one-time link signs the customer straight in."""
+#        link = self.login_button(sender)
+#        self.state[chat] = ("ip", None)
+#        if link:
+#            return self.say(chat, "🌐 ثبت آی‌پی\n\nاین لینک را با همان اینترنتی باز کنید که "
+#                            "می‌خواهید سرویس رویش کار کند (مثلاً وای‌فای خانه، نه اینترنت "
+#                            "گوشی)؛ خودکار وارد حسابتان می‌شوید و فقط «ثبت آی‌پی» را بزنید:\n\n"
+#                            "%s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)\n\n"
+#                            "یا آی‌پی را همین‌جا بفرستید." % (link["url"], link["minutes"]),
+#                            CANCEL)
+#        return self.say(chat, "آی‌پی اینترنتی را که می‌خواهید سرویس رویش کار کند بفرستید.\n\n"
+#                        "روی همان اینترنت (مودم یا سیم‌کارت) یک سایت «آی‌پی من چیست» را "
+#                        "باز کنید تا پیدایش کنید. مثال: 5.123.45.67", CANCEL)
+#
+#    def show_web(self, chat, sender):
+#        u = self.account(sender)
+#        self.say(chat, "🔑 پنل وب\n\n%sنام کاربری: %s\n\nرمز را فراموش کرده‌اید؟ «رمز تازه» "
+#                 "را بزنید." % ("آدرس: %s\n" % u["panel_url"] if u.get("panel_url") else "",
+#                              u["username"]),
+#                 {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
+#                                       {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
+#
+#    def help_text(self):
+#        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
+#                "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
+#                "🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند\n"
+#                "🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی\n"
+#                "🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه\n\n"
+#                "حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را "
+#                "همین‌جا بفرستید." + ("\n\n" + self.cfg["support"] if self.cfg["support"] else ""))
+#
+#    # -- the customer's screens ---------------------------------------------
+#    def show_account(self, chat, sender):
+#        u = self.account(sender)
+#        lines = ["👤 %s" % (u["name"] or "حساب شما"),
+#                 "وضعیت: %s" % STATUS.get(u["status"], u["status"])]
+#        if u["plan"]:
+#            lines.append("پلن: %s" % u["plan"]["name"])
+#        if u["status"] != "pending":
+#            lines.append("حجم مانده: %s" % ("نامحدود" if u["unlimited"]
+#                                              else size_fa(u["remaining_bytes"])))
+#            lines.append("مصرف: %s" % size_fa(u["used_bytes"]))
+#        if u["expires_at"]:
+#            lines.append("پایان دوره: %s" % u["expires_at"][:10])
+#        lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
+#        if u["dns"]:
+#            lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
+#                         "بگذارید." % u["dns"][0])
+#        if u["receipt_waiting"]:
+#            lines.append("\n⏳ یک رسید در انتظار بررسی دارید.")
+#        self.say(chat, "\n".join(lines), MENU)
+#
+#    def show_plans(self, chat, sender):
+#        u = self.account(sender)
+#        plans = self.panel.call("GET", "/plans")["plans"]
+#        trial = u.get("trial")
+#        rows = []
+#        if trial and trial.get("available"):
+#            p = trial["plan"]
+#            rows.append([{"text": "🎁 تست رایگان: %s، %d روز" % (
+#                size_fa(p["quota_bytes"]) if p["quota_bytes"] else "نامحدود", p["days"]),
+#                "callback_data": "trial"}])
+#        if not plans and not rows:
+#            return self.say(chat, "فعلاً پلنی برای فروش نیست. با پشتیبانی در تماس باشید.", MENU)
+#        for p in plans:
+#            size = size_fa(p["quota_bytes"]) if p["quota_bytes"] else "نامحدود"
+#            rows.append([{"text": "%s · %s · %d روز · %s تومان"
+#                          % (p["name"], size, p["days"], format(p["price"], ",")),
+#                          "callback_data": "buy:%d" % p["id"]}])
+#        notes = "\n".join("• %s (%s): %s" % (p["name"], p["template"], p["note"])
+#                          for p in plans if p.get("note"))
+#        self.say(chat, "پلن را انتخاب کنید:" + ("\n\n" + notes if notes else ""),
+#                 {"inline_keyboard": rows})
+#
+#    def chose_plan(self, chat, sender, plan_id):
+#        sale = self.panel.call("GET", "/plans")
+#        plans = {p["id"]: p for p in sale["plans"]}
+#        # What the admin panel says, first: changing the card there changes it
+#        # here at once. PAY_TEXT is only for a panel that has none set.
+#        pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
+#        plan = plans.get(plan_id)
+#        if not plan:
+#            return self.say(chat, "این پلن دیگر فروخته نمی‌شود.", MENU)
+#        u = self.account(sender)
+#        warn = ""
+#        if u["plan"] and u["plan"]["id"] != plan_id and u["status"] in ("active", "over_quota"):
+#            warn = ("\n\n⚠️ پلن فعلی شما «%s» است. پلن تازه از لحظهٔ تأیید از نو شروع می‌شود "
+#                    "و باقی‌ماندهٔ پلن فعلی از بین می‌رود." % u["plan"]["name"])
+#        elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
+#            warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
+#        self.state[chat] = ("receipt", plan_id)
+#        self.say(chat, "پلن «%s» — %s تومان%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+#                 "بفرستید." % (plan["name"], format(plan["price"], ","), warn,
+#                               pay or "برای روش پرداخت با پشتیبانی تماس بگیرید."),
+#                 CANCEL)
+#
+#    def got_receipt(self, chat, sender, msg, plan_id):
+#        file_id = None
+#        if msg.get("photo"):
+#            file_id = msg["photo"][-1]["file_id"]
+#        elif msg.get("document"):
+#            file_id = msg["document"]["file_id"]
+#        if not file_id:
+#            return self.say(chat, "عکس رسید را بفرستید (یا «انصراف»).", CANCEL)
+#        try:
+#            blob = self.tg.download(file_id)
+#        except ValueError as e:
+#            return self.say(chat, "⚠️ %s" % e, CANCEL)
+#        kind = image_type(blob)
+#        if not kind or len(blob) > MAX_FILE:
+#            return self.say(chat, "⚠️ فقط عکس (JPG، PNG، WEBP) یا PDF تا ۴ مگابایت.", CANCEL)
+#        # One key per Telegram message: a retry after a timeout is the same receipt.
+#        res = self.panel.call("POST", "/users/%d/receipts" % sender["id"],
+#                              {"plan_id": plan_id, "content_type": kind,
+#                               "data": base64.b64encode(blob).decode()},
+#                              idem="receipt-%d-%d" % (sender["id"], msg["message_id"]))
+#        self.state.pop(chat, None)
+#        self.say(chat, "✅ " + res["message"], MENU)
+#
+#    def got_ip(self, chat, sender, text):
+#        self.account(sender)
+#        ip = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٫", "0123456789.")).strip()
+#        try:
+#            res = self.panel.call("POST", "/users/%d/ips" % sender["id"], {"ip": ip})
+#        except ApiError as e:
+#            return self.say(chat, "⚠️ %s\nدوباره بفرستید یا «انصراف»." % e, CANCEL)
+#        self.state.pop(chat, None)
+#        self.say(chat, "✅ %s\n\nDNS را روی %s بگذارید." % (
+#            res["message"], res["user"]["dns"][0] if res["user"]["dns"] else "آدرس سرویس"), MENU)
+#
+#    def show_tickets(self, chat, sender):
+#        self.account(sender)
+#        tickets = self.panel.call("GET", "/users/%d/tickets" % sender["id"])["tickets"]
+#        state = {"open": "⏳", "answered": "💬", "closed": "✔️"}
+#        rows = [[{"text": "%s %s" % (state.get(t["status"], ""), t["subject"]),
+#                  "callback_data": "tk:%d" % t["id"]}] for t in tickets[:8]]
+#        rows.append([{"text": "➕ تیکت تازه", "callback_data": "tknew"}])
+#        self.say(chat, "تیکت‌های شما:" if tickets else "هنوز تیکتی ندارید.",
+#                 {"inline_keyboard": rows})
+#
+#    def show_ticket(self, chat, sender, tid):
+#        t = self.panel.call("GET", "/users/%d/tickets/%d" % (sender["id"], tid))["ticket"]
+#        lines = ["🎫 %s" % t["subject"]]
+#        for m in t["messages"][-10:]:
+#            lines.append("\n%s %s:\n%s%s" % ("👨‍💻" if m["from"] == "admin" else "👤",
+#                                              "پشتیبانی" if m["from"] == "admin" else "شما",
+#                                              m["body"], " 🖼" if m["has_image"] else ""))
+#        buttons = [{"text": "✍️ پیام تازه", "callback_data": "tkr:%d" % tid}]
+#        if t["status"] != "closed":
+#            buttons.append({"text": "✔️ بستن", "callback_data": "tkc:%d" % tid})
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
+#
+#    def got_ticket(self, chat, sender, msg, subject=None, ticket=None):
+#        body = (msg.get("text") or msg.get("caption") or "").strip()
+#        if not body:
+#            return self.say(chat, "متن پیام را بنویسید (یا «انصراف»).", CANCEL)
+#        payload = {"body": body}
+#        if msg.get("photo"):
+#            blob = self.tg.download(msg["photo"][-1]["file_id"])
+#            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
+#                payload.update(image_type=image_type(blob),
+#                               image_data=base64.b64encode(blob).decode())
+#        idem = "ticket-%d-%d" % (sender["id"], msg["message_id"])
+#        if subject is not None:
+#            payload["subject"] = subject
+#            res = self.panel.call("POST", "/users/%d/tickets" % sender["id"], payload, idem)
+#        else:
+#            res = self.panel.call("POST", "/users/%d/tickets/%d/messages"
+#                                  % (sender["id"], ticket), payload, idem)
+#        self.state.pop(chat, None)
+#        self.say(chat, "✅ " + res["message"], MENU)
+#
+#    # -- buttons ------------------------------------------------------------
+#    def on_button(self, q):
+#        chat, sender, data = q["message"]["chat"]["id"], q["from"], q.get("data") or ""
+#        try:
+#            self.tg.call("answerCallbackQuery", callback_query_id=q["id"])
+#        except Exception:
+#            pass
+#        kind, _, arg = data.partition(":")
+#        if kind in ("ok", "no", "areply", "aclose"):
+#            if not self.is_admin(sender["id"]):
+#                return
+#            return self.admin_button(chat, q, kind, int(arg))
+#        if kind == "buy":
+#            return self.chose_plan(chat, sender, int(arg))
+#        if kind == "plans":
+#            return self.show_plans(chat, sender)
+#        if kind == "login":
+#            link = self.login_button(sender)
+#            return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
+#                                   % (link["url"], link["minutes"])) if link
+#                            else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
+#        if kind == "newpw":
+#            res = self.panel.call("POST", "/users/%d/password" % sender["id"])
+#            return self.say(chat, "🔄 رمز تازهٔ پنل: %s\nنام کاربری: %s\n\nهر جا با رمز قبلی "
+#                            "وارد بودید، خارج شدید." % (res["password"], res["username"]))
+#        if kind == "trial":
+#            self.account(sender)
+#            res = self.panel.call("POST", "/users/%d/trial" % sender["id"])
+#            self.say(chat, res["message"], MENU)
+#            if not res["user"]["ips"]:
+#                return self.ip_help(chat, sender)
+#            return None
+#        if kind == "tk":
+#            return self.show_ticket(chat, sender, int(arg))
+#        if kind == "tknew":
+#            self.state[chat] = ("ticket_subject", None)
+#            return self.say(chat, "موضوع تیکت را در یک خط بنویسید:", CANCEL)
+#        if kind == "tkr":
+#            self.state[chat] = ("ticket_reply", int(arg))
+#            return self.say(chat, "پیامتان را بنویسید:", CANCEL)
+#        if kind == "tkc":
+#            res = self.panel.call("POST", "/users/%d/tickets/%d/close" % (sender["id"], int(arg)))
+#            return self.say(chat, "✔️ " + res["message"], MENU)
+#
+#    # -- the operator -------------------------------------------------------
+#    def admin_command(self, chat, text):
+#        if text == "/stats":
+#            return self.say(chat, self.panel.call("GET", "/admin/stats")["text"])
+#        receipts = self.panel.call("GET", "/admin/receipts")["receipts"]
+#        if not receipts:
+#            return self.say(chat, "رسیدی در انتظار نیست.")
+#        for r in receipts[:10]:
+#            self.post_receipt(chat, r["id"], "رسید از %s%s — %s تومان" % (
+#                r["user"]["label"], " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
+#                format(r["amount"], ",")))
+#
+#    def post_receipt(self, chat, rid, caption):
+#        buttons = {"inline_keyboard": [[{"text": "✅ تأیید", "callback_data": "ok:%d" % rid},
+#                                        {"text": "❌ رد", "callback_data": "no:%d" % rid}]]}
+#        try:
+#            pic = self.panel.call("GET", "/admin/receipts/%d/image" % rid)
+#            self.tg.photo(chat, base64.b64decode(pic["data"]), caption, buttons)
+#        except ApiError:
+#            self.say(chat, caption, buttons)
+#
+#    def admin_button(self, chat, q, kind, num):
+#        if kind in ("ok", "no"):
+#            try:
+#                res = self.panel.call("POST", "/admin/receipts/%d/%s"
+#                                      % (num, "approve" if kind == "ok" else "reject"))
+#                done = ("✅ " if kind == "ok" else "❌ ") + res["message"]
+#            except ApiError as e:
+#                done = "⚠️ " + str(e)
+#            # Take the buttons off, so nobody presses them again.
+#            try:
+#                self.tg.call("editMessageReplyMarkup", chat_id=chat,
+#                             message_id=q["message"]["message_id"],
+#                             reply_markup={"inline_keyboard": []})
+#            except Exception:
+#                pass
+#            return self.say(chat, "رسید #%d: %s" % (num, done))
+#        if kind == "areply":
+#            self.state[chat] = ("admin_reply", num)
+#            return self.say(chat, "جواب تیکت #%d را بنویسید:" % num, CANCEL)
+#        if kind == "aclose":
+#            res = self.panel.call("POST", "/admin/tickets/%d/close" % num)
+#            return self.say(chat, "تیکت #%d: %s" % (num, res["message"]))
+#
+#    def admin_reply(self, chat, msg, tid):
+#        body = (msg.get("text") or msg.get("caption") or "").strip()
+#        if not body:
+#            return self.say(chat, "متن جواب را بنویسید (یا «انصراف»).", CANCEL)
+#        payload = {"body": body}
+#        if msg.get("photo"):
+#            blob = self.tg.download(msg["photo"][-1]["file_id"])
+#            if image_type(blob) in ("image/jpeg", "image/png", "image/webp"):
+#                payload.update(image_type=image_type(blob),
+#                               image_data=base64.b64encode(blob).decode())
+#        self.panel.call("POST", "/admin/tickets/%d/reply" % tid, payload,
+#                        idem="areply-%d-%d" % (chat, msg["message_id"]))
+#        self.state.pop(chat, None)
+#        self.say(chat, "✅ جواب تیکت #%d فرستاده شد." % tid, MENU)
+#
+#    # -- what the panel tells us -------------------------------------------
+#    def on_event(self, ev):
+#        with self.lock:
+#            if ev.get("id") in self.seen:
+#                return
+#            self.seen = (self.seen + [ev.get("id")])[-1000:]
+#        data, kind = ev.get("data") or {}, ev.get("event")
+#        text = data.get("text") or ""
+#        if ev.get("audience") == "admin" or kind == "ping":
+#            for admin in self.cfg["admins"]:
+#                if kind == "receipt.submitted":
+#                    self.post_receipt(admin, data["receipt_id"], "🧾 " + text)
+#                elif kind in ("ticket.opened", "ticket.message"):
+#                    tid = data["ticket_id"]
+#                    self.say(admin, "🎫 #%d %s" % (tid, text), {"inline_keyboard": [[
+#                        {"text": "✍️ جواب", "callback_data": "areply:%d" % tid},
+#                        {"text": "✔️ بستن", "callback_data": "aclose:%d" % tid}]]})
+#                elif text:
+#                    self.say(admin, text)
+#            return
+#        chat = ev.get("telegram_id")
+#        if not chat or not text:
+#            return
+#        markup = None
+#        if kind == "ticket.answered":
+#            markup = {"inline_keyboard": [[{"text": "✍️ جواب",
+#                                            "callback_data": "tkr:%d" % data["ticket_id"]}]]}
+#        elif kind in ("quota.warning", "quota.exhausted", "plan.expiring", "plan.expired"):
+#            markup = {"inline_keyboard": [[{"text": "🛒 تمدید", "callback_data": "plans"}]]}
+#        self.say(chat, text, markup)
+#
+#
+## ---------------------------------------------------------- panel webhooks
+#def signed(secret, header, body, now=None):
+#    """The panel's signature: t=<time>,v1=HMAC-SHA256("<t>.<body>")."""
+#    try:
+#        parts = dict(p.split("=", 1) for p in (header or "").split(","))
+#        stamp = int(parts["t"])
+#    except (ValueError, KeyError):
+#        return False
+#    want = hmac.new(secret.encode(), ("%d." % stamp).encode() + body,
+#                    hashlib.sha256).hexdigest()
+#    return (hmac.compare_digest(want, parts.get("v1", ""))
+#            and abs((now or time.time()) - stamp) < 300)
+#
+#
+#def webhook_server(bot, work):
+#    host, _, port = bot.cfg["listen"].rpartition(":")
+#
+#    class Hook(http.server.BaseHTTPRequestHandler):
+#        def do_POST(self):
+#            length = int(self.headers.get("Content-Length") or 0)
+#            body = self.rfile.read(min(length, 1024 * 1024))
+#            if not signed(bot.cfg["secret"], self.headers.get("X-DoctorDNS-Signature"), body):
+#                self.send_response(401)
+#                self.end_headers()
+#                return
+#            # Answer at once; Telegram calls happen after, on the worker.
+#            self.send_response(200)
+#            self.end_headers()
+#            try:
+#                work.put(json.loads(body))
+#            except ValueError:
+#                pass
+#
+#        def log_message(self, *a):
+#            pass
+#
+#    return http.server.ThreadingHTTPServer((host or "127.0.0.1", int(port)), Hook)
+#
+#
+#def main():
+#    cfg = settings()
+#    if not cfg["secret"]:
+#        log("WEBHOOK_SECRET is empty: the panel's messages will be refused")
+#    bot = Bot(cfg)
+#    me = bot.tg.call("getMe")
+#    log("bot @%s up; panel messages on %s; %d admin(s)"
+#        % (me.get("username"), cfg["listen"], len(cfg["admins"])))
+#    work = queue.Queue()
+#
+#    def events():
+#        while True:
+#            ev = work.get()
+#            try:
+#                bot.on_event(ev)
+#            except Exception:
+#                log("event failed:\n" + traceback.format_exc())
+#
+#    threading.Thread(target=events, daemon=True).start()
+#    server = webhook_server(bot, work)
+#    threading.Thread(target=server.serve_forever, daemon=True).start()
+#
+#    offset = None
+#    while True:
+#        try:
+#            # Long polling: Telegram holds the request up to 50 seconds.
+#            updates = bot.tg.call("getUpdates", http_timeout=70, timeout=50, offset=offset,
+#                                  allowed_updates=["message", "callback_query"])
+#        except Exception as e:
+#            log("getUpdates: %s" % e)
+#            time.sleep(5)
+#            continue
+#        # In order: a customer's photo and the text after it must not race.
+#        for u in updates or []:
+#            offset = u["update_id"] + 1
+#            bot.handle(u)
+#
+#
+#if __name__ == "__main__":
+#    main()
+#__END_BOT__
+
+#__BEGIN_BOT_SERVICE__
+#[Unit]
+#Description=doctor-dns sample Telegram bot
+#After=network-online.target
+#Wants=network-online.target
+#
+#[Service]
+#Type=simple
+#EnvironmentFile=/etc/doctor-dns-bot.env
+#ExecStart=/usr/bin/python3 /usr/local/bin/doctor-dns-bot
+#Restart=always
+#RestartSec=10
+#DynamicUser=yes
+#NoNewPrivileges=yes
+#ProtectSystem=strict
+#ProtectHome=yes
+#PrivateTmp=yes
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_BOT_SERVICE__
 
 #__BEGIN_FONT_LICENSE__
 #Copyright 2015 The Vazirmatn Project Authors (https://github.com/rastikerdar/vazirmatn)
