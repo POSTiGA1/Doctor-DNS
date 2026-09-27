@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.0"
+VERSION="0.9.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -21227,6 +21227,8 @@ exit 0
 #button.danger:hover{background:var(--bad);border-color:var(--bad);color:var(--on-btn)}
 #button.ghost{background:transparent;border-color:var(--line2);color:var(--dim);font-weight:400}
 #button.ghost:hover{background:var(--row);color:var(--fg)}
+#button.ghost.go{border-color:var(--btn);color:var(--btn);font-weight:600}
+#button.ghost.go:hover{background:var(--btn);color:var(--on-btn)}
 #button.del{background:transparent;border-color:var(--bad);color:var(--bad);font-weight:400}
 #button.del:hover{background:var(--err-bg)}
 #.onetime code{display:inline-block;direction:ltr;font-size:22px;letter-spacing:1px;
@@ -23253,7 +23255,8 @@ exit 0
 #                "</a>%s</td><td class='muted'>%s</td><td>%s</td><td>%s</td>"
 #                "<td>%s</td><td class='acts'><div style='display:flex;gap:6px;"
 #                "align-items:center;flex-wrap:wrap'>%s"
-#                "<a href='/%s/admins?id=%d'>ویرایش</a>"
+#                "<form method='get' action='/%s/admins'><input type='hidden' name='id' "
+#                "value='%d'><button class='ghost go'>ویرایش</button></form>"
 #                "<form method='post' action='/%s/admin-view-as'><input type='hidden' name='id' "
 #                "value='%d'><button class='ghost' title='پنل را همان‌طور ببینید که او می‌بیند'>"
 #                "دیدن به‌جای او</button></form></div></td></tr>"
