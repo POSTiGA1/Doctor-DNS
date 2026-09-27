@@ -129,6 +129,8 @@ check("the unique index on it exists",
 
 class FakeHandler:
     """Just enough of the API handler to call the endpoint methods."""
+    relays = ("198.51.100.1",)
+
     def __init__(self, store):
         self.store = store
 

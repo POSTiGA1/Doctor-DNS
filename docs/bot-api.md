@@ -71,6 +71,8 @@ curl -s -H "Authorization: Bearer $KEY" $API/plans
 
 به ترتیب قالب و بعد ارزان به گران. `quota_bytes: 0` یعنی حجم نامحدود. `speed_kbps: 0` یعنی بدون سقف سرعت.
 
+کنار پلن‌ها `pay_text` (اطلاعات پرداخت)، `wallet_on` (شارژ کیف پول باز است یا نه) و `topup_min`/`topup_max` (کمترین و بیشترین مبلغ شارژ، تومان) هم می‌آید.
+
 `games` اسم بازی‌هایی است که آن پلن پوشش می‌دهد — همان چیزی که مشتری می‌فهمد، به‌جای اسم سرویس‌ها. یک بازی وقتی در این فهرست می‌آید که **همهٔ** سرویس‌های لازمش در آن قالب روشن باشند (نیمِ والورانت، والورانت نیست). فهرست می‌تواند بلند باشد؛ در ربات چند تای اول را نشان بدهید و بقیه را بشمارید. اگر پنل قدیمی باشد این فیلد نیست، پس با `plan.get("games", [])` بخوانیدش.
 
 ### `POST /users` — ثبت‌نام (یا پیدا کردن) مشتری
@@ -81,6 +83,8 @@ curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
 ```
 
 مشتری تازه `201` می‌گیرد، و اگر با این آیدی از قبل هست `200` — همان حساب، نه یک حساب دوم. پس لازم نیست ربات اول بپرسد هست یا نه؛ در `/start` همین را صدا بزنید.
+
+اگر مشتری با لینک دعوت کسی آمده (`/start ref_<code>`)، کد را در `"ref": "<code>"` بفرستید. معرف فقط برای حسابی ثبت می‌شود که همین درخواست می‌سازد، و فقط وقتی ادمین «دعوت از دوستان» را روشن کرده باشد.
 
 ```json
 {"ok": true, "created": true, "user": { ... }}
@@ -122,6 +126,8 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
 - `dns` همان آدرسی است که مشتری باید در کنسول یا مودم به‌عنوان DNS بگذارد (آدرس رله‌ها).
 - `doh` آدرس‌های DNS رمزگذاری‌شدهٔ خود مشتری: `url` برای DoH (آیفون، ویندوز، مرورگرها) و `dot_host` برای DoT («DNS خصوصی» اندروید). تا وقتی هیچ رله‌ای DoH روشن نکرده `null` است. مثل DNS معمولی فقط روی آی‌پی ثبت‌شده کار می‌کند؛ توکن داخل آدرس فقط می‌گوید قالب کدام مشتری را جواب بدهد. مخصوص همان مشتری است و نباید جای دیگری نشان داده شود.
 - `receipt_waiting` اگر رسیدی منتظر تأیید باشد: `{"id", "created_at", "amount", "plan"}`.
+- `wallet` موجودی کیف پول، تومان.
+- `ref` لینک دعوت مشتری، تا وقتی ادمین «دعوت از دوستان» را روشن کرده (وگرنه `null`): `{"percent", "mode", "code", "bot_link", "web_link", "invited", "earned"}`. `mode` یکی از `every` (هر خرید) یا `first` (فقط اولین خرید). `bot_link` وقتی پنل آدرس ربات را می‌داند و `web_link` وقتی آدرس پنل مشتری را.
 - مشتری ناشناس: `404` با `user_not_found`.
 
 ### `GET /users/{telegram_id}/usage` — مصرف مشتری
@@ -240,6 +246,16 @@ curl -s -X POST -H "Authorization: Bearer $KEY" $API/users/123456789/trial
 
 خطاها: `404` با `trial_none`، `409` با `trial_used` یا `trial_running`.
 
+### کیف پول و دعوت از دوستان
+
+| | |
+|---|---|
+| `GET /users/{telegram_id}/wallet` | `{"balance", "wallet_on", "topup_min", "topup_max", "moves", "ref"}` — `moves` بیست گردش آخر، تازه‌ترین اول: `{"at", "amount", "balance", "kind", "what", "note"}`؛ `kind` یکی از `topup`، `purchase`، `referral`، `admin` |
+| `POST /users/{telegram_id}/wallet/buy` | `{"plan_id": 1}` — خرید پلن از کیف پول، بدون رسید و فوری: `{"message", "balance", "user"}`. موجودی کم: `402` با `wallet_short` (متنش می‌گوید چقدر کم است) |
+| `POST /users/{telegram_id}/receipts` | با `{"kind": "topup", "amount": 500000, ...}` رسید **شارژ کیف پول** است، بی‌پلن. با تأیید ادمین همان مبلغ (یا مبلغی که ادمین درستش کند) به کیف پول اضافه می‌شود. بسته بودن شارژ: `400` با `wallet_off`؛ مبلغ بیرون از حد: `bad_amount` |
+
+پورسانت دعوت از **خرید پلن** حساب می‌شود، چه با رسید چه از کیف پول؛ شارژ کیف پول پورسانت ندارد. درصد و اینکه هر خرید یا فقط اولی را ادمین در صفحهٔ «پرداخت» تعیین می‌کند.
+
 ### `POST /link` — وصل کردن حساب وب به تلگرام
 
 مشتری‌ای که از پنل وب ثبت‌نام کرده آیدی تلگرام ندارد. در صفحهٔ حسابش «اتصال حساب به تلگرام»، با رمز فعلی حساب، یک کد هشت‌حرفی می‌دهد (۱۵ دقیقه اعتبار). مشتری همان‌جا می‌تواند تلگرام را جدا هم کند (مثلاً وقتی تلگرامش عوض شده)، و ادمین هم از صفحهٔ کاربران. مشتری کد را برای ربات می‌فرستد و ربات آن را به پنل می‌دهد:
@@ -320,6 +336,8 @@ curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
 | `plan.expiring` | ۳ روز یا کمتر به پایان دوره مانده | `expires_at`، `days_left` |
 | `plan.expired` | دوره تمام شد | `expires_at` |
 | `password.reset_code` | مشتری در پنل وب «بازیابی رمز» زد | `code` (شش رقم)، `minutes` |
+| `wallet.referral` | کسی که با لینک این مشتری آمده بود خرید کرد و پورسانتش به کیف پول رفت | `amount`، `balance` |
+| `wallet.changed` | ادمین دستی موجودی را عوض کرد | `amount` (منفی یعنی کم شد)، `balance` |
 | `ping` | دکمهٔ «ارسال آزمایشی» | — (`telegram_id` خالی است) |
 
 هر اتفاق **یک بار** خبر داده می‌شود و فقط برای مشتری‌ای که آیدی تلگرام دارد.
@@ -350,12 +368,13 @@ def from_panel(secret, header, body):      # body: bytes، همان‌طور ک�
 | `GET /admin/stats` | آمار: کاربرها به تفکیک وضعیت، ثبت‌نام امروز، رسید در انتظار، تأیید و درآمد امروز، درآمد ۷ روز، تیکت منتظر، دوره‌های نزدیک به پایان — و `text` آماده |
 | `GET /admin/receipts?status=pending` | رسیدها؛ `status` یکی از `pending` (پیش‌فرض، قدیمی اول)، `approved`، `rejected`، `all` |
 | `GET /admin/receipts/{id}/image` | عکس رسید: `{"content_type", "data"}` (بعد از تصمیم پاک می‌شود) |
-| `POST /admin/receipts/{id}/approve` | تأیید — پلن رسید خودکار روی حساب می‌نشیند، دقیقاً مثل پنل |
+| `POST /admin/receipts/{id}/approve` | تأیید — پلن رسید خودکار روی حساب می‌نشیند، دقیقاً مثل پنل. رسید شارژ کیف پول (`"kind": "topup"`) مبلغش به کیف پول می‌رود؛ با `{"amount": 450000}` مبلغ درست را بدهید اگر رسید چیز دیگری می‌گوید |
 | `POST /admin/receipts/{id}/reject` | رد |
 | `GET /admin/users?q=...` | جستجو با نام، نام کاربری، شماره، آیدی تلگرام، شمارهٔ حساب یا آی‌پی (بیست تا)؛ بدون `q` تازه‌ترین‌ها |
 | `GET /admin/users/{id}` | یک حساب |
 | `POST /admin/users/{id}/status` | `{"status": "suspended"}` یا `{"status": "active"}` |
 | `POST /admin/users/{id}/plan` | `{"plan_id": 1}` — دادن پلن بدون رسید (مثلاً پرداخت نقدی) |
+| `POST /admin/users/{id}/wallet` | `{"amount": "50000", "note": "هدیه"}` — اضافه کردن به کیف پول؛ `"-50000"` کم می‌کند. کمتر از صفر نمی‌شود (`409` با `wallet_short`). به مشتری خبر `wallet.changed` می‌رود |
 | `GET /admin/tickets?status=open` | تیکت‌ها؛ `open` (پیش‌فرض)، `answered`، `closed`، `all` |
 | `GET /admin/tickets/{id}` | یک تیکت با پیام‌ها و صاحبش |
 | `POST /admin/tickets/{id}/reply` | جواب: `{"body": "...", "image_type"?, "image_data"?}` |
@@ -375,7 +394,8 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" $API/admin/receipts/31/app
 
 | `event` | کی | در `data` |
 |---|---|---|
-| `receipt.submitted` | رسید تازه رسید | `receipt_id`، `user_id`، `amount`، `plan` |
+| `receipt.submitted` | رسید تازه رسید | `receipt_id`، `user_id`، `amount`، `kind` (`card` یا `topup`)، `plan` |
+| `wallet.bought` | مشتری پلن را از کیف پول خرید | `user_id`، `amount`، `plan` |
 | `ticket.opened` | تیکت تازه | `ticket_id`، `user_id`، `subject`، `body` |
 | `ticket.message` | مشتری در تیکتی نوشت | `ticket_id`، `user_id`، `subject`، `body` |
 | `user.created` | مشتری تازه ثبت‌نام کرد | `user_id`، `via` (`web` یا `bot`) |
@@ -391,6 +411,8 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" $API/admin/receipts/31/app
 | 400 | `bad_json`، `bad_request` | بدنه JSON درستی نیست |
 | 400 | `bad_telegram_id`، `bad_ip` | ورودی نادرست |
 | 400 | `plan_required`، `bad_type`، `bad_file`، `empty_file` | رسید ناقص |
+| 400 | `wallet_off`، `bad_amount`، `not_for_wallet` | شارژ کیف پول بسته، مبلغ نادرست، پلنی که با کیف پول خریدنی نیست |
+| 402 | `wallet_short` | موجودی کیف پول برای این پلن کافی نیست |
 | 400 | `bad_code`، `code_expired` | کد اتصال تلگرام |
 | 403 | `telegram_required` | ادمین خرید بدون تلگرام را بسته؛ مشتری پنل وب باید اول تلگرامش را وصل کند |
 | 400 | `bad_idempotency_key` | بیش از ۱۰۰ نویسه |

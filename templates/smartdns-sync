@@ -26,6 +26,7 @@ still carries its own traffic through its own exit.
 """
 
 import base64
+import gzip
 import hashlib
 import hmac
 import html
@@ -174,9 +175,44 @@ def api_endpoints():
     except ValueError:
         port = API_PORT
     direct = (CFG["PANEL_HOST"], port)
-    if (CFG.get("TUNNEL") or "off") != "backpack":
-        return [direct]
-    return [("127.0.0.1", API_TUNNEL_PORT), direct]
+    ways = [direct] if (CFG.get("TUNNEL") or "off") != "backpack" \
+        else [("127.0.0.1", API_TUNNEL_PORT), direct]
+    # The standby, last: it answers only once it has taken the panel over,
+    # with the same certificate, which is checked all the same.
+    standby = CFG.get("PANEL_STANDBY") or ""
+    if standby and standby != CFG["PANEL_HOST"]:
+        ways.append((standby, API_PORT))
+    return ways
+
+
+def fetch(path):
+    """Bytes the panel hands out, not JSON - the installer - pinned to its
+    certificate as post() is: (body, headers)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    last = None
+    for host, port in api_endpoints():
+        conn = NamedHTTPS(host, port, sync_sni(), timeout=60, context=ctx)
+        try:
+            try:
+                conn.connect()
+            except OSError as e:
+                last = e
+                continue
+            seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
+                raise RuntimeError("certificate fingerprint mismatch")
+            conn.request("POST", path, "{}", {"Content-Type": "application/json",
+                                              "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
+            res = conn.getresponse()
+            body = res.read()
+            if res.status != 200:
+                raise RuntimeError("panel returned %d" % res.status)
+            return body, dict(res.getheaders())
+        finally:
+            conn.close()
+    raise RuntimeError("panel not reachable: %s" % last)
 
 
 def post(path, payload):
@@ -231,6 +267,29 @@ def post(path, payload):
 
 
 # ------------------------------------------------------------------ health
+def conntrack_counts():
+    """(connections tracked, the table's size), or (None, None) where the
+    kernel keeps no table - when full, new connections are dropped."""
+    try:
+        with open("/proc/sys/net/netfilter/nf_conntrack_count") as fh:
+            count = int(fh.read().strip())
+        with open("/proc/sys/net/netfilter/nf_conntrack_max") as fh:
+            return count, int(fh.read().strip())
+    except (OSError, ValueError):
+        return None, None
+
+
+def cert_days(path):
+    """Whole days until this certificate expires, or None without one."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        ends = ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(path)["notAfter"])
+    except Exception:
+        return None
+    return int((ends - time.time()) // 86400)
+
+
 class Health:
     """Host metrics, read straight out of /proc.
 
@@ -283,9 +342,16 @@ class Health:
             return None, None
         return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
 
+    @staticmethod
+    def cert_path():
+        """The customer panel's certificate, when this machine has a name."""
+        domain = (CFG or {}).get("PANEL_DOMAIN") or ""
+        return "/etc/letsencrypt/live/%s/fullchain.pem" % domain if domain else None
+
     def sample(self):
         m = self._meminfo()
         rx, tx = self._net_rates()
+        track = conntrack_counts()
         st = os.statvfs("/")
         with open("/proc/uptime") as fh:
             uptime = int(float(fh.readline().split()[0]))
@@ -309,12 +375,20 @@ class Health:
             "rx_bps": rx,
             "tx_bps": tx,
             "uptime": uptime,
+            # Every byte since boot, for the month's traffic against a cap.
+            "rx_total": self.net[0] if self.net else None,
+            "tx_total": self.net[1] if self.net else None,
+            "conntrack": track[0],
+            "conntrack_max": track[1],
+            "cert_days": cert_days(self.cert_path()),
         }
 
 
 # ---------------------------------------------------------------- profiles
 PROFILE_DIR = "/etc/smartdns-profiles"
 PROFILE_BASE_PORT = 5300
+# 5300-5999: one port per template in use. The installer keeps tunnels off it.
+PROFILE_PORTS = 700
 NAT_TABLE = "smartdns_nat"
 
 
@@ -473,8 +547,8 @@ def base_settings():
 
 
 def rule_sets(text, me):
-    """What one resolver's config routes, bypasses and pins, as sets."""
-    out = {"routes": set(), "bypasses": set(), "pins": set()}
+    """What one resolver's config routes, bypasses, pins and blocks, as sets."""
+    out = {"routes": set(), "bypasses": set(), "pins": set(), "blocks": set()}
     for line in (text or "").splitlines():
         m = RULE_LINE.match(line.strip())
         if not m:
@@ -485,6 +559,8 @@ def rule_sets(text, me):
                 out["bypasses"].add(d)
             elif target == me:
                 out["routes"].add(d)
+            elif not target:
+                out["blocks"].add(d)
             else:
                 # With its address, so a pin moving somewhere new shows up as
                 # the change it is rather than as nothing.
@@ -509,14 +585,24 @@ def describe_change(old_text, new_text, me):
     """
     new = rule_sets(new_text, me)
     if old_text is None:
-        return "routes %d, bypasses %d, pins %d" % (
-            len(new["routes"]), len(new["bypasses"]), len(new["pins"]))
+        return "routes %d, bypasses %d, pins %d, blocks %d" % (
+            len(new["routes"]), len(new["bypasses"]), len(new["pins"]), len(new["blocks"]))
     old = rule_sets(old_text, me)
     parts = []
-    for key in ("routes", "bypasses", "pins"):
+    for key in ("routes", "bypasses", "pins", "blocks"):
         plus, minus = sorted(new[key] - old[key]), sorted(old[key] - new[key])
         if plus or minus:
             parts.append("%s %s" % (key, " ".join(signed(plus, "+") + signed(minus, "-"))))
+    lists = [{l.split()[3]: l.split()[4] for l in text.splitlines()
+              if l.startswith("# block list ") and len(l.split()) == 5}
+             for text in (old_text, new_text)]
+    for name in sorted(set(lists[0]) | set(lists[1])):
+        if name not in lists[0]:
+            parts.append("block list %s on" % name)
+        elif name not in lists[1]:
+            parts.append("block list %s off" % name)
+        elif lists[0][name] != lists[1][name]:
+            parts.append("block list %s updated" % name)
     return "; ".join(parts) or "settings only"
 
 
@@ -582,11 +668,56 @@ DEFAULT_PROFILE = "default"
 def default_profile(rules, custom):
     """That resolver's spec, or None when the main one does the job."""
     rules = rules if isinstance(rules, dict) else {}
-    if not rules.get("blocked") and not rules.get("forwards"):
+    if not rules.get("blocked") and not rules.get("forwards") and not rules.get("lists"):
         return None
     return {"raw": rule_lines(HIJACK_CONF) + rule_lines(BYPASS_CONF), "custom": list(custom),
             "pins": True, "blocked": rules.get("blocked") or [],
-            "forwards": rules.get("forwards") or {}}
+            "forwards": rules.get("forwards") or {}, "lists": rules.get("lists") or {}}
+
+
+# The panel's ready block lists - ads, porn - as dnsmasq rules, one file each,
+# fetched once by hash and read by every template's resolver that has it on.
+LIST_DIR = "/var/lib/smart-dns/relay-lists"
+LIST_HAVE = {}          # name -> (sha, mtime) checked, so a sync need not re-hash
+LIST_TRIED = {}         # name -> (sha, when) of the last failed fetch
+
+
+def ensure_list(name, sha):
+    """The local copy of a list with this hash - fetched if need be - or None."""
+    if not re.fullmatch(r"[a-z]{1,16}", name or "") or \
+            not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+        return None
+    path = os.path.join(LIST_DIR, name + ".conf")
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        stamp = None
+    if stamp is not None and LIST_HAVE.get(name) == (sha, stamp):
+        return path
+    if stamp is not None:
+        with open(path, "rb") as fh:
+            if hashlib.sha256(fh.read()).hexdigest() == sha:
+                LIST_HAVE[name] = (sha, stamp)
+                return path
+    tried = LIST_TRIED.get(name)
+    if tried and tried[0] == sha and time.time() - tried[1] < 600:
+        return None
+    try:
+        blob, headers = fetch("/blocklist/" + name)
+        text = gzip.decompress(blob)
+        if hashlib.sha256(text).hexdigest() != sha:
+            raise RuntimeError("the panel sent a different list than it named")
+        os.makedirs(LIST_DIR, exist_ok=True)
+        with open(path + ".tmp", "wb") as fh:
+            fh.write(text)
+        os.replace(path + ".tmp", path)
+    except Exception as e:
+        LIST_TRIED[name] = (sha, time.time())
+        log(WARN, "block list %s not fetched: %s" % (name, e))
+        return None
+    LIST_HAVE[name] = (sha, os.path.getmtime(path))
+    log(INFO, "block list %s: %d names" % (name, text.count(b"\n")))
+    return path
 
 
 def template_rules(spec):
@@ -719,7 +850,12 @@ def apply_profiles(profiles, assignment, restart=False, names=None):
         restart = True
     ports = {}
     for i, key in enumerate(sorted(profiles)):
+        if i >= PROFILE_PORTS:
+            log(ERROR, "%d templates in use - more than the %d resolver ports; %s and the "
+                "rest stay on the main resolver" % (len(profiles), PROFILE_PORTS, key))
+            break
         ports[key] = PROFILE_BASE_PORT + i
+    profiles = {k: v for k, v in profiles.items() if k in ports}
 
     # Read once: every profile that wants them gets the same lines.
     epic_pins = epic_pin_lines()
@@ -745,6 +881,12 @@ def apply_profiles(profiles, assignment, restart=False, names=None):
         # rule for a name they cover is left out below: see drop_overridden.
         blocked, forwards, taken = template_rules(spec)
         body += ["address=/%s/" % d for d in blocked]
+        # The ready lists, by file. The hash is written too, so a new list is
+        # a changed config and the resolver is restarted to read it.
+        for name, sha in sorted((spec.get("lists") or {}).items()):
+            path = ensure_list(name, sha)
+            if path:
+                body += ["# block list %s %s" % (name, sha[:16]), "conf-file=%s" % path]
         body += ["server=/%s/%s" % (d, v) for d in sorted(forwards) for v in forwards[d]]
         body += ["address=/%s/%s" % (d, me)
                  for d in sorted(set(spec.get("routed") or []))
@@ -956,6 +1098,41 @@ def close_relay_when_ready(allowed_count):
           % allowed_count, flush=True)
 
 
+# Set while this relay is open because the panel made the DNS public, so
+# that turning it back off closes only what public DNS opened: a relay an
+# operator opened by hand stays open.
+PUBLIC_MARK = "/etc/smart-dns/public-dns"
+
+
+def follow_public(public, allowed_count):
+    """Open the relay to everyone while the panel says the DNS is public,
+    and close it again after. True when it changed which way the door is."""
+    enforcing = os.path.exists(ENFORCE_FILE)
+    if public:
+        if not enforcing:
+            return False          # already open; and the installer's note waits
+        r = subprocess.run([ACL, "enforce", "off"], capture_output=True, text=True,
+                           timeout=30)
+        if r.returncode != 0:
+            log(ERROR, "public DNS: could not open the relay: %s" % r.stderr.strip())
+            return False
+        with open(PUBLIC_MARK, "w") as fh:
+            fh.write("closed before public DNS\n")
+        log(INFO, "public DNS: the relay is open to everyone")
+        return True
+    if os.path.exists(PUBLIC_MARK):
+        r = subprocess.run([ACL, "enforce", "on", "--yes", "--allow-empty"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log(ERROR, "public DNS off: could not close the relay: %s" % r.stderr.strip())
+            return False
+        os.unlink(PUBLIC_MARK)
+        log(INFO, "public DNS off: only registered addresses again (%d)" % allowed_count)
+        return True
+    close_relay_when_ready(allowed_count)
+    return False
+
+
 # The relay's own recent logs, sent to the panel now and then so the operator
 # can read them in the admin panel without logging in to this machine. Every
 # few minutes rather than every sync: a log is read by a person, not a
@@ -975,6 +1152,62 @@ LOG_SENT = [0.0]
 WATCH = "/usr/local/bin/smartdns-watch"
 WATCH_DONE = {"id": None, "result": None}
 WATCH_MAX = 40000
+
+
+# The same logs, one part of the machine at a time, so a busy part - the
+# customer panel's requests - cannot push a quiet one out of the window: (key,
+# what it is, its units or "kernel", how many lines).
+RELAY_LOG_PARTS = (
+    ("sync", "همگام‌سازی و پنل مشتری", ("smartdns-sync",), 80),
+    ("dnsmasq", "DNS — dnsmasq", ("dnsmasq",), 40),
+    ("templates", "DNS قالب‌ها", ("smartdns-dns@*",), 40),
+    ("doh", "DNS امن — DoH و DoT", ("smartdns-doh",), 40),
+    ("nginx", "nginx", ("nginx",), 40),
+    ("coturn", "STUN — coturn", ("coturn",), 30),
+    ("epic", "epic-pin", ("epic-pin",), 20),
+    ("acl", "ذخیرهٔ فهرست مشتری‌ها", ("smartdns-acl-save",), 20),
+    ("cert", "تمدید گواهی HTTPS", ("smartdns-cert",), 20),
+    ("kernel", "هشدارهای هستهٔ لینوکس — کم آمدن حافظه، پر شدن جدول اتصال‌ها", "kernel", 40),
+)
+NODE_LOG_PARTS = (
+    ("sync", "همگام‌سازی با پنل", ("smartdns-node",), 60),
+    ("nginx", "nginx", ("nginx",), 40),
+    ("cert", "تمدید گواهی HTTPS", ("smartdns-cert",), 20),
+    ("kernel", "هشدارهای هستهٔ لینوکس — کم آمدن حافظه، پر شدن جدول اتصال‌ها", "kernel", 40),
+)
+LOG_PART_MAX = 8000
+
+
+# What the kernel says that matters here, and not the hardware notes every
+# machine prints at boot: memory running out and what was killed for it, the
+# connection table full and dropping packets, crashes, a disk failing.
+KERNEL_TROUBLE = re.compile(r"(?i)(out of memory|invoked oom-killer|oom-kill:|killed process|"
+                            r"nf_conntrack: table full|dropping packet|segfault|"
+                            r"general protection|hung task|i/o error|ext4-fs error|"
+                            r"blk_update_request|soft lockup)")
+
+
+def kernel_log(lines):
+    """The kernel's troubles, the last few: memory running out and processes
+    killed for it, the connection table filling up and dropping packets."""
+    try:
+        text = subprocess.run(["journalctl", "-k", "-p", "warning", "-n", "2000",
+                               "--no-pager", "-o", "short-iso"],
+                              capture_output=True, text=True, timeout=20).stdout
+    except Exception as e:
+        return "journalctl: %s" % e
+    return "\n".join([l for l in text.splitlines() if KERNEL_TROUBLE.search(l)][-lines:])
+
+
+def log_parts(parts):
+    """[[key, what it is, its last lines], ...] for the admin panel's logs page."""
+    out = []
+    for key, label, units, lines in parts:
+        text = kernel_log(lines) if units == "kernel" else recent_logs(units, lines)
+        if "-- No entries --" in text and len(text.strip().splitlines()) <= 1:
+            text = ""
+        out.append([key, label, text[-LOG_PART_MAX:]])
+    return out
 
 
 def recent_logs(units=LOG_UNITS, lines=LOG_LINES):
@@ -1218,6 +1451,84 @@ def logs_due(clock=time.monotonic):
 # already known, once per sync.
 DOH_STATE = "/var/lib/smart-dns/doh.json"
 ENFORCE_FILE = "/etc/nftables.d/30-smartdns-enforce.conf"
+
+
+# ------------------------------------------------------------ the way back
+# With the door closed (smartdns-acl enforce on), an address that is not
+# registered gets no DNS at all - so a customer whose line changed its address
+# cannot even look up the customer panel to register the new one, unless they
+# know to change their device's DNS. For such an address, port 53 goes to a
+# resolver of its own that answers the customer panel's name and refuses
+# everything else: the page that lets them back in, and nothing it could use
+# to ride along free.
+GATE_PORT = 5299
+GATE_CONF = os.path.join(PROFILE_DIR, "gate.conf")
+GATE_UNIT = "smartdns-dns-gate"
+GATE_UNIT_FILE = "/etc/systemd/system/smartdns-dns-gate.service"
+GATE_CHAIN = "gatedns"
+GATE_KEEP = ("bind-interfaces", "listen-address=", "domain-needed", "bogus-priv", "no-hosts",
+             "interface=", "except-interface=")
+
+
+def gate_names():
+    """The names an unregistered address may look up."""
+    name = ((CFG or {}).get("PANEL_DOMAIN") or "").strip().lower().strip(".")
+    return [name] if is_domain(name) else []
+
+
+def gate_conf_text(names, upstream):
+    lines = ["# generated by smartdns-sync - do not edit",
+             "# Only the service's own names, for addresses not registered yet.",
+             "port=%d" % GATE_PORT, "no-resolv", "cache-size=100"]
+    lines += [l for l in base_settings() if l.startswith(GATE_KEEP)]
+    lines += ["server=/%s/%s" % (n, u) for n in names for u in upstream]
+    return "\n".join(lines) + "\n"
+
+
+def gate_rules():
+    return ['iifname != "lo" ip saddr != @allowed udp dport 53 redirect to :%d' % GATE_PORT,
+            'iifname != "lo" ip saddr != @allowed tcp dport 53 redirect to :%d' % GATE_PORT]
+
+
+def apply_gate_dns():
+    """Keep the way back open while the door is closed: its resolver, and the
+    redirect of unregistered port 53 to it. Undone when the door opens, or
+    when this relay has no customer panel name to give."""
+    names, upstream = gate_names(), current_upstream()
+    want = (os.path.exists(ENFORCE_FILE) and names and upstream
+            and os.path.exists(GATE_UNIT_FILE))
+    listed = nft("list", "chain", "inet", "smartdns", GATE_CHAIN)
+    if not want:
+        if listed.returncode == 0 and "redirect" in listed.stdout:
+            nft("flush", "chain", "inet", "smartdns", GATE_CHAIN)
+        if sh("systemctl", "is-active", GATE_UNIT).stdout.strip() == "active":
+            sh("systemctl", "stop", GATE_UNIT)
+        return False
+    text = gate_conf_text(names, upstream)
+    try:
+        with open(GATE_CONF) as fh:
+            old = fh.read()
+    except OSError:
+        old = None
+    if old != text:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        with open(GATE_CONF, "w") as fh:
+            fh.write(text)
+    active = sh("systemctl", "is-active", GATE_UNIT).stdout.strip() == "active"
+    if old != text or not active:
+        sh("systemctl", "restart", GATE_UNIT)
+        log(INFO, "the way back open: %s answered for unregistered addresses"
+            % ", ".join(names))
+    if listed.returncode != 0:
+        nft("add", "chain", "inet", "smartdns", GATE_CHAIN,
+            "{ type nat hook prerouting priority -110 ; policy accept ; }")
+        listed = nft("list", "chain", "inet", "smartdns", GATE_CHAIN)
+    if ("redirect to :%d" % GATE_PORT) not in (listed.stdout or ""):
+        nft("flush", "chain", "inet", "smartdns", GATE_CHAIN)
+        for rule in gate_rules():
+            nft("add", "rule", "inet", "smartdns", GATE_CHAIN, *rule.split())
+    return True
+
 MAIN_DNS_PORT = 53
 
 
@@ -1544,6 +1855,40 @@ USAGE_LOG = "/run/smartdns-usage"
 USAGE_TAKEN = USAGE_LOG + ".taken"
 # What was read but not yet delivered, so a sync that fails does not lose it.
 USAGE_PENDING = {}
+# The same bytes by which exit carried them: {ip: {exit: [up, down]}}.
+EXIT_PENDING = {}
+
+
+def exit_of(upstream):
+    """Which exit a connection went out through, from nginx's $upstream_addr:
+    an exit's address, or the tunnel's end here - the main exit - or None for
+    what never left this machine, DoH and DoT."""
+    host, _, port = upstream.rstrip(",").rpartition(":")
+    if host == "127.0.0.1":
+        if not port.isdigit():
+            return None
+        # A tunnel's end here: the main exit's, or a node's.
+        if int(port) in {local for _, local, _ in TUNNEL_PORTS}:
+            return current_exit_ip()
+        for node, base in NODE_TUNNELS.items():
+            if base <= int(port) < base + len(TUNNEL_PORTS):
+                return node
+        return None
+    return host if is_ipv4(host) else None
+
+
+def count_exit(ip, upstream, sent, got):
+    if is_single():
+        return                      # a single machine is its own and only exit
+    to = exit_of(upstream)
+    try:
+        down, up = int(sent), int(got)      # sent to the customer, got from them
+    except ValueError:
+        return
+    if to and up + down > 0:
+        pair = EXIT_PENDING.setdefault(ip, {}).setdefault(to, [0, 0])
+        pair[0] += up
+        pair[1] += down
 
 
 def take_usage():
@@ -1559,7 +1904,10 @@ def take_usage():
             with open(USAGE_TAKEN, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     parts = line.split()
-                    if len(parts) == 5:
+                    if len(parts) >= 6:
+                        ip, port, name, sent, got = parts[:5]
+                        count_exit(ip, parts[-1], sent, got)
+                    elif len(parts) == 5:
                         ip, port, name, sent, got = parts
                     elif len(parts) == 4:          # no name was asked for
                         ip, port, sent, got = parts
@@ -1588,6 +1936,854 @@ def take_usage():
     return dict(USAGE_PENDING)
 
 
+# ------------------------------------------------------------------ tunnel
+# The tunnel to the exit, when the admin panel sets it for this relay - every
+# relay but the one the exit's installer tunnels to, whose tunnel stays the
+# installer's (the panel then sends None and nothing here touches it). The
+# files are the installer's own, written the same way to the byte, so an
+# installer run afterwards finds them as they should be and changes nothing.
+TUNNEL_DIR = "/etc/smart-dns/tunnel"
+TUNNEL_TOML = TUNNEL_DIR + "/tunnel.toml"
+TUNNEL_NFT = "/etc/nftables.d/40-smartdns-tunnel.conf"
+TUNNEL_UNIT_FILE = "/etc/systemd/system/smartdns-tunnel.service"
+BACKPACK_BIN = "/usr/local/lib/smart-dns/backpack"
+EXIT_CONF = "/etc/nginx/smartdns-exit.conf"
+TUNNEL_TRANSPORTS = {
+    "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
+                "wsmux", "xdi", "udp"),
+    "direct": ("stealth", "wss", "tcp", "ws"),
+}
+# This end of each port the tunnel carries, and the exit's port it comes out on.
+TUNNEL_PORTS = (("https", 18443, 443), ("http", 18080, 80), ("spotify", 14070, 4070),
+                ("blizzard", 11119, 1119))
+TUNNEL_REPORT = {"state": None}
+
+
+def tunnel_token(secret):
+    return hashlib.sha256(("doctor-dns-tunnel:%s" % secret).encode()).hexdigest()[:48]
+
+
+def exit_group(ip):
+    """The name of the upstreams that put this exit first."""
+    return "to_ip_" + ip.replace(".", "_")
+
+
+def exit_conf_text(exit_ip, tunnel, order=None, down=(), nodes=None):
+    """nginx's way to the exits, in the order given - the exit this relay's
+    tunnel goes to by default. The tunnel's end here goes just before that
+    exit; the first of them all is the way, the rest are only fallbacks.
+    With more than one exit, each also gets upstreams of its own that put it
+    first, for the customers the admin sent through it."""
+    out = ["# The way to the exit - written by doctor dns: the installer, and\n"
+           "# smartdns-sync when the admin panel turns this relay's tunnel on or off.\n"]
+    order = order or [exit_ip]
+    groups = [("to_exit", order)]
+    if len(order) > 1:
+        groups += [(exit_group(ip), [ip] + [x for x in order if x != ip]) for ip in order]
+    for group, seq in groups:
+        # An exit that has stopped answering goes last, still a fallback:
+        # nginx would otherwise wait out its timeout on every new connection.
+        seq = [x for x in seq if x not in down] + [x for x in seq if x in down]
+        for i, (name, local, port) in enumerate(TUNNEL_PORTS):
+            servers = []
+            for ip in seq:
+                # The tunnel's end here, just before the exit it goes to.
+                if ip == exit_ip and tunnel:
+                    servers.append("127.0.0.1:%d" % local)
+                elif ip in (nodes or {}):
+                    servers.append("127.0.0.1:%d" % (nodes[ip] + i))
+                servers.append("%s:%d" % (ip, port))
+            out.append("upstream %s_%s {\n    server %s;\n%s}\n" % (
+                group, name, servers[0],
+                "".join("    server %s backup;\n" % s for s in servers[1:])))
+    return "".join(out)
+
+
+def tunnel_nft_text(port, peer):
+    return ("# written by doctor dns: the tunnel's port answers %(peer)s only\n"
+            "table inet smartdns_tunnel\n"
+            "delete table inet smartdns_tunnel\n"
+            "table inet smartdns_tunnel {\n"
+            "    chain input {\n"
+            "        type filter hook input priority -5 ; policy accept ;\n"
+            "        tcp dport %(port)s ip saddr != %(peer)s drop\n"
+            "        udp dport %(port)s ip saddr != %(peer)s drop\n"
+            "        meta nfproto ipv6 tcp dport %(port)s drop\n"
+            "        meta nfproto ipv6 udp dport %(port)s drop\n"
+            "    }\n"
+            "}\n" % {"port": port, "peer": peer})
+
+
+def tunnel_cert():
+    """wss on the listening end wants a certificate: the relay's own if it has
+    a domain, a self-signed one if not - the exit does not check it."""
+    domain = (CFG or {}).get("PANEL_DOMAIN") or ""
+    live = "/etc/letsencrypt/live/%s/" % domain
+    if domain and os.path.exists(live + "fullchain.pem"):
+        return live + "fullchain.pem", live + "privkey.pem"
+    c, k = TUNNEL_DIR + "/tls.crt", TUNNEL_DIR + "/tls.key"
+    os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
+    if not os.path.exists(c):
+        sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+           "-subj", "/CN=%s" % (domain or "localhost"), "-keyout", k, "-out", c)
+    return c, k
+
+
+def tunnel_toml_text(spec, exit_ip, secret, carried=None):
+    # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
+    # a node's carries only the proxy's ports, on its own.
+    if carried is None:
+        carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
+    ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
+    out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
+    if spec["direction"] == "reverse":
+        out.append('[server]\nbind_addr = "0.0.0.0:%d"\nports = [%s]\n' % (spec["port"], ports))
+        if spec["transport"] in ("wss", "wssmux"):
+            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % tunnel_cert())
+    else:
+        out.append('[direct]\nrole = "iran"\naddr = "%s:%d"\nports = [%s]\n'
+                   % (exit_ip, spec["port"], ports))
+    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+    if spec["direction"] == "reverse":
+        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
+    return "".join(out)
+
+
+def clean_tunnel(spec):
+    """The panel's word on this relay's tunnel, checked: None to leave it
+    alone, {} for none, or the transport, direction and port."""
+    if not isinstance(spec, dict):
+        return None
+    if not spec.get("on"):
+        return {}
+    direction = spec.get("direction")
+    transport = spec.get("transport")
+    try:
+        port = int(spec.get("port"))
+    except (TypeError, ValueError):
+        return None
+    if direction not in TUNNEL_TRANSPORTS or transport not in TUNNEL_TRANSPORTS[direction] \
+            or not 1 <= port <= 65535:
+        return None
+    return {"direction": direction, "transport": transport, "port": port}
+
+
+def write_if_changed(path, text, mode=0o644):
+    if read_text(path) == text:
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    return True
+
+
+def set_sync_env(values):
+    """Put these keys into sync.env, the rest as it was - the installer reads
+    them on its next run, so it keeps what the panel set."""
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            lines = [l.rstrip("\n") for l in fh]
+    except OSError:
+        return
+    keys = set(values)
+    kept = [l for l in lines if l.split("=", 1)[0].strip() not in keys]
+    new = kept + ["%s=%s" % (k, v) for k, v in values.items()]
+    if new != lines:
+        write_if_changed(CONFIG, "\n".join(new) + "\n", 0o600)
+    CFG.update(values)
+
+
+def point_exit_nginx(exit_ip, tunnel):
+    """nginx through the tunnel or straight to the exit, checked by nginx
+    first and put back if refused. False when refused."""
+    old = read_text(EXIT_CONF)
+    new = exit_conf_text(exit_ip, tunnel,
+                         EXIT_PLAN["order"] if EXIT_PLAN["main"] == exit_ip else None,
+                         {ip for ip, h in EXIT_HEALTH.items() if h["down"]}
+                         | EXIT_PLAN["capped"], dict(NODE_TUNNELS))
+    if old == new:
+        return True
+    write_if_changed(EXIT_CONF, new)
+    if sh("nginx", "-t").returncode != 0:
+        if old is None:
+            os.unlink(EXIT_CONF)
+        else:
+            write_if_changed(EXIT_CONF, old)
+        return False
+    sh("systemctl", "reload", "nginx")
+    return True
+
+
+def current_exit_ip():
+    if EXIT_PLAN["main"]:
+        return EXIT_PLAN["main"]
+    m = re.search(r"server ((?:\d{1,3}\.){3}\d{1,3}):443", read_text(EXIT_CONF) or "")
+    return m.group(1) if m else CFG.get("PANEL_HOST", "")
+
+
+def apply_tunnel(raw):
+    """Bring this relay's tunnel to what the admin panel set."""
+    if raw is None or is_single():
+        return                      # the installer's tunnel, or a single machine
+    spec = clean_tunnel(raw)
+    if spec is None:
+        TUNNEL_REPORT["state"] = {"on": False, "error": "تنظیم تونل از پنل خوانا نبود"}
+        return
+    exit_ip = str(raw.get("exit") or "") or current_exit_ip()
+    if not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", exit_ip):
+        TUNNEL_REPORT["state"] = {"on": False, "error": "آدرس سرور خارج معلوم نیست"}
+        return
+    error = ""
+    if spec and not os.access(BACKPACK_BIN, os.X_OK):
+        spec, error = {}, ("BackPack روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله "
+                           "اجرا کنید")
+    elif spec and not os.path.exists(TUNNEL_UNIT_FILE):
+        spec, error = {}, "سرویس تونل روی این رله نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید"
+    if not spec:
+        if CFG.get("TUNNEL") == "backpack" or os.path.exists(TUNNEL_TOML):
+            sh("systemctl", "disable", "--now", "smartdns-tunnel")
+            for path in (TUNNEL_TOML, TUNNEL_NFT):
+                if os.path.exists(path):
+                    os.unlink(path)
+            nft("delete", "table", "inet", "smartdns_tunnel")
+            log(INFO, "tunnel off, as the admin panel says - straight to the exit")
+        if not point_exit_nginx(exit_ip, False):
+            error = error or "nginx راه مستقیم را نپذیرفت"
+        set_sync_env({"TUNNEL": "off", "TUNNEL_TRANSPORT": "", "TUNNEL_DIRECTION": "",
+                      "TUNNEL_PORT": ""})
+        TUNNEL_REPORT["state"] = {"on": False, "error": error}
+        return
+    os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
+    changed = write_if_changed(TUNNEL_TOML, tunnel_toml_text(spec, exit_ip, CFG["SYNC_SECRET"]),
+                               0o600)
+    if spec["direction"] == "reverse":
+        os.makedirs(os.path.dirname(TUNNEL_NFT), exist_ok=True)
+        if write_if_changed(TUNNEL_NFT, tunnel_nft_text(spec["port"], exit_ip)) or changed:
+            if nft("-f", TUNNEL_NFT).returncode != 0:
+                error = "قاعدهٔ فایروال تونل بار نشد؛ درگاه %d به روی همه باز است" % spec["port"]
+    elif os.path.exists(TUNNEL_NFT):
+        os.unlink(TUNNEL_NFT)
+        nft("delete", "table", "inet", "smartdns_tunnel")
+    if changed or CFG.get("TUNNEL") != "backpack":
+        sh("systemctl", "enable", "smartdns-tunnel")
+    running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
+    if changed or not running:
+        sh("systemctl", "restart", "smartdns-tunnel")
+        running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
+        log(INFO, "tunnel %s, %s, port %d, as the admin panel says"
+            % (spec["transport"], spec["direction"], spec["port"]))
+    if not point_exit_nginx(exit_ip, True):
+        error = error or "nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود"
+    set_sync_env({"TUNNEL": "backpack", "TUNNEL_TRANSPORT": spec["transport"],
+                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"])})
+    TUNNEL_REPORT["state"] = {"on": True, "error": error, "running": running}
+
+
+# ------------------------------------------------------------------ node
+# A node is another exit joined to this panel: nginx as on the exit, and no
+# panel of its own. This same program runs there with --node, from
+# node.env: the relays to let in and the resolvers to ask come from the
+# panel, and the machine's health and logs go back to it.
+NODE_CONFIG = "/etc/smart-dns/node.env"
+RELAYS_CONF = "/etc/nginx/smartdns-relays.conf"
+NGINX_CONF = "/etc/nginx/nginx.conf"
+UPSTREAM_FILE = "/etc/smart-dns/upstream"
+RESOLVER_LINE = re.compile(r"(\bresolver )([0-9. ]+?)( ipv[46]=off;)")
+NODE_LOG_UNITS = ("smartdns-node", "nginx", "smartdns-tunnel@*")
+NODE_STATE = {"resolvers": None, "tunnels": None, "standby": None}
+
+
+def is_ipv4(ip):
+    return isinstance(ip, str) and re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) is not None \
+        and all(int(p) <= 255 for p in ip.split("."))
+
+
+def relays_conf_text(ips):
+    """The file the exit's nginx lets relays in from - the installer's and the
+    admin panel's own words, so the three of them never disagree."""
+    return ("# The relays this exit lets in: written by the installer and the admin panel.\n"
+            + "".join("allow %s;\n" % ip for ip in ips))
+
+
+def nginx_swap(path, text):
+    """Write this file for nginx, checked by nginx -t and put back if refused.
+    True when nginx took it (or it was already so)."""
+    old = read_text(path)
+    if old == text:
+        return True
+    write_if_changed(path, text)
+    if sh("nginx", "-t").returncode != 0:
+        if old is None:
+            os.unlink(path)
+        else:
+            write_if_changed(path, old)
+        return False
+    sh("systemctl", "reload", "nginx")
+    return True
+
+
+def apply_node_relays(raw):
+    """Let in exactly the relays the panel serves. An empty or unreadable
+    list changes nothing: it would shut every relay out."""
+    ips = []
+    for ip in raw or []:
+        if is_ipv4(ip) and ip not in ips:
+            ips.append(ip)
+    if not ips:
+        return
+    before = read_text(RELAYS_CONF)
+    if nginx_swap(RELAYS_CONF, relays_conf_text(ips)):
+        if before != relays_conf_text(ips):
+            log(INFO, "relays let in: %s" % ", ".join(ips))
+    else:
+        log(WARN, "nginx refused the relays' list - kept the one it had")
+
+
+def apply_node_resolvers(raw):
+    """nginx's resolvers, as the panel's picks - those that answer from here."""
+    picks = [ip for ip in (raw or []) if is_ipv4(ip)][:2]
+    if not picks:
+        return
+    text = read_text(NGINX_CONF) or ""
+    m = RESOLVER_LINE.search(text)
+    if not m:
+        NODE_STATE["resolvers"] = {"using": "", "error": "خط resolver در nginx.conf پیدا نشد"}
+        return
+    if m.group(2).split() == picks:
+        NODE_STATE["resolvers"] = {"using": " ".join(picks), "error": ""}
+        return
+    alive = [ip for ip in picks if dns_probe(ip) is not None]
+    if not alive:
+        NODE_STATE["resolvers"] = {"using": m.group(2),
+                                   "error": "%s از این سرور جواب نداد" % " و ".join(picks)}
+        return
+    new = RESOLVER_LINE.sub(lambda x: x.group(1) + " ".join(alive) + x.group(3), text)
+    if not nginx_swap(NGINX_CONF, new):
+        NODE_STATE["resolvers"] = {"using": m.group(2), "error": "nginx نپذیرفت"}
+        return
+    write_if_changed(UPSTREAM_FILE, " ".join(alive) + "\n")
+    log(INFO, "resolvers now %s" % " ".join(alive))
+    NODE_STATE["resolvers"] = {"using": " ".join(alive), "error": ""}
+
+
+def node_once():
+    try:
+        host = HEALTH.sample()
+    except Exception as e:
+        host = {"error": str(e)}
+    payload = {"node": CFG["SELF_IP"], "host": host}
+    if NODE_STATE["resolvers"] is not None:
+        payload["resolvers"] = NODE_STATE["resolvers"]
+    if NODE_STATE["tunnels"] is not None:
+        payload["tunnel_state"] = NODE_STATE["tunnels"]
+    payload["version"] = installed_version()
+    finished_upgrade = upgrade_result()
+    if finished_upgrade:
+        payload["upgrade_result"] = finished_upgrade
+    if NODE_STATE["standby"]:
+        payload["standby_kept"] = NODE_STATE["standby"]
+    if logs_due():
+        payload["logs"] = ""
+        payload["log_parts"] = log_parts(NODE_LOG_PARTS)
+        payload["tunnel_logs"] = recent_logs(("smartdns-tunnel@*",), 80)
+        payload["nginx_logs"] = nginx_errors()
+    answer = post("/node", payload)
+    if finished_upgrade and answer.get("upgrade_ack"):
+        upgrade_heard()
+    try:
+        follow_panel(answer.get("panel"))
+    except Exception as e:
+        log(WARN, "the panel's whereabouts not kept: %s" % e)
+    try:
+        NODE_STATE["standby"] = keep_standby(answer.get("standby"))
+    except Exception as e:
+        log(WARN, "standby backup not kept: %s" % e)
+    try:
+        start_upgrade(answer.get("upgrade"))
+    except Exception as e:
+        log(WARN, "upgrade not started: %s" % e)
+    try:
+        apply_node_relays(answer.get("relays"))
+    except Exception as e:
+        log_exception("relays not applied: %s" % e)
+    try:
+        apply_node_resolvers(answer.get("upstream"))
+    except Exception as e:
+        log_exception("resolvers not applied: %s" % e)
+    try:
+        apply_relay_tunnels(answer.get("tunnels"))
+    except Exception as e:
+        log_exception("relays' tunnels not applied: %s" % e)
+
+
+def node_loop():
+    fails = 0
+    while True:
+        try:
+            node_once()
+            fails = 0
+        except Exception as e:
+            fails += 1
+            # The relays already let in keep working while the panel is away.
+            if fails <= 3 or fails % 20 == 0:
+                log(WARN if fails < 3 else ERROR, "node sync failed (%d): %s" % (fails, e))
+        time.sleep(INTERVAL)
+
+
+# ------------------------------------------------------------------ exits
+# Which exit this relay's traffic goes to, as the panel says: the one the
+# admin picked first, the others after it as nginx's fallbacks. The tunnel,
+# when there is one, is to the panel's own exit - "main" - and goes just
+# before it.
+EXIT_PLAN = {"main": None, "order": None, "capped": set()}
+
+
+CUSTOMER_EXITS = "/etc/nginx/smartdns-customer-exits.map"
+
+
+def customer_exits_text(pairs):
+    return ("# Customers the admin panel sent through another exit than this relay's:\n"
+            "# written by the installer (empty) and smartdns-sync.\n"
+            + "".join("%s %s;\n" % (ip, group) for ip, group in pairs))
+
+
+def apply_customer_exits(raw):
+    """Send each of these customers' addresses through their exit - one this
+    relay has upstreams for, and not its own first one, which is where they
+    would go anyway."""
+    if is_single() or not isinstance(raw, dict):
+        return
+    order = EXIT_PLAN["order"] or []
+    pairs = sorted((ip, exit_group(to)) for ip, to in raw.items()
+                   if is_ipv4(ip) and to in order[1:])
+    if not nginx_swap(CUSTOMER_EXITS, customer_exits_text(pairs)):
+        log(WARN, "nginx refused the customers' exits - kept the ones it had")
+
+
+# Whether each exit still carries traffic: a TLS handshake with a real site
+# through it, from here - the tunnel's end for the main exit when there is a
+# tunnel, then the exit itself. Two misses in a row and it is down, two
+# answers and it is back: one lost packet moves nothing.
+HEALTH_NAME = "www.cloudflare.com"
+EXIT_HEALTH = {}
+
+
+def exit_answers(addr, port, timeout=5.0):
+    """Milliseconds for a verified TLS handshake with HEALTH_NAME through
+    this address and port, or None."""
+    t0 = time.monotonic()
+    try:
+        raw = socket.create_connection((addr, port), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        with ssl.create_default_context().wrap_socket(raw, server_hostname=HEALTH_NAME):
+            return int((time.monotonic() - t0) * 1000)
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+    finally:
+        raw.close()
+
+
+def probe_exits():
+    """Try every exit at once; update EXIT_HEALTH."""
+    if is_single():
+        return
+    main = current_exit_ip()
+    order = EXIT_PLAN["order"] or ([main] if is_ipv4(main) else [])
+    tunnel = (CFG.get("TUNNEL") or "off") == "backpack"
+    seen = {}
+
+    def check(ip):
+        ms = exit_answers("127.0.0.1", 18443) if ip == main and tunnel else None
+        if ip in NODE_TUNNELS:
+            ms = exit_answers("127.0.0.1", NODE_TUNNELS[ip])
+        seen[ip] = ms if ms is not None else exit_answers(ip, 443)
+
+    workers = [threading.Thread(target=check, args=(ip,)) for ip in order]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(15)
+    for ip in list(EXIT_HEALTH):
+        if ip not in order:
+            del EXIT_HEALTH[ip]
+    for ip in order:
+        h = EXIT_HEALTH.setdefault(ip, {"fails": 0, "oks": 0, "down": False, "ms": None})
+        ms = seen.get(ip)
+        if ms is None:
+            h["fails"], h["oks"] = h["fails"] + 1, 0
+            if h["fails"] >= 2 and not h["down"]:
+                h["down"] = True
+                log(WARN, "exit %s is not answering - it goes last" % ip)
+        else:
+            h["fails"], h["oks"], h["ms"] = 0, h["oks"] + 1, ms
+            if h["oks"] >= 2 and h["down"]:
+                h["down"] = False
+                log(INFO, "exit %s answers again" % ip)
+
+
+# The tunnels between relays and nodes. On a relay, one BackPack per node it
+# has a tunnel to; on a node, one per relay. Each from its own directory,
+# smartdns-tunnel@<the other end>, as the exit's are.
+RELAY_TUNNEL_DIR = "/etc/smart-dns/relay-tunnels"
+TUNNEL_INSTANCE_FILE = "/etc/systemd/system/smartdns-tunnel@.service"
+NODE_TUNNEL_BASE = 20000
+# On a relay: the node's tunnel's first port here, for each node it has one to.
+NODE_TUNNELS = {}
+NODE_TUNNEL_REPORT = {"state": None}
+
+
+def instance_nft(ip):
+    return ("/etc/nftables.d/41-smartdns-tunnel-%s.conf" % ip,
+            "smartdns_tunnel_" + ip.replace(".", "_"))
+
+
+def run_instance(peer, text, listen):
+    """smartdns-tunnel@<peer> from this config, with this machine's port
+    answering the peer only when it is the one listening. Whether it runs."""
+    where = os.path.join(RELAY_TUNNEL_DIR, peer)
+    os.makedirs(where, mode=0o700, exist_ok=True)
+    changed = write_if_changed(os.path.join(where, "tunnel.toml"), text, 0o600)
+    path, table = instance_nft(peer)
+    if listen:
+        rules = ("# written by doctor dns: the tunnel's port answers %s only\n"
+                 "table inet %s\ndelete table inet %s\ntable inet %s {\n    chain input {\n"
+                 "        type filter hook input priority -5 ; policy accept ;\n"
+                 "        tcp dport %d ip saddr != %s drop\n"
+                 "        udp dport %d ip saddr != %s drop\n"
+                 "        meta nfproto ipv6 tcp dport %d drop\n"
+                 "        meta nfproto ipv6 udp dport %d drop\n    }\n}\n"
+                 % (peer, table, table, table, listen, peer, listen, peer, listen, listen))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if write_if_changed(path, rules) or changed:
+            nft("-f", path)
+    elif os.path.exists(path):
+        os.unlink(path)
+        nft("delete", "table", "inet", table)
+    unit = "smartdns-tunnel@%s" % peer
+    if changed:
+        sh("systemctl", "enable", unit)
+    running = sh("systemctl", "is-active", unit).returncode == 0
+    if changed or not running:
+        sh("systemctl", "restart", unit)
+        running = sh("systemctl", "is-active", unit).returncode == 0
+        log(INFO, "tunnel to %s (re)started" % peer)
+    return running
+
+
+def drop_instances(keep):
+    """Take down every tunnel instance here whose other end is not in `keep`."""
+    try:
+        have = [d for d in os.listdir(RELAY_TUNNEL_DIR) if is_ipv4(d)]
+    except OSError:
+        have = []
+    for peer in have:
+        if peer in keep:
+            continue
+        sh("systemctl", "disable", "--now", "smartdns-tunnel@%s" % peer)
+        subprocess.run(["rm", "-rf", os.path.join(RELAY_TUNNEL_DIR, peer)], capture_output=True)
+        path, table = instance_nft(peer)
+        if os.path.exists(path):
+            os.unlink(path)
+        nft("delete", "table", "inet", table)
+        log(INFO, "tunnel to %s taken down" % peer)
+
+
+def apply_node_tunnels(raw):
+    """On a relay: its tunnels to the nodes, as the admin panel set them."""
+    if not isinstance(raw, dict) or is_single():
+        return
+    want = {}
+    for node, spec in list(raw.items())[:16]:
+        clean = clean_tunnel(spec) if isinstance(spec, dict) else None
+        try:
+            slot = int(spec.get("slot"))
+        except (TypeError, ValueError, AttributeError):
+            slot = 0
+        if is_ipv4(node) and clean and 1 <= slot <= 99:
+            want[node] = (clean, NODE_TUNNEL_BASE + slot * 10)
+    states = {}
+    if want and not (os.access(BACKPACK_BIN, os.X_OK) and os.path.exists(TUNNEL_INSTANCE_FILE)):
+        states = {n: {"running": False, "error": "BackPack یا سرویس تونل روی این رله نیست؛ "
+                                                 "نصب‌کننده را یک بار دیگر اجرا کنید"}
+                  for n in want}
+        want = {}
+    drop_instances(want)
+    for node, (spec, base) in want.items():
+        carried = [(name, base + i, port) for i, (name, _, port) in enumerate(TUNNEL_PORTS)]
+        text = tunnel_toml_text(spec, node, CFG["SYNC_SECRET"], carried)
+        up = run_instance(node, text, spec["port"] if spec["direction"] == "reverse" else None)
+        states[node] = {"running": up, "error": ""}
+    NODE_TUNNELS.clear()
+    NODE_TUNNELS.update({n: base for n, (_, base) in want.items()})
+    NODE_TUNNEL_REPORT["state"] = states
+
+
+def exit_side_toml(relay, spec, secret, where):
+    """A node's end of a relay's tunnel - the exit's, word for word."""
+    out = ["# written by doctor dns: the admin panel's relays card\n"]
+    if spec["direction"] == "reverse":
+        out.append('[client]\nremote_addr = "%s:%d"\n' % (relay, spec["port"]))
+    else:
+        out.append('[direct]\nrole = "kharej"\naddr = "0.0.0.0:%d"\n' % spec["port"])
+        if spec["transport"] in ("wss", "wssmux"):
+            c, k = where + "/tls.crt", where + "/tls.key"
+            os.makedirs(where, mode=0o700, exist_ok=True)
+            if not os.path.exists(c):
+                sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                   "-subj", "/CN=localhost", "-keyout", k, "-out", c)
+            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
+    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+    if spec["direction"] == "reverse":
+        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
+    return "".join(out)
+
+
+def apply_relay_tunnels(raw):
+    """On a node: its ends of the relays' tunnels."""
+    if not isinstance(raw, dict):
+        return
+    want = {}
+    for relay, spec in list(raw.items())[:64]:
+        clean = clean_tunnel(dict(spec, on=True)) if isinstance(spec, dict) else None
+        if is_ipv4(relay) and clean:
+            want[relay] = clean
+    if want and not (os.access(BACKPACK_BIN, os.X_OK) and os.path.exists(TUNNEL_INSTANCE_FILE)):
+        log(WARN, "BackPack or its tunnel service is not on this node - run the installer again")
+        want = {}
+    drop_instances(want)
+    states = {}
+    for relay, spec in want.items():
+        where = os.path.join(RELAY_TUNNEL_DIR, relay)
+        states[relay] = run_instance(relay, exit_side_toml(relay, spec, CFG["SYNC_SECRET"], where),
+                                     spec["port"] if spec["direction"] == "direct" else None)
+    NODE_STATE["tunnels"] = states
+
+
+def apply_exits(raw):
+    if not isinstance(raw, dict) or is_single():
+        return
+    main = raw.get("main")
+    order = []
+    for ip in raw.get("order") or []:
+        if is_ipv4(ip) and ip not in order:
+            order.append(ip)
+    if not is_ipv4(main) or main not in order:
+        return
+    changed = EXIT_PLAN["order"] != order[:8]
+    EXIT_PLAN.update(main=main, order=order[:8],
+                     capped={ip for ip in raw.get("capped") or [] if is_ipv4(ip)})
+    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"):
+        log(WARN, "nginx refused the way to the exits - kept the one it had")
+    elif changed:
+        log(INFO, "exits: %s first" % order[0])
+
+
+# ------------------------------------------------------------------ upgrades
+# When the admin panel's job comes to this server: the installer fetched from
+# the panel, its hash checked, and run as a unit of its own - it restarts
+# this program, which must not take the installer down with it. The result
+# waits here, beside the installer's log, until the panel has it.
+UPGRADE_DIR = "/var/lib/smart-dns/upgrade"
+VERSION_FILE = "/var/lib/smart-dns/version"
+
+
+def installed_version():
+    return (read_text(VERSION_FILE) or "").strip()
+
+
+STANDBY_DIR = "/var/lib/smart-dns/standby"
+
+
+def follow_panel(raw):
+    """Where the panel says it is: the standby that has taken it over is the
+    panel from now on, and a panel come back from the dead is not."""
+    if not isinstance(raw, dict) or os.path.exists(PANEL_ENV_HERE):
+        return
+    host, standby = raw.get("host"), raw.get("standby") or ""
+    want = {}
+    if is_ipv4(host) and host != CFG.get("PANEL_HOST"):
+        want["PANEL_HOST"] = host
+        log(WARN, "the panel is on %s now - syncing there from here on" % host)
+    if (standby == "" or is_ipv4(standby)) and standby != (CFG.get("PANEL_STANDBY") or ""):
+        want["PANEL_STANDBY"] = standby
+    if want:
+        set_sync_env(want)
+
+
+def keep_standby(raw):
+    """On the standby node: the panel's latest backup and installer, kept
+    against the day it is needed - and nothing kept once it is not the one."""
+    if not isinstance(raw, dict):
+        if os.path.isdir(STANDBY_DIR):
+            subprocess.run(["rm", "-rf", STANDBY_DIR], capture_output=True)
+        return None
+    os.makedirs(STANDBY_DIR, mode=0o700, exist_ok=True)
+    for name, path, want in (("backup.enc", "/standby-bundle", raw.get("bundle")),
+                             ("doctor-dns.sh", "/installer", raw.get("installer"))):
+        where = os.path.join(STANDBY_DIR, name)
+        try:
+            with open(where, "rb") as fh:
+                have = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            have = ""
+        if want and have != want:
+            blob, _ = fetch(path)
+            if hashlib.sha256(blob).hexdigest() == want:
+                with open(where + ".tmp", "wb") as fh:
+                    fh.write(blob)
+                os.chmod(where + ".tmp", 0o600)
+                os.replace(where + ".tmp", where)
+                log(INFO, "standby: kept the panel's latest %s" % name)
+    kept = {}
+    for name, key in (("backup.enc", "bundle"), ("doctor-dns.sh", "installer")):
+        try:
+            with open(os.path.join(STANDBY_DIR, name), "rb") as fh:
+                kept[key] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            kept[key] = ""
+    return kept
+
+
+def start_upgrade(order):
+    """Fetch and run the installer the panel names, once."""
+    if not isinstance(order, dict) or not order.get("sha"):
+        return
+    started = read_text(os.path.join(UPGRADE_DIR, "started")) or ""
+    if started.strip() == order["sha"]:
+        return                      # running, or done and waiting to be heard
+    if sh("systemctl", "is-active", "smartdns-upgrade").returncode == 0:
+        return
+    blob, headers = fetch("/installer")
+    if hashlib.sha256(blob).hexdigest() != order["sha"]:
+        raise RuntimeError("the installer from the panel is not the one it named")
+    os.makedirs(UPGRADE_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(UPGRADE_DIR, "doctor-dns.sh")
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    for name in ("rc", "run.log"):
+        try:
+            os.unlink(os.path.join(UPGRADE_DIR, name))
+        except OSError:
+            pass
+    write_if_changed(os.path.join(UPGRADE_DIR, "started"), order["sha"] + "\n", 0o600)
+    r = sh("systemd-run", "--unit=smartdns-upgrade", "--collect", "--quiet", "/bin/bash", "-c",
+           "ASSUME_YES=1 bash %s < /dev/null > %s/run.log 2>&1; echo $? > %s/rc"
+           % (path, UPGRADE_DIR, UPGRADE_DIR))
+    if r.returncode != 0:
+        raise RuntimeError("systemd-run: %s" % r.stderr.strip()[-200:])
+    log(INFO, "upgrading to %s, as the admin panel asked" % order.get("version"))
+
+
+DOMAIN_DIR = "/var/lib/smart-dns/domain"
+DOMAIN_RETRY = 15 * 60
+
+
+def name_points_here(name):
+    """Whether the name's A record is this server's address - checked before
+    anything is run, so a record not made yet is said plainly, not as a
+    certificate that failed."""
+    try:
+        found = {a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)}
+    except OSError:
+        found = set()
+    return CFG.get("SELF_IP") in found, sorted(found)
+
+
+def start_domain(order):
+    """Give this server the domain the panel names: its certificate, and
+    DoH and DoT on it - by running the installer again with that name,
+    which is what a new install with it does. Once per name; a failure is
+    tried again a quarter of an hour later."""
+    if not isinstance(order, dict):
+        return
+    name = str(order.get("name") or "").lower()
+    if not re.fullmatch(r"[a-z0-9.-]{4,253}", name) or name == CFG.get("PANEL_DOMAIN"):
+        return
+    for unit in ("smartdns-domain", "smartdns-upgrade"):
+        if sh("systemctl", "is-active", unit).returncode == 0:
+            return
+    os.makedirs(DOMAIN_DIR, mode=0o700, exist_ok=True)
+    tried = os.path.join(DOMAIN_DIR, "tried")
+    last = (read_text(tried) or "").split()
+    if last[:1] == [name] and len(last) > 1 and time.time() - float(last[1]) < DOMAIN_RETRY:
+        return
+    write_if_changed(tried, "%s %d\n" % (name, time.time()), 0o600)
+    here, found = name_points_here(name)
+    if not here:
+        write_if_changed(os.path.join(DOMAIN_DIR, "result.json"), json.dumps({
+            "name": name, "ok": False,
+            "error": "رکورد A دامنه به این سرور (%s) اشاره نمی‌کند؛ الان: %s"
+                     % (CFG.get("SELF_IP"), "، ".join(found) or "هیچ")}), 0o600)
+        return
+    blob, _ = fetch("/installer")
+    if hashlib.sha256(blob).hexdigest() != order.get("sha"):
+        raise RuntimeError("the installer from the panel is not the one it named")
+    path = os.path.join(DOMAIN_DIR, "doctor-dns.sh")
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    for n in ("rc", "run.log", "result.json"):
+        try:
+            os.unlink(os.path.join(DOMAIN_DIR, n))
+        except OSError:
+            pass
+    write_if_changed(os.path.join(DOMAIN_DIR, "name"), name + "\n", 0o600)
+    r = sh("systemd-run", "--unit=smartdns-domain", "--collect", "--quiet", "/bin/bash", "-c",
+           "PANEL_DOMAIN=%s ASSUME_YES=1 bash %s < /dev/null > %s/run.log 2>&1; echo $? > %s/rc"
+           % (name, path, DOMAIN_DIR, DOMAIN_DIR))
+    if r.returncode != 0:
+        raise RuntimeError("systemd-run: %s" % r.stderr.strip()[-200:])
+    log(INFO, "getting the domain %s, as the admin panel asked" % name)
+
+
+def domain_result():
+    """How giving this server its domain went, once there is something to
+    say; None before."""
+    early = read_text(os.path.join(DOMAIN_DIR, "result.json"))
+    if early:
+        try:
+            return json.loads(early)
+        except ValueError:
+            return None
+    rc = read_text(os.path.join(DOMAIN_DIR, "rc"))
+    if rc is None:
+        return None
+    text = read_text(os.path.join(DOMAIN_DIR, "run.log")) or ""
+    name = (read_text(os.path.join(DOMAIN_DIR, "name")) or "").strip()
+    ok = rc.strip() == "0" and "DNS over HTTPS on https://%s/" % name in text
+    return {"name": name, "ok": ok, "log": text[-3000:],
+            "error": "" if ok else "گرفتن گواهی یا روشن کردن DoH نشد"}
+
+
+def domain_heard():
+    for n in ("rc", "result.json"):
+        try:
+            os.unlink(os.path.join(DOMAIN_DIR, n))
+        except OSError:
+            pass
+
+
+def upgrade_result():
+    """How the last upgrade went, once it has finished; None before."""
+    rc = read_text(os.path.join(UPGRADE_DIR, "rc"))
+    if rc is None:
+        return None
+    text = read_text(os.path.join(UPGRADE_DIR, "run.log")) or ""
+    return {"version": installed_version(), "log": text[-3000:],
+            "ok": rc.strip() == "0" and "is installed and working" in text}
+
+
+def upgrade_heard():
+    """The panel has the result: it is not sent again."""
+    try:
+        os.unlink(os.path.join(UPGRADE_DIR, "rc"))
+    except OSError:
+        pass
+
+
 def sync_once():
     rows = current_state()
     counters = {r["ip"]: r["total"] for r in rows}
@@ -1605,6 +2801,8 @@ def sync_once():
     url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
            if CFG.get("PANEL_DOMAIN") else "")
     payload = {"counters": counters, "host": host, "relay": CFG["SELF_IP"],
+               # Relay and exit both, so the panel offers it no exits or tunnels.
+               "single": is_single(),
                "panel_url": url,
                # The name a bot should give out for DoH and DoT, once this
                # relay has the certificate for it; empty until then.
@@ -1627,6 +2825,9 @@ def sync_once():
         log(WARN, "usage not read: %s" % e)
     if services:
         payload["services"] = services
+    if EXIT_PENDING:
+        payload["exit_usage"] = {ip: {to: list(pair) for to, pair in v.items()}
+                                 for ip, v in EXIT_PENDING.items()}
     try:
         payload["dns_seen"] = dns_seen()
     except Exception as e:
@@ -1638,8 +2839,9 @@ def sync_once():
     if qlog:
         payload["qlog"] = qlog
     if logs_due():
-        payload["logs"] = recent_logs()
-        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+        payload["logs"] = ""
+        payload["log_parts"] = log_parts(RELAY_LOG_PARTS)
+        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT, "smartdns-tunnel@*"), 80)
         payload["nginx_logs"] = nginx_errors()
     finished = WATCH_DONE["result"]
     if finished:
@@ -1647,9 +2849,35 @@ def sync_once():
     checked = PROBE_DONE["result"]
     if checked:
         payload["probe_result"] = checked
+    if TUNNEL_REPORT["state"] is not None:
+        payload["tunnel_state"] = TUNNEL_REPORT["state"]
+    if NODE_TUNNEL_REPORT["state"] is not None:
+        payload["node_tunnel_state"] = NODE_TUNNEL_REPORT["state"]
+    try:
+        probe_exits()
+    except Exception as e:
+        log(WARN, "exits not checked: %s" % e)
+    if EXIT_HEALTH:
+        payload["exit_health"] = {ip: {"ok": not h["down"], "ms": h["ms"]}
+                                  for ip, h in EXIT_HEALTH.items()}
+    payload["version"] = installed_version()
+    finished_upgrade = upgrade_result()
+    if finished_upgrade:
+        payload["upgrade_result"] = finished_upgrade
+    finished_domain = domain_result()
+    if finished_domain:
+        payload["domain_result"] = finished_domain
     answer = post("/sync", payload)
+    if finished_domain and answer.get("domain_ack"):
+        domain_heard()
+    try:
+        start_domain(answer.get("domain"))
+    except Exception as e:
+        log(WARN, "domain not started: %s" % e)
     if services:
         USAGE_PENDING.clear()
+    if "exit_usage" in payload:
+        EXIT_PENDING.clear()
     if "doh_stats" in payload:
         DOH_PENDING["doh"].clear()
         DOH_PENDING["dot"].clear()
@@ -1696,12 +2924,43 @@ def sync_once():
         apply_doh_name(answer.get("doh_name"))
     except Exception as e:
         log(WARN, "DoH name not applied: %s" % e)
+    if finished_upgrade and answer.get("upgrade_ack"):
+        upgrade_heard()
+    try:
+        follow_panel(answer.get("panel"))
+    except Exception as e:
+        log(WARN, "the panel's whereabouts not kept: %s" % e)
+    try:
+        start_upgrade(answer.get("upgrade"))
+    except Exception as e:
+        log(WARN, "upgrade not started: %s" % e)
+    try:
+        apply_node_tunnels(answer.get("node_tunnels"))
+    except Exception as e:
+        log_exception("tunnels to the nodes not applied: %s" % e)
+    try:
+        apply_exits(answer.get("exits"))
+    except Exception as e:
+        log_exception("exits not applied: %s" % e)
+    try:
+        apply_customer_exits(answer.get("customer_exits"))
+    except Exception as e:
+        log_exception("customers' exits not applied: %s" % e)
+    try:
+        apply_tunnel(answer.get("tunnel"))
+    except Exception as e:
+        TUNNEL_REPORT["state"] = {"on": False, "error": str(e)[:300]}
+        log_exception("tunnel not applied: %s" % e)
     try:
         maybe_bench(answer.get("bench"))
     except Exception as e:
         log(WARN, "resolvers not timed: %s" % e)
     try:
         new_upstream = apply_upstream(answer.get("upstream"))
+        # A single machine joined to another panel is its own exit as well:
+        # its nginx asks the same resolvers, as a node's does.
+        if is_single() and not os.path.exists(PANEL_ENV_HERE):
+            apply_node_resolvers(answer.get("upstream"))
     except Exception as e:
         new_upstream = False
         log_exception("resolvers not applied: %s" % e)
@@ -1731,6 +2990,10 @@ def sync_once():
         write_doh_state(answer.get("doh"), ports or {}, assignment, want)
     except Exception as e:
         log_exception("DoH state not written: %s" % e)
+    try:
+        apply_gate_dns()
+    except Exception as e:
+        log_exception("the way back for unregistered addresses not set: %s" % e)
 
     try:
         apply_speeds(answer.get("allowed") or [])
@@ -1748,7 +3011,11 @@ def sync_once():
 
     # After the set is filled, not before: enforcing while the kernel list is
     # still empty is refused, and would leave the relay open for another cycle.
-    close_relay_when_ready(len(want))
+    if follow_public(bool(answer.get("public")), len(want)):
+        try:
+            apply_gate_dns()
+        except Exception as e:
+            log_exception("the way back for unregistered addresses not set: %s" % e)
     return len(want), len(want - have), len(have - want)
 
 
@@ -1784,14 +3051,17 @@ DARK = """color-scheme:dark;
  --faint:#6e7681;--accent:#7dd3a0;--accent2:#58a6ff;--btn:#238636;
  --btn-hover:#2ea043;--on-btn:#ffffff;--danger:#6e2c2c;--warn:#e3b341;
  --bad:#f85149;--good-bg:#12261a;--err-bg:#2b1416;--warn-bg:#2b2411;
- --warn-line:#6e5a2c;--sun:inline;--moon:none"""
+ --warn-line:#6e5a2c;--sun:inline;--moon:none;
+ --shadow:0 1px 2px rgba(0,0,0,.35);--pop:0 10px 30px rgba(0,0,0,.45)"""
 LIGHT = """color-scheme:light;
  --bg:#f6f8fa;--card:#ffffff;--line:#d0d7de;--line2:#afb8c1;--row:#eaeef2;
  --track:#eaeef2;--fg:#1f2328;--head:#24292f;--muted:#59636e;--dim:#57606a;
  --faint:#6e7781;--accent:#1a7f37;--accent2:#0969da;--btn:#1f883d;
  --btn-hover:#1a7f37;--on-btn:#ffffff;--danger:#cf222e;--warn:#9a6700;
  --bad:#cf222e;--good-bg:#dafbe1;--err-bg:#ffebe9;--warn-bg:#fff8c5;
- --warn-line:#d4a72c;--sun:none;--moon:inline"""
+ --warn-line:#d4a72c;--sun:none;--moon:inline;
+ --shadow:0 1px 2px rgba(31,35,40,.04),0 4px 14px rgba(31,35,40,.05);
+ --pop:0 10px 30px rgba(31,35,40,.15)"""
 THEME_CSS = (":root{%s}\n"
              "@media (prefers-color-scheme: light){:root:not([data-theme=dark]){%s}}\n"
              ":root[data-theme=light]{%s}\n" % (DARK, LIGHT, LIGHT))
@@ -1806,7 +3076,12 @@ THEME_BUTTON = (
     "(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'),"
     "n=c=='light'?'dark':'light';r.setAttribute('data-theme',n);"
     "try{localStorage.setItem('theme',n)}catch(e){}})(document.documentElement)\">"
-    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>")
+    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>"
+    "<button type='button' class='theme lang' title='English / فارسی'"
+    " aria-label='English / فارسی' onclick=\"document.cookie='lang='+"
+    "(document.documentElement.lang=='en'?'fa':'en')+"
+    "'; path=/; max-age=31536000; samesite=lax';location.reload()\">"
+    "<span class='fa-only'>EN</span><span class='en-only'>فا</span></button>")
 
 # Vazirmatn, served by this panel: every font host worth using is blocked or
 # slow from Iran. swap: the page is readable in the system font at once, on a
@@ -1920,6 +3195,18 @@ details.pw>.btn{margin:0 16px;width:calc(100% - 32px)}
 details.pw>.msg{margin:0 16px 12px}
 .copy{display:flex;gap:6px;margin:0 16px 10px}
 .copy input{flex:1;min-width:0;direction:ltr;font-size:12px;padding:9px 10px}
+.dns>.copy{margin:0 0 10px}
+form.codebox{display:flex;gap:6px;margin:0 0 10px}
+form.codebox input{flex:1;min-width:0;padding:9px 10px}
+form.codebox button{width:auto;margin:0;padding:9px 16px}
+.dns>label{margin-top:10px}
+table.moves{width:calc(100% - 32px);margin:0 16px 14px;border-collapse:collapse;
+ font-size:12px}
+table.moves td{padding:7px 4px;border-bottom:1px solid var(--row);vertical-align:top}
+table.moves td small{display:block;color:var(--muted)}
+table.moves td:first-child,table.moves td:last-child{white-space:nowrap}
+table.moves td:first-child{direction:ltr;text-align:right;color:var(--muted)}
+table.moves td:last-child{text-align:left}
 .copy button{width:auto;padding:8px 14px;margin:0;font-size:12px;flex:none}
 button.small{width:auto;padding:6px 12px;margin:0;font-size:12px}
 .ok{color:var(--accent)}.bad{color:var(--bad)}.warn{color:var(--warn)}
@@ -1971,6 +3258,8 @@ button.theme{position:absolute;top:14px;left:14px;width:38px;height:38px;margin:
  font-size:17px;font-weight:400;line-height:1;cursor:pointer}
 button.theme:hover{background:var(--row)}
 .theme .sun{display:var(--sun)}.theme .moon{display:var(--moon)}
+.theme.lang{left:auto;right:14px;font-size:12px;font-weight:700;letter-spacing:.5px}
+html[lang=en] .fa-only,html:not([lang=en]) .en-only{display:none}
 """
 
 # Where the installer writes the version it installed. Read per page rather
@@ -2031,8 +3320,101 @@ def one_server_words(text):
 PANEL_ENV_HERE = "/etc/smart-dns/panel.env"
 
 
+def is_single():
+    """One machine that is relay and exit both: with its own panel, or
+    joined to the panel on another (SINGLE=1 in sync.env). It has no exits
+    to choose between and no tunnels."""
+    return os.path.exists(PANEL_ENV_HERE) or (CFG or {}).get("SINGLE") == "1"
+
+
+# ---------------------------------------------------------------- English
+# The pages and the bot are written in Persian; English is the same text with
+# every Persian phrase swapped for its English, from one file the installer
+# ships (domains/i18n-en.json). A phrase is a piece of a Persian string in the
+# code, cut where a value goes in and at each tag - tools/i18n-extract.py lists
+# them. What somebody typed - a name, a note - is left as they wrote it.
+I18N_FILE = "/usr/local/share/smart-dns/i18n-en.json"
+I18N = {}
+
+
+def english_index():
+    """The phrases by their first two characters, longest first."""
+    if "index" not in I18N:
+        try:
+            with open(I18N_FILE, encoding="utf-8") as fh:
+                pairs = json.load(fh)
+        except (OSError, ValueError):
+            pairs = {}
+        index = {}
+        for k, v in pairs.items():
+            if len(k) >= 2 and isinstance(v, str):
+                # Plain text only: the English goes into attributes and
+                # script strings quoted either way.
+                v = v.replace("'", "\u2019").replace('"', "\u201d")
+                index.setdefault(k[:2], []).append((k, v))
+        for bucket in index.values():
+            bucket.sort(key=lambda kv: -len(kv[0]))
+        I18N["index"] = index
+    return I18N["index"]
+
+
+def fa_letter(c):
+    """Part of a Persian word: a letter or a mark on one, not the comma,
+    the semicolon or a digit - "نشد؛" ends a word at the "؛"."""
+    return "\u0621" <= c <= "\u065f" or "\u066e" <= c <= "\u06d3" or c == "\u200c"
+
+
+def to_english(text):
+    """`text` with every known Persian phrase in English. A phrase is only
+    taken whole - never the front of a longer Persian word."""
+    index = english_index()
+    if not index or not text or not any("\u0600" <= c <= "\u06ff" for c in text):
+        return text
+    out, last, i, n = [], 0, 0, len(text)
+    while i < n:
+        bucket = index.get(text[i:i + 2])
+        if bucket and not (fa_letter(text[i]) and i and fa_letter(text[i - 1])):
+            for k, v in bucket:
+                end = i + len(k)
+                if text.startswith(k, i) and not (
+                        fa_letter(k[-1]) and end < n and fa_letter(text[end])):
+                    out.append(text[last:i])
+                    out.append(v)
+                    i = last = end
+                    break
+            else:
+                i += 1
+            continue
+        i += 1
+    out.append(text[last:])
+    # What is left - the quote marks around a name, a digit - in English form.
+    return "".join(out).translate(ENGLISH_MARKS)
+
+
+ENGLISH_MARKS = str.maketrans({"\u00ab": "\u201c", "\u00bb": "\u201d", "\u060c": ",",
+                               "\u061b": ";", "\u061f": "?", "\u066a": "%",
+                               **{chr(0x06f0 + i): str(i) for i in range(10)},
+                               **{chr(0x0660 + i): str(i) for i in range(10)}})
+
+
+def english_page(page_html):
+    """A whole page in English, laid out left to right."""
+    return to_english(page_html).replace('<html lang="fa" dir="rtl">',
+                                         '<html lang="en" dir="ltr">', 1)
+
+
+def wants_english(headers):
+    """Whether this browser picked English - a cookie the button sets."""
+    try:
+        cookie = http.cookies.SimpleCookie((headers or {}).get("Cookie", "") or "")
+    except http.cookies.CookieError:
+        return False
+    return "lang" in cookie and cookie["lang"].value == "en"
+
+
+
 def user_page(inner):
-    if os.path.exists(PANEL_ENV_HERE):
+    if is_single():
         inner = one_server_words(inner)
     return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2077,10 +3459,18 @@ def landing(banner=""):
             % html.escape(brand()))
 
 
-def signup_form(banner=""):
+REF_RE = re.compile(r"[A-Za-z0-9]{6,16}")
+
+
+def signup_form(banner="", ref=""):
+    # An invitation code, carried on to the panel with the form. Only its own
+    # characters, so it goes into the page as it is.
+    ref = ref if REF_RE.fullmatch(ref or "") else ""
     return (banner +
+            ("<div class='msg good'>🎁 با لینک دعوت یکی از دوستانتان آمده‌اید.</div>"
+             if ref else "") +
             "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
-            "<form method='post' action='/signup'>"
+            "<form method='post' action='/signup'>%s"
             "<label>نام</label>"
             "<input name='name' maxlength='60' autocomplete='name'>"
             "<label>نام کاربری</label>"
@@ -2099,7 +3489,8 @@ def signup_form(banner=""):
             "حروف انگلیسی، عدد، و . _ - ؛ بزرگ و کوچک فرقی ندارد. اگر قبلاً "
             "کسی گرفته باشدش، پیغام می‌دهد.</p>"
             "<p class='alt'>حساب دارید؟ <a href='/login'>وارد شوید</a></p>"
-            % html.escape(brand()))
+            % (html.escape(brand()),
+               "<input type='hidden' name='ref' value='%s'>" % ref if ref else ""))
 
 
 def login_form(banner=""):
@@ -2284,6 +3675,12 @@ def account_notice(info):
     same allowance is noise, and the reader stops reading.
     """
     status = info.get("status")
+    # Their seller's allowance ran out, not theirs: nothing on this page
+    # would fix it, so it says whom to ask.
+    if info.get("seller_stopped") and status == "active":
+        return ("<div class='msg err'><b>سرویس فروشندهٔ شما موقتاً قطع است.</b> "
+                "حساب شما سر جایش است؛ برای وصل شدن دوباره با فروشنده‌تان تماس "
+                "بگیرید.</div>")
     # First thing a new customer sees, so it says what to do rather than what
     # is wrong. Nothing is wrong: they have an account, and it is waiting.
     if status == "pending":
@@ -2356,14 +3753,31 @@ def plan_games(plan, most=14):
     return "<br><small class='games'>%s</small>" % "، ".join(shown)
 
 
+def code_box(info):
+    """A discount code: typed, it reloads the page with the plans' prices
+    after it, so the customer transfers the right sum."""
+    msg = info.get("code_message")
+    return ("<form method='get' action='/' class='codebox'><input name='code' dir='ltr' "
+            "maxlength='32' placeholder='کد تخفیف' value='%s'><button class='ghost'>اعمال"
+            "</button></form>%s"
+            % (html.escape(info.get("code") or ""),
+               "<div class='msg %s'>%s</div>" % ("good" if info.get("code_ok") else "err",
+                                                 html.escape(msg)) if msg else ""))
+
+
 def plan_line(p):
     """One plan as the customer reads it: what they get and what it costs."""
     size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
         else "حجم نامحدود"
     bits = [size, "%d روز" % p["days"]]
+    if (p.get("devices") or 1) > 1:
+        bits.append("%d دستگاه" % p["devices"])
     if p.get("speed_kbps"):
         bits.append("تا %g مگابیت" % (p["speed_kbps"] / 1000.0))
-    return "%s · %s تومان" % ("، ".join(bits), format(p["price"], ","))
+    if p.get("list_price") and p["list_price"] != p["price"]:
+        return "%s · <s>%s</s> %s تومان" % (html.escape("، ".join(bits)),
+                                           format(p["list_price"], ","), format(p["price"], ","))
+    return "%s · %s تومان" % (html.escape("، ".join(bits)), format(p["price"], ","))
 
 
 def pay_box(info):
@@ -2418,7 +3832,11 @@ def receipt_box(info):
                    " رسید تازه جای آن را می‌گیرد.</div>"
                    % (" برای «%s»" % html.escape(waiting["plan"])
                       if waiting.get("plan") else "", html.escape(waiting["at"])))
+    if plans:
+        out.append(code_box(info))
     out.append("<form method='post' action='/receipt' enctype='multipart/form-data'>")
+    if info.get("code"):
+        out.append("<input type='hidden' name='code' value='%s'>" % html.escape(info["code"]))
     if plans:
         out.append("<p class='note' style='margin-top:0'>پلن را انتخاب کنید، مبلغش "
                    "را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار "
@@ -2434,7 +3852,7 @@ def receipt_box(info):
                 " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
                 % (p["id"], " checked" if mine else "", html.escape(p["name"]),
                    " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
-                   html.escape(plan_line(p)),
+                   plan_line(p),
                    plan_games(p) +
                    ("<br><small>%s</small>" % html.escape(p["note"])
                     if p.get("note") else "")))
@@ -2452,32 +3870,156 @@ def receipt_box(info):
                    + pay_box(info))
     out.append("<input type='file' name='file' required "
                "accept='image/jpeg,image/png,image/webp,application/pdf'>"
-               "<button class='ghost'>فرستادن رسید</button></form></div>")
+               "<button class='ghost'>فرستادن رسید</button>")
+    wallet = info.get("wallet") or 0
+    if plans and wallet > 0:
+        # The same form, the plan chosen above - without the slip.
+        out.append("<button formaction='/wallet-buy' formnovalidate>💰 پرداخت از کیف پول "
+                   "(موجودی %s تومان)</button><p class='note'>پلن انتخاب‌شده فوراً فعال "
+                   "می‌شود و قیمتش از کیف پول کم می‌شود؛ رسید لازم نیست.</p>"
+                   % format(wallet, ","))
+    out.append("</form></div>")
     return "".join(out)
 
 
-def dns_box():
-    """The address the customer has to type into their console or router.
+def money(n):
+    return format(n or 0, ",")
 
-    Served by the relay, so it is this machine's own address - not something
-    configured twice and able to disagree. A customer on a second relay is
-    looking at that relay's page and gets that relay's address, which is the
-    one that will work for them.
 
-    Only the first is given. Consoles ask for two, and the honest answer is to
-    repeat this one: a second, different resolver would answer the sanctioned
-    names truthfully and the service would fail intermittently in a way nobody
-    could diagnose.
-    """
-    ip = (CFG or {}).get("SELF_IP", "")
-    if not ip:
+def wallet_box(info):
+    """The wallet: what is in it, topping it up with a receipt, and where the
+    money came from and went."""
+    moves = info.get("wallet_moves") or []
+    if not info.get("wallet_on") and not info.get("wallet") and not moves:
         return ""
-    return ("<div class='dns'><div class='k'>آدرس DNS</div>"
-            "<div class='big'>%s</div>"
-            "<p class='note'>این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
-            "به‌عنوان <b>DNS اول</b> بگذارید. اگر DNS دوم هم می‌خواهد، "
-            "<b>همین آدرس</b> را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود "
-            "سرویس گاهی کار کند و گاهی نه.</p></div>" % html.escape(ip))
+    out = ["<div class='dns'><div class='k'>💰 کیف پول</div>"
+           "<p class='note' style='margin-top:0'>موجودی: <b>%s تومان</b>. با موجودی "
+           "کیف پول، پلن را از بخش «خرید یا تمدید» بدون رسید و فوری بخرید.</p>"
+           % money(info.get("wallet"))]
+    if info.get("wallet_on") and not info.get("telegram_required"):
+        out.append("<details class='pw'><summary>شارژ کیف پول</summary>"
+                   "<form method='post' action='/wallet-topup' enctype='multipart/form-data'>"
+                   "<label>مبلغ (تومان)</label>"
+                   "<input name='amount' required inputmode='numeric' dir='ltr' "
+                   "placeholder='%s'>%s"
+                   "<label>عکس رسید واریز (عکس یا PDF، حداکثر ۴ مگابایت)</label>"
+                   "<input type='file' name='file' required "
+                   "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+                   "<button class='ghost'>فرستادن رسید شارژ</button></form>"
+                   "<p class='note'>همین مبلغ را واریز کنید و رسیدش را بفرستید؛ بعد از "
+                   "تأیید، به کیف پولتان اضافه می‌شود. حداقل %s تومان.</p></details>"
+                   % (money(max(info.get("topup_min") or 0, 100000)), pay_box(info),
+                      money(info.get("topup_min"))))
+    if moves:
+        out.append("<details class='pw'><summary>گردش کیف پول</summary><table class='moves'>")
+        for m in moves:
+            out.append("<tr><td>%s</td><td>%s%s</td><td dir='ltr' class='%s'>%s%s</td></tr>"
+                       % (html.escape((m.get("at") or "")[:10]), html.escape(m.get("what") or ""),
+                          " <small>%s</small>" % html.escape(m["note"]) if m.get("note") else "",
+                          "ok" if m["amount"] > 0 else "bad",
+                          "+" if m["amount"] > 0 else "−", money(abs(m["amount"]))))
+        out.append("</table></details>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def device_box(info):
+    """An extra device - another address at once - while the operator sells
+    them: from the wallet, or with a receipt."""
+    offer = info.get("device_offer")
+    if not offer:
+        return ""
+    out = ["<div class='dns'><div class='k'>📱 دستگاه اضافه</div>"
+           "<p class='note' style='margin-top:0'>الان %d دستگاه دارید — یعنی %d آی‌پی "
+           "هم‌زمان. هر دستگاه اضافه %s تومان؛ تا وقتی همین پلن را تمدید کنید می‌ماند.</p>"
+           % (offer["devices"], offer["devices"], money(offer["price"]))]
+    if not offer.get("available"):
+        out.append("<p class='note'>%s</p></div>" % html.escape(offer.get("why") or ""))
+        return "".join(out)
+    if (info.get("wallet") or 0) >= offer["price"]:
+        out.append("<form method='post' action='/device-wallet'><button>💰 خرید از کیف پول "
+                   "(موجودی %s تومان)</button></form>" % money(info.get("wallet")))
+    out.append("<details class='pw'><summary>خرید با رسید</summary>"
+               "<form method='post' action='/device-receipt' enctype='multipart/form-data'>%s"
+               "<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>"
+               "<input type='file' name='file' required "
+               "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+               "<button class='ghost'>فرستادن رسید</button></form>"
+               "<p class='note'>%s تومان را واریز کنید و رسیدش را بفرستید؛ بعد از تأیید، یک "
+               "دستگاه به حسابتان اضافه می‌شود.</p></details></div>"
+               % (pay_box(info), money(offer["price"])))
+    return "".join(out)
+
+
+def ref_box(info, host=""):
+    """The customer's invitation link, while the operator pays for them."""
+    ref = info.get("ref")
+    if not ref:
+        return ""
+    web = ref.get("web_link") or (
+        "https://%s/signup?ref=%s" % (host, ref["code"])
+        if re.fullmatch(r"[A-Za-z0-9.-]{1,253}(:\d{1,5})?", host or "") else "")
+    out = ["<div class='dns'><div class='k'>🎁 دعوت از دوستان</div>"
+           "<p class='note' style='margin-top:0'>هر کس با لینک شما حساب بسازد و پلن بخرد، "
+           "<b>%d٪</b> مبلغ %s به کیف پول شما اضافه می‌شود.</p>"
+           % (ref["percent"], "اولین خریدش" if ref.get("mode") == "first"
+              else "هر خرید و تمدیدش")]
+    if ref.get("bot_link"):
+        out.append("<label>لینک ربات</label>" + copy_field(ref["bot_link"], "لینک دعوت ربات"))
+    if web:
+        out.append("<label>لینک ثبت‌نام در همین سایت</label>"
+                   + copy_field(web, "لینک دعوت سایت"))
+    out.append("<p class='note'>تا حالا %d نفر با لینک شما آمده‌اند و %s تومان "
+               "پورسانت گرفته‌اید.</p></div>" % (ref.get("invited") or 0,
+                                                money(ref.get("earned"))))
+    return "".join(out)
+
+
+def dns_box(info=None):
+    """The addresses the customer types into their console or router: the
+    relays the admin shows them, as the panel sends them, or this relay's
+    own when it sends none.
+
+    Two of ours may go in as DNS 1 and DNS 2 - they answer alike. What must
+    not go in second is anybody else's resolver: it answers the sanctioned
+    names truthfully, and the service fails now and then in a way nobody could
+    diagnose. So with one address, it is to be typed twice.
+    """
+    ips = [ip for ip in (info or {}).get("dns") or []
+           if isinstance(ip, str) and re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip)]
+    notes = {str(s.get("ip")): str(s.get("note") or "")[:120]
+             for s in (info or {}).get("servers") or [] if isinstance(s, dict)}
+    if not ips and (CFG or {}).get("SELF_IP"):
+        ips = [CFG["SELF_IP"]]
+    if not ips:
+        return ""
+    if len(ips) == 1:
+        return ("<div class='dns'><div class='k'>آدرس DNS</div>"
+                "<div class='big'>%s</div>%s"
+                "<p class='note'>این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
+                "به‌عنوان <b>DNS اول</b> بگذارید. اگر DNS دوم هم می‌خواهد، "
+                "<b>همین آدرس</b> را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود "
+                "سرویس گاهی کار کند و گاهی نه.</p></div>"
+                % (html.escape(ips[0]), "<p class='note'>%s</p>" % html.escape(notes[ips[0]])
+                   if notes.get(ips[0]) else ""))
+    names = ["DNS اول", "DNS دوم"] + ["DNS پشتیبان"] * (len(ips) - 2)
+    # The admin's words for a server, where there are any, in place of
+    # "DNS 1", "DNS 2" - they say which to take better than the order does.
+    rows = "".join("<div class='row'><span class='k'>%s</span><span class='v big' dir='ltr'>"
+                   "%s</span></div>" % (html.escape(notes[ip]) if notes.get(ip) else n,
+                                        html.escape(ip)) for n, ip in zip(names, ips))
+    if any(notes.get(ip) for ip in ips):
+        # The words say which to take: one of them, in both boxes.
+        how = ("<p class='note'>توضیح کنار هر آدرس می‌گوید کدام برای شما بهتر است. همان را در "
+               "تنظیمات شبکهٔ کنسول، گوشی یا مودم، هم به‌عنوان <b>DNS اول</b> و هم <b>DNS "
+               "دوم</b> بگذارید. DNS دیگری کنارش نگذارید — سرویس گاهی کار می‌کند و گاهی "
+               "نه.</p>")
+    else:
+        how = ("<p class='note'>این‌ها را در تنظیمات شبکهٔ کنسول، گوشی یا مودم بگذارید: "
+               "اولی را به‌عنوان <b>DNS اول</b> و دومی را <b>DNS دوم</b>. هر دو مال همین "
+               "سرویس‌اند و یکسان جواب می‌دهند؛ اگر یکی در دسترس نبود، دستگاه سراغ دیگری "
+               "می‌رود. DNS دیگری کنارشان نگذارید — سرویس گاهی کار می‌کند و گاهی نه.</p>")
+    return "<div class='dns'><div class='k'>آدرس‌های DNS</div>%s%s</div>" % (rows, how)
 
 
 def human_fa(n):
@@ -2777,30 +4319,78 @@ def copy_field(value, label):
             % (v, html.escape(label)))
 
 
-def windows_command(url):
+def windows_command(url, me=None):
     """PowerShell for Windows 11: register the address as the DoH template
     for this relay, and point every connected adapter at the relay."""
-    me = CFG.get("SELF_IP") or ""
+    me = me or CFG.get("SELF_IP") or ""
     return ('Add-DnsClientDohServerAddress -ServerAddress %s -DohTemplate "%s"'
             ' -AllowFallbackToUdp $false -AutoUpgrade $true; '
             'Get-NetAdapter | Where-Object Status -eq Up | '
             'Set-DnsClientServerAddress -ServerAddresses %s' % (me, url, me))
 
 
+def servers_doh(info):
+    """The customer's servers that have DoH, as the panel sends them."""
+    out = []
+    for s in (info or {}).get("servers") or []:
+        if not isinstance(s, dict):
+            continue
+        ip, host, url = str(s.get("ip") or ""), str(s.get("dot") or ""), str(s.get("doh") or "")
+        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) and \
+                re.fullmatch(r"[a-z0-9.-]{3,253}", host) and url.startswith("https://%s/" % host):
+            out.append({"ip": ip, "dot": host, "doh": url, "n": int(s.get("n") or 0),
+                        "single": bool(s.get("single")),
+                        "note": str(s.get("note") or "")[:120]})
+    return out
+
+
+def servers_doh_box(info, servers):
+    """Every server of the customer's with DoH on: each one's DoH, DoT, iPhone
+    profile and Windows command, side by side - when one name is filtered,
+    the next is right there."""
+    out = ["<details class='pw doh'><summary>🔒 DNS رمزگذاری‌شده</summary>"
+           "<p class='note'>همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار "
+           "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. هر سرور آدرس‌های خودش را دارد؛ اگر یکی فیلتر "
+           "شد، سراغ دیگری بروید. آدرس‌های DoH مخصوص حساب شماست.</p>"
+           "<form method='post' action='/doh-reset' style='margin:0 16px 4px' onsubmit="
+           "\"return confirm('آدرس‌های فعلی از کار می‌افتند و باید آدرس تازه را روی "
+           "دستگاه‌هایتان بگذارید. ادامه می‌دهید؟')\"><button class='ghost small'>"
+           "ساختن آدرس تازه</button></form>"]
+    for s in servers:
+        out.append("<h3>%s %d — <span dir='ltr'>%s</span></h3>%s"
+                   % ("تک‌سرور" if s["single"] else "سرور", s["n"], html.escape(s["ip"]),
+                      "<p class='note' style='margin-top:0'>%s</p>" % html.escape(s["note"])
+                      if s["note"] else ""))
+        out.append("<p class='note' style='margin-bottom:2px'><b>DoH</b> — آیفون، ویندوز، "
+                   "کروم و فایرفاکس</p>" + copy_field(s["doh"], "DoH"))
+        out.append("<p class='note' style='margin-bottom:2px'><b>DoT</b> — اندروید ← DNS "
+                   "خصوصی</p>" + copy_field(s["dot"], "DoT (اندروید ← DNS خصوصی)"))
+        out.append("<a class='btn ghost' href='/doh.mobileconfig?h=%s'>پروفایل آیفون این سرور</a>"
+                   % urllib.parse.quote(s["dot"]))
+        out.append("<details><summary class='note'>دستور ویندوز ۱۱</summary>%s</details>"
+                   % copy_field(windows_command(s["doh"], s["ip"]), "دستور ویندوز"))
+    out.append("<p class='note'>آیفون: بعد از دانلود پروفایل، تنظیمات ← پروفایل دانلودشده ← "
+               "نصب. اندروید: تنظیمات ← Private DNS ← نام میزبان، و نام DoT یک سرور. کروم و "
+               "فایرفاکس: بخش DNS امن تنظیماتشان، و آدرس DoH یک سرور.</p></details>")
+    return "".join(out)
+
+
 def doh_box(info, profile="/doh.mobileconfig", setup=False):
     """The encrypted-DNS section: folded away on the account page, open on
     the setup page a browser that opened the DoH address is sent to."""
+    servers = [] if setup else servers_doh(info)
+    if servers:
+        return servers_doh_box(info, servers)
     url = doh_url(info)
     if not url:
         return ""
     host = doh_public_name()
     return (
-        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده — وقتی اپراتور DNS را "
-        "دست‌کاری می‌کند</summary>" % (" open" if setup else "") +
-        "<p class='note'>برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند: "
-        "همان سرویس، از راه رمزگذاری‌شده. مثل DNS معمولی فقط روی اینترنتی کار "
-        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله "
-        "می‌گوید قالب شما کدام است.</p>"
+        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده</summary>"
+        % (" open" if setup else "") +
+        "<p class='note'>همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار "
+        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله می‌گوید "
+        "قالب شما کدام است.</p>"
         "<h3>DoH — DNS over HTTPS</h3>"
         + copy_field(url, "آدرس DoH شخصی")
         # Not on the setup page: that one is opened by the address itself,
@@ -2834,16 +4424,17 @@ def doh_box(info, profile="/doh.mobileconfig", setup=False):
         "</details>")
 
 
-def mobileconfig(info):
+def mobileconfig(info, server=None):
     """An iOS/macOS profile that turns the personal address on for the whole
-    device. The UUIDs come from the token, so downloading it again replaces
-    the profile rather than adding a second one."""
-    url = doh_url(info)
+    device - this relay's, or one of the customer's other servers'. The UUIDs
+    come from the token, so downloading it again replaces the profile rather
+    than adding a second one."""
+    url = server["doh"] if server else doh_url(info)
     token = info.get("doh_token") or ""
     one = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-payload:" + token)).upper()
     two = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-profile:" + token)).upper()
     name = html.escape(brand())
-    me = html.escape(CFG.get("SELF_IP") or "")
+    me = html.escape(server["ip"] if server else (CFG.get("SELF_IP") or ""))
     return ("""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -3211,7 +4802,10 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         return self.client_address[0]
 
     def send_html(self, body, code=200, headers=None):
-        blob = user_page(body).encode("utf-8")
+        page = user_page(body)
+        if wants_english(getattr(self, "headers", None)):
+            page = english_page(page)
+        blob = page.encode("utf-8")
         # See send(): a clean buffer, so a failed attempt cannot leave half a
         # status line in front of this one.
         self._headers_buffer = []
@@ -3279,6 +4873,13 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", "replace")
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
+    def field(self, name):
+        """A short text field of a multipart form, or ""."""
+        try:
+            return self.upload(name)[0].decode("utf-8", "replace").strip()[:40]
+        except ValueError:
+            return ""
+
     def cookie_for(self, session):
         return ("sdu=%s; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=%d"
                 % (session, 30 * 86400))
@@ -3326,9 +4927,10 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             # their way to the page that would have given them a new one.
             back = ("<p class='alt'><a href='/'>برگشت به حساب</a></p>"
                     if self.session() else "")
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             return self.send_html(
-                (signup_form(self.banner()) if path == "/signup"
-                 else login_form(self.banner())) + back)
+                (signup_form(self.banner(), (q.get("ref") or [""])[0])
+                 if path == "/signup" else login_form(self.banner())) + back)
 
         if path == "/register-ip":
             if not self.session():
@@ -3401,20 +5003,26 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if path in ("/signup", "/login"):
             form = self.form()
             endpoint = "/user-signup" if path == "/signup" else "/user-password-login"
+            back = path
             payload = {"username": form.get("username", ""),
                        "password": form.get("password", ""),
                        "ip": self.client_ip()}
             if path == "/signup":
                 payload["name"] = form.get("name", "")
+                # Whose invitation this came by; the panel decides if it counts.
+                payload["ref"] = form.get("ref", "")[:16]
+                back = ("/signup?ref=" + urllib.parse.quote(payload["ref"])
+                        if REF_RE.fullmatch(payload["ref"]) else "/signup")
                 if form.get("password") != form.get("password2"):
-                    return self.redirect("/signup", "دو رمز یکی نیستند", bad=True)
+                    return self.redirect(back, "دو رمز یکی نیستند", bad=True)
             try:
                 res = post(endpoint, payload)
             except Exception as e:
                 log(ERROR, "panel: %s failed: %s" % (endpoint, e))
                 return self.redirect(path, "الان نشد، چند دقیقه دیگر", bad=True)
             if not res.get("ok"):
-                return self.redirect(path, res.get("message", "خطا"), bad=True)
+                return self.redirect(back if path == "/signup" else path,
+                                     res.get("message", "خطا"), bad=True)
             # Straight to the address page either way. A new account has no
             # address yet, and somebody signing in from a new connection is
             # usually signing in precisely because the address changed.
@@ -3559,6 +5167,55 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             return self.redirect("/", res.get("message", ""),
                                  bad=not res.get("ok"))
 
+        if path in ("/device-wallet", "/device-receipt"):
+            if not self.session():
+                return self.redirect("/")
+            if path == "/device-wallet":
+                self.form()
+                res = self.ask_panel("/user-device-wallet", {})
+            else:
+                form = self.form()
+                if form.get("too_big"):
+                    return self.redirect("/", "فایل خیلی بزرگ است", bad=True)
+                try:
+                    blob, kind = self.upload("file")
+                except ValueError as e:
+                    return self.redirect("/", str(e), bad=True)
+                res = self.ask_panel("/user-receipt", {
+                    "kind": "device", "content_type": kind,
+                    "data": base64.b64encode(blob).decode("ascii")})
+            if res is None:
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
+        if path in ("/wallet-buy", "/wallet-topup"):
+            if not self.session():
+                return self.redirect("/")
+            form = self.form()
+            if form.get("too_big"):
+                return self.redirect("/", "فایل خیلی بزرگ است", bad=True)
+            if path == "/wallet-buy":
+                try:
+                    plan = int(self.upload("plan")[0].strip() or 0)
+                except ValueError:
+                    plan = 0
+                if not plan:
+                    return self.redirect("/", "اول پلن را انتخاب کنید", bad=True)
+                res = self.ask_panel("/user-wallet-buy", {"plan_id": plan,
+                                                          "code": self.field("code")})
+            else:
+                try:
+                    blob, kind = self.upload("file")
+                    amount = self.upload("amount")[0].decode("utf-8", "replace").strip()[:20]
+                except ValueError as e:
+                    return self.redirect("/", str(e), bad=True)
+                res = self.ask_panel("/user-receipt", {
+                    "kind": "topup", "amount": amount, "content_type": kind,
+                    "data": base64.b64encode(blob).decode("ascii")})
+            if res is None:
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
         if path == "/receipt":
             if not self.session():
                 return self.redirect("/")
@@ -3581,6 +5238,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                     "content_type": kind,
                     "data": base64.b64encode(blob).decode("ascii"),
                     "plan_id": plan,
+                    "code": self.field("code"),
                 })
             except Exception as e:
                 log(ERROR, "panel: receipt failed: %s" % e)
@@ -3794,9 +5452,13 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             log(ERROR, "panel: user-info failed: %s" % e)
             return self.send_html(NOT_NOW, 502)
-        if not info.get("ok") or not doh_url(info):
+        want = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("h")
+                or [""])[0]
+        server = next((s for s in servers_doh(info) if s["dot"] == want), None) \
+            if info.get("ok") and want else None
+        if not info.get("ok") or not (server or doh_url(info)):
             return self.redirect("/")
-        return self.send(mobileconfig(info), 200, {
+        return self.send(mobileconfig(info, server), 200, {
             "Content-Type": "application/x-apple-aspen-config",
             "Content-Disposition": "attachment; filename=doctor-dns.mobileconfig",
             "Cache-Control": "no-store"})
@@ -3805,8 +5467,11 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         token = self.session()
         if not token:
             return self.send_html(landing(self.banner()))
+        code = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("code")
+                or [""])[0][:40]
         try:
-            info = post("/user-info", {"session": token, "ip": self.client_ip()})
+            info = post("/user-info", {"session": token, "ip": self.client_ip(),
+                                       "code": code})
         except Exception as e:
             log(ERROR, "panel: user-info failed: %s" % e)
             return self.send_html("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
@@ -3827,7 +5492,13 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if info.get("plan_name"):
             rows.append(("پلن", html.escape(info["plan_name"])))
         rows += [("قالب", html.escape(info.get("plan") or "-")),
-                ("آی‌پی ثبت‌شده", "<code>%s</code>" % html.escape(info["ip"] or "ثبت نشده")),
+                ("آی‌پی ثبت‌شده", " ".join("<code>%s</code>" % html.escape(x)
+                                           for x in (info.get("ips") or [info["ip"]])
+                                           if x) or "<code>ثبت نشده</code>")]
+        if (info.get("devices") or 1) > 1:
+            rows.append(("دستگاه", "%d از %d" % (len(info.get("ips") or []),
+                                                 info["devices"])))
+        rows += [
                 ("مصرف", human_fa(used))]
         if quota:
             rows.append(("سهمیه", human_fa(quota)))
@@ -3864,7 +5535,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                         "<span class='v'>%s</span></div>" % (k, v))
         body.append(gauge)
         body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
-        body.append(dns_box())
+        body.append(dns_box(info))
         body.append(qlog_box(info))
 
         if not info["ip"]:
@@ -3888,6 +5559,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         body.append(doh_box(info))
         body.append(trial_box(info))
         body.append(receipt_box(info))
+        body.append(wallet_box(info))
+        body.append(device_box(info))
+        body.append(ref_box(info, (self.headers.get("Host") or "").strip()))
         body.append(support_box(info))
         if not info.get("telegram_required"):
             body.append(telegram_box(info))
@@ -3911,7 +5585,13 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    global CFG
+    global CFG, CONFIG
+    if "--node" in sys.argv[1:]:
+        CONFIG = NODE_CONFIG
+        CFG = load_config()
+        print("node up: every %ds to the panel at %s" % (INTERVAL, CFG["PANEL_HOST"]), flush=True)
+        node_loop()
+        return
     CFG = load_config()
     if not os.path.exists(ACL):
         sys.exit("%s is missing - run the installer first" % ACL)

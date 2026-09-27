@@ -261,8 +261,8 @@ class Stray(Rec):
 # view() binds every page method into a dict before it checks membership, so
 # the stand-in needs all of them or it fails for the wrong reason.
 for n in ("lost", "route", "do_GET", "session_ok", "view", "home", "users",
-          "receipts", "plans", "pay_page", "api_keys", "bot_page", "tickets", "templates", "domains", "logs", "restore_page", "user_usage_page",
-          "send_backup", "send_receipt"):
+          "receipts", "plans", "pay_page", "api_keys", "bot_page", "tickets", "templates", "domains", "logs", "restore_page", "user_usage_page", "wallet_page", "server_page",
+          "send_backup", "send_receipt", "settings", "admins_page"):
     setattr(Stray, n, getattr(admin.Admin, n))
 
 # Nobody signed in: a stranger typing the host learns nothing.
@@ -320,8 +320,12 @@ check("the login form posts to a fixed address",
 print("the settings page shows the address and warns about the firewall")
 page = Rec().settings()
 check("it shows where the panel is", "panel.example.com" in page)
-check("it asks for the password twice", page.count("type='password'") == 2,
-      str(page.count("type='password'")))
+# The admin password's own form - the backup's password and the restore's
+# are fields of other forms on the same page.
+form = page[page.index("/password'"):]
+form = form[:form.index("</form>")]
+check("it asks for the password twice", form.count("type='password'") == 2,
+      str(form.count("type='password'")))
 check("it warns about the security group", "security group" in page)
 
 shutil.rmtree(tmp, ignore_errors=True)

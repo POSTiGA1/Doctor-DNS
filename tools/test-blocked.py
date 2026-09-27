@@ -220,11 +220,13 @@ store.run("INSERT INTO forward_templates (domain, template_id) VALUES ('v.tiktok
           (t_work,))
 check("a rule for every template reaches each, one for some only those",
       store.template_rules(t_work) == {"blocked": ["ads.example"],
-                                       "forwards": {"v.tiktok.com": ["9.9.9.9"]}}
-      and store.template_rules(d_id) == {"blocked": ["ads.example"], "forwards": {}},
+                                       "forwards": {"v.tiktok.com": ["9.9.9.9"]}, "lists": {}}
+      and store.template_rules(d_id) == {"blocked": ["ads.example"], "forwards": {},
+                                         "lists": {}},
       repr(store.template_rules(t_work)))
 check("a forward under a block of the same template is left out",
-      store.template_rules(t_game) == {"blocked": ["ads.example", "tiktok.com"], "forwards": {}})
+      store.template_rules(t_game) == {"blocked": ["ads.example", "tiktok.com"], "forwards": {},
+                                       "lists": {}})
 psrc = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8").read()
 check("each profile carries its template's, and the default's are sent apart",
       "profiles[str(tid)].update(self.template_rules(tid))" in psrc

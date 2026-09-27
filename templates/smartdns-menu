@@ -195,6 +195,7 @@ menu_admin() {
         'its address - forgot it? start here   (smartdns-access)|run smartdns-access' \
         'move it to another port   (smartdns-access port)|ask "new port" && run smartdns-access port "$REPLY"' \
         'a new secret path   (smartdns-access path)|sure "the old address stops working - go ahead?" && run smartdns-access path' \
+        'the owner'"'"'s username   (smartdns-access username)|ask "new username" && run smartdns-access username "$REPLY"' \
         'a new password   (smartdns-access password)|run smartdns-access password' \
         'new path and new password at once   (smartdns-access rotate)|sure "the old address and password stop working - go ahead?" && run smartdns-access rotate'
 }

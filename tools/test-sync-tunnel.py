@@ -175,6 +175,7 @@ print("and the exit takes that name only from a relay it knows")
 
 class FakeApi:
     relays = ("203.0.113.4", "203.0.113.5")
+    nodes = ()
     secret = "s"
 
     def __init__(self, came_from, token="Bearer s"):

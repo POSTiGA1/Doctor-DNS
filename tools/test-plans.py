@@ -102,6 +102,8 @@ def act(rest, **form):
 
 
 class Api:
+    relays = ("198.51.100.1",)
+
     def __init__(self, store):
         self.store = store
 
@@ -298,7 +300,7 @@ where = act("user-plan", id="2", plan_id=str(game["id"]))
 u2 = store.one("SELECT * FROM users WHERE id = 2")
 check("the operator can give one without a receipt",
       u2["plan_id"] == game["id"] and u2["status"] == "active", where)
-check("the users page shows it", "پلن: گیمینگ ماهانه" in Rec().users())
+check("the users page shows it", "<summary>گیمینگ ماهانه</summary>" in Rec().users())
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

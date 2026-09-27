@@ -110,6 +110,11 @@ class FakeTelegram:
                 return p
         return {}
 
+    def recent(self, chat, n=3):
+        """The text of the last few messages to `chat`, joined."""
+        return " | ".join(p.get("text") or "" for m, p in self.out
+                          if p.get("chat_id") == chat)[-4000:] if n else ""
+
     def buttons(self, chat, method=None):
         markup = self.last(chat, method).get("reply_markup") or {}
         return [b for row in markup.get("inline_keyboard", []) for b in row]
@@ -228,12 +233,13 @@ check("the plans, as buttons with the price", len(plans) == 1
       and "200,000" in plans[0]["text"] and plans[0]["callback_data"] == "buy:1", str(plans))
 tap(CUSTOMER, "buy:1")
 check("how to pay, from its own settings while the panel has none",
-      "کارت ۶۰۳۷-۱۲۳۴" in tg.last(CUSTOMER)["text"])
+      "کارت ۶۰۳۷-۱۲۳۴" in tg.recent(CUSTOMER)[-1500:])
 store.set_setting("pay_text", "کارت پنل 6219-5555 به نام مهدی")
 tap(CUSTOMER, "buy:1")
+plan_msg = next(p["text"] for m, p in reversed(tg.out)
+                if p.get("chat_id") == CUSTOMER and "عکس رسید" in (p.get("text") or ""))
 check("the admin panel's payment details win, with no restart",
-      "کارت پنل 6219-5555" in tg.last(CUSTOMER)["text"]
-      and "۶۰۳۷-۱۲۳۴" not in tg.last(CUSTOMER)["text"])
+      "کارت پنل 6219-5555" in plan_msg and "۶۰۳۷-۱۲۳۴" not in plan_msg)
 message(CUSTOMER, "این رسید است")
 check("words are not a receipt", "عکس رسید" in tg.last(CUSTOMER)["text"]
       and not store.one("SELECT 1 FROM transactions"))
@@ -284,24 +290,41 @@ check("a LAN address is refused, and asked again", "آی‌پی نامعتبر" 
 message(CUSTOMER, "۵.۱۲۰.۱.۲")
 check("a real one, even in Persian digits, is registered",
       store.one("SELECT ip FROM ips")["ip"] == "5.120.1.2")
+check("  and the answer does not repeat the DNS address", "DNS را روی" not in tg.last(CUSTOMER)["text"])
 
-print("encrypted DNS")
-message(CUSTOMER, "/doh")
-check("before a relay has DoH, the bot says so", "فعال نیست" in tg.last(CUSTOMER)["text"])
-store.set_setting("doh_host", "user.example.com")
-message(CUSTOMER, botmod.B_DOH)
+print("the DNS button")
+panel.BotAPI.relays = ("198.51.100.4", "198.51.100.5")
+message(CUSTOMER, "/dns")
+first = tg.last(CUSTOMER)["text"]
+check("every server of the customer's with its DNS, and before one has DoH, no DoH",
+      "198.51.100.4" in first and "198.51.100.5" in first and "DoH" not in first, first)
+store.set_setting("doh_host:198.51.100.4", "r1.example.com")
+store.set_setting("doh_host:198.51.100.5", "r2.example.com")
+message(CUSTOMER, botmod.B_DNS)
 doh_text = tg.last(CUSTOMER)["text"]
 token = store.one("SELECT doh_token FROM users WHERE telegram_id = ?", (CUSTOMER,))["doh_token"]
-check("then the personal DoH address, and the DoT name for Android",
-      "https://user.example.com/dns-query/%s" % token in doh_text
-      and "\nuser.example.com\n" in doh_text and "آی‌پی ثبت نکرده" not in doh_text)
+check("then each server's own DoT name and the customer's DoH address on it",
+      "https://r1.example.com/dns-query/%s" % token in doh_text
+      and "https://r2.example.com/dns-query/%s" % token in doh_text
+      and "r1.example.com" in doh_text and "آی‌پی ثبت نکرده" not in doh_text, doh_text)
+cust = store.one("SELECT id FROM users WHERE telegram_id = ?", (CUSTOMER,))["id"]
+store.run("UPDATE users SET relays = '198.51.100.5' WHERE id = ?", (cust,))
+message(CUSTOMER, botmod.B_DNS)
+picked = tg.last(CUSTOMER)["text"]
+check("the ticks that pick a customer's DNS pick their DoT and DoH too",
+      "r2.example.com" in picked and "r1.example.com" not in picked
+      and "198.51.100.4" not in picked, picked)
+store.run("UPDATE users SET relays = NULL WHERE id = ?", (cust,))
 check("with a way into the web page, for the iPhone profile",
       tg.buttons(CUSTOMER)[0]["callback_data"] == "login")
-check("and the button is on the menu", botmod.B_DOH in sum(botmod.MENU["keyboard"], []))
+check("and the button is on the menu, in place of the old one",
+      botmod.B_DNS in sum(botmod.MENU["keyboard"], [])
+      and not any("DNS امن" in b for b in sum(botmod.MENU["keyboard"], [])))
 tap(CUSTOMER, "dohnew")
 fresh = store.one("SELECT doh_token FROM users WHERE telegram_id = ?", (CUSTOMER,))["doh_token"]
 check("the new-address button replaces it, and shows the new one",
-      fresh != token and "https://user.example.com/dns-query/%s" % fresh in tg.last(CUSTOMER)["text"])
+      fresh != token and "https://r1.example.com/dns-query/%s" % fresh in tg.last(CUSTOMER)["text"])
+panel.BotAPI.relays = ("198.51.100.4",)
 
 print("support")
 message(CUSTOMER, botmod.B_SUPPORT)

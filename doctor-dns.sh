@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.8.6"
+VERSION="0.9.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -91,7 +91,9 @@ backup_file() {
 # gate in front of the exit's proxy, with the panel beside them. Most of this
 # file asks which parts a machine has, not which role it is.
 is_relay() { [ "$ROLE" = relay ] || [ "$ROLE" = single ]; }
-is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }
+# A node (ROLE=node) is another exit, joined to the panel on an exit: the
+# exit's nginx and nothing of the panel.
+is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ] || [ "$ROLE" = node ]; }
 # Where a single machine's sync API listens: loopback only, because 8443 is
 # its customer panel, and the only relay it has is itself.
 SINGLE_API_PORT=8449
@@ -156,6 +158,29 @@ doh_paths() {
     fi
 }
 
+# The relays an exit lets in, for nginx to include on every port it proxies:
+# every one on the panel's list and the one this run was given. The admin
+# panel rewrites the file when a relay is added or taken off there.
+RELAYS_CONF=/etc/nginx/smartdns-relays.conf
+relay_allows() {
+    local ip out="" have=""
+    # A node has no panel here: its list is the one smartdns-sync last had
+    # from the panel, and is kept as it is.
+    [ "$ROLE" = node ] && have="$(sed -n 's/^allow \(.*\);$/\1/p' "$RELAYS_CONF" 2>/dev/null || true)"
+    for ip in $(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env 2>/dev/null | head -1 | tr ',' ' ') \
+              $have $RELAY_IP; do
+        valid_ip "$ip" || continue
+        case " $out " in *" $ip "*) continue ;; esac
+        out="$out $ip"
+    done
+    note_file "$RELAYS_CONF"
+    {
+        printf '# The relays this exit lets in: written by the installer and the admin panel.\n'
+        for ip in $out; do printf 'allow %s;\n' "$ip"; done
+    } > "$RELAYS_CONF"
+    chmod 644 "$RELAYS_CONF"
+}
+
 # What nginx's DoH blocks include: the certificate, and the names that reach
 # the DoH server. Written here with the machine's own name; once the admin
 # panel has given DoH a name of its own and smartdns-sync has a certificate
@@ -213,7 +238,7 @@ install_payload() {
     # empty for the payloads written before it is discovered, and none of those
     # contain the placeholder.
     payload "$name" \
-        | sed -e "${SINGLE:+/^ *allow __RELAY_IP__;\$/d}" \
+        | sed -e "${SINGLE:+/smartdns-relays\\.conf;\$/d}" \
               -e "${SINGLE:+/^ *allow 127\.0\.0\.1;\$/d}" \
               -e "${SINGLE:+/^ *deny all;\$/d}" \
               -e "${solo:+/# single begin/,/# single end/d}" \
@@ -224,11 +249,6 @@ install_payload() {
               -e "s#__EXIT_IP__#${EXIT_IP}#g" \
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
               -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
-              -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
-              -e "s#__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}#g" \
-              -e "s#__EXIT_BLIZZARD__#${EXIT_BLIZZARD:-__EXIT_BLIZZARD__}#g" \
-              -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
-              -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
               -e "s#__DOH_HOST__#${DOH_HOST:-doh.invalid}#g" \
               -e "s#__DOH_CERT__#${DOH_CERT:-/nonexistent}#g" \
               -e "s#__DOH_KEY__#${DOH_KEY:-/nonexistent}#g" \
@@ -264,6 +284,10 @@ install_font() {
     note_file "$dir/Vazirmatn-OFL.txt"
     payload FONT_LICENSE > "$dir/Vazirmatn-OFL.txt"
     chmod 644 "$dir/Vazirmatn-OFL.txt"
+    # The pages' and the bot's English, for whoever presses EN.
+    note_file "$dir/i18n-en.json"
+    payload I18N_EN > "$dir/i18n-en.json"
+    chmod 644 "$dir/i18n-en.json"
 }
 
 # Set KEY=VALUE in a shell-style config file, replacing the line if it is
@@ -379,7 +403,7 @@ tunnel_port_problem() {
         3478) echo "STUN on the relay" ;;
         "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API"|"$TUNNEL_LOCAL_SPOTIFY"|"$TUNNEL_LOCAL_BLIZZARD") echo "the tunnel's own end on the relay" ;;
     esac
-    { [ "$p" -ge 5300 ] && [ "$p" -le 5399 ]; } && echo "the templates' resolvers on the relay"
+    { [ "$p" -ge 5299 ] && [ "$p" -le 5999 ]; } && echo "the templates' resolvers on the relay"
     admin="$(sed -n 's/^ADMIN_PORT=//p' /etc/smart-dns/admin.env 2>/dev/null | head -1 || true)"
     [ -n "$admin" ] && [ "$p" = "$admin" ] && echo "the admin panel"
     return 0
@@ -487,7 +511,13 @@ install_backpack() {
     tmp="$(mktemp -d)"
     if [ -n "${BACKPACK_TARBALL:-}" ]; then
         cp "$BACKPACK_TARBALL" "$tmp/bp.tgz" || { warn "cannot read $BACKPACK_TARBALL"; rm -rf "$tmp"; return 1; }
-    elif ! curl -fsSL -m 300 -o "$tmp/bp.tgz" \
+    elif [ -n "${BACKPACK_QUIET:-}" ] && ! curl -fsSL --connect-timeout 15 -m 180 -o "$tmp/bp.tgz" \
+            "https://github.com/AminMGMT/BackPack/releases/download/$BACKPACK_VERSION/backpack_linux_$arch.tar.gz"; then
+        info "BackPack could not be downloaded from GitHub - a tunnel set from the admin"
+        info "panel needs it here. Later, run this again, or with BACKPACK_TARBALL=/path/to/"
+        info "backpack_linux_$arch.tar.gz ($BACKPACK_VERSION) fetched elsewhere."
+        rm -rf "$tmp"; return 1
+    elif [ -z "${BACKPACK_QUIET:-}" ] && ! curl -fsSL -m 300 -o "$tmp/bp.tgz" \
             "https://github.com/AminMGMT/BackPack/releases/download/$BACKPACK_VERSION/backpack_linux_$arch.tar.gz"; then
         warn "could not download BackPack from GitHub. Without internet, fetch"
         warn "backpack_linux_$arch.tar.gz ($BACKPACK_VERSION) elsewhere and run with"
@@ -510,6 +540,42 @@ install_backpack() {
     info "BackPack is the work of Amin Mohammadi - github.com/AminMGMT/BackPack (AGPL-3.0)"
 }
 
+# The relay's way to the exit, which its nginx.conf includes: through the
+# tunnel's end here first, or straight to the exit. smartdns-sync writes the
+# same file, to the byte, when the admin panel turns the tunnel on or off.
+EXIT_CONF=/etc/nginx/smartdns-exit.conf
+CUSTOMER_EXITS=/etc/nginx/smartdns-customer-exits.map
+exit_upstreams() {
+    local line name here there tmp
+    tmp="$(mktemp)"
+    {
+        printf '# The way to the exit - written by doctor dns: the installer, and\n'
+        printf "# smartdns-sync when the admin panel turns this relay's tunnel on or off.\n"
+        for line in "https $TUNNEL_LOCAL_HTTPS 443" "http $TUNNEL_LOCAL_HTTP 80" \
+                    "spotify $TUNNEL_LOCAL_SPOTIFY 4070" "blizzard $TUNNEL_LOCAL_BLIZZARD 1119"; do
+            read -r name here there <<<"$line"
+            if [ "$TUNNEL" = backpack ]; then
+                printf 'upstream to_exit_%s {\n    server 127.0.0.1:%s;\n    server %s:%s backup;\n}\n' \
+                       "$name" "$here" "$EXIT_IP" "$there"
+            else
+                printf 'upstream to_exit_%s {\n    server %s:%s;\n}\n' "$name" "$EXIT_IP" "$there"
+            fi
+        done
+    } > "$tmp"
+    # The customers the admin panel sent through another exit: none until
+    # smartdns-sync says, a few seconds after this run - never names this
+    # file's new version might not have.
+    note_file "$CUSTOMER_EXITS"
+    printf '# Customers the admin panel sent through another exit than this relay'"'"'s:\n# written by the installer (empty) and smartdns-sync.\n' \
+        > "$CUSTOMER_EXITS"
+    chmod 644 "$CUSTOMER_EXITS"
+    note_file "$EXIT_CONF"
+    if [ -f "$EXIT_CONF" ] && cmp -s "$tmp" "$EXIT_CONF"; then rm -f "$tmp"; return 0; fi
+    mv "$tmp" "$EXIT_CONF"; chmod 644 "$EXIT_CONF"
+    if [ "$TUNNEL" = backpack ]; then info "nginx reaches the exit through the tunnel, directly when it is down"
+    else info "nginx reaches the exit directly"; fi
+}
+
 # The tunnel's config for this end, on stdout.
 tunnel_toml() {
     local token c="" k=""
@@ -526,7 +592,7 @@ tunnel_toml() {
                 -subj "/CN=${PANEL_DOMAIN:-localhost}" -keyout "$k" -out "$c" >/dev/null 2>&1 || true
         fi ;;
     esac
-    printf '# written by the doctor dns installer - re-run it to change the tunnel\n'
+    printf "# written by doctor dns: the installer, or the admin panel's relays card\n"
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
@@ -553,8 +619,20 @@ tunnel_toml() {
 # Bring this end of the tunnel to what TUNNEL says, or take it down.
 apply_tunnel() {
     local secret="$1" tmp changed=0 peer
+    # The units, whether there is a tunnel now or not: the admin panel can set
+    # one for any relay later - the relay's own, and on the exit one per relay.
+    if [ "$ROLE" = relay ]; then
+        install_payload TUNNEL_SERVICE /etc/systemd/system/smartdns-tunnel.service && changed=1 || true
+        # And one per node, for the tunnels the admin panel sets to them.
+        install_payload TUNNEL_INSTANCE /etc/systemd/system/smartdns-tunnel@.service || true
+        systemctl daemon-reload
+    elif [ "$ROLE" = exit ] || [ "$ROLE" = node ]; then
+        install_payload TUNNEL_INSTANCE /etc/systemd/system/smartdns-tunnel@.service || true
+        systemctl daemon-reload
+    fi
     if [ "${TUNNEL:-off}" != backpack ]; then
-        if [ -f /etc/systemd/system/smartdns-tunnel.service ]; then
+        if systemctl is-enabled --quiet smartdns-tunnel.service 2>/dev/null \
+           || systemctl is-active --quiet smartdns-tunnel.service 2>/dev/null; then
             systemctl disable --now smartdns-tunnel.service >/dev/null 2>&1 || true
             info "no tunnel - the relay reaches the exit directly"
         fi
@@ -584,7 +662,7 @@ apply_tunnel() {
         mkdir -p /etc/nftables.d
         note_file "$TUNNEL_NFT"
         cat > "$TUNNEL_NFT" <<EOF
-# written by the doctor dns installer: the tunnel's port answers $peer only
+# written by doctor dns: the tunnel's port answers $peer only
 table inet smartdns_tunnel
 delete table inet smartdns_tunnel
 table inet smartdns_tunnel {
@@ -651,12 +729,17 @@ case "${1:-}" in
         printf '  no arguments   install or update this machine\n'
         printf '  --uninstall    put it back as it was\n'
         printf '  --tunnel       choose the tunnel between relay and exit again, then update\n'
+        printf '  --take-over    on the standby node: become the panel, from its backup\n'
         printf '  --version      print the version of this file\n'
         printf '\nenvironment (sudo does not pass these, put them after it):\n'
         printf '  ASSUME_YES=1   take the default for every question\n'
         printf '  ENFORCE=no     leave a relay open to everyone\n'
         printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|direct\n'
         printf '  TUNNEL_PORT=8444     the tunnel between relay and exit, asked on the exit\n'
+        printf '  ROLE=node PANEL_IP=<main exit> SYNC_TOKEN=<token>   another exit, joined to\n'
+        printf '                 that panel - the token is on its admin panel'"'"'s Node page\n'
+        printf '  ROLE=single PANEL_IP=<main exit> SYNC_TOKEN=<token>   a single server in\n'
+        printf '                 another country, its customers and quota those of that panel\n'
         printf '  BACKPACK_TARBALL=/path/backpack_linux_amd64.tar.gz   BackPack without GitHub\n'
         exit 0 ;;
 esac
@@ -759,6 +842,16 @@ uninstall() {
         rm -f /etc/doctor-dns-bot.env
         info "stopped the Telegram bot and removed its settings"
     fi
+    # The resellers' bots, one unit of the template each.
+    local sb
+    for sb in /etc/doctor-dns-bot-*.env; do
+        [ -f "$sb" ] || continue
+        sb=${sb#/etc/doctor-dns-bot-}; sb=${sb%.env}
+        systemctl disable --now "doctor-dns-bot@$sb.service" >/dev/null 2>&1 || true
+        rm -f "/etc/doctor-dns-bot-$sb.env"
+        info "stopped reseller $sb's Telegram bot and removed its settings"
+    done
+    rm -f /etc/systemd/system/doctor-dns-bot@.service
 
     step "Removing files this install created"
     local f
@@ -801,6 +894,20 @@ uninstall() {
     if nft list table inet smartdns_tunnel >/dev/null 2>&1; then
         nft delete table inet smartdns_tunnel; info "removed the tunnel's firewall table"
     fi
+    # The tunnels the admin panel set: one per relay on an exit, or a relay's
+    # own when this installer did not make it. Not on the list of services.
+    local t
+    for t in $(systemctl list-units --all --plain --no-legend 'smartdns-tunnel@*' 2>/dev/null | awk '{print $1}'); do
+        systemctl disable --now "$t" >/dev/null 2>&1 || true
+        info "stopped $t"
+    done
+    systemctl disable --now smartdns-tunnel.service >/dev/null 2>&1 || true
+    systemctl disable --now smartdns-dns-gate.service >/dev/null 2>&1 || true
+    nft delete chain inet smartdns gatedns >/dev/null 2>&1 || true
+    for t in $(nft list tables 2>/dev/null | awk '$3 ~ /^smartdns_tunnel_/ {print $3}'); do
+        nft delete table inet "$t" && info "removed the firewall table $t"
+    done
+    rm -f /etc/nftables.d/41-smartdns-tunnel-*.conf
     if nft list table inet smartdns_api >/dev/null 2>&1; then
         nft delete table inet smartdns_api; info "removed the sync API's firewall table"
     fi
@@ -874,6 +981,9 @@ case "${1:-}" in
     # Asked on the exit, carried to the relay by the pairing token - see the
     # tunnel section below.
     --tunnel|tunnel) ASK_TUNNEL=1 ;;
+    # On the standby the admin panel named: become the exit with the panel,
+    # from the backup kept here, when the machine it was on is gone.
+    --take-over|take-over) TAKE_OVER=1 ;;
     "") ;;
     *) die "unknown argument: $1  (try --help)" ;;
 esac
@@ -960,6 +1070,62 @@ fi
 # exactly as they are, and the only question it has is the one above: whether
 # to install this version at all. It used to walk the whole questionnaire
 # again, addresses and all, as if the machine had never been set up.
+# ---------------------------------------------------------------- take over
+# The standby node the admin panel named becomes the exit with the panel,
+# from the encrypted backup the panel kept on it: the database, the pictures'
+# key, and the sync secret, key and certificate the relays pin - so they
+# take this machine for the panel they had, find it on their own and stay.
+STANDBY_DIR="$STATE_DIR/standby"
+if [ -n "${TAKE_OVER:-}" ]; then
+    RESTORE="${RESTORE:-$STANDBY_DIR/backup.enc}"
+    [ -f "$RESTORE" ] || die "no panel backup at $RESTORE - is this the standby the Node page named?"
+    if [ -z "${RESTORE_PASS:-}" ]; then
+        read -r -s -p "  the backup password (the admin panel's settings): " RESTORE_PASS
+        printf '\n'
+    fi
+    tmpr="$(mktemp -d)"; chmod 700 "$tmpr"
+    DDNS_BACKUP_PASS="$RESTORE_PASS" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -in "$RESTORE" -pass env:DDNS_BACKUP_PASS -out "$tmpr/b.tgz" 2>/dev/null \
+        || { rm -rf "$tmpr"; die "that password does not open the backup"; }
+    tar -xzf "$tmpr/b.tgz" -C "$tmpr" 2>/dev/null || { rm -rf "$tmpr"; die "the backup is damaged"; }
+    for f in panel.db panel.env sync.key sync.crt; do
+        [ -f "$tmpr/$f" ] || { rm -rf "$tmpr"; die "the backup has no $f - not a whole panel"; }
+    done
+    me="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/node.env 2>/dev/null | head -1 || true)"
+    me="${SELF_IP:-$me}"
+    # The admin panel's name has to point here already: its certificate is
+    # got again below, the way it was the first time.
+    dom="$(sed -n 's#^ADMIN_CERT=/etc/letsencrypt/live/\([^/]*\)/.*#\1#p' "$tmpr/admin.env" 2>/dev/null | head -1 || true)"
+    if [ -n "$dom" ] && [ -n "$me" ]; then
+        seen="$(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1; exit}' || true)"
+        if [ "$seen" != "$me" ]; then
+            rm -rf "$tmpr"
+            die "point $dom at this server ($me) first - it points at ${seen:-nothing} now.
+    Then run this again."
+        fi
+    fi
+    step "Taking over the panel from its backup"
+    systemctl disable --now smartdns-node.service >/dev/null 2>&1 || true
+    mkdir -p /etc/smart-dns "$STATE_DIR"; chmod 700 /etc/smart-dns
+    for f in panel.env sync.key sync.crt admin.env db.key; do
+        [ -f "$tmpr/$f" ] && install -m 600 "$tmpr/$f" "/etc/smart-dns/$f"
+    done
+    [ -f "$tmpr/doctor-dns-bot.env" ] && install -m 600 "$tmpr/doctor-dns-bot.env" /etc/doctor-dns-bot.env
+    for f in "$tmpr"/doctor-dns-bot-*.env; do
+        [ -f "$f" ] && install -m 600 "$f" "/etc/$(basename "$f")"
+    done
+    install -m 600 "$tmpr/panel.db" "$STATE_DIR/panel.db"
+    rm -f "$STATE_DIR/panel.db-wal" "$STATE_DIR/panel.db-shm" /etc/smart-dns/node.env
+    rm -rf "$tmpr"
+    # This machine is the panel's exit now, no longer one of its nodes.
+    if [ -n "$me" ]; then
+        set_env_key /etc/smart-dns/panel.env NODE_IP "$(sed -n 's/^NODE_IP=//p' /etc/smart-dns/panel.env \
+            | head -1 | tr ',' '\n' | grep -vx "$me" | paste -sd, - || true)"
+    fi
+    ROLE=exit; SELF_IP="$me"
+    info "the panel's database, secret and certificate are this machine's now"
+fi
+
 UPGRADE=""
 if [ -n "$INSTALLED_VERSION" ]; then
     UPGRADE=1
@@ -968,6 +1134,8 @@ if [ -n "$INSTALLED_VERSION" ]; then
     if [ -z "$ROLE" ]; then
         # Both files is a single machine; one of them, that end.
         if [ -f /etc/smart-dns/sync.env ] && [ -f /etc/smart-dns/panel.env ]; then ROLE=single
+        elif grep -qx 'SINGLE=1' /etc/smart-dns/sync.env 2>/dev/null; then ROLE=single
+        elif [ -f /etc/smart-dns/node.env ]; then ROLE=node
         elif [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
         elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
         fi
@@ -975,12 +1143,21 @@ if [ -n "$INSTALLED_VERSION" ]; then
     if [ "$ROLE" = single ]; then
         SELF_IP="${SELF_IP:-$(was relay-ip)}"
         [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+        # One joined to another machine's panel keeps syncing there.
+        if [ ! -f /etc/smart-dns/panel.env ]; then
+            PANEL_IP="${PANEL_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)}"
+        fi
     elif [ "$ROLE" = relay ]; then
         PEER_IP="${PEER_IP:-$(was exit-ip)}"
         SELF_IP="${SELF_IP:-$(was relay-ip)}"
         # Older state files, or none: the relay's own config has both.
         [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
         [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+    elif [ "$ROLE" = node ]; then
+        SELF_IP="${SELF_IP:-$(was exit-ip)}"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/node.env 2>/dev/null | head -1 || true)"
+        PEER_IP="${PEER_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/node.env 2>/dev/null | head -1 || true)}"
+        SYNC_TOKEN="${SYNC_TOKEN:-$(sed -n 's/^SYNC_SECRET=//p' /etc/smart-dns/node.env 2>/dev/null | head -1 || true).$(sed -n 's/^SYNC_FINGERPRINT=//p' /etc/smart-dns/node.env 2>/dev/null | head -1 || true)}"
     elif [ "$ROLE" = exit ]; then
         PEER_IP="${PEER_IP:-$(was relay-ip)}"
         SELF_IP="${SELF_IP:-$(was exit-ip)}"
@@ -1006,19 +1183,23 @@ if [ -z "$ROLE" ]; then
     printf '\n%sWhich side is this machine?%s\n\n' "$B" "$N"
     printf '  1) relay  - the server inside Iran, the one clients point their DNS at\n'
     printf '  2) exit   - the server abroad, which reaches the blocked sites\n'
-    printf '  3) single - both on one server abroad, with no relay in Iran\n\n'
+    printf '  3) single - both on one server abroad, with no relay in Iran\n'
+    printf '  4) node   - another exit abroad, joined to the panel on an exit\n\n'
     while :; do
-        read -r -p "  choice [1/2/3]: " answer
+        read -r -p "  choice [1/2/3/4]: " answer
         case "$answer" in
             1|relay)  ROLE=relay;  break ;;
             2|exit)   ROLE=exit;   break ;;
             3|single) ROLE=single; break ;;
-            *) warn "answer 1, 2 or 3" ;;
+            4|node)   ROLE=node;   break ;;
+            *) warn "answer 1, 2, 3 or 4" ;;
         esac
     done
 fi
-[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || [ "$ROLE" = single ] \
-    || die "ROLE must be relay, exit or single"
+[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || [ "$ROLE" = single ] || [ "$ROLE" = node ] \
+    || die "ROLE must be relay, exit, single or node"
+# A node's other end is the exit its panel is on.
+[ "$ROLE" = node ] && [ -z "$PEER_IP" ] && PEER_IP="${PANEL_IP:-}"
 SINGLE=""
 if [ "$ROLE" = single ]; then
     SINGLE=1
@@ -1035,6 +1216,8 @@ if [ -z "$PEER_IP" ] && [ "$ROLE" != single ]; then
     printf '\n'
     if [ "$ROLE" = relay ]; then
         read -r -p "  public address of the EXIT server abroad: " PEER_IP
+    elif [ "$ROLE" = node ]; then
+        read -r -p "  public address of the exit with the PANEL: " PEER_IP
     else
         read -r -p "  public address of the RELAY server in Iran: " PEER_IP
     fi
@@ -1051,10 +1234,32 @@ valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
 [ "$ROLE" = single ] || [ "$SELF_IP" != "$PEER_IP" ] || die "both addresses are the same"
 if is_exit; then exit_owner_check "$SELF_IP"; fi
 
+# A single machine joined to the panel on another one (PANEL_IP): its
+# customers, their quota and its settings are that panel's, and it has no
+# panel of its own.
+JOINED=""
 if [ "$ROLE" = single ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"
+    if [ -n "${PANEL_IP:-}" ] && [ "$PANEL_IP" != 127.0.0.1 ] && [ "$PANEL_IP" != "$SELF_IP" ]; then
+        JOINED=1
+        valid_ip "$PANEL_IP" || die "PANEL_IP '$PANEL_IP' is not an IPv4 address"
+        if [ -z "${SYNC_TOKEN:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+            printf '\n  The pairing token is on the admin panel'"'"'s Node page, on %s.\n' "$PANEL_IP"
+            read -r -p "  pairing token: " SYNC_TOKEN
+        fi
+        [ -n "${SYNC_TOKEN:-}" ] || [ -f /etc/smart-dns/sync.env ] \
+            || die "a single server joined to a panel needs the pairing token from its Node page"
+    fi
 elif [ "$ROLE" = relay ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$PEER_IP"
+elif [ "$ROLE" = node ]; then
+    # The relays come from the panel; the panel is the other address.
+    RELAY_IP=""; EXIT_IP="$SELF_IP"; PANEL_IP="$PEER_IP"
+    if [ -z "${SYNC_TOKEN:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+        printf '\n  The pairing token is on the admin panel'"'"'s Node page, on %s.\n' "$PEER_IP"
+        read -r -p "  pairing token: " SYNC_TOKEN
+    fi
+    [ -n "${SYNC_TOKEN:-}" ] || die "a node needs the pairing token from the admin panel's Node page"
 else
     RELAY_IP="$PEER_IP"; EXIT_IP="$SELF_IP"
 fi
@@ -1092,7 +1297,7 @@ fi
 # Optional, like the panel. Without it the claim link is plain http, which
 # works but sends the registration token in the clear - anyone on the path can
 # take it and register their own address against the user's account.
-if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
+if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ] && [ "$ROLE" != node ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
     if [ "$ROLE" = single ]; then
         printf '  A name pointing at this machine, for both panels and for DNS\n'
@@ -1143,7 +1348,7 @@ if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
     fi
 fi
 # One machine has nothing to tunnel between.
-[ "$ROLE" = single ] && TUNNEL=off
+{ [ "$ROLE" = single ] || [ "$ROLE" = node ]; } && TUNNEL=off
 if [ -z "$TUNNEL" ]; then
     if [ "$ROLE" = exit ] && [ -n "$(env_get /etc/smart-dns/panel.env TUNNEL)" ]; then
         TUNNEL="$(env_get /etc/smart-dns/panel.env TUNNEL)"
@@ -1197,7 +1402,11 @@ else
 fi
 
 printf '\n%sAbout to configure:%s\n' "$B" "$N"
-printf '    role   : %s\n    relay  : %s\n    exit   : %s\n    tunnel : %s\n\n' "$ROLE" "$RELAY_IP" "$EXIT_IP" "$TUNNEL_OUT"
+if [ "$ROLE" = node ]; then
+    printf '    role   : node\n    this   : %s\n    panel  : %s\n\n' "$EXIT_IP" "$PANEL_IP"
+else
+    printf '    role   : %s\n    relay  : %s\n    exit   : %s\n    tunnel : %s\n\n' "$ROLE" "$RELAY_IP" "$EXIT_IP" "$TUNNEL_OUT"
+fi
 if [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     read -r -p "  proceed? [y/N]: " ok
     case "$ok" in y|Y|yes) ;; *) die "cancelled" ;; esac
@@ -1214,6 +1423,7 @@ DNSMASQ_CHANGED=0
 # its work, and before recording that it had.
 ADMIN_URL_OUT=""
 ADMIN_PASS_OUT=""
+ADMIN_USER_OUT=""
 SYNC_TOKEN_OUT=""
 USER_PANEL_OUT=""
 ENFORCE_OUT=""
@@ -1403,14 +1613,13 @@ fi
 if [ "$TUNNEL" = backpack ] && ! install_backpack; then
     warn "no tunnel this run - the relay reaches the exit directly"
     TUNNEL=off; TUNNEL_SPEC=""; TUNNEL_OUT="none - BackPack could not be installed"
+elif [ "$TUNNEL" != backpack ] && [ "$ROLE" != single ]; then
+    # Here all the same, on a relay or an exit with no tunnel now: the admin
+    # panel can give any relay one later, without this installer. Not being
+    # able to fetch it is no failure of this run.
+    BACKPACK_QUIET=1 install_backpack || true
 fi
-if [ "$ROLE" = relay ] && [ "$TUNNEL" = backpack ]; then
-    NO_TUNNEL=""; EXIT_HTTPS=to_exit_https; EXIT_HTTP=to_exit_http; EXIT_SPOTIFY=to_exit_spotify
-    EXIT_BLIZZARD=to_exit_blizzard
-else
-    NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"; EXIT_SPOTIFY="$EXIT_IP:4070"
-    EXIT_BLIZZARD="$EXIT_IP:1119"
-fi
+if [ "$ROLE" = relay ]; then exit_upstreams; fi
 # DNS over HTTPS and TLS, on a relay that has a name and a certificate for
 # it. On a first install the certificate comes later in this run, so this is
 # decided again once it is there - see relay_doh.
@@ -1423,6 +1632,7 @@ if is_exit && [ -f /etc/smart-dns/upstream ]; then
     RESOLVERS="$(head -n 1 /etc/smart-dns/upstream \
         | grep -Ex '([0-9]{1,3}\.){3}[0-9]{1,3}( ([0-9]{1,3}\.){3}[0-9]{1,3})?' || true)"
 fi
+if [ "$ROLE" = exit ] || [ "$ROLE" = node ]; then relay_allows; fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
 else
@@ -1704,8 +1914,42 @@ if [ -n "${PANEL_DOMAIN:-}" ]; then
 fi
 relay_doh
 
+# ------------------------------------------------------------------ node
+if [ "$ROLE" = node ]; then
+    step "Node: joined to the panel on $PANEL_IP"
+    SECRET="$(printf '%s' "$SYNC_TOKEN" | cut -d. -f1)"
+    FINGER="$(printf '%s' "$SYNC_TOKEN" | cut -s -d. -f2)"
+    [ -n "$SECRET" ] && [ -n "$FINGER" ] && [ "$SECRET" != "$FINGER" ] \
+        || die "that does not look like a pairing token - the whole line from the Node page"
+    case "$FINGER" in
+        *[!0-9a-f]*|"") die "the fingerprint half of the token is not hexadecimal" ;;
+    esac
+    valid_ip "$PANEL_IP" || die "PANEL_IP '$PANEL_IP' is not an IPv4 address"
+    mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
+    umask 077
+    note_file /etc/smart-dns/node.env
+    cat > /etc/smart-dns/node.env <<EOF
+PANEL_HOST=$PANEL_IP
+SYNC_SECRET=$SECRET
+SYNC_FINGERPRINT=$FINGER
+SELF_IP=$SELF_IP
+EOF
+    umask 022
+    chmod 600 /etc/smart-dns/node.env
+    payload SYNC > /usr/local/bin/smartdns-sync
+    chmod +x /usr/local/bin/smartdns-sync
+    note_file /usr/local/bin/smartdns-sync
+    note_file /usr/local/bin/smartdns-api-guard
+    payload SMARTDNS_API_GUARD > /usr/local/bin/smartdns-api-guard
+    chmod +x /usr/local/bin/smartdns-api-guard
+    install_payload NODE_SERVICE /etc/systemd/system/smartdns-node.service || true
+    systemctl daemon-reload
+    enable_service smartdns-node.service
+    systemctl restart smartdns-node.service
+fi
+
 # ----------------------------------------------------------------- panel
-if is_exit; then
+if is_exit && [ "$ROLE" != node ] && [ -z "$JOINED" ]; then
     step "Panel: database and sync API"
     mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
 
@@ -1778,6 +2022,10 @@ EOF
     # references - nothing here routes anything on its own.
     note_file /usr/local/share/smart-dns/games.json
     payload GAMES > /usr/local/share/smart-dns/games.json
+    # What a template can close: ad networks and adult sites, by name and
+    # domain, for the admin to tick at the foot of a template's page.
+    note_file /usr/local/share/smart-dns/blocks.json
+    payload BLOCKS > /usr/local/share/smart-dns/blocks.json
     # Only the relays reach the sync API. The panel's service runs this before
     # every start, so a relay added to RELAY_IP by hand is let in the next time
     # the panel restarts - exactly when the panel itself would let it in.
@@ -1851,6 +2099,9 @@ EOF
                     printf '\n'
                     read -r -p "  port to serve it on [9443]: " ADMIN_PORT
                 fi
+                if [ -z "${ADMIN_USER:-}" ]; then
+                    read -r -p "  username [admin]: " ADMIN_USER
+                fi
                 if [ -z "${ADMIN_PASS:-}" ]; then
                     printf '  password [enter for a generated one]: '
                     read -rs ADMIN_PASS; printf '\n'
@@ -1865,6 +2116,9 @@ EOF
                 fi
             fi
             ADMIN_PORT="${ADMIN_PORT:-9443}"
+            ADMIN_USER="$(printf '%s' "${ADMIN_USER:-admin}" | tr 'A-Z' 'a-z')"
+            printf '%s' "$ADMIN_USER" | grep -Eq '^[a-z0-9._-]{3,32}$' \
+                || die "a username is 3 to 32 lower-case letters, digits, . - _"
             case "$ADMIN_PORT" in
                 *[!0-9]*|"") die "the admin port must be a number" ;;
                 22) die "port 22 is ssh" ;;
@@ -1895,6 +2149,7 @@ print(hashlib.pbkdf2_hmac("sha256", os.environ["ADMIN_PASS"].encode(),
 # Written once at install. The password itself is not stored - only a salted
 # hash - so a forgotten password is replaced, never recovered.
 ADMIN_PORT=$ADMIN_PORT
+ADMIN_USER=$ADMIN_USER
 ADMIN_PATH=$ADMIN_PATH_GEN
 ADMIN_SALT=$ADMIN_SALT
 ADMIN_HASH=$ADMIN_HASH
@@ -1910,9 +2165,31 @@ EOF
             systemctl try-restart smartdns-panel.service >/dev/null 2>&1 || true
             ADMIN_URL_OUT="https://$PANEL_DOMAIN:$ADMIN_PORT/$ADMIN_PATH_GEN/"
             ADMIN_PASS_OUT="$ADMIN_PASS"
+            ADMIN_USER_OUT="$ADMIN_USER"
         else
             info "keeping the admin URL and password already set up here"
             info "change them with: smartdns-access"
+            # From 0.9.0 the panel is signed into with a username too. A panel
+            # from before gets one now - asked for, or "admin" to change later.
+            if ! grep -q '^ADMIN_USER=.' /etc/smart-dns/admin.env; then
+                # One chosen in the panel by a build before this one is kept.
+                [ -n "${ADMIN_USER:-}" ] || ADMIN_USER="$(python3 -c '
+import sqlite3, sys
+try:
+    r = sqlite3.connect(sys.argv[1]).execute(
+        "SELECT value FROM settings WHERE key = ?", ("owner_username",)).fetchone()
+    print(r[0] if r and r[0] else "")
+except Exception:
+    pass' "$STATE_DIR/panel.db" 2>/dev/null || true)"
+                if [ -z "${ADMIN_USER:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+                    printf '\n  The admin panel now asks for a username as well as the password.\n'
+                    read -r -p "  username [admin]: " ADMIN_USER
+                fi
+                ADMIN_USER="$(printf '%s' "${ADMIN_USER:-admin}" | tr 'A-Z' 'a-z')"
+                printf '%s' "$ADMIN_USER" | grep -Eq '^[a-z0-9._-]{3,32}$' || ADMIN_USER=admin
+                printf 'ADMIN_USER=%s\n' "$ADMIN_USER" >> /etc/smart-dns/admin.env
+                ADMIN_USER_OUT="$ADMIN_USER"
+            fi
         fi
         install_font
         # Which operator each customer's address is on, for the users page: a
@@ -1935,6 +2212,9 @@ EOF
         payload BOT > /usr/local/bin/doctor-dns-bot
         chmod +x /usr/local/bin/doctor-dns-bot
         payload BOT_SERVICE > /etc/systemd/system/doctor-dns-bot.service
+        # A reseller's own bot: the same program, one unit of this each.
+        note_file /etc/systemd/system/doctor-dns-bot@.service
+        payload BOT_SELLER_SERVICE > /etc/systemd/system/doctor-dns-bot@.service
         note_file /usr/local/bin/smartdns-bot-logs
         payload SMARTDNS_BOT_LOGS > /usr/local/bin/smartdns-bot-logs
         chmod +x /usr/local/bin/smartdns-bot-logs
@@ -1948,6 +2228,19 @@ EOF
             || systemctl start --no-block smartdns-operators.service >/dev/null 2>&1 || true
         systemctl restart smartdns-admin.service
         systemctl try-restart doctor-dns-bot.service >/dev/null 2>&1 || true
+        # Taken over with a bot that was running: running here too.
+        if [ -n "${TAKE_OVER:-}" ] && grep -q '^BOT_TOKEN=.' /etc/doctor-dns-bot.env 2>/dev/null; then
+            systemctl enable --now doctor-dns-bot.service >/dev/null 2>&1 || true
+        fi
+        for sb in /etc/doctor-dns-bot-*.env; do
+            [ -f "$sb" ] || continue
+            sb=${sb#/etc/doctor-dns-bot-}; sb=${sb%.env}
+            if [ -n "${TAKE_OVER:-}" ]; then
+                systemctl enable --now "doctor-dns-bot@$sb.service" >/dev/null 2>&1 || true
+            else
+                systemctl try-restart "doctor-dns-bot@$sb.service" >/dev/null 2>&1 || true
+            fi
+        done
         sleep 2
         if systemctl is-active --quiet smartdns-admin.service; then
             info "admin panel running"
@@ -2028,7 +2321,10 @@ EOF
         set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
     fi
     if [ "$ROLE" = single ]; then
-        set_env_key /etc/smart-dns/sync.env PANEL_PORT "$SINGLE_API_PORT"
+        # Its own panel's API on loopback - or, joined, the other panel's 8443.
+        if [ -n "$JOINED" ]; then set_env_key /etc/smart-dns/sync.env PANEL_PORT ""
+        else set_env_key /etc/smart-dns/sync.env PANEL_PORT "$SINGLE_API_PORT"; fi
+        set_env_key /etc/smart-dns/sync.env SINGLE 1
     fi
     set_env_key /etc/smart-dns/sync.env TUNNEL "$TUNNEL"
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
@@ -2045,6 +2341,10 @@ EOF
     # themselves are started and stopped by the sync agent as the panel adds
     # and retires templates, so nothing here is enabled.
     install_payload DNS_PROFILE_UNIT /etc/systemd/system/smartdns-dns@.service || true
+    # The customer panel's name for addresses not registered yet, so a
+    # customer whose line changed can still reach the page. The sync agent
+    # starts it while enforcement is on.
+    install_payload DNS_GATE_UNIT /etc/systemd/system/smartdns-dns-gate.service || true
     mkdir -p /etc/smartdns-profiles
     install_payload SYNC_SERVICE /etc/systemd/system/smartdns-sync.service || true
     # DNS over HTTPS and TLS. Harmless where the relay has no certificate:
@@ -2155,10 +2455,19 @@ if is_relay; then
     # and leaves no "wrong secret" warning in the exit's log. A relay whose
     # sync could not get through used to pass every check here and then fail
     # in the customer's panel instead.
-    if [ "$ROLE" = single ]; then api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"
+    if [ -n "$JOINED" ]; then api_at="$PANEL_IP"; api_port=8443
+    elif [ "$ROLE" = single ]; then api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"
     else api_at="$EXIT_IP"; api_port=8443; fi
     check "the exit's sync API answers this relay" \
           "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:${api_port}:${api_at}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:${api_port}/" 2>/dev/null || true)" "501"
+fi
+if [ "$ROLE" = node ]; then
+    check "the node's sync is running" "$(systemctl is-active smartdns-node.service)" active
+    # The panel's API, the way the node reaches it; a GET is refused as 501
+    # without any secret being looked at. Anything else - a timeout, most
+    # likely - is this node's address not yet on the panel's Node page.
+    check "the panel's API answers this node" \
+          "$(curl -sk -o /dev/null -m 20 --resolve "sync.example.com:8443:${PANEL_IP}" -w '%{http_code}' "https://sync.example.com:8443/" 2>/dev/null || true)" "501"
 fi
 if [ "$TUNNEL" = backpack ]; then
     check "the tunnel service is running" "$(systemctl is-active smartdns-tunnel.service)" active
@@ -2186,6 +2495,16 @@ if [ "$fail" = 0 ]; then
     # there was nothing left to do.
     mkdir -p "$STATE_DIR"
     printf '%s\n' "$VERSION" > "$VERSION_FILE"
+    # On the exit with the panel, a copy of this very file, for the admin
+    # panel to upgrade the other servers with - never from the internet,
+    # which a relay in Iran may not reach. Only when run from a file.
+    if [ "$ROLE" = exit ] && [ -f "$0" ] && grep -qx "VERSION=\"$VERSION\"" "$0"; then
+        mkdir -p "$STATE_DIR/installer"
+        cp -f "$0" "$STATE_DIR/installer/doctor-dns.sh.tmp" \
+            && chmod 600 "$STATE_DIR/installer/doctor-dns.sh.tmp" \
+            && mv -f "$STATE_DIR/installer/doctor-dns.sh.tmp" "$STATE_DIR/installer/doctor-dns.sh" \
+            && info "kept this installer for the admin panel to upgrade the other servers with"
+    fi
     printf '%s%s is installed and working, version %s.%s\n' \
            "$G" "$ROLE" "$VERSION" "$N"
 else
@@ -2258,9 +2577,18 @@ if [ -n "$ADMIN_URL_OUT" ]; then
     so it can be replaced but never read back. Write it down now.
 
         %s
+        username: %s
         password: %s
 
-' "$B" "$N" "$ADMIN_URL_OUT" "$ADMIN_PASS_OUT"
+' "$B" "$N" "$ADMIN_URL_OUT" "$ADMIN_USER_OUT" "$ADMIN_PASS_OUT"
+elif [ -n "$ADMIN_USER_OUT" ]; then
+    printf '    %sAdmin panel%s - it now asks for a username with the password:
+
+        username: %s
+
+    Change it in the panel'"'"'s settings, or with: smartdns-access username
+
+' "$B" "$N" "$ADMIN_USER_OUT"
 fi
 
 if [ "$TUNNEL" = backpack ]; then
@@ -2285,6 +2613,19 @@ fi
 if [ -n "${ASK_TUNNEL:-}" ] && [ "$ROLE" = exit ]; then
     printf '    %sNow the relay%s: run the installer there with --tunnel and paste the\n' "$Y" "$N"
     printf '    pairing token above. Until then it goes straight to this exit.\n\n'
+fi
+
+if [ -n "$JOINED" ]; then
+    printf '    %sJoined%s - this single server'"'"'s customers, their quota and its settings
+    are those of the panel on %s, and it shows on that panel'"'"'s Node page.
+
+' "$B" "$N" "$PANEL_IP"
+fi
+if [ "$ROLE" = node ]; then
+    printf '    %sNode%s - joined to the panel on %s. Its relays come from there, and a
+    relay goes through this server once the admin panel'"'"'s Node page says so.
+
+' "$B" "$N" "$PANEL_IP"
 fi
 
 printf '    Every command there is, in one menu:  %ssudo smartdns-menu%s\n\n' "$B" "$N"
@@ -2574,7 +2915,11 @@ exit 0
 #        listen 80;
 #        listen [::]:80;
 #        server_name ~^.*\.(playstation\.(net|com)|xboxlive\.com|gamepass\.com)$;
-#        allow __RELAY_IP__;
+#        # The relays this exit serves, one allow line each: written by the
+#        # installer and rewritten by the admin panel when a relay is added
+#        # or taken off - so a second relay no longer means re-running the
+#        # installer here, and adding it no longer cuts the first one off.
+#        include /etc/nginx/smartdns-relays.conf;
 #        # The tunnel, when there is one: its end on this machine hands each
 #        # connection to nginx from loopback. Nothing else can arrive from here.
 #        allow 127.0.0.1;
@@ -2705,7 +3050,7 @@ exit 0
 #    server {
 #        resolver __RESOLVERS__ ipv6=off;
 #        listen 443;
-#        allow __RELAY_IP__;
+#        include /etc/nginx/smartdns-relays.conf;
 #        # The tunnel, when there is one: its end on this machine hands each
 #        # connection to nginx from loopback. Nothing else can arrive from here.
 #        allow 127.0.0.1;
@@ -2730,7 +3075,7 @@ exit 0
 #    server {
 #        listen 4070;
 #        resolver __RESOLVERS__ ipv6=off;
-#        allow __RELAY_IP__;
+#        include /etc/nginx/smartdns-relays.conf;
 #        allow 127.0.0.1;
 #        deny all;
 #        proxy_connect_timeout 10s;
@@ -2753,7 +3098,7 @@ exit 0
 #    server {
 #        listen 1119;
 #        resolver __RESOLVERS__ ipv6=off;
-#        allow __RELAY_IP__;
+#        include /etc/nginx/smartdns-relays.conf;
 #        allow 127.0.0.1;
 #        deny all;
 #        ssl_preread on;
@@ -2810,31 +3155,25 @@ exit 0
 #    # the names never reach the database. In /run, which is memory: the
 #    # lines never touch the disk, and not under /var/log/nginx, where the
 #    # daily logrotate would have kept a copy for two weeks.
-#    log_format usage '$remote_addr $server_port $ssl_preread_server_name $bytes_sent $bytes_received';
+#    # Last, where it went: which exit carried it, for the usage per server -
+#    # "a:443, b:443" when the first refused and nginx went on to the next.
+#    log_format usage '$remote_addr $server_port $ssl_preread_server_name $bytes_sent $bytes_received $upstream_addr';
 #    access_log /run/smartdns-usage usage buffer=32k flush=10s;
 #
-#    # tunnel begin
-#    # With a tunnel, its end on this machine is the way to the exit, and the
-#    # exit's own address is only the fallback: nginx turns to a backup server
+#    # The way to the exit: the upstreams to_exit_https, _http, _spotify and
+#    # _blizzard. With a tunnel, its end on this machine comes first and the
+#    # exit's own address is only the fallback - nginx turns to a backup server
 #    # when the first refuses, which is what the tunnel's local port does while
-#    # the tunnel is down. Without one, this block is not here at all.
-#    upstream to_exit_https {
-#        server 127.0.0.1:18443;
-#        server __EXIT_IP__:443 backup;
+#    # the tunnel is down. Written by the installer, and by smartdns-sync when
+#    # the admin panel turns this relay's tunnel on or off.
+#    include /etc/nginx/smartdns-exit.conf;
+#    # Which exit each customer goes through: this relay's own - to_exit -
+#    # unless the admin panel sent them through another, whose upstreams put
+#    # it first. By their address; kept by smartdns-sync.
+#    map $remote_addr $to_exit {
+#        include /etc/nginx/smartdns-customer-exits.map;
+#        default to_exit;
 #    }
-#    upstream to_exit_http {
-#        server 127.0.0.1:18080;
-#        server __EXIT_IP__:80 backup;
-#    }
-#    upstream to_exit_spotify {
-#        server 127.0.0.1:14070;
-#        server __EXIT_IP__:4070 backup;
-#    }
-#    upstream to_exit_blizzard {
-#        server 127.0.0.1:11119;
-#        server __EXIT_IP__:1119 backup;
-#    }
-#    # tunnel end
 #
 #    # doh begin
 #    # Port 443 carries two things: everything a customer opens, which goes on
@@ -2847,7 +3186,7 @@ exit 0
 #        # The DoH names this machine answers - its own, and any the admin
 #        # panel set - kept by the installer and smartdns-sync.
 #        include /etc/nginx/smartdns-doh-names.map;
-#        default       __EXIT_HTTPS__;
+#        default       ${to_exit}_https;
 #    }
 #    server {
 #        listen 443;
@@ -2878,7 +3217,7 @@ exit 0
 #        ssl_preread on;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_HTTPS__;
+#        proxy_pass ${to_exit}_https;
 #    }
 #    # nodoh end
 #
@@ -2891,7 +3230,7 @@ exit 0
 #        listen 80;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_HTTP__;
+#        proxy_pass ${to_exit}_http;
 #    }
 #
 #    # Spotify on 4070 - see the exit's config for why this port exists at all.
@@ -2899,7 +3238,7 @@ exit 0
 #        listen 4070;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_SPOTIFY__;
+#        proxy_pass ${to_exit}_spotify;
 #    }
 #
 #    # Battle.net on 1119 - see the exit's config for why.
@@ -2909,7 +3248,7 @@ exit 0
 #        ssl_preread on;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_BLIZZARD__;
+#        proxy_pass ${to_exit}_blizzard;
 #    }
 #}
 #
@@ -3955,6 +4294,7 @@ exit 0
 #"""
 #
 #import base64
+#import gzip
 #import hashlib
 #import hmac
 #import html
@@ -4179,6 +4519,128 @@ exit 0
 #    PRIMARY KEY (day, user_id)
 #);
 #
+#-- What went through each server: kind is "relay" (from the relay's counters,
+#-- as the bill is) or "exit" (from the relays' nginx, by which exit carried
+#-- the connection). All customers together, in the grains of the usage table
+#-- and kept as long, for the admin panel's charts of one server...
+#CREATE TABLE IF NOT EXISTS server_usage (
+#    grain  TEXT NOT NULL,
+#    bucket TEXT NOT NULL,
+#    kind   TEXT NOT NULL,
+#    server TEXT NOT NULL,
+#    up     INTEGER NOT NULL DEFAULT 0,
+#    down   INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (grain, bucket, kind, server)
+#);
+#-- ...and each customer's through each, per day, kept ninety days.
+#CREATE TABLE IF NOT EXISTS user_server_usage (
+#    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    day     TEXT NOT NULL,
+#    kind    TEXT NOT NULL,
+#    server  TEXT NOT NULL,
+#    up      INTEGER NOT NULL DEFAULT 0,
+#    down    INTEGER NOT NULL DEFAULT 0,
+#    PRIMARY KEY (user_id, day, kind, server)
+#);
+#
+#-- What went wrong with the servers and came right again, for the admin
+#-- panel and the operator's bot: each change of state once. Kept thirty days.
+#CREATE TABLE IF NOT EXISTS alerts (
+#    id   INTEGER PRIMARY KEY,
+#    at   TEXT NOT NULL,
+#    key  TEXT NOT NULL,
+#    ok   INTEGER NOT NULL,
+#    text TEXT NOT NULL
+#);
+#
+#-- Every change to a customer's wallet and what it was for: a top-up receipt
+#-- approved, a plan paid for, a share of a purchase by somebody they invited,
+#-- or the operator's hand. users.wallet is the balance; this is how it got
+#-- there, for the customer and the operator to read.
+#-- Every new address a customer registered, for the admin's limit on how
+#-- often an address may change. Kept a few days.
+#CREATE TABLE IF NOT EXISTS ip_log (
+#    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    ip      TEXT NOT NULL,
+#    at      TEXT NOT NULL
+#);
+#CREATE INDEX IF NOT EXISTS ip_log_user ON ip_log(user_id, at);
+#
+#-- Discount codes the admin hands out, and who used which: a percent or a
+#-- sum off a plan, until a date, for so many uses, once a customer or not,
+#-- on some plans or all of them.
+#CREATE TABLE IF NOT EXISTS discount_codes (
+#    id          INTEGER PRIMARY KEY,
+#    code        TEXT NOT NULL UNIQUE,
+#    kind        TEXT NOT NULL,
+#    value       INTEGER NOT NULL,
+#    expires_at  TEXT,
+#    max_uses    INTEGER,
+#    once        INTEGER NOT NULL DEFAULT 1,
+#    plans       TEXT,
+#    active      INTEGER NOT NULL DEFAULT 1,
+#    uses        INTEGER NOT NULL DEFAULT 0,
+#    created_at  TEXT NOT NULL
+#);
+#CREATE TABLE IF NOT EXISTS discount_uses (
+#    code_id        INTEGER NOT NULL REFERENCES discount_codes(id) ON DELETE CASCADE,
+#    user_id        INTEGER NOT NULL,
+#    transaction_id INTEGER,
+#    at             TEXT NOT NULL
+#);
+#CREATE INDEX IF NOT EXISTS discount_uses_code ON discount_uses(code_id, user_id);
+#
+#-- Messages the admin sent every customer, or some of them, through the bot:
+#-- the text, who it was for, and the outbox rows that carried it, so the
+#-- page can say how many have reached the bot.
+#CREATE TABLE IF NOT EXISTS broadcasts (
+#    id          INTEGER PRIMARY KEY,
+#    text        TEXT NOT NULL,
+#    target      TEXT NOT NULL,
+#    recipients  INTEGER NOT NULL,
+#    first_row   INTEGER,
+#    last_row    INTEGER,
+#    created_at  TEXT NOT NULL
+#);
+#
+#-- The admins besides the owner - whose own password stays in admin.env -
+#-- with what each may see, and for a reseller the customers they bring, the
+#-- traffic their customers may use and until when.
+#CREATE TABLE IF NOT EXISTS admins (
+#    id             INTEGER PRIMARY KEY,
+#    username       TEXT NOT NULL UNIQUE,
+#    password_hash  TEXT NOT NULL,
+#    password_salt  TEXT NOT NULL,
+#    perms          TEXT NOT NULL DEFAULT '[]',
+#    own_only       INTEGER NOT NULL DEFAULT 0,
+#    can_route      INTEGER NOT NULL DEFAULT 0,
+#    max_users      INTEGER,
+#    cap_bytes      INTEGER,
+#    used_bytes     INTEGER NOT NULL DEFAULT 0,
+#    expires_at     TEXT,
+#    templates_mode TEXT NOT NULL DEFAULT 'pick',
+#    templates      TEXT,
+#    templates_max  INTEGER NOT NULL DEFAULT 1,
+#    ref_code       TEXT UNIQUE,
+#    disabled       INTEGER NOT NULL DEFAULT 0,
+#    warned         INTEGER NOT NULL DEFAULT 0,
+#    created_at     TEXT NOT NULL
+#);
+#
+#CREATE TABLE IF NOT EXISTS wallet_moves (
+#    id             INTEGER PRIMARY KEY,
+#    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    at             TEXT NOT NULL,
+#    amount         INTEGER NOT NULL,
+#    balance        INTEGER NOT NULL,
+#    kind           TEXT NOT NULL,
+#    note           TEXT,
+#    -- The receipt or purchase it came from; for an invitation, who bought.
+#    transaction_id INTEGER,
+#    other_user     INTEGER
+#);
+#CREATE INDEX IF NOT EXISTS wallet_moves_user ON wallet_moves(user_id, id);
+#
 #CREATE TABLE IF NOT EXISTS usage_service (
 #    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 #    day     TEXT NOT NULL,
@@ -4399,7 +4861,8 @@ exit 0
 #
 #METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
 #                 "swap_total", "disk_used", "disk_total", "rx_bps", "tx_bps",
-#                 "uptime")
+#                 "uptime", "rx_total", "tx_total", "conntrack", "conntrack_max",
+#                 "cert_days")
 #
 ## How long health samples are kept. A day is enough to answer "was it the
 ## server?" about something that happened this morning, and short enough that
@@ -4409,6 +4872,23 @@ exit 0
 ## Columns added after the first release. sqlite has no ADD COLUMN IF NOT
 ## EXISTS, so these are applied only when the column is genuinely missing.
 #MIGRATIONS = [
+#    # The connection table, the certificate's days left and every byte since
+#    # boot - for the alerts, and the month's traffic against a cap.
+#    ("metrics", "rx_total", "INTEGER"),
+#    ("metrics", "tx_total", "INTEGER"),
+#    ("metrics", "conntrack", "INTEGER"),
+#    ("metrics", "conntrack_max", "INTEGER"),
+#    ("metrics", "cert_days", "INTEGER"),
+#    # The exit the admin sent this customer through, on every relay; null for
+#    # each relay's own.
+#    ("users", "exit", "TEXT"),
+#    # The exit a plan puts its customers on; null for all of them.
+#    ("plans", "exit", "TEXT"),
+#    # And on particular relays, when not the same on all: {relay: exit}.
+#    ("users", "relay_exits", "TEXT"),
+#    # Which relays this customer is shown as DNS addresses, comma separated;
+#    # null for the ones shown to everybody. Every relay still serves them.
+#    ("users", "relays", "TEXT"),
 #    # Blocks and forwards per template; the ones made before that are for all.
 #    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -4438,6 +4918,9 @@ exit 0
 #    # allowance was set by hand.
 #    ("users", "plan_id", "INTEGER"),
 #    ("transactions", "plan_id", "INTEGER"),
+#    # A discount on it: the code, and the plan's price before it.
+#    ("transactions", "code_id", "INTEGER"),
+#    ("transactions", "list_price", "INTEGER"),
 #    # Where a bot wants to be told things, and the secret its messages are
 #    # signed with. Kept readable, unlike the key: the panel has to sign with it.
 #    ("api_tokens", "webhook_url", "TEXT"),
@@ -4449,6 +4932,8 @@ exit 0
 #    ("relay_logs", "tunnel", "TEXT"),
 #    # And nginx's error log, which is a file on the relay, not its journal.
 #    ("relay_logs", "nginx", "TEXT"),
+#    # The same logs a part of the machine at a time: [[key, label, text], ...].
+#    ("relay_logs", "parts", "TEXT"),
 #    # A free trial: given with one tap, never bought.
 #    ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
 #    # When this account had its trial; one per account.
@@ -4470,6 +4955,27 @@ exit 0
 #    ("users", "doh_seen_at", "TEXT"),
 #    # Until when the customer wants their DNS kept for support; NULL is off.
 #    ("users", "qlog_until", "TEXT"),
+#    # Inviting: the code in this customer's invitation link, and who invited
+#    # this account - written when it is opened, never after.
+#    ("users", "ref_code", "TEXT"),
+#    ("users", "referred_by", "INTEGER"),
+#    # Devices: how many addresses a plan gives, and the ones bought on top
+#    # of it, which last until another plan replaces it.
+#    ("plans", "devices", "INTEGER NOT NULL DEFAULT 1"),
+#    # Whose they are: a reseller's customers, plans, templates and bot key;
+#    # null is the owner's.
+#    ("users", "owner_admin", "INTEGER"),
+#    ("plans", "owner_admin", "INTEGER"),
+#    ("templates", "owner_admin", "INTEGER"),
+#    ("api_tokens", "admin_id", "INTEGER"),
+#    ("broadcasts", "admin_id", "INTEGER"),
+#    # Usage back to zero every so many days, whatever the plan: the admin's
+#    # choice per customer and per seller, and when it next happens.
+#    ("users", "reset_days", "INTEGER"),
+#    ("users", "reset_next", "TEXT"),
+#    ("admins", "reset_days", "INTEGER"),
+#    ("admins", "reset_next", "TEXT"),
+#    ("users", "extra_devices", "INTEGER NOT NULL DEFAULT 0"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -4483,18 +4989,13 @@ exit 0
 #    # not collide in a unique index, which is what accounts that never had one
 #    # need.
 #    "CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)",
+#    "CREATE UNIQUE INDEX IF NOT EXISTS users_ref_code ON users(ref_code)",
+#    "CREATE INDEX IF NOT EXISTS users_referred_by ON users(referred_by)",
 #]
 #
 ## Where the installer puts the service catalogue - which brands exist, which
 ## groups each has, and which domains are in each group.
 #SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
-#
-## Ceiling on distinct templates actually in use. Each one is a dnsmasq
-## instance on every relay, with its own cache and its own port, so this is a
-## real resource limit rather than a preference. Eight plans is more than any
-## of this is likely to need; the panel refuses to exceed it rather than
-## quietly starting a ninth resolver on every machine.
-#MAX_TEMPLATES = 8
 #
 #MB = 1024 ** 2
 #GB = 1024 ** 3
@@ -4859,6 +5360,34 @@ exit 0
 #        return []
 #
 #
+#BLOCKS_FILE = "/usr/local/share/smart-dns/blocks.json"
+#BLOCKS = []
+#
+#
+#def load_blocks():
+#    """What a template can close - ad networks, adult sites - each with its
+#    domains. The admin ticks them at the foot of a template's page."""
+#    try:
+#        with io_open(BLOCKS_FILE) as fh:
+#            return json.load(fh).get("blocks", [])
+#    except Exception as e:
+#        log(WARN, "no block catalogue at %s: %s" % (BLOCKS_FILE, e))
+#        return []
+#
+#
+#def picked_blocks(store, template_id):
+#    """The domains a template closes from that catalogue: every row ticked,
+#    less the domains taken out of it - so a domain a later version adds to a
+#    ticked row is closed too, as a service's is routed."""
+#    try:
+#        v = json.loads(store.setting("blocks:%d" % template_id) or "{}")
+#    except (ValueError, TypeError):
+#        v = {}
+#    on, off = set(v.get("on") or []), set(v.get("off") or [])
+#    return {d for b in BLOCKS if b.get("key") in on
+#            for d in b.get("domains") or [] if d not in off}
+#
+#
 #def load_config():
 #    cfg = {}
 #    with open(CONFIG) as fh:
@@ -4875,6 +5404,17 @@ exit 0
 #
 #
 ## --------------------------------------------------------------- database
+#def clean_log_parts(parts):
+#    """A server's logs by part, as it sent them, within bounds - or None."""
+#    if not isinstance(parts, list):
+#        return None
+#    out = []
+#    for p in parts[:20]:
+#        if isinstance(p, list) and len(p) == 3 and all(isinstance(x, str) for x in p):
+#            out.append([p[0][:30], p[1][:120], p[2][-10000:]])
+#    return json.dumps(out, ensure_ascii=False)
+#
+#
 #def relax_telegram_id(db, path):
 #    """Drop the NOT NULL from users.telegram_id on databases that predate web
 #    signup.
@@ -4931,6 +5471,14 @@ exit 0
 #    if broken:
 #        raise RuntimeError("migration left %d dangling references - the "
 #                           "database before it is at %s" % (len(broken), backup))
+#
+#
+## A seller's customers are served while the seller's traffic cap and days
+## last and the owner has not disabled them; otherwise all of them stop.
+#SELLER_LIVE = ("(u.owner_admin IS NULL OR u.owner_admin IN (SELECT id FROM admins"
+#               " WHERE disabled = 0 AND (cap_bytes IS NULL OR used_bytes < cap_bytes)"
+#               " AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%S+00:00',"
+#               " 'now'))))")
 #
 #
 #class Store:
@@ -4991,7 +5539,14 @@ exit 0
 #
 #    def run(self, sql, args=()):
 #        with self.lock:
-#            cur = self.db.execute(sql, args)
+#            try:
+#                cur = self.db.execute(sql, args)
+#            except Exception:
+#                # A statement that failed - a name that is taken, say - must
+#                # not leave its transaction open: until something commits,
+#                # the other process could not write to the database at all.
+#                self.db.rollback()
+#                raise
 #            self.db.commit()
 #            return cur
 #
@@ -5058,7 +5613,7 @@ exit 0
 #                 timespec="seconds")))
 #        return token
 #
-#    def plans_for_sale(self):
+#    def plans_for_sale(self, seller=None):
 #        """The plans a customer may buy, grouped the way they are shown: by
 #        template, then cheapest first.
 #
@@ -5068,9 +5623,10 @@ exit 0
 #        """
 #        rows = [dict(r) for r in self.q(
 #            "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
-#            " p.note, p.template_id, t.name AS template FROM plans p"
+#            " p.devices, p.note, p.template_id, t.name AS template FROM plans p"
 #            " JOIN templates t ON t.id = p.template_id"
-#            " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+#            " WHERE p.active = 1 AND p.is_trial = 0 AND COALESCE(p.owner_admin, 0) = ?"
+#            " ORDER BY t.id, p.price, p.id", (seller or 0,))]
 #        for row in rows:
 #            row["games"] = games_in_template(self, row.pop("template_id"))
 #        return rows
@@ -5078,7 +5634,7 @@ exit 0
 #    def trial_plan(self):
 #        """The free trial on offer, if the operator made one."""
 #        row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
-#                       " p.template_id, t.name AS template FROM plans p JOIN templates t"
+#                       " p.devices, p.template_id, t.name AS template FROM plans p JOIN templates t"
 #                       " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
 #                       " ORDER BY p.id LIMIT 1")
 #        if not row:
@@ -5093,7 +5649,7 @@ exit 0
 #    def allowed(self):
 #        return self.q(
 #            "SELECT i.ip AS ip, u.id AS uid FROM ips i JOIN users u ON u.id = i.user_id"
-#            " WHERE u.status = 'active'"
+#            " WHERE u.status = 'active' AND " + SELLER_LIVE
 #        )
 #
 #    # ----------------------------------------------------------- templates
@@ -5217,7 +5773,7 @@ exit 0
 #            " COALESCE(u.template_id, ?) AS tid,"
 #            " COALESCE(u.username, '') AS uname"
 #            " FROM ips i JOIN users u ON u.id = i.user_id"
-#            " WHERE u.status = 'active'", (default_id,))
+#            " WHERE u.status = 'active' AND " + SELLER_LIVE, (default_id,))
 #        by_ip = {}
 #        used = set()
 #        for r in rows:
@@ -5282,10 +5838,11 @@ exit 0
 #        """The blocks and forwards one template has: those for every template
 #        and those ticked for it. A forward under one of its blocks is left out
 #        - the block wins - so the relay is never handed the two to settle."""
-#        blocked = [r["domain"] for r in self.q(
+#        blocked = sorted({r["domain"] for r in self.q(
 #            "SELECT domain FROM blocked_domains b WHERE all_templates = 1 OR EXISTS"
 #            " (SELECT 1 FROM blocked_templates t WHERE t.domain = b.domain"
-#            " AND t.template_id = ?) ORDER BY domain", (template_id,))]
+#            " AND t.template_id = ?)", (template_id,))}
+#            | picked_blocks(self, template_id))
 #        closed = set(blocked)
 #        forwards = {}
 #        for r in self.q("SELECT domain, servers FROM dns_forwards f WHERE all_templates = 1"
@@ -5294,7 +5851,8 @@ exit 0
 #            parts = r["domain"].split(".")
 #            if not any(".".join(parts[i:]) in closed for i in range(len(parts))):
 #                forwards[r["domain"]] = r["servers"].split()
-#        return {"blocked": blocked, "forwards": forwards}
+#        return {"blocked": blocked, "forwards": forwards,
+#                "lists": blocklists_for(self, template_id)}
 #
 #    def template_names(self):
 #        """Every template's name by id, and which is the default - so the
@@ -5391,6 +5949,10 @@ exit 0
 #            % (", ".join(cols), ", ".join("?" * len(cols))),
 #            [host, now()] + [sample[c] for c in cols],
 #        )
+#        try:
+#            count_month(self, host, sample)
+#        except Exception as e:
+#            log(WARN, "month's traffic not counted for %s: %r" % (host, e))
 #
 #    def prune_metrics(self):
 #        self.run(
@@ -5438,6 +6000,9 @@ exit 0
 #                        "UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?",
 #                        (delta, row["user_id"]),
 #                    )
+#                    self.db.execute(
+#                        "UPDATE admins SET used_bytes = used_bytes + ? WHERE id ="
+#                        " (SELECT owner_admin FROM users WHERE id = ?)", (delta, row["user_id"]))
 #                    touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
 #                # Upload and download apart, for the charts. The relay sends
 #                # both beside the total; one that does not is an older relay,
@@ -5457,6 +6022,8 @@ exit 0
 #                    d_up, d_down = 0, max(delta, 0)
 #                if d_up or d_down:
 #                    record_usage(self.db, row["user_id"], d_up, d_down)
+#                if d_up or d_down:
+#                    record_server(self.db, row["user_id"], "relay", relay, d_up, d_down)
 #                self.db.execute(
 #                    "INSERT INTO ip_counters (ip, relay, last_counter, last_up, last_down)"
 #                    " VALUES (?, ?, ?, ?, ?) ON CONFLICT(ip, relay)"
@@ -5468,6 +6035,29 @@ exit 0
 #
 #
 ## ----------------------------------------------------------------- health
+#def conntrack_counts():
+#    """(connections tracked, the table's size), or (None, None) where the
+#    kernel keeps no table - when full, new connections are dropped."""
+#    try:
+#        with open("/proc/sys/net/netfilter/nf_conntrack_count") as fh:
+#            count = int(fh.read().strip())
+#        with open("/proc/sys/net/netfilter/nf_conntrack_max") as fh:
+#            return count, int(fh.read().strip())
+#    except (OSError, ValueError):
+#        return None, None
+#
+#
+#def cert_days(path):
+#    """Whole days until this certificate expires, or None without one."""
+#    if not path or not os.path.exists(path):
+#        return None
+#    try:
+#        ends = ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(path)["notAfter"])
+#    except Exception:
+#        return None
+#    return int((ends - time.time()) // 86400)
+#
+#
 #class Health:
 #    """This machine's own metrics, read straight out of /proc.
 #
@@ -5520,9 +6110,22 @@ exit 0
 #            return None, None
 #        return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
 #
+#    @staticmethod
+#    def cert_path():
+#        """The admin panel's certificate, as admin.env names it."""
+#        try:
+#            with open("/etc/smart-dns/admin.env") as fh:
+#                for line in fh:
+#                    if line.startswith("ADMIN_CERT="):
+#                        return line.split("=", 1)[1].strip()
+#        except OSError:
+#            pass
+#        return None
+#
 #    def sample(self):
 #        m = self._meminfo()
 #        rx, tx = self._net_rates()
+#        track = conntrack_counts()
 #        st = os.statvfs("/")
 #        with open("/proc/uptime") as fh:
 #            uptime = int(float(fh.readline().split()[0]))
@@ -5541,6 +6144,12 @@ exit 0
 #            "rx_bps": rx,
 #            "tx_bps": tx,
 #            "uptime": uptime,
+#            # Every byte since boot, for the month's traffic against a cap.
+#            "rx_total": self.net[0] if self.net else None,
+#            "tx_total": self.net[1] if self.net else None,
+#            "conntrack": track[0],
+#            "conntrack_max": track[1],
+#            "cert_days": cert_days(self.cert_path()),
 #        }
 #
 #
@@ -5563,7 +6172,7 @@ exit 0
 #    (the plan or None, why not): 'none' - there is no trial; 'telegram' - link
 #    Telegram first; 'used' - this account or this Telegram account had one;
 #    'running' - a plan is running, and a trial would end it."""
-#    plan = store.trial_plan()
+#    plan = store.trial_plan() if not seller_of(user) else None
 #    if not plan:
 #        return None, "none"
 #    if user["trial_at"]:
@@ -5615,6 +6224,490 @@ exit 0
 #    return {"ok": True, "message": "🎁 تست رایگان فعال شد. %s" % done}
 #
 #
+## ------------------------------------------------------- wallet and invites
+## Toman. Below the least a top-up is a slip of the finger more often than a
+## payment; above the most, a zero too many.
+#TOPUP_MIN = 10_000
+#TOPUP_MAX = 100_000_000
+#REF_CODE_RE = re.compile(r"[a-z0-9]{6,16}")
+#REF_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+#MONEY_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+#
+#
+#def toman(text):
+#    """A sum as somebody typed it - Persian digits, thousands commas - or None."""
+#    raw = str(text if text is not None else "").translate(MONEY_DIGITS)
+#    raw = re.sub(r"[\s,٬،]", "", raw)
+#    return int(raw) if raw.isdigit() and len(raw) < 16 else None
+#
+#
+#def wallet_on(store):
+#    """Whether customers may top their wallet up with a receipt. Spending what
+#    is in it works either way: an invitation or the operator can put money
+#    there with this off."""
+#    return store.setting("wallet_on") == "1"
+#
+#
+#def referral_terms(store):
+#    """(percent, "every" or "first") while inviting pays, else None."""
+#    if store.setting("ref_on") != "1":
+#        return None
+#    try:
+#        pct = int(store.setting("ref_percent") or 0)
+#    except ValueError:
+#        return None
+#    if not 0 < pct <= 100:
+#        return None
+#    return pct, ("first" if store.setting("ref_mode") == "first" else "every")
+#
+#
+#def move_wallet(db, uid, amount, kind, note="", tid=None, other=None):
+#    """Change a balance and write down why; the new balance. On a connection
+#    already under the store's lock, inside the caller's transaction.
+#
+#    Never below zero: a spend larger than the balance changes nothing and
+#    gives None - decided by the database in one statement, so two purchases
+#    at once cannot both spend the same money."""
+#    cur = db.execute("UPDATE users SET wallet = wallet + ? WHERE id = ? AND wallet + ? >= 0",
+#                     (amount, uid, amount))
+#    if not cur.rowcount:
+#        return None
+#    balance = db.execute("SELECT wallet FROM users WHERE id = ?", (uid,)).fetchone()[0]
+#    db.execute("INSERT INTO wallet_moves (user_id, at, amount, balance, kind, note,"
+#               " transaction_id, other_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+#               (uid, now(), amount, balance, kind, (note or "")[:200], tid, other))
+#    return balance
+#
+#
+#WALLET_KINDS = {"topup": "شارژ کیف پول", "purchase": "خرید پلن",
+#                "referral": "پورسانت دعوت", "admin": "تغییر به دست مدیر"}
+#
+#
+#def wallet_moves(store, uid, most=10):
+#    return [{"at": r["at"], "amount": r["amount"], "balance": r["balance"],
+#             "kind": r["kind"], "what": WALLET_KINDS.get(r["kind"], r["kind"]),
+#             "note": r["note"] or ""}
+#            for r in store.q("SELECT * FROM wallet_moves WHERE user_id = ?"
+#                             " ORDER BY id DESC LIMIT ?", (uid, most))]
+#
+#
+#def ref_code(store, user):
+#    """This customer's invitation code, made the first time it is asked for."""
+#    if user["ref_code"]:
+#        return user["ref_code"]
+#    for _ in range(5):
+#        code = "".join(secrets.choice(REF_ALPHABET) for _ in range(8))
+#        try:
+#            store.run("UPDATE users SET ref_code = ? WHERE id = ? AND ref_code IS NULL",
+#                      (code, user["id"]))
+#        except sqlite3.IntegrityError:
+#            continue        # somebody else's already; draw again
+#        row = store.one("SELECT ref_code FROM users WHERE id = ?", (user["id"],))
+#        return row["ref_code"] if row else None
+#    return None
+#
+#
+#def set_referrer(store, uid, code):
+#    """Who invited a new account, from the code in the link it came by: the
+#    inviter's id, or None. Only while inviting pays, never oneself, and once -
+#    an account's inviter is not something a later link can change."""
+#    code = str(code or "").strip().lower()
+#    if not referral_terms(store) or not REF_CODE_RE.fullmatch(code):
+#        return None
+#    who = store.one("SELECT id FROM users WHERE ref_code = ?", (code,))
+#    if not who or who["id"] == uid:
+#        return None
+#    cur = store.run("UPDATE users SET referred_by = ? WHERE id = ? AND referred_by IS NULL",
+#                    (who["id"], uid))
+#    if not cur.rowcount:
+#        return None
+#    log(INFO, "user #%d came by the invitation of #%d" % (uid, who["id"]))
+#    return who["id"]
+#
+#
+#def seller_of(user):
+#    """The reseller a customer belongs to, or None for the owner's."""
+#    try:
+#        return user["owner_admin"] or None
+#    except (KeyError, IndexError):
+#        return None
+#
+#
+#def seller_by_code(store, code):
+#    """The reseller whose sign-up link this is, or None."""
+#    code = str(code or "").strip().lower()
+#    if not REF_CODE_RE.fullmatch(code):
+#        return None
+#    return store.one("SELECT * FROM admins WHERE ref_code = ? AND own_only = 1", (code,))
+#
+#
+#def seller_from_link(store, code):
+#    """The reseller a sign-up link brings a customer to: their own link, or
+#    the invitation of one of their customers - whether or not inviting pays."""
+#    s = seller_by_code(store, code)
+#    if s:
+#        return s
+#    code = str(code or "").strip().lower()
+#    if not REF_CODE_RE.fullmatch(code):
+#        return None
+#    return store.one("SELECT a.* FROM users u JOIN admins a ON a.id = u.owner_admin"
+#                     " WHERE u.ref_code = ? AND a.own_only = 1", (code,))
+#
+#
+#def seller_full(store, seller):
+#    return bool(seller["max_users"]) and store.one(
+#        "SELECT count(*) c FROM users WHERE owner_admin = ?", (seller["id"],))["c"] \
+#        >= seller["max_users"]
+#
+#
+#def seller_stopped(store, seller_id):
+#    """Why a reseller's customers are not served now, or None."""
+#    if not seller_id:
+#        return None
+#    s = store.one("SELECT * FROM admins WHERE id = ?", (seller_id,))
+#    if not s:
+#        return None
+#    if s["disabled"]:
+#        return "disabled"
+#    if s["cap_bytes"] and s["used_bytes"] >= s["cap_bytes"]:
+#        return "cap"
+#    if s["expires_at"] and s["expires_at"] <= now():
+#        return "expired"
+#    return None
+#
+#
+#def seller_off(store, user):
+#    """A refusal when this customer's seller is disabled: nothing of theirs
+#    is sold while it is."""
+#    seller = seller_of(user)
+#    if seller and store.one("SELECT 1 FROM admins WHERE id = ? AND disabled = 1", (seller,)):
+#        return refused("seller_disabled", "فروشندهٔ شما فعلاً غیرفعال است؛ با خودش تماس بگیرید")
+#    return None
+#
+#
+#def seller_pay_text(store, user):
+#    seller = seller_of(user)
+#    return store.setting("pay_text:%d" % seller) if seller else store.setting("pay_text")
+#
+#
+#def pay_referral(store, buyer_id, amount, tid, kind="plan"):
+#    """The inviter's share of a plan bought - by receipt or from the wallet -
+#    into their wallet, and a word to them: the share, or None. An extra
+#    device counts only when every purchase does."""
+#    terms = referral_terms(store)
+#    if not terms or amount <= 0:
+#        return None
+#    pct, mode = terms
+#    if kind == "device" and mode == "first":
+#        return None
+#    buyer = store.one("SELECT referred_by FROM users WHERE id = ?", (buyer_id,))
+#    if not buyer or not buyer["referred_by"]:
+#        return None
+#    if mode == "first" and store.one(
+#            "SELECT 1 FROM transactions WHERE user_id = ? AND id != ? AND status = 'approved'"
+#            " AND plan_id IS NOT NULL AND kind != 'topup'", (buyer_id, tid)):
+#        return None
+#    share = amount * pct // 100
+#    if share <= 0:
+#        return None
+#    with store.lock:
+#        balance = move_wallet(store.db, buyer["referred_by"], share, "referral",
+#                              "%d٪ از خرید %s تومانی" % (pct, format(amount, ",")),
+#                              tid=tid, other=buyer_id)
+#        store.db.commit()
+#    if balance is None:
+#        return None         # the inviter's account is gone
+#    log(INFO, "invitation: user #%d earned %d for #%d's purchase"
+#        % (buyer["referred_by"], share, buyer_id))
+#    inviter = store.one("SELECT * FROM users WHERE id = ?", (buyer["referred_by"],))
+#    emit(store, inviter, "wallet.referral", {
+#        "amount": share, "balance": balance,
+#        "text": "🎉 یکی از کسانی که با لینک دعوت شما آمده بود خرید کرد؛ %s تومان به "
+#                "کیف پولتان اضافه شد.\nموجودی: %s تومان"
+#                % (format(share, ","), format(balance, ","))})
+#    return share
+#
+#
+#def ref_view(store, user):
+#    """The customer's invitation, while inviting pays: the links, the terms,
+#    and what it has brought them so far."""
+#    terms = referral_terms(store)
+#    if not terms:
+#        return None
+#    code = ref_code(store, user)
+#    if not code:
+#        return None
+#    bot = bot_link_for(store, user) or ""
+#    web = store.setting("customer_panel_url") or ""
+#    row = store.one("SELECT (SELECT count(*) FROM users WHERE referred_by = ?) AS n,"
+#                    " (SELECT COALESCE(sum(amount), 0) FROM wallet_moves"
+#                    "  WHERE user_id = ? AND kind = 'referral') AS earned",
+#                    (user["id"], user["id"]))
+#    return {"percent": terms[0], "mode": terms[1], "code": code,
+#            "bot_link": "%s?start=ref_%s" % (bot, code)
+#            if bot.startswith("https://t.me/") else None,
+#            "web_link": "%ssignup?ref=%s" % (web, code) if web else None,
+#            "invited": row["n"], "earned": row["earned"]}
+#
+#
+#MAX_DEVICES = 10
+#
+#
+#def plan_devices(plan):
+#    try:
+#        return max(1, min(5, int(plan["devices"] or 1)))
+#    except (KeyError, IndexError, TypeError, ValueError):
+#        return 1
+#
+#
+#def set_devices(db, uid, total, extra=None):
+#    """An account's number of devices - its addresses at once - and, when
+#    it went down, its oldest addresses let go to fit."""
+#    total = max(1, min(MAX_DEVICES, int(total)))
+#    if extra is None:
+#        db.execute("UPDATE users SET max_ips = ? WHERE id = ?", (total, uid))
+#    else:
+#        db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
+#                   (total, max(0, int(extra)), uid))
+#    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
+#                     (uid,)).fetchall()
+#    for row in ips[total:]:
+#        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
+#    return total
+#
+#
+#def ip_change_limit(store):
+#    """New addresses a customer may register a day, or None for no limit."""
+#    raw = (store.setting("ip_changes_per_day") or "").strip()
+#    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+#
+#
+#def device_price(store):
+#    raw = (store.setting("device_price") or "").strip()
+#    return int(raw) if raw.isdigit() and int(raw) > 0 else 0
+#
+#
+#def device_offer(store, user):
+#    """An extra device for this customer, while the operator sells them:
+#    {"price", "devices", "available", "why"}, or None when not sold."""
+#    price = device_price(store)
+#    if not price:
+#        return None
+#    why = None
+#    if not user["plan_id"] or user["status"] not in ("active", "over_quota"):
+#        why = "دستگاه اضافه برای پلن فعال است؛ اول پلن بخرید"
+#    elif (user["max_ips"] or 1) >= MAX_DEVICES:
+#        why = "بیشتر از %d دستگاه نمی‌شود" % MAX_DEVICES
+#    return {"price": price, "devices": user["max_ips"] or 1,
+#            "extra": user["extra_devices"] or 0, "available": why is None, "why": why}
+#
+#
+#def add_device(db, uid):
+#    user = db.execute("SELECT max_ips, extra_devices FROM users WHERE id = ?", (uid,)).fetchone()
+#    return set_devices(db, uid, (user[0] or 1) + 1, (user[1] or 0) + 1)
+#
+#
+#def buy_device_with_wallet(store, user):
+#    """An extra device paid from the wallet, at once: the money and the
+#    device in one transaction."""
+#    off = seller_off(store, user)
+#    if off:
+#        return off
+#    offer = device_offer(store, user)
+#    if not offer:
+#        return refused("devices_not_sold", "دستگاه اضافه فروخته نمی‌شود")
+#    if not offer["available"]:
+#        return refused("device_unavailable", offer["why"])
+#    price = offer["price"]
+#    with store.lock:
+#        cur = store.db.execute(
+#            "INSERT INTO transactions (user_id, amount, kind, note, status, created_at,"
+#            " decided_at) VALUES (?, ?, 'device', 'دستگاه اضافه از کیف پول', 'approved', ?, ?)",
+#            (user["id"], price, now(), now()))
+#        tid = cur.lastrowid
+#        balance = move_wallet(store.db, user["id"], -price, "purchase", "دستگاه اضافه",
+#                              tid=tid)
+#        if balance is None:
+#            store.db.rollback()
+#            have = store.db.execute("SELECT wallet FROM users WHERE id = ?",
+#                                    (user["id"],)).fetchone()[0]
+#            return refused("wallet_short", "موجودی کیف پول کافی نیست: %s تومان کم دارید"
+#                           % format(price - have, ","))
+#        total = add_device(store.db, user["id"])
+#        store.db.commit()
+#    emit_admin(store, "wallet.bought", {
+#        "user_id": user["id"], "amount": price, "plan": None,
+#        "text": "💰 دستگاه اضافه از کیف پول: %s — %s تومان"
+#                % (who_label(user), format(price, ","))})
+#    pay_referral(store, user["id"], price, tid, kind="device")
+#    return {"ok": True, "balance": balance, "devices": total,
+#            "message": "✅ یک دستگاه اضافه شد؛ حالا %d دستگاه دارید. %s تومان از کیف پول "
+#                       "برداشته شد؛ موجودی: %s تومان"
+#                       % (total, format(price, ","), format(balance, ","))}
+#
+#
+#def put_plan(db, uid, plan_id, stamp=None):
+#    """apply_plan's work, inside a transaction somebody else commits - so a
+#    plan paid from the wallet is the money and the plan together, or neither."""
+#    stamp = stamp or datetime.now(timezone.utc)
+#    user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+#    plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+#    if not user or not plan:
+#        return None
+#    ends = parse_ts(user["expires_at"])
+#    renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
+#                and user["status"] in ("active", "over_quota"))
+#    if renewing:
+#        until = ends + timedelta(days=plan["days"])
+#        quota = (user["quota_bytes"] + plan["quota_bytes"]
+#                 if plan["quota_bytes"] and user["quota_bytes"] else 0)
+#        used = user["used_bytes"]
+#    else:
+#        until = stamp + timedelta(days=plan["days"])
+#        quota = plan["quota_bytes"]
+#        used = 0
+#    db.execute(
+#        "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
+#        " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
+#        " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
+#        " status = CASE WHEN status = 'suspended' THEN 'suspended'"
+#        " ELSE 'active' END WHERE id = ?",
+#        (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
+#         until.isoformat(timespec="seconds"), uid))
+#    # The plan's devices, and those bought on top - which a renewal keeps
+#    # and another plan ends.
+#    extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
+#    set_devices(db, uid, plan_devices(plan) + extra, extra)
+#    # A plan sold with an exit of its own puts the customer on it, on
+#    # every relay; one sold with all of them leaves their exit alone.
+#    if "exit" in plan.keys() and plan["exit"]:
+#        db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
+#                   (plan["exit"], uid))
+#    return ("پلن «%s» تمدید شد تا %s" if renewing
+#            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+#
+#
+#CODE_RE = re.compile(r"[A-Z0-9_-]{3,32}")
+#
+#
+#def clean_code(raw):
+#    code = str(raw or "").strip().upper().translate(MONEY_DIGITS)
+#    return code if CODE_RE.fullmatch(code) else ""
+#
+#
+#def discount_for(store, user, plan, raw):
+#    """(price after the code, the code's row, why not): the code as this
+#    customer may use it on this plan. No code is the plan's price."""
+#    price = plan["price"]
+#    if not str(raw or "").strip():
+#        return price, None, None
+#    code = clean_code(raw)
+#    row = store.one("SELECT * FROM discount_codes WHERE code = ?", (code,)) if code else None
+#    if not row or not row["active"]:
+#        return price, None, "این کد تخفیف معتبر نیست"
+#    if row["expires_at"] and row["expires_at"] < now():
+#        return price, None, "مهلت این کد تخفیف تمام شده"
+#    if row["max_uses"] and row["uses"] >= row["max_uses"]:
+#        return price, None, "ظرفیت این کد تخفیف تمام شده"
+#    try:
+#        plans = json.loads(row["plans"]) if row["plans"] else None
+#    except ValueError:
+#        plans = None
+#    if plans and plan["id"] not in plans:
+#        return price, None, "این کد تخفیف برای این پلن نیست"
+#    if row["once"] and store.one("SELECT 1 FROM discount_uses WHERE code_id = ? AND user_id = ?",
+#                                 (row["id"], user["id"])):
+#        return price, None, "این کد تخفیف را قبلاً استفاده کرده‌اید"
+#    if "owner_admin" in plan.keys() and plan["owner_admin"]:
+#        return price, None, "این کد تخفیف برای این پلن نیست"
+#    off = price * row["value"] // 100 if row["kind"] == "percent" else row["value"]
+#    return max(0, price - off), row, None
+#
+#
+#def use_discount(db, code_id, user_id, tid):
+#    """A code counted as used, inside the purchase's transaction."""
+#    if not code_id:
+#        return
+#    db.execute("INSERT INTO discount_uses (code_id, user_id, transaction_id, at)"
+#               " VALUES (?, ?, ?, ?)", (code_id, user_id, tid, now()))
+#    db.execute("UPDATE discount_codes SET uses = uses + 1 WHERE id = ?", (code_id,))
+#
+#
+#def discount_view(store, user, raw):
+#    """The plans on sale with a code's prices, for the page and the bot to
+#    show before paying: (plans, message, ok)."""
+#    plans = store.plans_for_sale(seller_of(user))
+#    if not str(raw or "").strip():
+#        return plans, None, True
+#    ok, why = False, None
+#    for p in plans:
+#        price, row, err = discount_for(store, user, p, raw)
+#        if row:
+#            p["list_price"], p["price"], ok = p["price"], price, True
+#        why = why or err
+#    if ok:
+#        return plans, "کد تخفیف «%s» اعمال شد" % clean_code(raw), True
+#    return plans, why or "این کد تخفیف معتبر نیست", False
+#
+#
+#def buy_with_wallet(store, user, plan_id, code=None):
+#    """Pay for a plan from the wallet: no receipt, nobody to wait for. The
+#    money leaves and the plan arrives in one transaction."""
+#    off = seller_off(store, user)
+#    if off:
+#        return off
+#    if telegram_required(store, user):
+#        return refused("telegram_required", "برای خرید، اول حسابتان را به تلگرام وصل کنید")
+#    try:
+#        pid = int(plan_id or 0)
+#    except (TypeError, ValueError):
+#        pid = 0
+#    if not pid:
+#        return refused("plan_required", "اول پلن را انتخاب کنید")
+#    plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1 AND is_trial = 0"
+#                     " AND COALESCE(owner_admin, 0) = ?", (pid, seller_of(user) or 0))
+#    if not plan:
+#        return refused("plan_not_on_sale", "این پلن دیگر فروخته نمی‌شود، یکی دیگر را "
+#                                           "انتخاب کنید")
+#    if plan["price"] <= 0:
+#        return refused("not_for_wallet", "این پلن با کیف پول خریدنی نیست")
+#    price, row, why = discount_for(store, user, plan, code)
+#    if why:
+#        return refused("bad_code", why)
+#    with store.lock:
+#        cur = store.db.execute(
+#            "INSERT INTO transactions (user_id, amount, kind, note, status, created_at,"
+#            " decided_at, plan_id, code_id, list_price)"
+#            " VALUES (?, ?, 'wallet', 'از کیف پول', 'approved', ?, ?, ?, ?, ?)",
+#            (user["id"], price, now(), now(), plan["id"], row["id"] if row else None,
+#             plan["price"] if row else None))
+#        tid = cur.lastrowid
+#        use_discount(store.db, row["id"] if row else None, user["id"], tid)
+#        balance = move_wallet(store.db, user["id"], -price, "purchase",
+#                              "پلن «%s»" % plan["name"], tid=tid)
+#        if balance is None:
+#            store.db.rollback()
+#            have = store.db.execute("SELECT wallet FROM users WHERE id = ?",
+#                                    (user["id"],)).fetchone()[0]
+#            return refused("wallet_short",
+#                           "موجودی کیف پول کافی نیست: %s تومان دارید و این پلن %s تومان است"
+#                           " — %s تومان کم دارید" % (format(have, ","), format(price, ","),
+#                                                     format(price - have, ",")))
+#        done = put_plan(store.db, user["id"], plan["id"])
+#        store.db.commit()
+#    log(INFO, "user #%d bought plan #%d from the wallet: %d, %d left"
+#        % (user["id"], plan["id"], price, balance))
+#    emit_admin(store, "wallet.bought", {
+#        "user_id": user["id"], "amount": price,
+#        "plan": {"id": plan["id"], "name": plan["name"]},
+#        "text": "💰 خرید از کیف پول: %s — «%s»، %s تومان"
+#                % (who_label(user), plan["name"], format(price, ","))})
+#    pay_referral(store, user["id"], price, tid)
+#    return {"ok": True, "balance": balance,
+#            "message": "✅ %s. %s تومان از کیف پول برداشته شد؛ موجودی: %s تومان"
+#                       % (done, format(price, ","), format(balance, ","))}
+#
+#
 #def create_receipt(store, user, body):
 #    """Record a photograph of a payment slip against a customer.
 #
@@ -5623,6 +6716,9 @@ exit 0
 #    and not the other. Nothing about the account changes here: this records a
 #    claim, and the operator decides what it is worth.
 #    """
+#    off = seller_off(store, user)
+#    if off:
+#        return off
 #    # One account per person, as far as one Telegram account per person goes:
 #    # the operator can ask that buying wait until Telegram is linked.
 #    if telegram_required(store, user):
@@ -5640,10 +6736,13 @@ exit 0
 #    if len(blob) > MAX_RECEIPT:
 #        return refused("too_big", "فایل بزرگ‌تر از %s است" % human(MAX_RECEIPT))
 #
+#    code_row = None
 #    # What the receipt pays for. Once there is anything on sale a receipt has
 #    # to name one of those plans, or the operator is back to guessing what a
 #    # sum of money was meant to buy. The price comes from the plan, never from
-#    # the form.
+#    # the form - except for a top-up, where the sum is the whole point.
+#    topup = body.get("kind") == "topup"
+#    device = body.get("kind") == "device"
 #    try:
 #        amount = max(0, int(body.get("amount") or 0))
 #    except (TypeError, ValueError):
@@ -5653,14 +6752,32 @@ exit 0
 #        wanted = int(body.get("plan_id") or 0)
 #    except (TypeError, ValueError):
 #        wanted = 0
-#    if wanted:
+#    if device:
+#        offer = device_offer(store, user)
+#        if not offer:
+#            return refused("devices_not_sold", "دستگاه اضافه فروخته نمی‌شود")
+#        if not offer["available"]:
+#            return refused("device_unavailable", offer["why"])
+#        amount = offer["price"]
+#    elif topup:
+#        if not wallet_on(store):
+#            return refused("wallet_off", "شارژ کیف پول فعلاً بسته است")
+#        amount = toman(body.get("amount"))
+#        if amount is None or not TOPUP_MIN <= amount <= TOPUP_MAX:
+#            return refused("bad_amount", "مبلغ شارژ باید بین %s و %s تومان باشد"
+#                           % (format(TOPUP_MIN, ","), format(TOPUP_MAX, ",")))
+#    elif wanted:
 #        plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1"
-#                         " AND is_trial = 0", (wanted,))
+#                         " AND is_trial = 0 AND COALESCE(owner_admin, 0) = ?",
+#                         (wanted, seller_of(user) or 0))
 #        if not plan:
 #            return refused("plan_not_on_sale",
 #                           "این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید")
-#        amount = plan["price"]
-#    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"):
+#        amount, code_row, why = discount_for(store, user, plan, body.get("code"))
+#        if why:
+#            return refused("bad_code", why)
+#    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"
+#                   " AND COALESCE(owner_admin, 0) = ?", (seller_of(user) or 0,)):
 #        return refused("plan_required", "اول پلنی را که خریده‌اید انتخاب کنید")
 #
 #    # One pending receipt per customer. A second one replaces the first rather
@@ -5672,33 +6789,57 @@ exit 0
 #        cur = store.db.execute(
 #            "INSERT INTO transactions"
 #            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
-#            "  status, created_at, plan_id)"
-#            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, ?)",
-#            (user["id"], amount, seal(blob), kind,
+#            "  status, created_at, plan_id, code_id, list_price)"
+#            " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+#            (user["id"], amount, "topup" if topup else "device" if device else "card",
+#             seal(blob), kind,
 #             (body.get("note") or "").strip()[:200], now(),
-#             plan["id"] if plan else None))
+#             plan["id"] if plan else None, code_row["id"] if code_row else None,
+#             plan["price"] if code_row else None))
 #        store.db.commit()
 #    print("receipt from user %d: %s, %s%s"
 #          % (user["id"], kind, human(len(blob)),
 #             ", plan %d" % plan["id"] if plan else ""), flush=True)
 #    emit_admin(store, "receipt.submitted", {
 #        "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
+#        "kind": "topup" if topup else "device" if device else "card",
 #        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
 #        "text": "رسید تازه از %s%s — %s تومان"
-#                % (who_label(user), " برای «%s»" % plan["name"] if plan else "",
+#                % (who_label(user), " برای شارژ کیف پول" if topup
+#                   else " برای دستگاه اضافه" if device
+#                   else " برای «%s»" % plan["name"] if plan else "",
 #                   format(amount, ","))})
 #    return {"ok": True, "receipt_id": cur.lastrowid,
-#            "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+#            "message": "رسید فرستاده شد. پس از بررسی، %s تومان به کیف پولتان اضافه "
+#                       "می‌شود" % format(amount, ",") if topup
+#            else "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
 #
 #
-#def register_ip(store, user_id, ip):
+#def register_ip(store, user_id, ip, limited=False):
 #    """Put an address on an account - the web panel's button and the API's
-#    call both land here."""
+#    call both land here. `limited`: the customer themselves, held to the
+#    admin's number of new addresses a day; the admin is not."""
 #    owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
 #    if owner and owner["user_id"] != user_id:
 #        return refused("ip_taken", "این آی‌پی به حساب دیگری ثبت شده است")
 #    user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
 #    existing = store.user_ips(user_id)
+#    new = not any(r["ip"] == ip for r in existing)
+#    limit = ip_change_limit(store) if limited and new else None
+#    if limit:
+#        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+#        rows = store.q("SELECT at FROM ip_log WHERE user_id = ? AND at > ? ORDER BY at",
+#                       (user_id, since))
+#        if len(rows) >= limit:
+#            free = parse_ts(rows[len(rows) - limit]["at"]) + timedelta(days=1)
+#            hours = max(1, int((free - datetime.now(timezone.utc)).total_seconds() // 3600) + 1)
+#            return refused("ip_changes", "در ۲۴ ساعت گذشته %d بار آی‌پی تازه ثبت کرده‌اید و "
+#                           "به سقف رسیده‌اید؛ حدود %d ساعت دیگر دوباره امتحان کنید"
+#                           % (limit, hours))
+#    if new:
+#        store.run("INSERT INTO ip_log (user_id, ip, at) VALUES (?, ?, ?)", (user_id, ip, now()))
+#        store.run("DELETE FROM ip_log WHERE at < ?", ((datetime.now(timezone.utc)
+#                  - timedelta(days=7)).isoformat(timespec="seconds"),))
 #    # One active address per account, with as many changes as they like.
 #    # Replacing rather than adding is what makes that true.
 #    if existing and len(existing) >= user["max_ips"]:
@@ -5940,6 +7081,43 @@ exit 0
 #                   (user_id, grain, bucket, up, down))
 #
 #
+#def record_server(db, user_id, kind, server, up, down, when=None):
+#    """Add a stretch of this customer's traffic through this server: to the
+#    server's own charts, and to the customer's day on it."""
+#    buckets = usage_buckets(when)
+#    for grain, bucket in buckets.items():
+#        db.execute("INSERT INTO server_usage (grain, bucket, kind, server, up, down)"
+#                   " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(grain, bucket, kind, server)"
+#                   " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+#                   (grain, bucket, kind, server, up, down))
+#    db.execute("INSERT INTO user_server_usage (user_id, day, kind, server, up, down)"
+#               " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, day, kind, server)"
+#               " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+#               (user_id, buckets["1d"], kind, server, up, down))
+#
+#
+#def record_exit_usage(store, rows):
+#    """A relay's customers' bytes by the exit that carried them, since the
+#    last sync: {ip: {exit: [up, down]}}."""
+#    if not isinstance(rows, dict):
+#        return
+#    for ip, per in list(rows.items())[:5000]:
+#        if not isinstance(per, dict):
+#            continue
+#        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+#        if not owner:
+#            continue
+#        with store.lock:
+#            for to, n in list(per.items())[:16]:
+#                try:
+#                    up, down = (int(n[0]), int(n[1])) if isinstance(n, list) else (0, int(n))
+#                except (TypeError, ValueError, IndexError):
+#                    continue
+#                if up >= 0 and down >= 0 and up + down > 0 and valid_ip(str(to)):
+#                    record_server(store.db, owner["user_id"], "exit", str(to), up, down)
+#            store.db.commit()
+#
+#
 #def service_index(catalogue):
 #    """Every catalogue name, mapped to its service, for turning the names a
 #    relay's connections asked for into the service they belong to."""
@@ -6099,12 +7277,16 @@ exit 0
 #    rules = store.template_rules(tid)
 #    blocked = set(rules["blocked"])
 #    forwards = rules["forwards"]
+#    lists = [blocklist_names(n) for n in rules.get("lists") or {}]
 #
 #    def reason(name):
 #        parts = name.lower().rstrip(".").split(".")
 #        tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
 #        if any(t in blocked for t in tails):
 #            return "blocked:"
+#        for names in lists:
+#            if any(t in names for t in tails):
+#                return "blocked:"
 #        for t in tails:
 #            if t in forwards:
 #                return "forward:" + " ".join(forwards[t])
@@ -6195,10 +7377,14 @@ exit 0
 #    for grain, days in USAGE_KEEP.items():
 #        cutoff = usage_buckets(now_t - timedelta(days=days))[grain]
 #        store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
+#        store.run("DELETE FROM server_usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
 #    cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
 #    store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
 #    cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
 #    store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+#    store.run("DELETE FROM user_server_usage WHERE day < ?", (cutoff,))
+#    store.run("DELETE FROM alerts WHERE at < ?", ((now_t - timedelta(days=30)).isoformat(
+#        timespec="seconds"),))
 #    prune_qlog(store)
 #    store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 #
@@ -6290,12 +7476,34 @@ exit 0
 #    return hashlib.sha256(token.encode()).hexdigest()
 #
 #
-#def doh_view(store, user):
+#def doh_view(store, user, relays=()):
+#    """The first of this customer's servers that has DoH on - for a bot
+#    that knows only one; `servers` below has them all."""
+#    for s in customer_servers(store, user, relays):
+#        if s["dot"]:
+#            return {"url": s["doh"], "dot_host": s["dot"]}
 #    host = store.setting("doh_host")
 #    if not host:
 #        return None
 #    return {"url": "https://%s/dns-query/%s" % (host, doh_token(store, user)),
 #            "dot_host": host}
+#
+#
+#def customer_servers(store, user, relays):
+#    """Every server this customer is shown, with all three ways to use it:
+#    its address for plain DNS, and - once it has a name and a certificate -
+#    its DoT name and the customer's own DoH address on it. The same ticks
+#    that pick a customer's DNS pick these."""
+#    out, token = [], None
+#    for n, ip in enumerate(shown_relays(store, user, relays), 1):
+#        host = store.setting("doh_host:" + ip) or ""
+#        if host and token is None:
+#            token = doh_token(store, user)
+#        out.append({"ip": ip, "n": n, "note": server_note(store, user, ip),
+#                    "single": store.setting("single:" + ip) == "1",
+#                    "dot": host or None,
+#                    "doh": "https://%s/dns-query/%s" % (host, token) if host else None})
+#    return out
 #
 #
 #def doh_tokens(store, profiles, default_id):
@@ -6567,7 +7775,7 @@ exit 0
 #    code = "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
 #    new_code(store, user["id"], "link", code, LINK_MINUTES)
 #    return {"ok": True, "code": code, "minutes": LINK_MINUTES,
-#            "bot_link": store.setting("bot_link")}
+#            "bot_link": bot_link_for(store, user)}
 #
 #
 #def unlink_telegram(store, user, password):
@@ -6685,8 +7893,9 @@ exit 0
 #    return refused("bad_link", "این لینک درست نیست یا قبلاً استفاده شده")
 #
 #
-#def link_telegram(store, tg, code):
-#    """The bot says: this Telegram account sent this code."""
+#def link_telegram(store, tg, code, seller=None):
+#    """The bot says: this Telegram account sent this code. A reseller's bot
+#    links only the reseller's own customers."""
 #    code = (code or "").strip().lower()
 #    if not re.match(r"^[a-z0-9]{8}$", code):
 #        return refused("bad_code", "کد اتصال درست نیست")
@@ -6697,6 +7906,9 @@ exit 0
 #        ends = parse_ts(row["expires_at"])
 #        if not ends or datetime.now(timezone.utc) >= ends:
 #            return refused("code_expired", "کد اتصال منقضی شده؛ یکی تازه بگیرید")
+#        if seller and not store.one("SELECT 1 FROM users WHERE id = ? AND owner_admin = ?",
+#                                    (row["user_id"], seller)):
+#            return refused("bad_code", "کد اتصال درست نیست")
 #        other = store.user_by_telegram(tg)
 #        if other and other["id"] != row["user_id"] and empty_bot_account(store, other):
 #            # Somebody who opened the bot before linking gets a bot account
@@ -6796,16 +8008,33 @@ exit 0
 #WEBHOOK_KEEP_DAYS = 7
 #
 #
+#def bot_keys(store, seller_id=None, admin=False):
+#    """The keys a message goes to: a reseller's own bot for their customers,
+#    when they have one; the owner's bots for everybody else."""
+#    base = ("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+#            " AND COALESCE(webhook_url, '') != ''" + (" AND scope = 'admin'" if admin else ""))
+#    if seller_id:
+#        rows = store.q(base + " AND admin_id = ?", (seller_id,))
+#        if rows:
+#            return rows
+#    return store.q(base + " AND admin_id IS NULL")
+#
+#
+#def bot_link_for(store, user=None):
+#    """The bot a customer talks to: their reseller's, or the owner's."""
+#    seller = seller_of(user) if user is not None else None
+#    return (seller and store.setting("bot_link:%d" % seller)) or store.setting("bot_link")
+#
+#
 #def emit(store, user, event, data):
-#    """Queue something for every bot that asked to be told.
+#    """Queue something for the bot this customer talks to.
 #
 #    Only for an account a bot can reach - one with a Telegram id. Nothing is
 #    sent here; the worker does that.
 #    """
 #    if not user["telegram_id"]:
 #        return
-#    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
-#                   " AND COALESCE(webhook_url, '') != ''")
+#    keys = bot_keys(store, seller_of(user))
 #    if not keys:
 #        return
 #    stamp = now()
@@ -6921,35 +8150,10 @@ exit 0
 #    """The admin panel's Store.apply_plan, word for word in effect: the same
 #    plan while it runs is a renewal, anything else starts fresh, and a
 #    suspended account stays suspended."""
-#    stamp = stamp or datetime.now(timezone.utc)
 #    with store.lock:
-#        user = store.db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-#        plan = store.db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
-#        if not user or not plan:
-#            return None
-#        ends = parse_ts(user["expires_at"])
-#        renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
-#                    and user["status"] in ("active", "over_quota"))
-#        if renewing:
-#            until = ends + timedelta(days=plan["days"])
-#            quota = (user["quota_bytes"] + plan["quota_bytes"]
-#                     if plan["quota_bytes"] and user["quota_bytes"] else 0)
-#            used = user["used_bytes"]
-#        else:
-#            until = stamp + timedelta(days=plan["days"])
-#            quota = plan["quota_bytes"]
-#            used = 0
-#        store.db.execute(
-#            "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
-#            " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
-#            " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
-#            " status = CASE WHEN status = 'suspended' THEN 'suspended'"
-#            " ELSE 'active' END WHERE id = ?",
-#            (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
-#             until.isoformat(timespec="seconds"), uid))
+#        done = put_plan(store.db, uid, plan_id, stamp)
 #        store.db.commit()
-#    return ("پلن «%s» تمدید شد تا %s" if renewing
-#            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+#    return done
 #
 #
 #def plan_event(store, uid):
@@ -6962,22 +8166,65 @@ exit 0
 #            "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
 #
 #
-#def decide_receipt(store, tid, to):
+#def decide_receipt(store, tid, to, amount=None):
 #    """Approve or reject a pending receipt, once - the admin panel's
-#    receipt-decide."""
+#    receipt-decide. `amount` corrects a top-up to what the slip really says."""
 #    if to not in ("approved", "rejected"):
 #        return refused("bad_decision", "تصمیم باید approve یا reject باشد")
-#    row = store.one("SELECT user_id, plan_id, status FROM transactions WHERE id = ?", (tid,))
+#    row = store.one("SELECT user_id, plan_id, status, kind, amount, code_id FROM transactions"
+#                    " WHERE id = ?", (tid,))
 #    if not row:
 #        return refused("receipt_not_found", "این رسید پیدا نشد")
 #    if row["status"] != "pending":
 #        return refused("already_decided", "این رسید قبلاً بررسی شده")
+#    topup = row["kind"] == "topup"
+#    credit = row["amount"]
+#    if row["kind"] == "device" and to == "approved":
+#        with store.lock:
+#            cur = store.db.execute(
+#                "UPDATE transactions SET status = ?, decided_at = ?, receipt_blob = NULL"
+#                " WHERE id = ? AND status = 'pending'", (to, now(), tid))
+#            total = add_device(store.db, row["user_id"]) if cur.rowcount else None
+#            store.db.commit()
+#        if not cur.rowcount:
+#            return refused("already_decided", "این رسید قبلاً بررسی شده")
+#        user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+#        emit(store, user, "receipt.approved", {
+#            "receipt_id": tid, "devices": total,
+#            "text": "رسید شما تأیید شد؛ یک دستگاه اضافه شد و حالا %d دستگاه دارید." % total})
+#        pay_referral(store, row["user_id"], row["amount"], tid, kind="device")
+#        return {"ok": True, "message": "رسید تأیید شد؛ یک دستگاه اضافه شد (%d)" % total}
+#    if topup and to == "approved" and amount not in (None, ""):
+#        credit = toman(amount)
+#        if credit is None or not 0 < credit <= TOPUP_MAX:
+#            return refused("bad_amount", "مبلغ درست نیست")
+#    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+#    if topup and to == "approved":
+#        # The decision and the money together: a receipt approved twice at
+#        # once - the panel and the bot - must not pay twice.
+#        with store.lock:
+#            cur = store.db.execute(
+#                "UPDATE transactions SET status = ?, decided_at = ?, amount = ?,"
+#                " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+#                (to, now(), credit, tid))
+#            balance = move_wallet(store.db, row["user_id"], credit, "topup",
+#                                  "رسید #%d" % tid, tid=tid) if cur.rowcount else None
+#            store.db.commit()
+#        if not cur.rowcount:
+#            return refused("already_decided", "این رسید قبلاً بررسی شده")
+#        log(INFO, "receipt #%d approved by bot: user #%d, wallet +%d"
+#            % (tid, row["user_id"], credit))
+#        emit(store, user, "receipt.approved", {
+#            "receipt_id": tid, "amount": credit, "balance": balance,
+#            "text": "رسید شما تأیید شد؛ %s تومان به کیف پولتان اضافه شد.\nموجودی: %s تومان"
+#                    % (format(credit, ","), format(balance or 0, ","))})
+#        return {"ok": True, "message": "رسید تأیید شد؛ %s تومان به کیف پول اضافه شد"
+#                % format(credit, ",")}
 #    cur = store.run("UPDATE transactions SET status = ?, decided_at = ?,"
 #                    " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
 #                    (to, now(), tid))
 #    if not cur.rowcount:
 #        return refused("already_decided", "این رسید قبلاً بررسی شده")
-#    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
 #    if to == "rejected":
 #        emit(store, user, "receipt.rejected", {
 #            "receipt_id": tid,
@@ -6985,12 +8232,17 @@ exit 0
 #                    "با پشتیبانی در تماس باشید."})
 #        return {"ok": True, "message": "رسید رد شد"}
 #    done = apply_plan(store, row["user_id"], row["plan_id"]) if row["plan_id"] else None
+#    if row["code_id"]:
+#        with store.lock:
+#            use_discount(store.db, row["code_id"], row["user_id"], tid)
+#            store.db.commit()
 #    if done:
 #        log(INFO, "receipt #%d approved by bot: user #%d, plan #%d"
 #            % (tid, row["user_id"], row["plan_id"]))
 #        emit(store, user, "receipt.approved",
 #             dict(plan_event(store, row["user_id"]), receipt_id=tid,
 #                  text="رسید پرداخت شما تأیید شد. %s" % done))
+#        pay_referral(store, row["user_id"], row["amount"], tid)
 #        return {"ok": True, "message": "رسید تأیید شد؛ %s" % done}
 #    emit(store, user, "receipt.approved", {
 #        "receipt_id": tid,
@@ -7030,11 +8282,474 @@ exit 0
 #                else "#%d" % user["id"]))
 #
 #
+## How long a relay or node may go without a report before the operator is told.
+#ALERT_SILENT = 180
+#
+#
+#def alert(store, key, ok, text):
+#    """A server's state for `key`, and the operator told when it changes -
+#    once per change, never for the first time something is seen well."""
+#    before = store.setting("alert_state:" + key)
+#    after = "ok" if ok else "down"
+#    if before == after or (not before and ok):
+#        if not before:
+#            store.set_setting("alert_state:" + key, after)
+#        return False
+#    store.set_setting("alert_state:" + key, after)
+#    store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, ?, ?, ?)",
+#              (now(), key, 1 if ok else 0, text))
+#    log(WARN if not ok else INFO, "alert: %s" % text)
+#    emit_admin(store, "server.%s" % ("up" if ok else "down"), {"text": text, "key": key})
+#    return True
+#
+#
+#def record_exit_health(store, relay, health):
+#    """What a relay found of its exits: {exit: {"ok": bool, "ms": int}}."""
+#    if not isinstance(health, dict):
+#        return
+#    for to, st in list(health.items())[:16]:
+#        if not valid_ip(str(to)) or not isinstance(st, dict):
+#            continue
+#        if st.get("ok"):
+#            text = "✅ سرور خارج %s از رلهٔ %s دوباره در دسترس است." % (to, relay)
+#        else:
+#            text = ("⚠️ سرور خارج %s از رلهٔ %s در دسترس نیست؛ مشتری‌های این رله از "
+#                    "سرور خارج بعدی می‌روند." % (to, relay))
+#        alert(store, "exit:%s:%s" % (relay, to), bool(st.get("ok")), text)
+#
+#
+#def check_servers(store, relays, nodes):
+#    """A relay or node that has stopped reporting, or started again."""
+#    for kind, ips in (("رله", relays), ("نود", nodes)):
+#        for ip in ips:
+#            if kind == "رله" and store.setting("single:" + ip) == "1":
+#                kind_here = "تک‌سرور"
+#            else:
+#                kind_here = kind
+#            row = store.one("SELECT MAX(at) at FROM metrics WHERE host = ?", (ip,))
+#            seen = parse_ts(row["at"]) if row and row["at"] else None
+#            if not seen:
+#                continue            # never reported: not installed yet
+#            quiet = (datetime.now(timezone.utc) - seen).total_seconds() > ALERT_SILENT
+#            alert(store, "silent:" + ip, not quiet,
+#                  "⚠️ %s %s بیش از ۳ دقیقه است گزارش نداده." % (kind_here, ip) if quiet
+#                  else "✅ %s %s دوباره وصل است." % (kind_here, ip))
+#
+#
+#def cap_config(store, host):
+#    """What the admin set as a server's monthly traffic cap: {"gb", "day",
+#    "count" - "both" or "out" - and "action" - "alert" or "move"}, or {}."""
+#    try:
+#        cap = json.loads(store.setting("cap:" + host) or "{}")
+#    except ValueError:
+#        return {}
+#    return cap if isinstance(cap, dict) else {}
+#
+#
+#def period_start(day, today=None):
+#    """The first day of the provider's current month: the last `day` of a
+#    month on or before today."""
+#    today = today or datetime.now(timezone.utc).date()
+#    day = max(1, min(int(day or 1), 28))
+#    if today.day >= day:
+#        return today.replace(day=day)
+#    first = today.replace(day=1) - timedelta(days=1)
+#    return first.replace(day=day)
+#
+#
+#def count_month(store, host, sample):
+#    """Add this sample's growth in the network card's counters to the
+#    server's traffic this month - its own counters, since boot, so a reboot
+#    starts them over and the growth is then all of what they say."""
+#    rx, tx = sample.get("rx_total"), sample.get("tx_total")
+#    if rx is None or tx is None:
+#        return
+#    period = period_start(cap_config(store, host).get("day")).isoformat()
+#    try:
+#        state = json.loads(store.setting("net_month:" + host) or "{}")
+#    except ValueError:
+#        state = {}
+#    last = state.get("last") or [rx, tx]
+#    d_in, d_out = rx - last[0], tx - last[1]
+#    if d_in < 0 or d_out < 0:
+#        d_in, d_out = rx, tx
+#    if state.get("period") != period:
+#        state = {"period": period, "in": 0, "out": 0}
+#    state.update({"in": state.get("in", 0) + d_in, "out": state.get("out", 0) + d_out,
+#                  "last": [rx, tx]})
+#    store.set_setting("net_month:" + host, json.dumps(state, sort_keys=True))
+#
+#
+#def month_used(store, host):
+#    """(bytes this period as the cap counts them, the cap in bytes or 0)."""
+#    cap = cap_config(store, host)
+#    try:
+#        state = json.loads(store.setting("net_month:" + host) or "{}")
+#    except ValueError:
+#        state = {}
+#    if state.get("period") != period_start(cap.get("day")).isoformat():
+#        state = {}
+#    used = state.get("out", 0) + (0 if cap.get("count") == "out" else state.get("in", 0))
+#    return used, int(float(cap.get("gb") or 0) * 1e9)
+#
+#
+#def next_reset(days, due, stamp=None):
+#    """The next reset after one that is due now, or None when none is due:
+#    counted on from the date it was due, so it stays on its own day even
+#    when the server was off at the time."""
+#    if not days or not due:
+#        return None
+#    stamp = stamp or datetime.now(timezone.utc)
+#    when = parse_ts(due)
+#    if not when or when > stamp:
+#        return None
+#    while when <= stamp:
+#        when += timedelta(days=days)
+#    return when.isoformat(timespec="seconds")
+#
+#
+#def check_sellers(store):
+#    """Tell the owner - and the reseller's own bot - as a reseller's traffic
+#    passes 80 and 95 percent of their cap, reaches it, or their days end:
+#    each once, until the owner renews them."""
+#    for s in store.q("SELECT * FROM admins WHERE own_only = 1"):
+#        nxt = next_reset(s["reset_days"], s["reset_next"])
+#        if nxt:
+#            # Their usage back to zero, as the owner set: served again, and
+#            # the warnings about the cap due again.
+#            store.run("UPDATE admins SET used_bytes = 0, warned = warned & ~7,"
+#                      " reset_next = ? WHERE id = ?", (nxt, s["id"]))
+#            log(INFO, "usage of seller %s reset, as every %d days"
+#                % (s["username"], s["reset_days"]))
+#            continue
+#        if s["disabled"]:
+#            continue
+#        warned = s["warned"] or 0
+#        steps = []
+#        if s["cap_bytes"]:
+#            pct = 100 * s["used_bytes"] // s["cap_bytes"]
+#            for bit, at in ((1, 80), (2, 95), (4, 100)):
+#                if pct >= at and not warned & bit:
+#                    steps.append((bit, at))
+#        ended = s["expires_at"] and s["expires_at"] <= now()
+#        soon = s["expires_at"] and not ended and s["expires_at"] <= (
+#            datetime.now(timezone.utc) + timedelta(days=3)).isoformat(timespec="seconds")
+#        text = None
+#        if steps:
+#            bit, at = steps[-1]
+#            warned |= sum(b for b, _ in steps)
+#            text = ("⛔ حجم فروشنده %s تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید."
+#                    % s["username"] if at == 100 else
+#                    "⚠️ فروشنده %s: %d٪ حجمش مصرف شد." % (s["username"], at))
+#        elif ended and not warned & 8:
+#            warned |= 8
+#            text = "⛔ روزهای فروشنده %s تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید." \
+#                % s["username"]
+#        elif soon and not warned & 16:
+#            warned |= 16
+#            text = "⚠️ روزهای فروشنده %s تا ۳ روز دیگر تمام می‌شود." % s["username"]
+#        if text:
+#            store.run("UPDATE admins SET warned = ? WHERE id = ?", (warned, s["id"]))
+#            emit_admin(store, "seller.limit", {"admin_id": s["id"], "text": text})
+#
+#
+#def check_caps(store, relays, nodes):
+#    """Each server's month against the cap the admin set for it."""
+#    main = exit_self()
+#    hosts = [("exit", "سرور خارج اصلی %s" % main)]
+#    hosts += [(ip, "%s %s" % ("تک‌سرور" if store.setting("single:" + ip) == "1" else "رله", ip))
+#              for ip in relays]
+#    hosts += [(ip, "نود %s" % ip) for ip in nodes]
+#    for host, name in hosts:
+#        used, cap = month_used(store, host)
+#        keys = {lv: "cap%d:%s" % (lv, host) for lv in (80, 95, 100)}
+#        state = {lv: store.setting("alert_state:" + k) for lv, k in keys.items()}
+#        if not cap:
+#            # No cap, or one taken away: nothing of it is still wrong.
+#            for k in keys.values():
+#                store.run("DELETE FROM settings WHERE key = ?", ("alert_state:" + k,))
+#            continue
+#        name, pct = name.strip(), int(100 * used / cap)
+#        # Crossing several levels at once - a cap set below what is already
+#        # used, a month's traffic in an hour - is one message, the highest;
+#        # and a new month back under all of them is one message too.
+#        went = [lv for lv in keys if pct >= lv and state[lv] != "down"]
+#        back = [lv for lv in keys if pct <= lv - 10 and state[lv] == "down"]
+#        if went:
+#            top = max(went)
+#            for lv in went:
+#                if lv != top:
+#                    store.set_setting("alert_state:" + keys[lv], "down")
+#            said = "به سقف ماهانه‌اش رسید" if top == 100 else "از %d٪ سقف ماهانه‌اش گذشت" % top
+#            alert(store, keys[top], False,
+#                  "⚠️ ترافیک %s %s: %s از %s." % (name, said, human_gb(used), human_gb(cap))
+#                  + (" رله‌ها از سرورهای خارج دیگر می‌روند." if top == 100
+#                     and cap_config(store, host).get("action") == "move" else ""))
+#        if back:
+#            low = min(back)
+#            for lv in back:
+#                if lv != low:
+#                    store.set_setting("alert_state:" + keys[lv], "ok")
+#            alert(store, keys[low], True,
+#                  "✅ ترافیک %s دوباره زیر %d٪ سقف است: %s از %s."
+#                  % (name, low, human_gb(used), human_gb(cap)))
+#
+#def capped_exits(store, nodes):
+#    """The exits that reached their cap with "move" as the admin's choice:
+#    the relays put them last, still a fallback."""
+#    out = []
+#    for host, ip in [("exit", exit_self())] + [(n, n) for n in nodes]:
+#        used, cap = month_used(store, host)
+#        if cap and used >= cap and cap_config(store, host).get("action") == "move" and ip:
+#            out.append(ip)
+#    return out
+#
+#
+#def human_gb(n):
+#    if n < 1e9:
+#        return "%d MB" % (n // 1e6)
+#    return "%.1f GB" % (n / 1e9) if n < 1e12 else "%.2f TB" % (n / 1e12)
+#
+#
+## ------------------------------------------------------------------ upgrades
+## The installer the exit last ran, kept by it, for the other servers: the
+## admin panel starts a job, and one server at a time fetches it from here,
+## runs it and says how it went. The first that fails, or does not answer in
+## twenty minutes, stops the job - the rest keep the version they have.
+#INSTALLER_COPY = "/var/lib/smart-dns/installer/doctor-dns.sh"
+#UPGRADE_WAIT = 20 * 60
+#_INSTALLER = {"mtime": None, "blob": b"", "version": "", "sha": ""}
+#
+#
+#def installer_on_hand():
+#    """(its version, its sha256, its bytes) - or ("", "", b"") without one."""
+#    try:
+#        mtime = os.path.getmtime(INSTALLER_COPY)
+#    except OSError:
+#        return "", "", b""
+#    if _INSTALLER["mtime"] != mtime:
+#        with open(INSTALLER_COPY, "rb") as fh:
+#            blob = fh.read()
+#        m = re.search(rb'^VERSION="([0-9.]+)"', blob, re.M)
+#        _INSTALLER.update(mtime=mtime, blob=blob, version=m.group(1).decode() if m else "",
+#                          sha=hashlib.sha256(blob).hexdigest())
+#    return _INSTALLER["version"], _INSTALLER["sha"], _INSTALLER["blob"]
+#
+#
+#def version_key(v):
+#    try:
+#        return tuple(int(x) for x in str(v).split("."))
+#    except ValueError:
+#        return ()
+#
+#
+#STANDBY_BUNDLE = "/var/lib/smart-dns/standby-bundle.enc"
+#
+#
+#def standby_info(store, who):
+#    """For the standby node: the bundle and the installer to keep, by hash."""
+#    if not who or store.setting("standby") != who:
+#        return None
+#    try:
+#        with open(STANDBY_BUNDLE, "rb") as fh:
+#            sha = hashlib.sha256(fh.read()).hexdigest()
+#    except OSError:
+#        return None
+#    return {"bundle": sha, "installer": installer_on_hand()[1]}
+#
+#
+#def panel_where(store):
+#    """Where the panel is, and its standby - so a server whose panel moved
+#    to the standby keeps to it."""
+#    return {"host": exit_self(), "standby": store.setting("standby") or ""}
+#
+#
+#def upgrade_job(store):
+#    try:
+#        job = json.loads(store.setting("upgrade_job") or "{}")
+#    except ValueError:
+#        return {}
+#    return job if isinstance(job, dict) else {}
+#
+#
+#def save_upgrade_job(store, job):
+#    store.set_setting("upgrade_job", json.dumps(job, ensure_ascii=False, sort_keys=True))
+#
+#
+#def upgrade_next(store, job):
+#    """On to the next server still behind, or the job is done."""
+#    while job.get("queue"):
+#        host = job["queue"].pop(0)
+#        if version_key(store.setting("version:" + host)) < version_key(job["version"]):
+#            job.update(current=host, asked_at=now())
+#            return
+#        job.setdefault("done", []).append(host)
+#    job.update(current=None, finished_at=now())
+#    alert_done = "✅ همهٔ سرورها به نسخهٔ %s آپدیت شدند." % job["version"]
+#    store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 1, ?)",
+#              (now(), alert_done))
+#    emit_admin(store, "server.up", {"text": alert_done, "key": "upgrade"})
+#
+#
+#def upgrade_order(store, who):
+#    """What this server is to install, when it is its turn."""
+#    job = upgrade_job(store)
+#    if job.get("current") != who or job.get("stopped"):
+#        return None
+#    return {"version": job["version"], "sha": job["sha"]}
+#
+#
+#def domain_order(store, who):
+#    """The domain the admin gave this relay or single server, and the
+#    installer that turns DoH and DoT on for it - until it has it."""
+#    want = store.setting("domain_want:" + who) or ""
+#    if not want or store.setting("doh_host:" + who) == want:
+#        return None
+#    try:
+#        done = json.loads(store.setting("domain_state:" + who) or "{}")
+#    except ValueError:
+#        done = {}
+#    if done.get("ok") and done.get("name") == want:
+#        return None       # it has it; the name it reports may be a shared one
+#    version, sha, _ = installer_on_hand()
+#    if not sha:
+#        return None
+#    return {"name": want, "sha": sha}
+#
+#
+#def domain_report(store, who, result):
+#    """How giving a server its domain went: kept for the nodes page, and
+#    the admin told when it did not."""
+#    if not isinstance(result, dict):
+#        return
+#    name = str(result.get("name") or "")[:253]
+#    ok = bool(result.get("ok"))
+#    state = {"name": name, "ok": ok, "at": now(),
+#             "error": str(result.get("error") or "")[:300],
+#             "log": str(result.get("log") or "")[-3000:]}
+#    store.set_setting("domain_state:" + who, json.dumps(state, ensure_ascii=False))
+#    if not ok:
+#        emit_admin(store, "server.down", {
+#            "key": "domain", "text": "⚠️ دامنهٔ %s روی %s راه نیفتاد: %s"
+#            % (name, who, state["error"] or "لاگش در صفحهٔ «نود» است")})
+#
+#
+#def upgrade_report(store, who, result):
+#    """A server's word on its upgrade: on to the next, or the job stops."""
+#    if not isinstance(result, dict):
+#        return
+#    version = str(result.get("version") or "")[:20]
+#    store.set_setting("version:" + who, version)
+#    job = upgrade_job(store)
+#    if job.get("current") != who or job.get("stopped"):
+#        return
+#    log_tail = str(result.get("log") or "")[-3000:]
+#    job.setdefault("logs", {})[who] = log_tail
+#    if result.get("ok") and version == job["version"]:
+#        job.setdefault("done", []).append(who)
+#        upgrade_next(store, job)
+#    else:
+#        job.update(stopped="آپدیت %s نشد" % who, current=None)
+#        text = ("⚠️ آپدیت %s به نسخهٔ %s نشد؛ بقیهٔ سرورها آپدیت نشدند. لاگش در صفحهٔ «نود» "
+#                "است." % (who, job["version"]))
+#        store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 0, ?)",
+#                  (now(), text))
+#        emit_admin(store, "server.down", {"text": text, "key": "upgrade"})
+#    save_upgrade_job(store, job)
+#
+#
+#def upgrade_timeout(store):
+#    """A server that took its turn and has not answered in twenty minutes."""
+#    job = upgrade_job(store)
+#    asked = parse_ts(job.get("asked_at")) if job.get("current") and not job.get("stopped") else None
+#    if asked and (datetime.now(timezone.utc) - asked).total_seconds() > UPGRADE_WAIT:
+#        who = job["current"]
+#        job.update(stopped="%s بعد از ۲۰ دقیقه جوابی نداد" % who, current=None)
+#        save_upgrade_job(store, job)
+#        text = ("⚠️ %s بعد از ۲۰ دقیقه از آپدیتش خبری نداده؛ بقیهٔ سرورها آپدیت نشدند. "
+#                "لاگ آن سرور را ببینید." % who)
+#        store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 0, ?)",
+#                  (now(), text))
+#        emit_admin(store, "server.down", {"text": text, "key": "upgrade"})
+#
+#
+#def watch_level(store, key, value, bad, good, down_text, up_text, rising=True):
+#    """An alert for a figure that crosses `bad`, cleared only once it is back
+#    past `good` - so one hovering at the line is not news every half minute."""
+#    if value is None:
+#        return
+#    worse = value >= bad if rising else value < bad
+#    better = value <= good if rising else value >= good
+#    if worse:
+#        alert(store, key, False, down_text)
+#    elif better:
+#        alert(store, key, True, up_text)
+#
+#
+#def check_health(store, relays, nodes):
+#    """What each server's own figures say: its disk, its connection table,
+#    its certificate, and its memory and processor over ten minutes."""
+#    fresh = (datetime.now(timezone.utc) - timedelta(seconds=ALERT_SILENT)).isoformat(
+#        timespec="seconds")
+#    since = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+#    hosts = [("exit", "سرور خارج اصلی %s" % (exit_self() or ""))]
+#    hosts += [(ip, "%s %s" % ("تک‌سرور" if store.setting("single:" + ip) == "1" else "رله", ip))
+#              for ip in relays]
+#    hosts += [(ip, "نود %s" % ip) for ip in nodes]
+#    for host, name in hosts:
+#        name = name.strip()
+#        m = store.one("SELECT * FROM metrics WHERE host = ? AND at >= ? ORDER BY at DESC LIMIT 1",
+#                      (host, fresh))
+#        if not m:
+#            continue            # a server not reporting is its own alert
+#        if m["disk_total"]:
+#            pct = int(100 * (m["disk_used"] or 0) / m["disk_total"])
+#            watch_level(store, "disk:" + host, pct, 90, 85,
+#                        "⚠️ دیسک %s پر شده است: %d٪. پر که بشود، لاگ و دیتابیس دیگر "
+#                        "نوشته نمی‌شوند." % (name, pct),
+#                        "✅ دیسک %s دوباره جا دارد: %d٪." % (name, pct))
+#        keys = m.keys()
+#        if "conntrack_max" in keys and m["conntrack_max"]:
+#            pct = int(100 * (m["conntrack"] or 0) / m["conntrack_max"])
+#            watch_level(store, "conntrack:" + host, pct, 80, 70,
+#                        "⚠️ جدول اتصال‌های %s نزدیک پر شدن است: %d٪. پر که بشود، اتصال‌های "
+#                        "تازهٔ مشتری‌ها رد می‌شوند." % (name, pct),
+#                        "✅ جدول اتصال‌های %s دوباره جا دارد: %d٪." % (name, pct))
+#        if "cert_days" in keys and m["cert_days"] is not None:
+#            watch_level(store, "cert:" + host, m["cert_days"], 14, 20,
+#                        "⚠️ گواهی HTTPS %s تا %d روز دیگر منقضی می‌شود و هنوز تمدید نشده؛ "
+#                        "لاگ «تمدید گواهی» را ببینید." % (name, m["cert_days"]),
+#                        "✅ گواهی HTTPS %s تمدید شد." % name, rising=False)
+#        rows = store.q("SELECT cpu, mem_used, mem_total FROM metrics WHERE host = ? AND at >= ?",
+#                       (host, since))
+#        mems = [100.0 * r["mem_used"] / r["mem_total"] for r in rows if r["mem_total"]]
+#        cpus = [r["cpu"] for r in rows if r["cpu"] is not None]
+#        if len(mems) >= 8:
+#            avg = int(sum(mems) / len(mems))
+#            watch_level(store, "mem:" + host, avg, 90, 85,
+#                        "⚠️ رم %s ده دقیقه است به‌طور میانگین %d٪ پر است." % (name, avg),
+#                        "✅ رم %s دوباره عادی است: %d٪." % (name, avg))
+#        if len(cpus) >= 8:
+#            avg = int(sum(cpus) / len(cpus))
+#            watch_level(store, "cpu:" + host, avg, 90, 80,
+#                        "⚠️ پردازندهٔ %s ده دقیقه است به‌طور میانگین %d٪ کار می‌کند." % (name, avg),
+#                        "✅ پردازندهٔ %s دوباره عادی است: %d٪." % (name, avg))
+#
+#
 #def emit_admin(store, event, data):
 #    """Tell the operator's bots - keys with admin rights - that something
-#    waits for them. No customer is addressed: telegram_id is empty."""
-#    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
-#                   " AND scope = 'admin' AND COALESCE(webhook_url, '') != ''")
+#    waits for them. No customer is addressed: telegram_id is empty. About a
+#    reseller's customer, the reseller's bot is told; about the reseller
+#    themselves, the owner's and theirs."""
+#    seller = data.get("admin_id")
+#    if seller is None and data.get("user_id"):
+#        row = store.one("SELECT owner_admin FROM users WHERE id = ?", (data["user_id"],))
+#        seller = row["owner_admin"] if row else None
+#    keys = bot_keys(store, seller, admin=True)
+#    if data.get("admin_id"):
+#        seen = {k["id"] for k in keys}
+#        keys = list(keys) + [k for k in bot_keys(store, None, admin=True)
+#                             if k["id"] not in seen]
 #    if not keys:
 #        return
 #    stamp = now()
@@ -7046,32 +8761,42 @@ exit 0
 #                  " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
 #
 #
-#def admin_stats(store):
-#    """The numbers an operator looks at in the morning."""
+#def admin_stats(store, seller=None):
+#    """The numbers an operator looks at in the morning - a reseller's, of
+#    their own customers."""
 #    stamp = datetime.now(timezone.utc)
 #    today = stamp.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(
 #        timespec="seconds")
 #    week = (stamp - timedelta(days=7)).isoformat(timespec="seconds")
 #    soon = (stamp + timedelta(days=EXPIRING_DAYS)).isoformat(timespec="seconds")
-#    one = lambda sql, args=(): store.one(sql, args)[0] or 0
+#    # Every query below reads its customers through u, so a reseller's are
+#    # theirs by one condition.
+#    mine = " AND u.owner_admin = ?" if seller else ""
+#    extra = (seller,) if seller else ()
+#    one = lambda sql, args=(): store.one(sql + mine, args + extra)[0] or 0
 #    by_status = {r["status"]: r["c"] for r in store.q(
-#        "SELECT status, count(*) c FROM users GROUP BY status")}
+#        "SELECT status, count(*) c FROM users u WHERE 1 = 1" + mine + " GROUP BY status",
+#        extra)}
+#    tx = "SELECT %s FROM transactions t JOIN users u ON u.id = t.user_id WHERE "
 #    return {
 #        "users": sum(by_status.values()),
 #        "by_status": by_status,
-#        "new_today": one("SELECT count(*) FROM users WHERE created_at >= ?", (today,)),
-#        "receipts_pending": one("SELECT count(*) FROM transactions WHERE status = 'pending'"),
-#        "approved_today": one("SELECT count(*) FROM transactions WHERE status = 'approved'"
-#                              " AND decided_at >= ?", (today,)),
-#        "income_today": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
-#                            " AND decided_at >= ?", (today,)),
-#        "income_7d": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
-#                         " AND decided_at >= ?", (week,)),
-#        "tickets_open": one("SELECT count(*) FROM tickets WHERE status = 'open'"),
-#        "trials_today": one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
-#        "expiring_soon": one("SELECT count(*) FROM users WHERE status = 'active'"
+#        "new_today": one("SELECT count(*) FROM users u WHERE created_at >= ?", (today,)),
+#        "receipts_pending": one(tx % "count(*)" + "t.status = 'pending'"),
+#        "approved_today": one(tx % "count(*)" + "t.status = 'approved'"
+#                              " AND t.decided_at >= ?", (today,)),
+#        "income_today": one(tx % "sum(t.amount)" + "t.status = 'approved'"
+#                            " AND t.decided_at >= ?", (today,)),
+#        "income_7d": one(tx % "sum(t.amount)" + "t.status = 'approved'"
+#                         " AND t.decided_at >= ?", (week,)),
+#        "tickets_open": one("SELECT count(*) FROM tickets t JOIN users u ON u.id = t.user_id"
+#                            " WHERE t.status = 'open'"),
+#        "trials_today": one("SELECT count(*) FROM trial_log g JOIN users u"
+#                            " ON u.id = g.user_id WHERE g.created_at >= ?", (today,))
+#        if seller else one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
+#        "expiring_soon": one("SELECT count(*) FROM users u WHERE status = 'active'"
 #                             " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
-#        "used_bytes": one("SELECT sum(used_bytes) FROM users"),
+#        "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
 #    }
 #
 #
@@ -7113,6 +8838,92 @@ exit 0
 #
 ## How long a service check is handed to the relays after it is asked for.
 #PROBE_FRESH = 1200
+#
+#
+#INSTALL_STATE = "/var/lib/smart-dns/install-state"
+#
+#
+#def exit_self():
+#    """This exit's own public address, as the installer recorded it."""
+#    try:
+#        with open(INSTALL_STATE, encoding="utf-8") as fh:
+#            found = [l.split()[1] for l in fh if l.startswith("exit-ip ") and len(l.split()) > 1]
+#        return found[-1] if found else ""
+#    except OSError:
+#        return ""
+#
+#
+#def relay_exits(store, relay, relays, nodes, main):
+#    """Where this relay's traffic goes, best first: the exit the admin picked
+#    for it - this one unless another - and then the rest, which nginx on the
+#    relay turns to only while the ones before them are down. None when this
+#    exit does not know its own address, and then the relay keeps what it has."""
+#    if relay not in relays or not main or store.setting("single:" + relay) == "1":
+#        return None
+#    every = [main] + [n for n in nodes if n != main]
+#    picked = store.setting("relay_exit:" + relay)
+#    first = picked if picked in every else main
+#    return {"main": main, "order": [first] + [ip for ip in every if ip != first],
+#            # Exits past their monthly cap, to be kept for when nothing else answers.
+#            "capped": capped_exits(store, nodes)}
+#
+#
+#def user_relay_exits(raw):
+#    """A customer's exits on particular relays, {relay: exit}; {} for none."""
+#    try:
+#        picked = json.loads(raw or "{}")
+#    except ValueError:
+#        return {}
+#    return {str(k): str(v) for k, v in picked.items()} if isinstance(picked, dict) else {}
+#
+#
+#def customer_exits(store, exits, relay=None):
+#    """The registered addresses whose customer the admin sent through a
+#    particular exit on this relay - their own for it, or else the one for
+#    every relay - and that exit; only exits the panel still has."""
+#    rows = store.q("SELECT i.ip AS ip, u.exit AS exit, u.relay_exits AS relay_exits"
+#                   " FROM ips i JOIN users u ON u.id = i.user_id WHERE u.status = 'active'"
+#                   " AND " + SELLER_LIVE +
+#                   " AND (COALESCE(u.exit, '') != '' OR COALESCE(u.relay_exits, '') != '')")
+#    out = {}
+#    for r in rows:
+#        picked = user_relay_exits(r["relay_exits"]).get(relay) or r["exit"]
+#        if picked in exits:
+#            out[r["ip"]] = picked
+#    return out
+#
+#
+#def node_tunnel_specs(store, relay=None, node=None):
+#    """The tunnels the admin set between relays and nodes, {(relay, node): spec}
+#    - one relay's, or one node's."""
+#    out = {}
+#    for r in store.q("SELECT key, value FROM settings WHERE key LIKE 'relay_tunnel:%:%'"):
+#        _, r_ip, n_ip = r["key"].split(":", 2)
+#        if (relay and r_ip != relay) or (node and n_ip != node):
+#            continue
+#        try:
+#            spec = json.loads(r["value"] or "{}")
+#        except ValueError:
+#            continue
+#        if isinstance(spec, dict) and spec.get("transport") and spec.get("slot"):
+#            out[(r_ip, n_ip)] = spec
+#    return out
+#
+#
+#def relay_tunnel(store, relay, relays, installer_tunnel):
+#    """What the admin panel set for this relay's tunnel, for its sync: None
+#    for the first relay while the exit's installer tunnels to it - that one
+#    stays the installer's - and for a machine that is not one of our relays."""
+#    if relay not in relays or (installer_tunnel == "backpack" and relay == relays[0]) \
+#            or store.setting("single:" + relay) == "1":
+#        return None
+#    try:
+#        spec = json.loads(store.setting("relay_tunnel:" + relay) or "{}")
+#    except ValueError:
+#        spec = {}
+#    if not isinstance(spec, dict) or not spec.get("transport"):
+#        return {"on": False}
+#    return dict(spec, on=True)
 #
 #
 #def probe_job(store):
@@ -7160,6 +8971,16 @@ exit 0
 #    stamp = datetime.now(timezone.utc)
 #    for u in store.q("SELECT * FROM users"):
 #        quota, used = u["quota_bytes"], u["used_bytes"]
+#
+#        # Every so many days, as the admin set for this customer: the usage
+#        # back to zero, and the warnings about it due again.
+#        nxt = next_reset(u["reset_days"], u["reset_next"], stamp)
+#        if nxt:
+#            store.run("UPDATE users SET used_bytes = 0, warned = warned & ?,"
+#                      " status = CASE WHEN status = 'over_quota' THEN 'active' ELSE status END,"
+#                      " reset_next = ? WHERE id = ?", (WARNED_EXPIRING, nxt, u["id"]))
+#            log(INFO, "usage of user #%d reset, as every %d days" % (u["id"], u["reset_days"]))
+#            continue
 #
 #        # A trial ends on its date whether or not the allowance ran out, so
 #        # this comes before anything to do with bytes. Checked for every
@@ -7335,6 +9156,10 @@ exit 0
 #    store = None
 #    secret = None
 #    relays = ()
+#    # The other exits joined to this panel - nodes: no panel of their own,
+#    # each syncing here for the relays to let in and reporting its health.
+#    nodes = ()
+#    tunnel = "off"
 #    tg = None
 #
 #    def log_message(self, fmt, *args):
@@ -7377,6 +9202,7 @@ exit 0
 #        # through the tunnel arrives here from this machine's own address.
 #        # Nothing is waved through - the secret below is still required.
 #        if self.client_address[0] not in self.relays \
+#                and self.client_address[0] not in self.nodes \
 #                and self.client_address[0] not in ("127.0.0.1", "::1"):
 #            return False
 #        given = self.headers.get("Authorization", "")
@@ -7406,6 +9232,58 @@ exit 0
 #        except Exception:
 #            return self.reply(400, {"error": "bad json"})
 #
+#        if self.path == "/node":
+#            return self.reply(*self.do_node(body))
+#
+#        if self.path == "/standby-bundle":
+#            # Only for the standby, which keeps it against the day it is needed.
+#            if self.store.setting("standby") != self.client_address[0]:
+#                return self.reply(403, {"error": "not the standby"})
+#            try:
+#                with open(STANDBY_BUNDLE, "rb") as fh:
+#                    blob = fh.read()
+#            except OSError:
+#                return self.reply(404, {"error": "no bundle yet"})
+#            self.send_response(200)
+#            self.send_header("Content-Type", "application/octet-stream")
+#            self.send_header("Content-Length", str(len(blob)))
+#            self.end_headers()
+#            self.wfile.write(blob)
+#            return None
+#
+#        if self.path.startswith("/blocklist/"):
+#            # A ready block list, gzipped; the hash is of what is inside.
+#            name = self.path.rsplit("/", 1)[1]
+#            sha = blocklist_meta(self.store, name).get("sha") if name in BLOCKLISTS else None
+#            try:
+#                with open(os.path.join(BLOCKLIST_DIR, name + ".conf.gz"), "rb") as fh:
+#                    blob = fh.read()
+#            except OSError:
+#                blob = None
+#            if not sha or not blob:
+#                return self.reply(404, {"error": "no such list here"})
+#            self.send_response(200)
+#            self.send_header("Content-Type", "application/gzip")
+#            self.send_header("Content-Length", str(len(blob)))
+#            self.send_header("X-Sha256", sha)
+#            self.end_headers()
+#            self.wfile.write(blob)
+#            return None
+#
+#        if self.path == "/installer":
+#            # The installer the admin panel is upgrading the servers with.
+#            version, sha, blob = installer_on_hand()
+#            if not blob:
+#                return self.reply(404, {"error": "no installer here"})
+#            self.send_response(200)
+#            self.send_header("Content-Type", "application/octet-stream")
+#            self.send_header("Content-Length", str(len(blob)))
+#            self.send_header("X-Sha256", sha)
+#            self.send_header("X-Version", version)
+#            self.end_headers()
+#            self.wfile.write(blob)
+#            return None
+#
 #        if self.path == "/sync":
 #            counters = body.get("counters") or {}
 #            clean = {
@@ -7416,6 +9294,7 @@ exit 0
 #            self.store.fold_counters(who, clean, split)
 #            try:
 #                record_services(self.store, body.get("services"), CATALOGUE)
+#                record_exit_usage(self.store, body.get("exit_usage"))
 #            except Exception as e:
 #                log_exception("per-service usage not recorded: %r" % e)
 #            try:
@@ -7431,10 +9310,11 @@ exit 0
 #            if isinstance(body.get("logs"), str):
 #                tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
 #                self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel,"
-#                               " nginx) VALUES (?, ?, ?, ?, ?)",
+#                               " nginx, parts) VALUES (?, ?, ?, ?, ?, ?)",
 #                               (who, now(), body["logs"][-40000:],
 #                                tunnel[-20000:] if isinstance(tunnel, str) else None,
-#                                errors[-20000:] if isinstance(errors, str) else None))
+#                                errors[-20000:] if isinstance(errors, str) else None,
+#                                clean_log_parts(body.get("log_parts"))))
 #            # What the service check found from here, the customer's way.
 #            probed = body.get("probe_result")
 #            if isinstance(probed, dict) and isinstance(probed.get("results"), dict):
@@ -7462,12 +9342,45 @@ exit 0
 #            # ever set, never cleared, so a second relay without DoH does not
 #            # flip it back and forth every half minute.
 #            doh_host = str(body.get("doh_host") or "")
-#            if doh_host and re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host) and \
-#                    self.store.setting("doh_host") != doh_host:
+#            if doh_host and not re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host):
+#                doh_host = ""
+#            if self.store.setting("doh_host:" + who) != doh_host:
+#                self.store.set_setting("doh_host:" + who, doh_host)
+#            if doh_host and not self.store.setting("doh_host"):
 #                self.store.set_setting("doh_host", doh_host)
 #            # Which resolvers the relay asks and how the admin's last pick
 #            # went there, for the settings page. Written only when it changes.
 #            # How the admin panel's name for DoH is going on this relay.
+#            # Its version, and how an upgrade the admin panel asked for went.
+#            if isinstance(body.get("version"), str) and \
+#                    self.store.setting("version:" + who) != body["version"][:20]:
+#                self.store.set_setting("version:" + who, body["version"][:20])
+#            upgrade_report(self.store, who, body.get("upgrade_result"))
+#            domain_report(self.store, who, body.get("domain_result"))
+#            # A single machine joined here: relay and exit both.
+#            single = "1" if body.get("single") else ""
+#            if self.store.setting("single:" + who) != single:
+#                self.store.set_setting("single:" + who, single)
+#            # And its tunnels to the nodes.
+#            states = body.get("node_tunnel_state")
+#            if isinstance(states, dict):
+#                for n_ip, st in list(states.items())[:16]:
+#                    if not valid_ip(str(n_ip)) or not isinstance(st, dict):
+#                        continue
+#                    text = json.dumps({"on": True, "running": bool(st.get("running")),
+#                                       "error": str(st.get("error") or "")[:400]},
+#                                      sort_keys=True)
+#                    key = "relay_tunnel_state:%s:%s" % (who, n_ip)
+#                    if self.store.setting(key) != text:
+#                        self.store.set_setting(key, text)
+#            # How the tunnel the admin panel set for this relay is going.
+#            state = body.get("tunnel_state")
+#            if isinstance(state, dict):
+#                text = json.dumps({"on": bool(state.get("on")),
+#                                   "running": bool(state.get("running")),
+#                                   "error": str(state.get("error") or "")[:400]}, sort_keys=True)
+#                if self.store.setting("relay_tunnel_state:" + who) != text:
+#                    self.store.set_setting("relay_tunnel_state:" + who, text)
 #            state = body.get("doh_name")
 #            if isinstance(state, dict):
 #                text = json.dumps({k: str(state.get(k) or "")[:400]
@@ -7500,6 +9413,10 @@ exit 0
 #            # The relay names itself by the address it connected from, so a
 #            # second relay appears on its own without any configuration.
 #            self.store.record_metrics(who, body.get("host") or {})
+#            try:
+#                record_exit_health(self.store, who, body.get("exit_health"))
+#            except Exception as e:
+#                log_exception("exit health not recorded: %r" % e)
 #            # Quotas are evaluated here, on fresh numbers, so a user who runs
 #            # out is off the list this relay is about to be handed.
 #            try:
@@ -7552,12 +9469,39 @@ exit 0
 #                                    "qlog": qlog_wanted(self.store),
 #                                    # The name the admin panel gave DoH, if any.
 #                                    "doh_name": self.store.setting("doh_name") or "",
+#                                    # Public DNS: open to everyone, no allowlist.
+#                                    "public": self.store.setting("public_dns") == "1",
 #                                    # The resolvers to time, and when last asked.
 #                                    "bench": bench_wanted(self.store),
 #                                    "templates": self.store.template_names(),
 #                                    "watch": watch_job(self.store),
 #                                    # The admin panel's service check, if asked.
 #                                    "probe": probe_job(self.store),
+#                                    # This relay's tunnel, when the admin
+#                                    # panel is the one to say.
+#                                    "tunnel": relay_tunnel(self.store, who, self.relays,
+#                                                           self.tunnel),
+#                                    # Which exit this relay uses, and the
+#                                    # others after it for when it is down.
+#                                    "exits": relay_exits(self.store, who, self.relays,
+#                                                         self.nodes, exit_self()),
+#                                    # An upgrade, when it is this one's turn,
+#                                    # and word that its last result arrived.
+#                                    "upgrade": upgrade_order(self.store, who),
+#                                    "upgrade_ack": bool(body.get("upgrade_result")),
+#                                    # A domain the admin gave it, until it has it.
+#                                    "domain": domain_order(self.store, who),
+#                                    "domain_ack": bool(body.get("domain_result")),
+#                                    "panel": panel_where(self.store),
+#                                    # Its tunnels to the nodes, by node.
+#                                    "node_tunnels": {
+#                                        n: dict(spec, on=True)
+#                                        for (r, n), spec in node_tunnel_specs(
+#                                            self.store, relay=who).items()
+#                                        if n in self.nodes} if who in self.relays else None,
+#                                    # Customers sent through another exit.
+#                                    "customer_exits": customer_exits(
+#                                        self.store, [exit_self()] + list(self.nodes), who),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -7605,6 +9549,22 @@ exit 0
 #            new_doh_token(self.store, user)
 #            return self.reply(200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه "
 #                                    "دیگر کار می‌کند و آدرس قبلی دیگر نه"})
+#        if self.path == "/user-device-wallet":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            res = buy_device_with_wallet(self.store, user)
+#            res.pop("error", None)
+#            return self.reply(200, res)
+#        if self.path == "/user-wallet-buy":
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            if self._must_choose(user):
+#                return self.reply(200, self._must_choose(user))
+#            res = buy_with_wallet(self.store, user, body.get("plan_id"), body.get("code"))
+#            res.pop("error", None)
+#            return self.reply(200, res)
 #        if self.path == "/user-trial":
 #            user = self._session_user(body.get("session"))
 #            if not user:
@@ -7653,6 +9613,55 @@ exit 0
 #        if path == "/user-ticket-image":
 #            return ticket_picture(self.store, user, body.get("message_id"))
 #        return {"ok": False, "message": "چنین کاری نیست"}
+#
+#    def do_node(self, body):
+#        """A node's sync: its health and logs in; the relays it is to let
+#        in, and the resolvers its nginx asks, out."""
+#        claimed = str(body.get("node") or "").strip()
+#        who = claimed if claimed in self.nodes else self.client_address[0]
+#        if who not in self.nodes:
+#            return 403, {"error": "not a node of this panel"}
+#        self._who = "node " + who
+#        self.store.record_metrics(who, body.get("host") or {})
+#        if isinstance(body.get("logs"), str):
+#            tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
+#            self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel, nginx,"
+#                           " parts) VALUES (?, ?, ?, ?, ?, ?)",
+#                           (who, now(), body["logs"][-40000:],
+#                            tunnel[-20000:] if isinstance(tunnel, str) else None,
+#                            errors[-20000:] if isinstance(errors, str) else None,
+#                            clean_log_parts(body.get("log_parts"))))
+#        state = body.get("resolvers")
+#        if isinstance(state, dict):
+#            text = json.dumps({"using": str(state.get("using") or "")[:100],
+#                               "error": str(state.get("error") or "")[:300]}, sort_keys=True)
+#            if self.store.setting("node_resolvers:" + who) != text:
+#                self.store.set_setting("node_resolvers:" + who, text)
+#        if isinstance(body.get("version"), str) and \
+#                self.store.setting("version:" + who) != body["version"][:20]:
+#            self.store.set_setting("version:" + who, body["version"][:20])
+#        upgrade_report(self.store, who, body.get("upgrade_result"))
+#        kept = body.get("standby_kept")
+#        if isinstance(kept, dict) and self.store.setting("standby") == who:
+#            self.store.set_setting("standby_kept", json.dumps(
+#                {"bundle": str(kept.get("bundle") or "")[:64],
+#                 "installer": str(kept.get("installer") or "")[:64], "at": now()}))
+#        running = body.get("tunnel_state")
+#        if isinstance(running, dict):
+#            for r_ip, up in list(running.items())[:64]:
+#                if valid_ip(str(r_ip)):
+#                    key = "node_tunnel_state:%s:%s" % (who, r_ip)
+#                    if self.store.setting(key) != ("1" if up else "0"):
+#                        self.store.set_setting(key, "1" if up else "0")
+#        return 200, {"relays": list(self.relays),
+#                     "upstream": (self.store.setting("dns_upstream") or DEFAULT_UPSTREAM).split(),
+#                     "upgrade": upgrade_order(self.store, who),
+#                     "upgrade_ack": bool(body.get("upgrade_result")),
+#                     "panel": panel_where(self.store),
+#                     "standby": standby_info(self.store, who),
+#                     # Its ends of the relays' tunnels, by relay.
+#                     "tunnels": {r: spec for (r, n), spec in node_tunnel_specs(
+#                         self.store, node=who).items() if r in self.relays}}
 #
 #    def relay_name(self, body):
 #        """Which relay this sync is from.
@@ -7706,6 +9715,13 @@ exit 0
 #            return {"ok": False,
 #                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
 #                               " بنویسید یا وارد شوید"}
+#        seller = seller_from_link(self.store, body.get("ref"))
+#        if seller and seller["disabled"]:
+#            return {"ok": False, "message": "این فروشنده فعلاً غیرفعال است؛ با خودش تماس "
+#                                            "بگیرید"}
+#        if seller and seller_full(self.store, seller):
+#            return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
+#                                            "بگیرید"}
 #        try:
 #            user = self.store.create_web_user(username, name, password)
 #        except sqlite3.IntegrityError:
@@ -7716,6 +9732,10 @@ exit 0
 #                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
 #                               " بنویسید یا وارد شوید"}
 #        THROTTLE.hit("signup:%s" % ip)
+#        if seller:
+#            self.store.run("UPDATE users SET owner_admin = ? WHERE id = ?",
+#                           (seller["id"], user["id"]))
+#        set_referrer(self.store, user["id"], body.get("ref"))
 #        print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
 #        emit_admin(self.store, "user.created", {
 #            "user_id": user["id"], "via": "web",
@@ -7856,7 +9876,7 @@ exit 0
 #        return self.do_claim_register(user["id"], ip)
 #
 #    def do_claim_register(self, user_id, ip):
-#        res = register_ip(self.store, user_id, ip)
+#        res = register_ip(self.store, user_id, ip, limited=True)
 #        res.pop("error", None)
 #        return res
 #
@@ -7875,6 +9895,7 @@ exit 0
 #            "SELECT t.created_at, p.name FROM transactions t"
 #            " LEFT JOIN plans p ON p.id = t.plan_id"
 #            " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
+#        plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
 #        return {
 #            "ok": True,
 #            "name": user["first_name"] or user["username"] or "",
@@ -7892,12 +9913,28 @@ exit 0
 #            # page turns this into the banner the bot used to send.
 #            "warned": user["warned"] or 0,
 #            "seen_ip": body.get("ip", ""),
+#            # The relays to type in as DNS 1 and DNS 2 - the same the bot gives.
+#            "dns": shown_relays(self.store, user, self.relays),
 #            "must_change": bool(user["must_change_password"]),
 #            # What can be bought, and what this account already holds - the
 #            # page warns before a different plan replaces it.
-#            "plans": self.store.plans_for_sale(),
+#            "plans": plans,
+#            "code": clean_code(body.get("code")) if code_ok else "",
+#            "code_message": code_message,
+#            "code_ok": code_ok,
 #            "trial": trial_view(self.store, user),
-#            "pay_text": self.store.setting("pay_text"),
+#            "pay_text": seller_pay_text(self.store, user),
+#            "seller_stopped": seller_stopped(self.store, seller_of(user)),
+#            # Devices: how many addresses at once, and an extra one to buy.
+#            "ips": [r["ip"] for r in ips],
+#            "devices": user["max_ips"] or 1,
+#            "device_offer": device_offer(self.store, user),
+#            # The wallet: whether it can be topped up, and its last moves.
+#            "wallet_on": wallet_on(self.store),
+#            "wallet_moves": wallet_moves(self.store, user["id"]),
+#            "topup_min": TOPUP_MIN,
+#            # The invitation link and what it has brought, while it pays.
+#            "ref": ref_view(self.store, user),
 #            "plan_id": user["plan_id"],
 #            "plan_name": mine["name"] if mine else "",
 #            # Tickets with a reply the customer has not answered, for the
@@ -7914,6 +9951,7 @@ exit 0
 #            # The personal DoH address. The relay builds the full address from
 #            # its own name - it knows which relay the customer is looking at.
 #            "doh_token": doh_token(self.store, user),
+#            "servers": customer_servers(self.store, user, self.relays),
 #            # Whether that address's DNS reaches us, and whether this account
 #            # uses the encrypted kind: the page's "your DNS arrives" line.
 #            "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
@@ -7944,6 +9982,9 @@ exit 0
 #    API.secret = cfg["SYNC_SECRET"]
 #    # Comma separated, so one exit can serve several relays.
 #    API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+#    # The installer's tunnel, which is to the first relay only.
+#    API.tunnel = cfg.get("TUNNEL") or "off"
+#    API.nodes = tuple(x.strip() for x in (cfg.get("NODE_IP") or "").split(",") if x.strip())
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #    ctx.load_cert_chain(CERT, KEY)
 #    make_api_server(ctx, address=api_address(cfg)).serve_forever()
@@ -7998,6 +10039,49 @@ exit 0
 #    return addr.version == 4 and addr.is_global
 #
 #
+#def server_order(store, relays):
+#    """The servers in the order the admin put them, the ones not yet placed
+#    after, in the order they were added - and which are hidden from everyone."""
+#    try:
+#        order = [str(x) for x in json.loads(store.setting("server_order") or "[]")]
+#    except (ValueError, TypeError):
+#        order = []
+#    try:
+#        hidden = {str(x) for x in json.loads(store.setting("server_hidden") or "[]")}
+#    except (ValueError, TypeError):
+#        hidden = set()
+#    rank = {ip: n for n, ip in enumerate(order)}
+#    ordered = sorted(relays, key=lambda ip: (rank.get(ip, len(order)), list(relays).index(ip)))
+#    return ordered, hidden
+#
+#
+#def shown_relays(store, user, relays):
+#    """The relays a customer is given as DNS addresses, in the admin's order:
+#    the ones picked for them, or else all, less those hidden from everyone.
+#    Never none - an address to type in is the one thing a customer cannot do
+#    without - and only relays that still exist. What is shown, not what may
+#    be used: every relay serves every customer."""
+#    keys = user.keys() if hasattr(user, "keys") else user
+#    picked = (user["relays"] if "relays" in keys else None) or ""
+#    want = {ip.strip() for ip in picked.split(",") if ip.strip()}
+#    ordered, hidden = server_order(store, relays)
+#    visible = [ip for ip in ordered if ip not in hidden]
+#    return [ip for ip in visible if ip in want] or visible or ordered
+#
+#
+#def server_note(store, user, ip):
+#    """What the customer is told about a server: their seller's words when
+#    the seller may pick servers and wrote some, else the owner's."""
+#    seller = seller_of(user)
+#    if seller:
+#        s = store.one("SELECT can_route FROM admins WHERE id = ?", (seller,))
+#        if s and s["can_route"]:
+#            own = store.setting("server_note:%d:%s" % (seller, ip))
+#            if own:
+#                return own
+#    return store.setting("server_note:" + ip) or ""
+#
+#
 #def user_view(store, user, relays):
 #    """An account as the bot sees it.
 #
@@ -8032,15 +10116,23 @@ exit 0
 #        "expires_at": user["expires_at"],
 #        "ips": [r["ip"] for r in store.user_ips(user["id"])],
 #        "max_ips": user["max_ips"],
+#        "extra_devices": user["extra_devices"] or 0,
+#        "device_offer": device_offer(store, user),
 #        "wallet": user["wallet"],
-#        # What to put in the console or router: the relays, which is where a
-#        # customer's DNS has to point.
-#        "dns": list(relays),
+#        # What to put in the console or router: the relays the admin shows
+#        # this customer, first to last - DNS 1, DNS 2. Every relay serves
+#        # every customer; this is what they are told, not what they may use.
+#        "dns": shown_relays(store, user, relays),
 #        "trial": trial_view(store, user),
+#        # The customer's invitation link and what it has brought them - null
+#        # while the operator does not pay for invitations.
+#        "ref": ref_view(store, user),
 #        # The personal encrypted-DNS addresses, for a bot to hand out: null
 #        # until a relay has DoH on. Like plain DNS they answer only on the
 #        # registered address; the token says whose template to answer from.
-#        "doh": doh_view(store, user),
+#        "doh": doh_view(store, user, relays),
+#        # Every server of theirs: plain DNS, DoT and DoH side by side.
+#        "servers": customer_servers(store, user, relays),
 #        "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
 #                                      " AND status = 'answered'", (user["id"],))["c"],
 #        "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
@@ -8054,11 +10146,12 @@ exit 0
 #    are."""
 #    return dict(user_view(store, user, relays), username=user["username"],
 #                phone=user["phone"], created_at=user["created_at"],
-#                label=who_label(user))
+#                label=who_label(user), referred_by=user["referred_by"])
 #
 #
 #def admin_receipt(store, row):
 #    return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+#            "kind": row["kind"],
 #            "created_at": row["created_at"], "decided_at": row["decided_at"],
 #            "has_image": bool(row["has_image"]),
 #            "plan": {"id": row["plan_id"], "name": row["plan_name"]}
@@ -8067,7 +10160,8 @@ exit 0
 #                     "telegram_id": row["telegram_id"]}}
 #
 #
-#RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.created_at, t.decided_at, t.plan_id,"
+#RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
+#                " t.plan_id,"
 #                " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
 #                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
 #                " FROM transactions t JOIN users u ON u.id = t.user_id"
@@ -8081,26 +10175,41 @@ exit 0
 #    def admin_log(self, what):
 #        log(INFO, "bot-api admin (key %r): %s" % (self._key["name"], what))
 #
+#    def mine(self, alias="u"):
+#        """A reseller's key reaches only the reseller's customers."""
+#        seller = getattr(self, "_seller", None)
+#        if not seller:
+#            return "", ()
+#        return " AND %s.owner_admin = ?" % alias, (seller,)
+#
+#    def owns(self, sql, *args):
+#        extra, more = self.mine()
+#        return bool(self.store.one(sql + extra, args + more))
+#
 #    def api_admin_stats(self, body):
-#        s = admin_stats(self.store)
+#        s = admin_stats(self.store, getattr(self, "_seller", None))
 #        return 200, dict({"ok": True, "text": daily_report_text(s)}, **s)
 #
 #    def api_admin_receipts(self, body):
 #        which = (self.query.get("status") or ["pending"])[0]
+#        extra, more = self.mine()
 #        if which == "all":
-#            rows = self.store.q(RECEIPT_ROWS + " ORDER BY t.id DESC LIMIT 50")
+#            rows = self.store.q(RECEIPT_ROWS + " WHERE 1 = 1" + extra
+#                                + " ORDER BY t.id DESC LIMIT 50", more)
 #        elif which in ("pending", "approved", "rejected"):
-#            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ? ORDER BY t.id"
+#            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ?" + extra + " ORDER BY t.id"
 #                                + (" DESC" if which != "pending" else "") + " LIMIT 50",
-#                                (which,))
+#                                (which,) + more)
 #        else:
 #            return 400, refused("bad_status", "status یکی از pending، approved، "
 #                                              "rejected یا all است")
 #        return 200, {"ok": True, "receipts": [admin_receipt(self.store, r) for r in rows]}
 #
 #    def api_admin_receipt_image(self, body, rid):
-#        row = self.store.one("SELECT receipt_blob, receipt_type FROM transactions"
-#                             " WHERE id = ?", (int(rid),))
+#        extra, more = self.mine()
+#        row = self.store.one("SELECT t.receipt_blob, t.receipt_type FROM transactions t"
+#                             " JOIN users u ON u.id = t.user_id WHERE t.id = ?" + extra,
+#                             (int(rid),) + more)
 #        if not row or row["receipt_blob"] is None:
 #            return 404, refused("image_not_found", "عکس این رسید نیست (یا بعد از "
 #                                                   "تصمیم پاک شده)")
@@ -8111,8 +10220,12 @@ exit 0
 #                     "data": base64.b64encode(image).decode("ascii")}
 #
 #    def api_admin_decide(self, body, rid, verb):
+#        if not self.owns("SELECT 1 FROM transactions t JOIN users u ON u.id = t.user_id"
+#                         " WHERE t.id = ?", int(rid)):
+#            return 404, refused("receipt_not_found", "این رسید پیدا نشد")
 #        res = decide_receipt(self.store, int(rid),
-#                             "approved" if verb == "approve" else "rejected")
+#                             "approved" if verb == "approve" else "rejected",
+#                             amount=body.get("amount"))
 #        if not res["ok"]:
 #            return {"receipt_not_found": 404, "already_decided": 409}.get(
 #                res["error"], 400), res
@@ -8122,20 +10235,24 @@ exit 0
 #
 #    def api_admin_users(self, body):
 #        q = (self.query.get("q") or [""])[0].strip()[:64]
+#        extra, more = self.mine()
 #        if not q:
-#            rows = self.store.q("SELECT * FROM users ORDER BY id DESC LIMIT 20")
+#            rows = self.store.q("SELECT * FROM users u WHERE 1 = 1" + extra
+#                                + " ORDER BY id DESC LIMIT 20", more)
 #        else:
 #            like = "%" + q.replace("%", "").replace("_", "") + "%"
 #            rows = self.store.q(
 #                "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-#                " WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+#                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
 #                " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
-#                " OR i.ip = ? ORDER BY u.id DESC LIMIT 20", (like, like, like, q, q, q))
+#                " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
+#                (like, like, like, q, q, q) + more)
 #        return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
 #                                           for r in rows]}
 #
 #    def admin_target(self, uid):
-#        user = self.store.one("SELECT * FROM users WHERE id = ?", (int(uid),))
+#        extra, more = self.mine()
+#        user = self.store.one("SELECT * FROM users u WHERE id = ?" + extra, (int(uid),) + more)
 #        if not user:
 #            return None, (404, refused("user_not_found", "این کاربر پیدا نشد"))
 #        return user, None
@@ -8170,6 +10287,9 @@ exit 0
 #            pid = int(body.get("plan_id") or 0)
 #        except (TypeError, ValueError):
 #            pid = 0
+#        if not self.store.one("SELECT 1 FROM plans WHERE id = ? AND COALESCE(owner_admin, 0)"
+#                              " = ?", (pid, getattr(self, "_seller", None) or 0)):
+#            return 404, refused("plan_not_found", "این پلن پیدا نشد")
 #        done = apply_plan(self.store, user["id"], pid)
 #        if not done:
 #            return 404, refused("plan_not_found", "این پلن پیدا نشد")
@@ -8178,6 +10298,33 @@ exit 0
 #                                                      text=done))
 #        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
 #        return 200, {"ok": True, "message": done,
+#                     "user": admin_user_view(self.store, user, self.relays)}
+#
+#    def api_admin_wallet(self, body, uid):
+#        """Put money into a wallet or take it out - by hand, with a reason."""
+#        user, err = self.admin_target(uid)
+#        if err:
+#            return err
+#        raw = str(body.get("amount") if body.get("amount") is not None else "").strip()
+#        sign = -1 if raw[:1] in ("-", "−") else 1
+#        amount = toman(raw.lstrip("+-−"))
+#        if not amount or amount > TOPUP_MAX:
+#            return 400, refused("bad_amount", "مبلغ درست نیست")
+#        note = str(body.get("note") or "").strip()[:200]
+#        with self.store.lock:
+#            balance = move_wallet(self.store.db, user["id"], sign * amount, "admin", note)
+#            self.store.db.commit()
+#        if balance is None:
+#            return 409, refused("wallet_short", "موجودی کیف پول کمتر از این مبلغ است")
+#        self.admin_log("wallet of user #%d %+d" % (user["id"], sign * amount))
+#        emit(self.store, user, "wallet.changed", {
+#            "amount": sign * amount, "balance": balance,
+#            "text": "💰 %s تومان %s کیف پول شما %s.%s\nموجودی: %s تومان"
+#                    % (format(amount, ","), "به" if sign > 0 else "از",
+#                       "اضافه شد" if sign > 0 else "کم شد",
+#                       " (%s)" % note if note else "", format(balance, ","))})
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, {"ok": True, "balance": balance,
 #                     "user": admin_user_view(self.store, user, self.relays)}
 #
 #    def api_admin_tickets(self, body):
@@ -8189,8 +10336,9 @@ exit 0
 #            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
 #            " FROM tickets t JOIN users u ON u.id = t.user_id"
-#            + ("" if which == "all" else " WHERE t.status = ?")
-#            + " ORDER BY t.updated_at DESC LIMIT 50", () if which == "all" else (which,))
+#            + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
+#            + " ORDER BY t.updated_at DESC LIMIT 50",
+#            (() if which == "all" else (which,)) + self.mine()[1])
 #        return 200, {"ok": True, "tickets": [
 #            {"id": r["id"], "subject": r["subject"], "status": r["status"],
 #             "created_at": r["created_at"], "updated_at": r["updated_at"],
@@ -8199,7 +10347,9 @@ exit 0
 #                      "telegram_id": r["telegram_id"]}} for r in rows]}
 #
 #    def api_admin_ticket(self, body, tid):
-#        t = self.store.one("SELECT * FROM tickets WHERE id = ?", (int(tid),))
+#        extra, more = self.mine()
+#        t = self.store.one("SELECT t.* FROM tickets t JOIN users u ON u.id = t.user_id"
+#                           " WHERE t.id = ?" + extra, (int(tid),) + more)
 #        if not t:
 #            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
 #        owner = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
@@ -8209,6 +10359,9 @@ exit 0
 #        return 200, res
 #
 #    def api_admin_reply(self, body, tid):
+#        if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
+#                         " WHERE t.id = ?", int(tid)):
+#            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
 #        res = admin_ticket_reply(self.store, int(tid), body)
 #        if not res["ok"]:
 #            return {"ticket_not_found": 404, "too_big": 413}.get(res["error"], 400), res
@@ -8216,6 +10369,9 @@ exit 0
 #        return self.api_admin_ticket(body, tid)
 #
 #    def api_admin_close(self, body, tid):
+#        if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
+#                         " WHERE t.id = ?", int(tid)):
+#            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
 #        cur = self.store.run("UPDATE tickets SET status = 'closed', updated_at = ?"
 #                             " WHERE id = ?", (now(), int(tid)))
 #        if not cur.rowcount:
@@ -8232,6 +10388,7 @@ exit 0
 #    protocol_version = "HTTP/1.0"
 #    store = None
 #    relays = ()
+#    _seller = None
 #
 #    ROUTES = [
 #        ("GET", re.compile(r"/api/v1/?$"), "ping"),
@@ -8245,6 +10402,10 @@ exit 0
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wallet$"), "wallet"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wallet/buy$"), "wallet_buy"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/devices/buy$"), "device_buy"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/discount$"), "discount"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
@@ -8270,6 +10431,7 @@ exit 0
 #        ("GET", re.compile(r"/api/v1/admin/users/(\d{1,12})$"), "admin_user"),
 #        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/status$"), "admin_status"),
 #        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/plan$"), "admin_plan"),
+#        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/wallet$"), "admin_wallet"),
 #        ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
 #        ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
 #        ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
@@ -8342,6 +10504,11 @@ exit 0
 #            return self.reply(403, refused("admin_only",
 #                                           "این کلید دسترسی ادمین ندارد"))
 #        self._key = key
+#        # A reseller's bot: their customers, their plans, their card number.
+#        self._seller = key["admin_id"] if "admin_id" in key.keys() else None
+#        if self._seller and self.store.one("SELECT 1 FROM admins WHERE id = ? AND disabled = 1",
+#                                           (self._seller,)):
+#            return self.reply(403, refused("seller_disabled", "این فروشنده غیرفعال است"))
 #        self.query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 #        ok, wait = BOT_THROTTLE.check("key:%d" % key["id"], *BOT_RATE)
 #        if not ok:
@@ -8433,6 +10600,8 @@ exit 0
 #    # -- what it does ----------------------------------------------------
 #    def customer(self, tg):
 #        user = self.store.user_by_telegram(int(tg))
+#        if user and self._seller and user["owner_admin"] != self._seller:
+#            user = None
 #        if not user:
 #            return None, (404, refused("user_not_found",
 #                                       "کاربری با این آیدی تلگرام نیست"))
@@ -8448,8 +10617,12 @@ exit 0
 #
 #    def api_list_plans(self, body):
 #        # Where to pay travels with what there is to buy.
-#        return 200, {"ok": True, "plans": self.store.plans_for_sale(),
-#                     "pay_text": self.store.setting("pay_text")}
+#        seller = self._seller
+#        return 200, {"ok": True, "plans": self.store.plans_for_sale(seller),
+#                     "pay_text": self.store.setting("pay_text:%d" % seller if seller
+#                                                    else "pay_text"),
+#                     "wallet_on": wallet_on(self.store), "topup_min": TOPUP_MIN,
+#                     "topup_max": TOPUP_MAX, "device_price": device_price(self.store)}
 #
 #    def api_create_user(self, body):
 #        try:
@@ -8459,6 +10632,14 @@ exit 0
 #        if not 0 < tg < 10 ** 20:
 #            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
 #        user = self.store.user_by_telegram(tg)
+#        seller = None
+#        if self._seller:
+#            if user and user["owner_admin"] != self._seller:
+#                return 409, refused("other_seller", "این تلگرام به حساب دیگری وصل است؛ "
+#                                                    "از همان ربات استفاده کنید")
+#            seller = self.store.one("SELECT * FROM admins WHERE id = ?", (self._seller,))
+#            if not user and seller and seller_full(self.store, seller):
+#                return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
 #        created = not user
 #        if created:
 #            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
@@ -8467,6 +10648,16 @@ exit 0
 #            user = self.store.create_user(tg, None, name or None)
 #            print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
 #                  flush=True)
+#            # A reseller's link makes them the reseller's; somebody else's
+#            # invitation link, when that is how they came.
+#            seller = seller or seller_from_link(self.store, body.get("ref"))
+#            if seller and seller["disabled"]:
+#                seller = None
+#            if seller and (self._seller or not seller_full(self.store, seller)):
+#                self.store.run("UPDATE users SET owner_admin = ? WHERE id = ?",
+#                               (seller["id"], user["id"]))
+#            set_referrer(self.store, user["id"], body.get("ref"))
+#            user = self.store.user_by_telegram(tg)
 #            emit_admin(self.store, "user.created", {
 #                "user_id": user["id"], "via": "bot",
 #                "text": "مشتری تازه از ربات: %s" % who_label(user)})
@@ -8481,7 +10672,7 @@ exit 0
 #            tg = 0
 #        if not 0 < tg < 10 ** 20:
 #            return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
-#        res = link_telegram(self.store, tg, body.get("code"))
+#        res = link_telegram(self.store, tg, body.get("code"), self._seller)
 #        if not res["ok"]:
 #            return {"telegram_in_use": 409}.get(res["error"], 400), res
 #        user = self.store.one("SELECT * FROM users WHERE id = ?", (res["user_id"],))
@@ -8502,7 +10693,7 @@ exit 0
 #        if not public_ipv4(ip):
 #            return 400, refused("bad_ip", "آی‌پی نامعتبر است؛ آی‌پی عمومی اینترنت "
 #                                          "مشتری لازم است")
-#        res = register_ip(self.store, user["id"], ip)
+#        res = register_ip(self.store, user["id"], ip, limited=True)
 #        if not res["ok"]:
 #            return 409, res
 #        return 200, {"ok": True, "message": res["message"],
@@ -8588,12 +10779,54 @@ exit 0
 #        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
 #        return 200, dict(res, user=user_view(self.store, user, self.relays))
 #
+#    def api_wallet(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return 200, {"ok": True, "balance": user["wallet"], "wallet_on": wallet_on(self.store),
+#                     "topup_min": TOPUP_MIN, "topup_max": TOPUP_MAX,
+#                     "moves": wallet_moves(self.store, user["id"], 20),
+#                     "ref": ref_view(self.store, user)}
+#
+#    def api_discount(self, body, tg):
+#        """What a code makes of the plans' prices, before the customer pays."""
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        plans, message, ok = discount_view(self.store, user, body.get("code"))
+#        return (200 if ok else 409), {"ok": ok, "message": message, "plans": plans,
+#                                      "code": clean_code(body.get("code")) if ok else "",
+#                                      "error": None if ok else "bad_code"}
+#
+#    def api_device_buy(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = buy_device_with_wallet(self.store, user)
+#        if not res["ok"]:
+#            return {"wallet_short": 402, "devices_not_sold": 404,
+#                    "device_unavailable": 409}.get(res["error"], 400), res
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, dict(res, user=user_view(self.store, user, self.relays))
+#
+#    def api_wallet_buy(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = buy_with_wallet(self.store, user, body.get("plan_id"), body.get("code"))
+#        if not res["ok"]:
+#            return {"wallet_short": 402, "plan_not_on_sale": 409,
+#                    "telegram_required": 403}.get(res["error"], 400), res
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        return 200, dict(res, user=user_view(self.store, user, self.relays))
+#
 #    def receipt(self, rid):
 #        r = self.store.one(
-#            "SELECT t.id, t.amount, t.status, t.created_at, t.decided_at,"
+#            "SELECT t.id, t.amount, t.kind, t.status, t.created_at, t.decided_at,"
 #            " t.plan_id, p.name FROM transactions t"
 #            " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (rid,))
 #        return {"id": r["id"], "amount": r["amount"], "status": r["status"],
+#                "kind": r["kind"],
 #                "plan": ({"id": r["plan_id"], "name": r["name"]}
 #                         if r["plan_id"] else None),
 #                "created_at": r["created_at"], "decided_at": r["decided_at"]}
@@ -8750,6 +10983,11 @@ exit 0
 #        try:
 #            store.record_metrics("exit", health.sample())
 #            store.prune_metrics()
+#            check_servers(store, API.relays, API.nodes)
+#            check_health(store, API.relays, API.nodes)
+#            check_caps(store, API.relays, API.nodes)
+#            check_sellers(store)
+#            upgrade_timeout(store)
 #        except Exception as e:
 #            log(WARN, "self health failed: %r" % e)
 #        # Housekeeping that needs no hurry rides along, once an hour.
@@ -8789,6 +11027,221 @@ exit 0
 #    return 1
 #
 #
+## ------------------------------------------------------------- block lists
+## Ready lists the admin can close for a template - ads, porn - rather than
+## typing names one by one. Far too long to travel in every sync, so this
+## machine fetches them from their authors, cleans them and keeps them, and a
+## relay fetches each once by its hash, as it does the installer. Relays are in
+## Iran, where the authors' pages are not reliably reachable; this is abroad.
+#BLOCKLIST_DIR = "/var/lib/smart-dns/blocklists"
+#STEVENBLACK = "https://raw.githubusercontent.com/StevenBlack/hosts/master/"
+#BLOCKLISTS = {
+#    "ads": {"label": "تبلیغات و بدافزار", "icon": "📢",
+#            "urls": [STEVENBLACK + "hosts"]},
+#    "porn": {"label": "پورن", "icon": "🔞",
+#             "urls": [STEVENBLACK + "extensions/porn/sinfonietta/hosts",
+#                      STEVENBLACK + "extensions/porn/clefspeare13/hosts"]},
+#}
+## Fetched again after this long; a failed fetch is tried again after an hour.
+#BLOCKLIST_DAYS = 7
+#BLOCKLIST_RETRY = 3600
+#BLOCKLIST_MAX_BYTES = 40 * MB
+## Names a hosts file lists that are not somebody's server.
+#HOSTS_JUNK = {"localhost", "localhost.localdomain", "local", "broadcasthost",
+#              "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
+#              "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0"}
+#BLOCK_NAME = re.compile(r"(?=.{4,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z]{2,63}")
+#
+#
+#def blocklist_scope(store, name):
+#    """("all", []), ("some", [template ids]) or None while it is off."""
+#    try:
+#        v = json.loads(store.setting("blocklist:" + name) or "null")
+#    except ValueError:
+#        return None
+#    if not isinstance(v, dict) or v.get("mode") not in ("all", "some"):
+#        return None
+#    ids = [int(x) for x in v.get("templates") or [] if str(x).isdigit()]
+#    if v["mode"] == "some" and not ids:
+#        return None
+#    return v["mode"], ids
+#
+#
+#def blocklist_meta(store, name):
+#    try:
+#        return json.loads(store.setting("blocklist_meta:" + name) or "{}")
+#    except ValueError:
+#        return {}
+#
+#
+#def blocklists_for(store, template_id):
+#    """{name: hash} of the ready lists closed for this template - only those
+#    this machine has built, so a relay is never sent a hash it cannot get."""
+#    out = {}
+#    for name in BLOCKLISTS:
+#        scope = blocklist_scope(store, name)
+#        sha = blocklist_meta(store, name).get("sha")
+#        if scope and sha and (scope[0] == "all" or template_id in scope[1]) and \
+#                os.path.exists(os.path.join(BLOCKLIST_DIR, name + ".conf.gz")):
+#            out[name] = sha
+#    return out
+#
+#
+#def parse_hosts(text):
+#    """The names in a hosts file (or a plain list of names), lower-cased."""
+#    out = set()
+#    for line in text.splitlines():
+#        line = line.split("#", 1)[0].strip().lower()
+#        if not line:
+#            continue
+#        parts = line.split()
+#        name = parts[-1] if len(parts) > 1 else parts[0]
+#        name = name.strip(".")
+#        if name in HOSTS_JUNK or not BLOCK_NAME.fullmatch(name):
+#            continue
+#        if re.fullmatch(r"[0-9.]+", name):
+#            continue
+#        out.add(name)
+#    return out
+#
+#
+#def clean_blocklist(names, keep):
+#    """The names to close, sorted: without those under another in the list -
+#    one address= rule closes a name and everything under it - and without any
+#    `keep` names, or their parents: the service's own names, what it routes,
+#    the admin's own domains and forwards. dnsmasq prefers the longer rule, so a
+#    closed parent leaves a routed child working; only an exact tie, or a parent
+#    of this service's own addresses, would do harm."""
+#    keep = {k.lower().strip(".") for k in keep if k}
+#    guarded = set()
+#    for k in keep:
+#        parts = k.split(".")
+#        guarded.update(".".join(parts[i:]) for i in range(len(parts)))
+#    out = []
+#    for n in names:
+#        if n in guarded:
+#            continue
+#        parts = n.split(".")
+#        if any(".".join(parts[i:]) in names for i in range(1, len(parts) - 1)):
+#            continue
+#        out.append(n)
+#    return sorted(out)
+#
+#
+#def blocklist_keep(store):
+#    """Every name a list must not close."""
+#    keep = set(store.custom_domains()) | set(store.dns_forwards())
+#    for svc in CATALOGUE:
+#        for g in svc.get("groups") or []:
+#            keep.update(g.get("domains") or [])
+#    for key in ("doh_host", "doh_name", "customer_panel_url"):
+#        v = (store.setting(key) or "").strip().lower()
+#        v = v.split("://", 1)[-1].split("/")[0].split(":")[0].strip(".")
+#        if v:
+#            keep.add(v)
+#    return keep
+#
+#
+#def download_blocklist(name, opener=None):
+#    """The list's names as its authors publish them today."""
+#    opener = opener or urllib.request.urlopen
+#    names = set()
+#    for url in BLOCKLISTS[name]["urls"]:
+#        req = urllib.request.Request(url, headers={"User-Agent": "doctor-dns"})
+#        with opener(req, timeout=120) as r:
+#            blob = r.read(BLOCKLIST_MAX_BYTES + 1)
+#        if len(blob) > BLOCKLIST_MAX_BYTES:
+#            raise RuntimeError("%s is larger than %s" % (url, human(BLOCKLIST_MAX_BYTES)))
+#        names |= parse_hosts(blob.decode("utf-8", "replace"))
+#    if len(names) < 100:
+#        raise RuntimeError("only %d names - not the list it should be" % len(names))
+#    return names
+#
+#
+#def build_blocklist(store, name, raw_names):
+#    """Write the cleaned list as dnsmasq rules, gzipped for the relays, and
+#    note its hash and size for them and the admin panel."""
+#    keep = blocklist_keep(store)
+#    names = clean_blocklist(raw_names, keep)
+#    text = "".join("address=/%s/\n" % n for n in names).encode()
+#    sha = hashlib.sha256(text).hexdigest()
+#    os.makedirs(BLOCKLIST_DIR, exist_ok=True)
+#    tmp = os.path.join(BLOCKLIST_DIR, name + ".conf.gz.tmp")
+#    with open(tmp, "wb") as fh:
+#        fh.write(gzip.compress(text, 6))
+#    os.replace(tmp, os.path.join(BLOCKLIST_DIR, name + ".conf.gz"))
+#    meta = blocklist_meta(store, name)
+#    meta.update(sha=sha, count=len(names), built_at=now(),
+#                keep=hashlib.sha256("\n".join(sorted(keep)).encode()).hexdigest())
+#    store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+#    return meta
+#
+#
+#def refresh_blocklists(store, opener=None, stamp=None):
+#    """Fetch a list that is on and missing or a week old, and rebuild one
+#    whose names to keep have changed - a domain the admin routed since, say.
+#    Lists nobody uses are not fetched at all."""
+#    stamp = stamp or time.time()
+#    for name in BLOCKLISTS:
+#        if not blocklist_scope(store, name):
+#            continue
+#        meta = blocklist_meta(store, name)
+#        raw = os.path.join(BLOCKLIST_DIR, name + ".raw.gz")
+#        fresh = os.path.exists(raw) and stamp - os.path.getmtime(raw) < BLOCKLIST_DAYS * 86400
+#        if not fresh and stamp >= (meta.get("retry_at") or 0):
+#            try:
+#                names = download_blocklist(name, opener)
+#                os.makedirs(BLOCKLIST_DIR, exist_ok=True)
+#                with open(raw + ".tmp", "wb") as fh:
+#                    fh.write(gzip.compress("\n".join(sorted(names)).encode(), 6))
+#                os.replace(raw + ".tmp", raw)
+#                meta.update(fetched_at=now(), error="", retry_at=0)
+#                store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+#                build_blocklist(store, name, names)
+#                log(INFO, "block list %s: %d names fetched, %d kept"
+#                    % (name, len(names), blocklist_meta(store, name)["count"]))
+#                continue
+#            except Exception as e:
+#                meta.update(error=str(e)[:200], retry_at=stamp + BLOCKLIST_RETRY)
+#                store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+#                log(WARN, "block list %s not fetched: %s" % (name, e))
+#        if not os.path.exists(raw):
+#            continue
+#        keep = hashlib.sha256("\n".join(sorted(blocklist_keep(store))).encode()).hexdigest()
+#        if keep != meta.get("keep") or not os.path.exists(
+#                os.path.join(BLOCKLIST_DIR, name + ".conf.gz")):
+#            with open(raw, "rb") as fh:
+#                names = set(gzip.decompress(fh.read()).decode().split())
+#            build_blocklist(store, name, names)
+#
+#
+#BLOCKLIST_CACHE = {}
+#
+#
+#def blocklist_names(name):
+#    """A built list's names, for saying why a name did not answer; read once
+#    per build."""
+#    path = os.path.join(BLOCKLIST_DIR, name + ".conf.gz")
+#    try:
+#        stamp = os.path.getmtime(path)
+#    except OSError:
+#        return set()
+#    if BLOCKLIST_CACHE.get(name, (None,))[0] != stamp:
+#        with open(path, "rb") as fh:
+#            text = gzip.decompress(fh.read()).decode()
+#        BLOCKLIST_CACHE[name] = (stamp, {l[9:-1] for l in text.split() if l})
+#    return BLOCKLIST_CACHE[name][1]
+#
+#
+#def blocklist_loop(store):
+#    while True:
+#        try:
+#            refresh_blocklists(store)
+#        except Exception as e:
+#            log(WARN, "block lists: %r" % e)
+#        time.sleep(60)
+#
+#
 #def main():
 #    global CATALOGUE
 #    if sys.argv[1:] == ["--make-key"]:
@@ -8810,12 +11263,14 @@ exit 0
 #        print("<3>sealing failed: %r" % e, flush=True)
 #    CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
 #    GAMES[:] = load_games()
+#    BLOCKS[:] = load_blocks()
 #    follow_catalogue_split(store, CATALOGUE)
 #    DEFAULT_TEMPLATE[0] = store.ensure_default_template(CATALOGUE)["id"]
 #    print("catalogue: %d services, default template #%d"
 #          % (len(CATALOGUE), DEFAULT_TEMPLATE[0]), flush=True)
 #
 #    threading.Thread(target=watch_self, args=(store,), daemon=True).start()
+#    threading.Thread(target=blocklist_loop, args=(store,), daemon=True).start()
 #
 #    def bye(*_):
 #        sys.exit(0)
@@ -8892,6 +11347,7 @@ exit 0
 #"""
 #
 #import base64
+#import gzip
 #import hashlib
 #import hmac
 #import html
@@ -9040,9 +11496,44 @@ exit 0
 #    except ValueError:
 #        port = API_PORT
 #    direct = (CFG["PANEL_HOST"], port)
-#    if (CFG.get("TUNNEL") or "off") != "backpack":
-#        return [direct]
-#    return [("127.0.0.1", API_TUNNEL_PORT), direct]
+#    ways = [direct] if (CFG.get("TUNNEL") or "off") != "backpack" \
+#        else [("127.0.0.1", API_TUNNEL_PORT), direct]
+#    # The standby, last: it answers only once it has taken the panel over,
+#    # with the same certificate, which is checked all the same.
+#    standby = CFG.get("PANEL_STANDBY") or ""
+#    if standby and standby != CFG["PANEL_HOST"]:
+#        ways.append((standby, API_PORT))
+#    return ways
+#
+#
+#def fetch(path):
+#    """Bytes the panel hands out, not JSON - the installer - pinned to its
+#    certificate as post() is: (body, headers)."""
+#    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+#    ctx.check_hostname = False
+#    ctx.verify_mode = ssl.CERT_NONE
+#    last = None
+#    for host, port in api_endpoints():
+#        conn = NamedHTTPS(host, port, sync_sni(), timeout=60, context=ctx)
+#        try:
+#            try:
+#                conn.connect()
+#            except OSError as e:
+#                last = e
+#                continue
+#            seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+#            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
+#                raise RuntimeError("certificate fingerprint mismatch")
+#            conn.request("POST", path, "{}", {"Content-Type": "application/json",
+#                                              "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
+#            res = conn.getresponse()
+#            body = res.read()
+#            if res.status != 200:
+#                raise RuntimeError("panel returned %d" % res.status)
+#            return body, dict(res.getheaders())
+#        finally:
+#            conn.close()
+#    raise RuntimeError("panel not reachable: %s" % last)
 #
 #
 #def post(path, payload):
@@ -9097,6 +11588,29 @@ exit 0
 #
 #
 ## ------------------------------------------------------------------ health
+#def conntrack_counts():
+#    """(connections tracked, the table's size), or (None, None) where the
+#    kernel keeps no table - when full, new connections are dropped."""
+#    try:
+#        with open("/proc/sys/net/netfilter/nf_conntrack_count") as fh:
+#            count = int(fh.read().strip())
+#        with open("/proc/sys/net/netfilter/nf_conntrack_max") as fh:
+#            return count, int(fh.read().strip())
+#    except (OSError, ValueError):
+#        return None, None
+#
+#
+#def cert_days(path):
+#    """Whole days until this certificate expires, or None without one."""
+#    if not path or not os.path.exists(path):
+#        return None
+#    try:
+#        ends = ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(path)["notAfter"])
+#    except Exception:
+#        return None
+#    return int((ends - time.time()) // 86400)
+#
+#
 #class Health:
 #    """Host metrics, read straight out of /proc.
 #
@@ -9149,9 +11663,16 @@ exit 0
 #            return None, None
 #        return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
 #
+#    @staticmethod
+#    def cert_path():
+#        """The customer panel's certificate, when this machine has a name."""
+#        domain = (CFG or {}).get("PANEL_DOMAIN") or ""
+#        return "/etc/letsencrypt/live/%s/fullchain.pem" % domain if domain else None
+#
 #    def sample(self):
 #        m = self._meminfo()
 #        rx, tx = self._net_rates()
+#        track = conntrack_counts()
 #        st = os.statvfs("/")
 #        with open("/proc/uptime") as fh:
 #            uptime = int(float(fh.readline().split()[0]))
@@ -9175,12 +11696,20 @@ exit 0
 #            "rx_bps": rx,
 #            "tx_bps": tx,
 #            "uptime": uptime,
+#            # Every byte since boot, for the month's traffic against a cap.
+#            "rx_total": self.net[0] if self.net else None,
+#            "tx_total": self.net[1] if self.net else None,
+#            "conntrack": track[0],
+#            "conntrack_max": track[1],
+#            "cert_days": cert_days(self.cert_path()),
 #        }
 #
 #
 ## ---------------------------------------------------------------- profiles
 #PROFILE_DIR = "/etc/smartdns-profiles"
 #PROFILE_BASE_PORT = 5300
+## 5300-5999: one port per template in use. The installer keeps tunnels off it.
+#PROFILE_PORTS = 700
 #NAT_TABLE = "smartdns_nat"
 #
 #
@@ -9339,8 +11868,8 @@ exit 0
 #
 #
 #def rule_sets(text, me):
-#    """What one resolver's config routes, bypasses and pins, as sets."""
-#    out = {"routes": set(), "bypasses": set(), "pins": set()}
+#    """What one resolver's config routes, bypasses, pins and blocks, as sets."""
+#    out = {"routes": set(), "bypasses": set(), "pins": set(), "blocks": set()}
 #    for line in (text or "").splitlines():
 #        m = RULE_LINE.match(line.strip())
 #        if not m:
@@ -9351,6 +11880,8 @@ exit 0
 #                out["bypasses"].add(d)
 #            elif target == me:
 #                out["routes"].add(d)
+#            elif not target:
+#                out["blocks"].add(d)
 #            else:
 #                # With its address, so a pin moving somewhere new shows up as
 #                # the change it is rather than as nothing.
@@ -9375,14 +11906,24 @@ exit 0
 #    """
 #    new = rule_sets(new_text, me)
 #    if old_text is None:
-#        return "routes %d, bypasses %d, pins %d" % (
-#            len(new["routes"]), len(new["bypasses"]), len(new["pins"]))
+#        return "routes %d, bypasses %d, pins %d, blocks %d" % (
+#            len(new["routes"]), len(new["bypasses"]), len(new["pins"]), len(new["blocks"]))
 #    old = rule_sets(old_text, me)
 #    parts = []
-#    for key in ("routes", "bypasses", "pins"):
+#    for key in ("routes", "bypasses", "pins", "blocks"):
 #        plus, minus = sorted(new[key] - old[key]), sorted(old[key] - new[key])
 #        if plus or minus:
 #            parts.append("%s %s" % (key, " ".join(signed(plus, "+") + signed(minus, "-"))))
+#    lists = [{l.split()[3]: l.split()[4] for l in text.splitlines()
+#              if l.startswith("# block list ") and len(l.split()) == 5}
+#             for text in (old_text, new_text)]
+#    for name in sorted(set(lists[0]) | set(lists[1])):
+#        if name not in lists[0]:
+#            parts.append("block list %s on" % name)
+#        elif name not in lists[1]:
+#            parts.append("block list %s off" % name)
+#        elif lists[0][name] != lists[1][name]:
+#            parts.append("block list %s updated" % name)
 #    return "; ".join(parts) or "settings only"
 #
 #
@@ -9448,11 +11989,56 @@ exit 0
 #def default_profile(rules, custom):
 #    """That resolver's spec, or None when the main one does the job."""
 #    rules = rules if isinstance(rules, dict) else {}
-#    if not rules.get("blocked") and not rules.get("forwards"):
+#    if not rules.get("blocked") and not rules.get("forwards") and not rules.get("lists"):
 #        return None
 #    return {"raw": rule_lines(HIJACK_CONF) + rule_lines(BYPASS_CONF), "custom": list(custom),
 #            "pins": True, "blocked": rules.get("blocked") or [],
-#            "forwards": rules.get("forwards") or {}}
+#            "forwards": rules.get("forwards") or {}, "lists": rules.get("lists") or {}}
+#
+#
+## The panel's ready block lists - ads, porn - as dnsmasq rules, one file each,
+## fetched once by hash and read by every template's resolver that has it on.
+#LIST_DIR = "/var/lib/smart-dns/relay-lists"
+#LIST_HAVE = {}          # name -> (sha, mtime) checked, so a sync need not re-hash
+#LIST_TRIED = {}         # name -> (sha, when) of the last failed fetch
+#
+#
+#def ensure_list(name, sha):
+#    """The local copy of a list with this hash - fetched if need be - or None."""
+#    if not re.fullmatch(r"[a-z]{1,16}", name or "") or \
+#            not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+#        return None
+#    path = os.path.join(LIST_DIR, name + ".conf")
+#    try:
+#        stamp = os.path.getmtime(path)
+#    except OSError:
+#        stamp = None
+#    if stamp is not None and LIST_HAVE.get(name) == (sha, stamp):
+#        return path
+#    if stamp is not None:
+#        with open(path, "rb") as fh:
+#            if hashlib.sha256(fh.read()).hexdigest() == sha:
+#                LIST_HAVE[name] = (sha, stamp)
+#                return path
+#    tried = LIST_TRIED.get(name)
+#    if tried and tried[0] == sha and time.time() - tried[1] < 600:
+#        return None
+#    try:
+#        blob, headers = fetch("/blocklist/" + name)
+#        text = gzip.decompress(blob)
+#        if hashlib.sha256(text).hexdigest() != sha:
+#            raise RuntimeError("the panel sent a different list than it named")
+#        os.makedirs(LIST_DIR, exist_ok=True)
+#        with open(path + ".tmp", "wb") as fh:
+#            fh.write(text)
+#        os.replace(path + ".tmp", path)
+#    except Exception as e:
+#        LIST_TRIED[name] = (sha, time.time())
+#        log(WARN, "block list %s not fetched: %s" % (name, e))
+#        return None
+#    LIST_HAVE[name] = (sha, os.path.getmtime(path))
+#    log(INFO, "block list %s: %d names" % (name, text.count(b"\n")))
+#    return path
 #
 #
 #def template_rules(spec):
@@ -9585,7 +12171,12 @@ exit 0
 #        restart = True
 #    ports = {}
 #    for i, key in enumerate(sorted(profiles)):
+#        if i >= PROFILE_PORTS:
+#            log(ERROR, "%d templates in use - more than the %d resolver ports; %s and the "
+#                "rest stay on the main resolver" % (len(profiles), PROFILE_PORTS, key))
+#            break
 #        ports[key] = PROFILE_BASE_PORT + i
+#    profiles = {k: v for k, v in profiles.items() if k in ports}
 #
 #    # Read once: every profile that wants them gets the same lines.
 #    epic_pins = epic_pin_lines()
@@ -9611,6 +12202,12 @@ exit 0
 #        # rule for a name they cover is left out below: see drop_overridden.
 #        blocked, forwards, taken = template_rules(spec)
 #        body += ["address=/%s/" % d for d in blocked]
+#        # The ready lists, by file. The hash is written too, so a new list is
+#        # a changed config and the resolver is restarted to read it.
+#        for name, sha in sorted((spec.get("lists") or {}).items()):
+#            path = ensure_list(name, sha)
+#            if path:
+#                body += ["# block list %s %s" % (name, sha[:16]), "conf-file=%s" % path]
 #        body += ["server=/%s/%s" % (d, v) for d in sorted(forwards) for v in forwards[d]]
 #        body += ["address=/%s/%s" % (d, me)
 #                 for d in sorted(set(spec.get("routed") or []))
@@ -9822,6 +12419,41 @@ exit 0
 #          % allowed_count, flush=True)
 #
 #
+## Set while this relay is open because the panel made the DNS public, so
+## that turning it back off closes only what public DNS opened: a relay an
+## operator opened by hand stays open.
+#PUBLIC_MARK = "/etc/smart-dns/public-dns"
+#
+#
+#def follow_public(public, allowed_count):
+#    """Open the relay to everyone while the panel says the DNS is public,
+#    and close it again after. True when it changed which way the door is."""
+#    enforcing = os.path.exists(ENFORCE_FILE)
+#    if public:
+#        if not enforcing:
+#            return False          # already open; and the installer's note waits
+#        r = subprocess.run([ACL, "enforce", "off"], capture_output=True, text=True,
+#                           timeout=30)
+#        if r.returncode != 0:
+#            log(ERROR, "public DNS: could not open the relay: %s" % r.stderr.strip())
+#            return False
+#        with open(PUBLIC_MARK, "w") as fh:
+#            fh.write("closed before public DNS\n")
+#        log(INFO, "public DNS: the relay is open to everyone")
+#        return True
+#    if os.path.exists(PUBLIC_MARK):
+#        r = subprocess.run([ACL, "enforce", "on", "--yes", "--allow-empty"],
+#                           capture_output=True, text=True, timeout=30)
+#        if r.returncode != 0:
+#            log(ERROR, "public DNS off: could not close the relay: %s" % r.stderr.strip())
+#            return False
+#        os.unlink(PUBLIC_MARK)
+#        log(INFO, "public DNS off: only registered addresses again (%d)" % allowed_count)
+#        return True
+#    close_relay_when_ready(allowed_count)
+#    return False
+#
+#
 ## The relay's own recent logs, sent to the panel now and then so the operator
 ## can read them in the admin panel without logging in to this machine. Every
 ## few minutes rather than every sync: a log is read by a person, not a
@@ -9841,6 +12473,62 @@ exit 0
 #WATCH = "/usr/local/bin/smartdns-watch"
 #WATCH_DONE = {"id": None, "result": None}
 #WATCH_MAX = 40000
+#
+#
+## The same logs, one part of the machine at a time, so a busy part - the
+## customer panel's requests - cannot push a quiet one out of the window: (key,
+## what it is, its units or "kernel", how many lines).
+#RELAY_LOG_PARTS = (
+#    ("sync", "همگام‌سازی و پنل مشتری", ("smartdns-sync",), 80),
+#    ("dnsmasq", "DNS — dnsmasq", ("dnsmasq",), 40),
+#    ("templates", "DNS قالب‌ها", ("smartdns-dns@*",), 40),
+#    ("doh", "DNS امن — DoH و DoT", ("smartdns-doh",), 40),
+#    ("nginx", "nginx", ("nginx",), 40),
+#    ("coturn", "STUN — coturn", ("coturn",), 30),
+#    ("epic", "epic-pin", ("epic-pin",), 20),
+#    ("acl", "ذخیرهٔ فهرست مشتری‌ها", ("smartdns-acl-save",), 20),
+#    ("cert", "تمدید گواهی HTTPS", ("smartdns-cert",), 20),
+#    ("kernel", "هشدارهای هستهٔ لینوکس — کم آمدن حافظه، پر شدن جدول اتصال‌ها", "kernel", 40),
+#)
+#NODE_LOG_PARTS = (
+#    ("sync", "همگام‌سازی با پنل", ("smartdns-node",), 60),
+#    ("nginx", "nginx", ("nginx",), 40),
+#    ("cert", "تمدید گواهی HTTPS", ("smartdns-cert",), 20),
+#    ("kernel", "هشدارهای هستهٔ لینوکس — کم آمدن حافظه، پر شدن جدول اتصال‌ها", "kernel", 40),
+#)
+#LOG_PART_MAX = 8000
+#
+#
+## What the kernel says that matters here, and not the hardware notes every
+## machine prints at boot: memory running out and what was killed for it, the
+## connection table full and dropping packets, crashes, a disk failing.
+#KERNEL_TROUBLE = re.compile(r"(?i)(out of memory|invoked oom-killer|oom-kill:|killed process|"
+#                            r"nf_conntrack: table full|dropping packet|segfault|"
+#                            r"general protection|hung task|i/o error|ext4-fs error|"
+#                            r"blk_update_request|soft lockup)")
+#
+#
+#def kernel_log(lines):
+#    """The kernel's troubles, the last few: memory running out and processes
+#    killed for it, the connection table filling up and dropping packets."""
+#    try:
+#        text = subprocess.run(["journalctl", "-k", "-p", "warning", "-n", "2000",
+#                               "--no-pager", "-o", "short-iso"],
+#                              capture_output=True, text=True, timeout=20).stdout
+#    except Exception as e:
+#        return "journalctl: %s" % e
+#    return "\n".join([l for l in text.splitlines() if KERNEL_TROUBLE.search(l)][-lines:])
+#
+#
+#def log_parts(parts):
+#    """[[key, what it is, its last lines], ...] for the admin panel's logs page."""
+#    out = []
+#    for key, label, units, lines in parts:
+#        text = kernel_log(lines) if units == "kernel" else recent_logs(units, lines)
+#        if "-- No entries --" in text and len(text.strip().splitlines()) <= 1:
+#            text = ""
+#        out.append([key, label, text[-LOG_PART_MAX:]])
+#    return out
 #
 #
 #def recent_logs(units=LOG_UNITS, lines=LOG_LINES):
@@ -10084,6 +12772,84 @@ exit 0
 ## already known, once per sync.
 #DOH_STATE = "/var/lib/smart-dns/doh.json"
 #ENFORCE_FILE = "/etc/nftables.d/30-smartdns-enforce.conf"
+#
+#
+## ------------------------------------------------------------ the way back
+## With the door closed (smartdns-acl enforce on), an address that is not
+## registered gets no DNS at all - so a customer whose line changed its address
+## cannot even look up the customer panel to register the new one, unless they
+## know to change their device's DNS. For such an address, port 53 goes to a
+## resolver of its own that answers the customer panel's name and refuses
+## everything else: the page that lets them back in, and nothing it could use
+## to ride along free.
+#GATE_PORT = 5299
+#GATE_CONF = os.path.join(PROFILE_DIR, "gate.conf")
+#GATE_UNIT = "smartdns-dns-gate"
+#GATE_UNIT_FILE = "/etc/systemd/system/smartdns-dns-gate.service"
+#GATE_CHAIN = "gatedns"
+#GATE_KEEP = ("bind-interfaces", "listen-address=", "domain-needed", "bogus-priv", "no-hosts",
+#             "interface=", "except-interface=")
+#
+#
+#def gate_names():
+#    """The names an unregistered address may look up."""
+#    name = ((CFG or {}).get("PANEL_DOMAIN") or "").strip().lower().strip(".")
+#    return [name] if is_domain(name) else []
+#
+#
+#def gate_conf_text(names, upstream):
+#    lines = ["# generated by smartdns-sync - do not edit",
+#             "# Only the service's own names, for addresses not registered yet.",
+#             "port=%d" % GATE_PORT, "no-resolv", "cache-size=100"]
+#    lines += [l for l in base_settings() if l.startswith(GATE_KEEP)]
+#    lines += ["server=/%s/%s" % (n, u) for n in names for u in upstream]
+#    return "\n".join(lines) + "\n"
+#
+#
+#def gate_rules():
+#    return ['iifname != "lo" ip saddr != @allowed udp dport 53 redirect to :%d' % GATE_PORT,
+#            'iifname != "lo" ip saddr != @allowed tcp dport 53 redirect to :%d' % GATE_PORT]
+#
+#
+#def apply_gate_dns():
+#    """Keep the way back open while the door is closed: its resolver, and the
+#    redirect of unregistered port 53 to it. Undone when the door opens, or
+#    when this relay has no customer panel name to give."""
+#    names, upstream = gate_names(), current_upstream()
+#    want = (os.path.exists(ENFORCE_FILE) and names and upstream
+#            and os.path.exists(GATE_UNIT_FILE))
+#    listed = nft("list", "chain", "inet", "smartdns", GATE_CHAIN)
+#    if not want:
+#        if listed.returncode == 0 and "redirect" in listed.stdout:
+#            nft("flush", "chain", "inet", "smartdns", GATE_CHAIN)
+#        if sh("systemctl", "is-active", GATE_UNIT).stdout.strip() == "active":
+#            sh("systemctl", "stop", GATE_UNIT)
+#        return False
+#    text = gate_conf_text(names, upstream)
+#    try:
+#        with open(GATE_CONF) as fh:
+#            old = fh.read()
+#    except OSError:
+#        old = None
+#    if old != text:
+#        os.makedirs(PROFILE_DIR, exist_ok=True)
+#        with open(GATE_CONF, "w") as fh:
+#            fh.write(text)
+#    active = sh("systemctl", "is-active", GATE_UNIT).stdout.strip() == "active"
+#    if old != text or not active:
+#        sh("systemctl", "restart", GATE_UNIT)
+#        log(INFO, "the way back open: %s answered for unregistered addresses"
+#            % ", ".join(names))
+#    if listed.returncode != 0:
+#        nft("add", "chain", "inet", "smartdns", GATE_CHAIN,
+#            "{ type nat hook prerouting priority -110 ; policy accept ; }")
+#        listed = nft("list", "chain", "inet", "smartdns", GATE_CHAIN)
+#    if ("redirect to :%d" % GATE_PORT) not in (listed.stdout or ""):
+#        nft("flush", "chain", "inet", "smartdns", GATE_CHAIN)
+#        for rule in gate_rules():
+#            nft("add", "rule", "inet", "smartdns", GATE_CHAIN, *rule.split())
+#    return True
+#
 #MAIN_DNS_PORT = 53
 #
 #
@@ -10410,6 +13176,40 @@ exit 0
 #USAGE_TAKEN = USAGE_LOG + ".taken"
 ## What was read but not yet delivered, so a sync that fails does not lose it.
 #USAGE_PENDING = {}
+## The same bytes by which exit carried them: {ip: {exit: [up, down]}}.
+#EXIT_PENDING = {}
+#
+#
+#def exit_of(upstream):
+#    """Which exit a connection went out through, from nginx's $upstream_addr:
+#    an exit's address, or the tunnel's end here - the main exit - or None for
+#    what never left this machine, DoH and DoT."""
+#    host, _, port = upstream.rstrip(",").rpartition(":")
+#    if host == "127.0.0.1":
+#        if not port.isdigit():
+#            return None
+#        # A tunnel's end here: the main exit's, or a node's.
+#        if int(port) in {local for _, local, _ in TUNNEL_PORTS}:
+#            return current_exit_ip()
+#        for node, base in NODE_TUNNELS.items():
+#            if base <= int(port) < base + len(TUNNEL_PORTS):
+#                return node
+#        return None
+#    return host if is_ipv4(host) else None
+#
+#
+#def count_exit(ip, upstream, sent, got):
+#    if is_single():
+#        return                      # a single machine is its own and only exit
+#    to = exit_of(upstream)
+#    try:
+#        down, up = int(sent), int(got)      # sent to the customer, got from them
+#    except ValueError:
+#        return
+#    if to and up + down > 0:
+#        pair = EXIT_PENDING.setdefault(ip, {}).setdefault(to, [0, 0])
+#        pair[0] += up
+#        pair[1] += down
 #
 #
 #def take_usage():
@@ -10425,7 +13225,10 @@ exit 0
 #            with open(USAGE_TAKEN, encoding="utf-8", errors="replace") as fh:
 #                for line in fh:
 #                    parts = line.split()
-#                    if len(parts) == 5:
+#                    if len(parts) >= 6:
+#                        ip, port, name, sent, got = parts[:5]
+#                        count_exit(ip, parts[-1], sent, got)
+#                    elif len(parts) == 5:
 #                        ip, port, name, sent, got = parts
 #                    elif len(parts) == 4:          # no name was asked for
 #                        ip, port, sent, got = parts
@@ -10454,6 +13257,854 @@ exit 0
 #    return dict(USAGE_PENDING)
 #
 #
+## ------------------------------------------------------------------ tunnel
+## The tunnel to the exit, when the admin panel sets it for this relay - every
+## relay but the one the exit's installer tunnels to, whose tunnel stays the
+## installer's (the panel then sends None and nothing here touches it). The
+## files are the installer's own, written the same way to the byte, so an
+## installer run afterwards finds them as they should be and changes nothing.
+#TUNNEL_DIR = "/etc/smart-dns/tunnel"
+#TUNNEL_TOML = TUNNEL_DIR + "/tunnel.toml"
+#TUNNEL_NFT = "/etc/nftables.d/40-smartdns-tunnel.conf"
+#TUNNEL_UNIT_FILE = "/etc/systemd/system/smartdns-tunnel.service"
+#BACKPACK_BIN = "/usr/local/lib/smart-dns/backpack"
+#EXIT_CONF = "/etc/nginx/smartdns-exit.conf"
+#TUNNEL_TRANSPORTS = {
+#    "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
+#                "wsmux", "xdi", "udp"),
+#    "direct": ("stealth", "wss", "tcp", "ws"),
+#}
+## This end of each port the tunnel carries, and the exit's port it comes out on.
+#TUNNEL_PORTS = (("https", 18443, 443), ("http", 18080, 80), ("spotify", 14070, 4070),
+#                ("blizzard", 11119, 1119))
+#TUNNEL_REPORT = {"state": None}
+#
+#
+#def tunnel_token(secret):
+#    return hashlib.sha256(("doctor-dns-tunnel:%s" % secret).encode()).hexdigest()[:48]
+#
+#
+#def exit_group(ip):
+#    """The name of the upstreams that put this exit first."""
+#    return "to_ip_" + ip.replace(".", "_")
+#
+#
+#def exit_conf_text(exit_ip, tunnel, order=None, down=(), nodes=None):
+#    """nginx's way to the exits, in the order given - the exit this relay's
+#    tunnel goes to by default. The tunnel's end here goes just before that
+#    exit; the first of them all is the way, the rest are only fallbacks.
+#    With more than one exit, each also gets upstreams of its own that put it
+#    first, for the customers the admin sent through it."""
+#    out = ["# The way to the exit - written by doctor dns: the installer, and\n"
+#           "# smartdns-sync when the admin panel turns this relay's tunnel on or off.\n"]
+#    order = order or [exit_ip]
+#    groups = [("to_exit", order)]
+#    if len(order) > 1:
+#        groups += [(exit_group(ip), [ip] + [x for x in order if x != ip]) for ip in order]
+#    for group, seq in groups:
+#        # An exit that has stopped answering goes last, still a fallback:
+#        # nginx would otherwise wait out its timeout on every new connection.
+#        seq = [x for x in seq if x not in down] + [x for x in seq if x in down]
+#        for i, (name, local, port) in enumerate(TUNNEL_PORTS):
+#            servers = []
+#            for ip in seq:
+#                # The tunnel's end here, just before the exit it goes to.
+#                if ip == exit_ip and tunnel:
+#                    servers.append("127.0.0.1:%d" % local)
+#                elif ip in (nodes or {}):
+#                    servers.append("127.0.0.1:%d" % (nodes[ip] + i))
+#                servers.append("%s:%d" % (ip, port))
+#            out.append("upstream %s_%s {\n    server %s;\n%s}\n" % (
+#                group, name, servers[0],
+#                "".join("    server %s backup;\n" % s for s in servers[1:])))
+#    return "".join(out)
+#
+#
+#def tunnel_nft_text(port, peer):
+#    return ("# written by doctor dns: the tunnel's port answers %(peer)s only\n"
+#            "table inet smartdns_tunnel\n"
+#            "delete table inet smartdns_tunnel\n"
+#            "table inet smartdns_tunnel {\n"
+#            "    chain input {\n"
+#            "        type filter hook input priority -5 ; policy accept ;\n"
+#            "        tcp dport %(port)s ip saddr != %(peer)s drop\n"
+#            "        udp dport %(port)s ip saddr != %(peer)s drop\n"
+#            "        meta nfproto ipv6 tcp dport %(port)s drop\n"
+#            "        meta nfproto ipv6 udp dport %(port)s drop\n"
+#            "    }\n"
+#            "}\n" % {"port": port, "peer": peer})
+#
+#
+#def tunnel_cert():
+#    """wss on the listening end wants a certificate: the relay's own if it has
+#    a domain, a self-signed one if not - the exit does not check it."""
+#    domain = (CFG or {}).get("PANEL_DOMAIN") or ""
+#    live = "/etc/letsencrypt/live/%s/" % domain
+#    if domain and os.path.exists(live + "fullchain.pem"):
+#        return live + "fullchain.pem", live + "privkey.pem"
+#    c, k = TUNNEL_DIR + "/tls.crt", TUNNEL_DIR + "/tls.key"
+#    os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
+#    if not os.path.exists(c):
+#        sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+#           "-subj", "/CN=%s" % (domain or "localhost"), "-keyout", k, "-out", c)
+#    return c, k
+#
+#
+#def tunnel_toml_text(spec, exit_ip, secret, carried=None):
+#    # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
+#    # a node's carries only the proxy's ports, on its own.
+#    if carried is None:
+#        carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
+#    ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
+#    out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
+#    if spec["direction"] == "reverse":
+#        out.append('[server]\nbind_addr = "0.0.0.0:%d"\nports = [%s]\n' % (spec["port"], ports))
+#        if spec["transport"] in ("wss", "wssmux"):
+#            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % tunnel_cert())
+#    else:
+#        out.append('[direct]\nrole = "iran"\naddr = "%s:%d"\nports = [%s]\n'
+#                   % (exit_ip, spec["port"], ports))
+#    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+#    if spec["direction"] == "reverse":
+#        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
+#    return "".join(out)
+#
+#
+#def clean_tunnel(spec):
+#    """The panel's word on this relay's tunnel, checked: None to leave it
+#    alone, {} for none, or the transport, direction and port."""
+#    if not isinstance(spec, dict):
+#        return None
+#    if not spec.get("on"):
+#        return {}
+#    direction = spec.get("direction")
+#    transport = spec.get("transport")
+#    try:
+#        port = int(spec.get("port"))
+#    except (TypeError, ValueError):
+#        return None
+#    if direction not in TUNNEL_TRANSPORTS or transport not in TUNNEL_TRANSPORTS[direction] \
+#            or not 1 <= port <= 65535:
+#        return None
+#    return {"direction": direction, "transport": transport, "port": port}
+#
+#
+#def write_if_changed(path, text, mode=0o644):
+#    if read_text(path) == text:
+#        return False
+#    tmp = path + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write(text)
+#    os.chmod(tmp, mode)
+#    os.replace(tmp, path)
+#    return True
+#
+#
+#def set_sync_env(values):
+#    """Put these keys into sync.env, the rest as it was - the installer reads
+#    them on its next run, so it keeps what the panel set."""
+#    try:
+#        with open(CONFIG, encoding="utf-8") as fh:
+#            lines = [l.rstrip("\n") for l in fh]
+#    except OSError:
+#        return
+#    keys = set(values)
+#    kept = [l for l in lines if l.split("=", 1)[0].strip() not in keys]
+#    new = kept + ["%s=%s" % (k, v) for k, v in values.items()]
+#    if new != lines:
+#        write_if_changed(CONFIG, "\n".join(new) + "\n", 0o600)
+#    CFG.update(values)
+#
+#
+#def point_exit_nginx(exit_ip, tunnel):
+#    """nginx through the tunnel or straight to the exit, checked by nginx
+#    first and put back if refused. False when refused."""
+#    old = read_text(EXIT_CONF)
+#    new = exit_conf_text(exit_ip, tunnel,
+#                         EXIT_PLAN["order"] if EXIT_PLAN["main"] == exit_ip else None,
+#                         {ip for ip, h in EXIT_HEALTH.items() if h["down"]}
+#                         | EXIT_PLAN["capped"], dict(NODE_TUNNELS))
+#    if old == new:
+#        return True
+#    write_if_changed(EXIT_CONF, new)
+#    if sh("nginx", "-t").returncode != 0:
+#        if old is None:
+#            os.unlink(EXIT_CONF)
+#        else:
+#            write_if_changed(EXIT_CONF, old)
+#        return False
+#    sh("systemctl", "reload", "nginx")
+#    return True
+#
+#
+#def current_exit_ip():
+#    if EXIT_PLAN["main"]:
+#        return EXIT_PLAN["main"]
+#    m = re.search(r"server ((?:\d{1,3}\.){3}\d{1,3}):443", read_text(EXIT_CONF) or "")
+#    return m.group(1) if m else CFG.get("PANEL_HOST", "")
+#
+#
+#def apply_tunnel(raw):
+#    """Bring this relay's tunnel to what the admin panel set."""
+#    if raw is None or is_single():
+#        return                      # the installer's tunnel, or a single machine
+#    spec = clean_tunnel(raw)
+#    if spec is None:
+#        TUNNEL_REPORT["state"] = {"on": False, "error": "تنظیم تونل از پنل خوانا نبود"}
+#        return
+#    exit_ip = str(raw.get("exit") or "") or current_exit_ip()
+#    if not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", exit_ip):
+#        TUNNEL_REPORT["state"] = {"on": False, "error": "آدرس سرور خارج معلوم نیست"}
+#        return
+#    error = ""
+#    if spec and not os.access(BACKPACK_BIN, os.X_OK):
+#        spec, error = {}, ("BackPack روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله "
+#                           "اجرا کنید")
+#    elif spec and not os.path.exists(TUNNEL_UNIT_FILE):
+#        spec, error = {}, "سرویس تونل روی این رله نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید"
+#    if not spec:
+#        if CFG.get("TUNNEL") == "backpack" or os.path.exists(TUNNEL_TOML):
+#            sh("systemctl", "disable", "--now", "smartdns-tunnel")
+#            for path in (TUNNEL_TOML, TUNNEL_NFT):
+#                if os.path.exists(path):
+#                    os.unlink(path)
+#            nft("delete", "table", "inet", "smartdns_tunnel")
+#            log(INFO, "tunnel off, as the admin panel says - straight to the exit")
+#        if not point_exit_nginx(exit_ip, False):
+#            error = error or "nginx راه مستقیم را نپذیرفت"
+#        set_sync_env({"TUNNEL": "off", "TUNNEL_TRANSPORT": "", "TUNNEL_DIRECTION": "",
+#                      "TUNNEL_PORT": ""})
+#        TUNNEL_REPORT["state"] = {"on": False, "error": error}
+#        return
+#    os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
+#    changed = write_if_changed(TUNNEL_TOML, tunnel_toml_text(spec, exit_ip, CFG["SYNC_SECRET"]),
+#                               0o600)
+#    if spec["direction"] == "reverse":
+#        os.makedirs(os.path.dirname(TUNNEL_NFT), exist_ok=True)
+#        if write_if_changed(TUNNEL_NFT, tunnel_nft_text(spec["port"], exit_ip)) or changed:
+#            if nft("-f", TUNNEL_NFT).returncode != 0:
+#                error = "قاعدهٔ فایروال تونل بار نشد؛ درگاه %d به روی همه باز است" % spec["port"]
+#    elif os.path.exists(TUNNEL_NFT):
+#        os.unlink(TUNNEL_NFT)
+#        nft("delete", "table", "inet", "smartdns_tunnel")
+#    if changed or CFG.get("TUNNEL") != "backpack":
+#        sh("systemctl", "enable", "smartdns-tunnel")
+#    running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
+#    if changed or not running:
+#        sh("systemctl", "restart", "smartdns-tunnel")
+#        running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
+#        log(INFO, "tunnel %s, %s, port %d, as the admin panel says"
+#            % (spec["transport"], spec["direction"], spec["port"]))
+#    if not point_exit_nginx(exit_ip, True):
+#        error = error or "nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود"
+#    set_sync_env({"TUNNEL": "backpack", "TUNNEL_TRANSPORT": spec["transport"],
+#                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"])})
+#    TUNNEL_REPORT["state"] = {"on": True, "error": error, "running": running}
+#
+#
+## ------------------------------------------------------------------ node
+## A node is another exit joined to this panel: nginx as on the exit, and no
+## panel of its own. This same program runs there with --node, from
+## node.env: the relays to let in and the resolvers to ask come from the
+## panel, and the machine's health and logs go back to it.
+#NODE_CONFIG = "/etc/smart-dns/node.env"
+#RELAYS_CONF = "/etc/nginx/smartdns-relays.conf"
+#NGINX_CONF = "/etc/nginx/nginx.conf"
+#UPSTREAM_FILE = "/etc/smart-dns/upstream"
+#RESOLVER_LINE = re.compile(r"(\bresolver )([0-9. ]+?)( ipv[46]=off;)")
+#NODE_LOG_UNITS = ("smartdns-node", "nginx", "smartdns-tunnel@*")
+#NODE_STATE = {"resolvers": None, "tunnels": None, "standby": None}
+#
+#
+#def is_ipv4(ip):
+#    return isinstance(ip, str) and re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) is not None \
+#        and all(int(p) <= 255 for p in ip.split("."))
+#
+#
+#def relays_conf_text(ips):
+#    """The file the exit's nginx lets relays in from - the installer's and the
+#    admin panel's own words, so the three of them never disagree."""
+#    return ("# The relays this exit lets in: written by the installer and the admin panel.\n"
+#            + "".join("allow %s;\n" % ip for ip in ips))
+#
+#
+#def nginx_swap(path, text):
+#    """Write this file for nginx, checked by nginx -t and put back if refused.
+#    True when nginx took it (or it was already so)."""
+#    old = read_text(path)
+#    if old == text:
+#        return True
+#    write_if_changed(path, text)
+#    if sh("nginx", "-t").returncode != 0:
+#        if old is None:
+#            os.unlink(path)
+#        else:
+#            write_if_changed(path, old)
+#        return False
+#    sh("systemctl", "reload", "nginx")
+#    return True
+#
+#
+#def apply_node_relays(raw):
+#    """Let in exactly the relays the panel serves. An empty or unreadable
+#    list changes nothing: it would shut every relay out."""
+#    ips = []
+#    for ip in raw or []:
+#        if is_ipv4(ip) and ip not in ips:
+#            ips.append(ip)
+#    if not ips:
+#        return
+#    before = read_text(RELAYS_CONF)
+#    if nginx_swap(RELAYS_CONF, relays_conf_text(ips)):
+#        if before != relays_conf_text(ips):
+#            log(INFO, "relays let in: %s" % ", ".join(ips))
+#    else:
+#        log(WARN, "nginx refused the relays' list - kept the one it had")
+#
+#
+#def apply_node_resolvers(raw):
+#    """nginx's resolvers, as the panel's picks - those that answer from here."""
+#    picks = [ip for ip in (raw or []) if is_ipv4(ip)][:2]
+#    if not picks:
+#        return
+#    text = read_text(NGINX_CONF) or ""
+#    m = RESOLVER_LINE.search(text)
+#    if not m:
+#        NODE_STATE["resolvers"] = {"using": "", "error": "خط resolver در nginx.conf پیدا نشد"}
+#        return
+#    if m.group(2).split() == picks:
+#        NODE_STATE["resolvers"] = {"using": " ".join(picks), "error": ""}
+#        return
+#    alive = [ip for ip in picks if dns_probe(ip) is not None]
+#    if not alive:
+#        NODE_STATE["resolvers"] = {"using": m.group(2),
+#                                   "error": "%s از این سرور جواب نداد" % " و ".join(picks)}
+#        return
+#    new = RESOLVER_LINE.sub(lambda x: x.group(1) + " ".join(alive) + x.group(3), text)
+#    if not nginx_swap(NGINX_CONF, new):
+#        NODE_STATE["resolvers"] = {"using": m.group(2), "error": "nginx نپذیرفت"}
+#        return
+#    write_if_changed(UPSTREAM_FILE, " ".join(alive) + "\n")
+#    log(INFO, "resolvers now %s" % " ".join(alive))
+#    NODE_STATE["resolvers"] = {"using": " ".join(alive), "error": ""}
+#
+#
+#def node_once():
+#    try:
+#        host = HEALTH.sample()
+#    except Exception as e:
+#        host = {"error": str(e)}
+#    payload = {"node": CFG["SELF_IP"], "host": host}
+#    if NODE_STATE["resolvers"] is not None:
+#        payload["resolvers"] = NODE_STATE["resolvers"]
+#    if NODE_STATE["tunnels"] is not None:
+#        payload["tunnel_state"] = NODE_STATE["tunnels"]
+#    payload["version"] = installed_version()
+#    finished_upgrade = upgrade_result()
+#    if finished_upgrade:
+#        payload["upgrade_result"] = finished_upgrade
+#    if NODE_STATE["standby"]:
+#        payload["standby_kept"] = NODE_STATE["standby"]
+#    if logs_due():
+#        payload["logs"] = ""
+#        payload["log_parts"] = log_parts(NODE_LOG_PARTS)
+#        payload["tunnel_logs"] = recent_logs(("smartdns-tunnel@*",), 80)
+#        payload["nginx_logs"] = nginx_errors()
+#    answer = post("/node", payload)
+#    if finished_upgrade and answer.get("upgrade_ack"):
+#        upgrade_heard()
+#    try:
+#        follow_panel(answer.get("panel"))
+#    except Exception as e:
+#        log(WARN, "the panel's whereabouts not kept: %s" % e)
+#    try:
+#        NODE_STATE["standby"] = keep_standby(answer.get("standby"))
+#    except Exception as e:
+#        log(WARN, "standby backup not kept: %s" % e)
+#    try:
+#        start_upgrade(answer.get("upgrade"))
+#    except Exception as e:
+#        log(WARN, "upgrade not started: %s" % e)
+#    try:
+#        apply_node_relays(answer.get("relays"))
+#    except Exception as e:
+#        log_exception("relays not applied: %s" % e)
+#    try:
+#        apply_node_resolvers(answer.get("upstream"))
+#    except Exception as e:
+#        log_exception("resolvers not applied: %s" % e)
+#    try:
+#        apply_relay_tunnels(answer.get("tunnels"))
+#    except Exception as e:
+#        log_exception("relays' tunnels not applied: %s" % e)
+#
+#
+#def node_loop():
+#    fails = 0
+#    while True:
+#        try:
+#            node_once()
+#            fails = 0
+#        except Exception as e:
+#            fails += 1
+#            # The relays already let in keep working while the panel is away.
+#            if fails <= 3 or fails % 20 == 0:
+#                log(WARN if fails < 3 else ERROR, "node sync failed (%d): %s" % (fails, e))
+#        time.sleep(INTERVAL)
+#
+#
+## ------------------------------------------------------------------ exits
+## Which exit this relay's traffic goes to, as the panel says: the one the
+## admin picked first, the others after it as nginx's fallbacks. The tunnel,
+## when there is one, is to the panel's own exit - "main" - and goes just
+## before it.
+#EXIT_PLAN = {"main": None, "order": None, "capped": set()}
+#
+#
+#CUSTOMER_EXITS = "/etc/nginx/smartdns-customer-exits.map"
+#
+#
+#def customer_exits_text(pairs):
+#    return ("# Customers the admin panel sent through another exit than this relay's:\n"
+#            "# written by the installer (empty) and smartdns-sync.\n"
+#            + "".join("%s %s;\n" % (ip, group) for ip, group in pairs))
+#
+#
+#def apply_customer_exits(raw):
+#    """Send each of these customers' addresses through their exit - one this
+#    relay has upstreams for, and not its own first one, which is where they
+#    would go anyway."""
+#    if is_single() or not isinstance(raw, dict):
+#        return
+#    order = EXIT_PLAN["order"] or []
+#    pairs = sorted((ip, exit_group(to)) for ip, to in raw.items()
+#                   if is_ipv4(ip) and to in order[1:])
+#    if not nginx_swap(CUSTOMER_EXITS, customer_exits_text(pairs)):
+#        log(WARN, "nginx refused the customers' exits - kept the ones it had")
+#
+#
+## Whether each exit still carries traffic: a TLS handshake with a real site
+## through it, from here - the tunnel's end for the main exit when there is a
+## tunnel, then the exit itself. Two misses in a row and it is down, two
+## answers and it is back: one lost packet moves nothing.
+#HEALTH_NAME = "www.cloudflare.com"
+#EXIT_HEALTH = {}
+#
+#
+#def exit_answers(addr, port, timeout=5.0):
+#    """Milliseconds for a verified TLS handshake with HEALTH_NAME through
+#    this address and port, or None."""
+#    t0 = time.monotonic()
+#    try:
+#        raw = socket.create_connection((addr, port), timeout=timeout)
+#    except OSError:
+#        return None
+#    try:
+#        with ssl.create_default_context().wrap_socket(raw, server_hostname=HEALTH_NAME):
+#            return int((time.monotonic() - t0) * 1000)
+#    except (OSError, ssl.SSLError, ValueError):
+#        return None
+#    finally:
+#        raw.close()
+#
+#
+#def probe_exits():
+#    """Try every exit at once; update EXIT_HEALTH."""
+#    if is_single():
+#        return
+#    main = current_exit_ip()
+#    order = EXIT_PLAN["order"] or ([main] if is_ipv4(main) else [])
+#    tunnel = (CFG.get("TUNNEL") or "off") == "backpack"
+#    seen = {}
+#
+#    def check(ip):
+#        ms = exit_answers("127.0.0.1", 18443) if ip == main and tunnel else None
+#        if ip in NODE_TUNNELS:
+#            ms = exit_answers("127.0.0.1", NODE_TUNNELS[ip])
+#        seen[ip] = ms if ms is not None else exit_answers(ip, 443)
+#
+#    workers = [threading.Thread(target=check, args=(ip,)) for ip in order]
+#    for w in workers:
+#        w.start()
+#    for w in workers:
+#        w.join(15)
+#    for ip in list(EXIT_HEALTH):
+#        if ip not in order:
+#            del EXIT_HEALTH[ip]
+#    for ip in order:
+#        h = EXIT_HEALTH.setdefault(ip, {"fails": 0, "oks": 0, "down": False, "ms": None})
+#        ms = seen.get(ip)
+#        if ms is None:
+#            h["fails"], h["oks"] = h["fails"] + 1, 0
+#            if h["fails"] >= 2 and not h["down"]:
+#                h["down"] = True
+#                log(WARN, "exit %s is not answering - it goes last" % ip)
+#        else:
+#            h["fails"], h["oks"], h["ms"] = 0, h["oks"] + 1, ms
+#            if h["oks"] >= 2 and h["down"]:
+#                h["down"] = False
+#                log(INFO, "exit %s answers again" % ip)
+#
+#
+## The tunnels between relays and nodes. On a relay, one BackPack per node it
+## has a tunnel to; on a node, one per relay. Each from its own directory,
+## smartdns-tunnel@<the other end>, as the exit's are.
+#RELAY_TUNNEL_DIR = "/etc/smart-dns/relay-tunnels"
+#TUNNEL_INSTANCE_FILE = "/etc/systemd/system/smartdns-tunnel@.service"
+#NODE_TUNNEL_BASE = 20000
+## On a relay: the node's tunnel's first port here, for each node it has one to.
+#NODE_TUNNELS = {}
+#NODE_TUNNEL_REPORT = {"state": None}
+#
+#
+#def instance_nft(ip):
+#    return ("/etc/nftables.d/41-smartdns-tunnel-%s.conf" % ip,
+#            "smartdns_tunnel_" + ip.replace(".", "_"))
+#
+#
+#def run_instance(peer, text, listen):
+#    """smartdns-tunnel@<peer> from this config, with this machine's port
+#    answering the peer only when it is the one listening. Whether it runs."""
+#    where = os.path.join(RELAY_TUNNEL_DIR, peer)
+#    os.makedirs(where, mode=0o700, exist_ok=True)
+#    changed = write_if_changed(os.path.join(where, "tunnel.toml"), text, 0o600)
+#    path, table = instance_nft(peer)
+#    if listen:
+#        rules = ("# written by doctor dns: the tunnel's port answers %s only\n"
+#                 "table inet %s\ndelete table inet %s\ntable inet %s {\n    chain input {\n"
+#                 "        type filter hook input priority -5 ; policy accept ;\n"
+#                 "        tcp dport %d ip saddr != %s drop\n"
+#                 "        udp dport %d ip saddr != %s drop\n"
+#                 "        meta nfproto ipv6 tcp dport %d drop\n"
+#                 "        meta nfproto ipv6 udp dport %d drop\n    }\n}\n"
+#                 % (peer, table, table, table, listen, peer, listen, peer, listen, listen))
+#        os.makedirs(os.path.dirname(path), exist_ok=True)
+#        if write_if_changed(path, rules) or changed:
+#            nft("-f", path)
+#    elif os.path.exists(path):
+#        os.unlink(path)
+#        nft("delete", "table", "inet", table)
+#    unit = "smartdns-tunnel@%s" % peer
+#    if changed:
+#        sh("systemctl", "enable", unit)
+#    running = sh("systemctl", "is-active", unit).returncode == 0
+#    if changed or not running:
+#        sh("systemctl", "restart", unit)
+#        running = sh("systemctl", "is-active", unit).returncode == 0
+#        log(INFO, "tunnel to %s (re)started" % peer)
+#    return running
+#
+#
+#def drop_instances(keep):
+#    """Take down every tunnel instance here whose other end is not in `keep`."""
+#    try:
+#        have = [d for d in os.listdir(RELAY_TUNNEL_DIR) if is_ipv4(d)]
+#    except OSError:
+#        have = []
+#    for peer in have:
+#        if peer in keep:
+#            continue
+#        sh("systemctl", "disable", "--now", "smartdns-tunnel@%s" % peer)
+#        subprocess.run(["rm", "-rf", os.path.join(RELAY_TUNNEL_DIR, peer)], capture_output=True)
+#        path, table = instance_nft(peer)
+#        if os.path.exists(path):
+#            os.unlink(path)
+#        nft("delete", "table", "inet", table)
+#        log(INFO, "tunnel to %s taken down" % peer)
+#
+#
+#def apply_node_tunnels(raw):
+#    """On a relay: its tunnels to the nodes, as the admin panel set them."""
+#    if not isinstance(raw, dict) or is_single():
+#        return
+#    want = {}
+#    for node, spec in list(raw.items())[:16]:
+#        clean = clean_tunnel(spec) if isinstance(spec, dict) else None
+#        try:
+#            slot = int(spec.get("slot"))
+#        except (TypeError, ValueError, AttributeError):
+#            slot = 0
+#        if is_ipv4(node) and clean and 1 <= slot <= 99:
+#            want[node] = (clean, NODE_TUNNEL_BASE + slot * 10)
+#    states = {}
+#    if want and not (os.access(BACKPACK_BIN, os.X_OK) and os.path.exists(TUNNEL_INSTANCE_FILE)):
+#        states = {n: {"running": False, "error": "BackPack یا سرویس تونل روی این رله نیست؛ "
+#                                                 "نصب‌کننده را یک بار دیگر اجرا کنید"}
+#                  for n in want}
+#        want = {}
+#    drop_instances(want)
+#    for node, (spec, base) in want.items():
+#        carried = [(name, base + i, port) for i, (name, _, port) in enumerate(TUNNEL_PORTS)]
+#        text = tunnel_toml_text(spec, node, CFG["SYNC_SECRET"], carried)
+#        up = run_instance(node, text, spec["port"] if spec["direction"] == "reverse" else None)
+#        states[node] = {"running": up, "error": ""}
+#    NODE_TUNNELS.clear()
+#    NODE_TUNNELS.update({n: base for n, (_, base) in want.items()})
+#    NODE_TUNNEL_REPORT["state"] = states
+#
+#
+#def exit_side_toml(relay, spec, secret, where):
+#    """A node's end of a relay's tunnel - the exit's, word for word."""
+#    out = ["# written by doctor dns: the admin panel's relays card\n"]
+#    if spec["direction"] == "reverse":
+#        out.append('[client]\nremote_addr = "%s:%d"\n' % (relay, spec["port"]))
+#    else:
+#        out.append('[direct]\nrole = "kharej"\naddr = "0.0.0.0:%d"\n' % spec["port"])
+#        if spec["transport"] in ("wss", "wssmux"):
+#            c, k = where + "/tls.crt", where + "/tls.key"
+#            os.makedirs(where, mode=0o700, exist_ok=True)
+#            if not os.path.exists(c):
+#                sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+#                   "-subj", "/CN=localhost", "-keyout", k, "-out", c)
+#            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
+#    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+#    if spec["direction"] == "reverse":
+#        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
+#    return "".join(out)
+#
+#
+#def apply_relay_tunnels(raw):
+#    """On a node: its ends of the relays' tunnels."""
+#    if not isinstance(raw, dict):
+#        return
+#    want = {}
+#    for relay, spec in list(raw.items())[:64]:
+#        clean = clean_tunnel(dict(spec, on=True)) if isinstance(spec, dict) else None
+#        if is_ipv4(relay) and clean:
+#            want[relay] = clean
+#    if want and not (os.access(BACKPACK_BIN, os.X_OK) and os.path.exists(TUNNEL_INSTANCE_FILE)):
+#        log(WARN, "BackPack or its tunnel service is not on this node - run the installer again")
+#        want = {}
+#    drop_instances(want)
+#    states = {}
+#    for relay, spec in want.items():
+#        where = os.path.join(RELAY_TUNNEL_DIR, relay)
+#        states[relay] = run_instance(relay, exit_side_toml(relay, spec, CFG["SYNC_SECRET"], where),
+#                                     spec["port"] if spec["direction"] == "direct" else None)
+#    NODE_STATE["tunnels"] = states
+#
+#
+#def apply_exits(raw):
+#    if not isinstance(raw, dict) or is_single():
+#        return
+#    main = raw.get("main")
+#    order = []
+#    for ip in raw.get("order") or []:
+#        if is_ipv4(ip) and ip not in order:
+#            order.append(ip)
+#    if not is_ipv4(main) or main not in order:
+#        return
+#    changed = EXIT_PLAN["order"] != order[:8]
+#    EXIT_PLAN.update(main=main, order=order[:8],
+#                     capped={ip for ip in raw.get("capped") or [] if is_ipv4(ip)})
+#    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"):
+#        log(WARN, "nginx refused the way to the exits - kept the one it had")
+#    elif changed:
+#        log(INFO, "exits: %s first" % order[0])
+#
+#
+## ------------------------------------------------------------------ upgrades
+## When the admin panel's job comes to this server: the installer fetched from
+## the panel, its hash checked, and run as a unit of its own - it restarts
+## this program, which must not take the installer down with it. The result
+## waits here, beside the installer's log, until the panel has it.
+#UPGRADE_DIR = "/var/lib/smart-dns/upgrade"
+#VERSION_FILE = "/var/lib/smart-dns/version"
+#
+#
+#def installed_version():
+#    return (read_text(VERSION_FILE) or "").strip()
+#
+#
+#STANDBY_DIR = "/var/lib/smart-dns/standby"
+#
+#
+#def follow_panel(raw):
+#    """Where the panel says it is: the standby that has taken it over is the
+#    panel from now on, and a panel come back from the dead is not."""
+#    if not isinstance(raw, dict) or os.path.exists(PANEL_ENV_HERE):
+#        return
+#    host, standby = raw.get("host"), raw.get("standby") or ""
+#    want = {}
+#    if is_ipv4(host) and host != CFG.get("PANEL_HOST"):
+#        want["PANEL_HOST"] = host
+#        log(WARN, "the panel is on %s now - syncing there from here on" % host)
+#    if (standby == "" or is_ipv4(standby)) and standby != (CFG.get("PANEL_STANDBY") or ""):
+#        want["PANEL_STANDBY"] = standby
+#    if want:
+#        set_sync_env(want)
+#
+#
+#def keep_standby(raw):
+#    """On the standby node: the panel's latest backup and installer, kept
+#    against the day it is needed - and nothing kept once it is not the one."""
+#    if not isinstance(raw, dict):
+#        if os.path.isdir(STANDBY_DIR):
+#            subprocess.run(["rm", "-rf", STANDBY_DIR], capture_output=True)
+#        return None
+#    os.makedirs(STANDBY_DIR, mode=0o700, exist_ok=True)
+#    for name, path, want in (("backup.enc", "/standby-bundle", raw.get("bundle")),
+#                             ("doctor-dns.sh", "/installer", raw.get("installer"))):
+#        where = os.path.join(STANDBY_DIR, name)
+#        try:
+#            with open(where, "rb") as fh:
+#                have = hashlib.sha256(fh.read()).hexdigest()
+#        except OSError:
+#            have = ""
+#        if want and have != want:
+#            blob, _ = fetch(path)
+#            if hashlib.sha256(blob).hexdigest() == want:
+#                with open(where + ".tmp", "wb") as fh:
+#                    fh.write(blob)
+#                os.chmod(where + ".tmp", 0o600)
+#                os.replace(where + ".tmp", where)
+#                log(INFO, "standby: kept the panel's latest %s" % name)
+#    kept = {}
+#    for name, key in (("backup.enc", "bundle"), ("doctor-dns.sh", "installer")):
+#        try:
+#            with open(os.path.join(STANDBY_DIR, name), "rb") as fh:
+#                kept[key] = hashlib.sha256(fh.read()).hexdigest()
+#        except OSError:
+#            kept[key] = ""
+#    return kept
+#
+#
+#def start_upgrade(order):
+#    """Fetch and run the installer the panel names, once."""
+#    if not isinstance(order, dict) or not order.get("sha"):
+#        return
+#    started = read_text(os.path.join(UPGRADE_DIR, "started")) or ""
+#    if started.strip() == order["sha"]:
+#        return                      # running, or done and waiting to be heard
+#    if sh("systemctl", "is-active", "smartdns-upgrade").returncode == 0:
+#        return
+#    blob, headers = fetch("/installer")
+#    if hashlib.sha256(blob).hexdigest() != order["sha"]:
+#        raise RuntimeError("the installer from the panel is not the one it named")
+#    os.makedirs(UPGRADE_DIR, mode=0o700, exist_ok=True)
+#    path = os.path.join(UPGRADE_DIR, "doctor-dns.sh")
+#    with open(path, "wb") as fh:
+#        fh.write(blob)
+#    for name in ("rc", "run.log"):
+#        try:
+#            os.unlink(os.path.join(UPGRADE_DIR, name))
+#        except OSError:
+#            pass
+#    write_if_changed(os.path.join(UPGRADE_DIR, "started"), order["sha"] + "\n", 0o600)
+#    r = sh("systemd-run", "--unit=smartdns-upgrade", "--collect", "--quiet", "/bin/bash", "-c",
+#           "ASSUME_YES=1 bash %s < /dev/null > %s/run.log 2>&1; echo $? > %s/rc"
+#           % (path, UPGRADE_DIR, UPGRADE_DIR))
+#    if r.returncode != 0:
+#        raise RuntimeError("systemd-run: %s" % r.stderr.strip()[-200:])
+#    log(INFO, "upgrading to %s, as the admin panel asked" % order.get("version"))
+#
+#
+#DOMAIN_DIR = "/var/lib/smart-dns/domain"
+#DOMAIN_RETRY = 15 * 60
+#
+#
+#def name_points_here(name):
+#    """Whether the name's A record is this server's address - checked before
+#    anything is run, so a record not made yet is said plainly, not as a
+#    certificate that failed."""
+#    try:
+#        found = {a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)}
+#    except OSError:
+#        found = set()
+#    return CFG.get("SELF_IP") in found, sorted(found)
+#
+#
+#def start_domain(order):
+#    """Give this server the domain the panel names: its certificate, and
+#    DoH and DoT on it - by running the installer again with that name,
+#    which is what a new install with it does. Once per name; a failure is
+#    tried again a quarter of an hour later."""
+#    if not isinstance(order, dict):
+#        return
+#    name = str(order.get("name") or "").lower()
+#    if not re.fullmatch(r"[a-z0-9.-]{4,253}", name) or name == CFG.get("PANEL_DOMAIN"):
+#        return
+#    for unit in ("smartdns-domain", "smartdns-upgrade"):
+#        if sh("systemctl", "is-active", unit).returncode == 0:
+#            return
+#    os.makedirs(DOMAIN_DIR, mode=0o700, exist_ok=True)
+#    tried = os.path.join(DOMAIN_DIR, "tried")
+#    last = (read_text(tried) or "").split()
+#    if last[:1] == [name] and len(last) > 1 and time.time() - float(last[1]) < DOMAIN_RETRY:
+#        return
+#    write_if_changed(tried, "%s %d\n" % (name, time.time()), 0o600)
+#    here, found = name_points_here(name)
+#    if not here:
+#        write_if_changed(os.path.join(DOMAIN_DIR, "result.json"), json.dumps({
+#            "name": name, "ok": False,
+#            "error": "رکورد A دامنه به این سرور (%s) اشاره نمی‌کند؛ الان: %s"
+#                     % (CFG.get("SELF_IP"), "، ".join(found) or "هیچ")}), 0o600)
+#        return
+#    blob, _ = fetch("/installer")
+#    if hashlib.sha256(blob).hexdigest() != order.get("sha"):
+#        raise RuntimeError("the installer from the panel is not the one it named")
+#    path = os.path.join(DOMAIN_DIR, "doctor-dns.sh")
+#    with open(path, "wb") as fh:
+#        fh.write(blob)
+#    for n in ("rc", "run.log", "result.json"):
+#        try:
+#            os.unlink(os.path.join(DOMAIN_DIR, n))
+#        except OSError:
+#            pass
+#    write_if_changed(os.path.join(DOMAIN_DIR, "name"), name + "\n", 0o600)
+#    r = sh("systemd-run", "--unit=smartdns-domain", "--collect", "--quiet", "/bin/bash", "-c",
+#           "PANEL_DOMAIN=%s ASSUME_YES=1 bash %s < /dev/null > %s/run.log 2>&1; echo $? > %s/rc"
+#           % (name, path, DOMAIN_DIR, DOMAIN_DIR))
+#    if r.returncode != 0:
+#        raise RuntimeError("systemd-run: %s" % r.stderr.strip()[-200:])
+#    log(INFO, "getting the domain %s, as the admin panel asked" % name)
+#
+#
+#def domain_result():
+#    """How giving this server its domain went, once there is something to
+#    say; None before."""
+#    early = read_text(os.path.join(DOMAIN_DIR, "result.json"))
+#    if early:
+#        try:
+#            return json.loads(early)
+#        except ValueError:
+#            return None
+#    rc = read_text(os.path.join(DOMAIN_DIR, "rc"))
+#    if rc is None:
+#        return None
+#    text = read_text(os.path.join(DOMAIN_DIR, "run.log")) or ""
+#    name = (read_text(os.path.join(DOMAIN_DIR, "name")) or "").strip()
+#    ok = rc.strip() == "0" and "DNS over HTTPS on https://%s/" % name in text
+#    return {"name": name, "ok": ok, "log": text[-3000:],
+#            "error": "" if ok else "گرفتن گواهی یا روشن کردن DoH نشد"}
+#
+#
+#def domain_heard():
+#    for n in ("rc", "result.json"):
+#        try:
+#            os.unlink(os.path.join(DOMAIN_DIR, n))
+#        except OSError:
+#            pass
+#
+#
+#def upgrade_result():
+#    """How the last upgrade went, once it has finished; None before."""
+#    rc = read_text(os.path.join(UPGRADE_DIR, "rc"))
+#    if rc is None:
+#        return None
+#    text = read_text(os.path.join(UPGRADE_DIR, "run.log")) or ""
+#    return {"version": installed_version(), "log": text[-3000:],
+#            "ok": rc.strip() == "0" and "is installed and working" in text}
+#
+#
+#def upgrade_heard():
+#    """The panel has the result: it is not sent again."""
+#    try:
+#        os.unlink(os.path.join(UPGRADE_DIR, "rc"))
+#    except OSError:
+#        pass
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -10471,6 +14122,8 @@ exit 0
 #    url = ("https://%s:%d/" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
 #           if CFG.get("PANEL_DOMAIN") else "")
 #    payload = {"counters": counters, "host": host, "relay": CFG["SELF_IP"],
+#               # Relay and exit both, so the panel offers it no exits or tunnels.
+#               "single": is_single(),
 #               "panel_url": url,
 #               # The name a bot should give out for DoH and DoT, once this
 #               # relay has the certificate for it; empty until then.
@@ -10493,6 +14146,9 @@ exit 0
 #        log(WARN, "usage not read: %s" % e)
 #    if services:
 #        payload["services"] = services
+#    if EXIT_PENDING:
+#        payload["exit_usage"] = {ip: {to: list(pair) for to, pair in v.items()}
+#                                 for ip, v in EXIT_PENDING.items()}
 #    try:
 #        payload["dns_seen"] = dns_seen()
 #    except Exception as e:
@@ -10504,8 +14160,9 @@ exit 0
 #    if qlog:
 #        payload["qlog"] = qlog
 #    if logs_due():
-#        payload["logs"] = recent_logs()
-#        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT,), 80)
+#        payload["logs"] = ""
+#        payload["log_parts"] = log_parts(RELAY_LOG_PARTS)
+#        payload["tunnel_logs"] = recent_logs((TUNNEL_UNIT, "smartdns-tunnel@*"), 80)
 #        payload["nginx_logs"] = nginx_errors()
 #    finished = WATCH_DONE["result"]
 #    if finished:
@@ -10513,9 +14170,35 @@ exit 0
 #    checked = PROBE_DONE["result"]
 #    if checked:
 #        payload["probe_result"] = checked
+#    if TUNNEL_REPORT["state"] is not None:
+#        payload["tunnel_state"] = TUNNEL_REPORT["state"]
+#    if NODE_TUNNEL_REPORT["state"] is not None:
+#        payload["node_tunnel_state"] = NODE_TUNNEL_REPORT["state"]
+#    try:
+#        probe_exits()
+#    except Exception as e:
+#        log(WARN, "exits not checked: %s" % e)
+#    if EXIT_HEALTH:
+#        payload["exit_health"] = {ip: {"ok": not h["down"], "ms": h["ms"]}
+#                                  for ip, h in EXIT_HEALTH.items()}
+#    payload["version"] = installed_version()
+#    finished_upgrade = upgrade_result()
+#    if finished_upgrade:
+#        payload["upgrade_result"] = finished_upgrade
+#    finished_domain = domain_result()
+#    if finished_domain:
+#        payload["domain_result"] = finished_domain
 #    answer = post("/sync", payload)
+#    if finished_domain and answer.get("domain_ack"):
+#        domain_heard()
+#    try:
+#        start_domain(answer.get("domain"))
+#    except Exception as e:
+#        log(WARN, "domain not started: %s" % e)
 #    if services:
 #        USAGE_PENDING.clear()
+#    if "exit_usage" in payload:
+#        EXIT_PENDING.clear()
 #    if "doh_stats" in payload:
 #        DOH_PENDING["doh"].clear()
 #        DOH_PENDING["dot"].clear()
@@ -10562,12 +14245,43 @@ exit 0
 #        apply_doh_name(answer.get("doh_name"))
 #    except Exception as e:
 #        log(WARN, "DoH name not applied: %s" % e)
+#    if finished_upgrade and answer.get("upgrade_ack"):
+#        upgrade_heard()
+#    try:
+#        follow_panel(answer.get("panel"))
+#    except Exception as e:
+#        log(WARN, "the panel's whereabouts not kept: %s" % e)
+#    try:
+#        start_upgrade(answer.get("upgrade"))
+#    except Exception as e:
+#        log(WARN, "upgrade not started: %s" % e)
+#    try:
+#        apply_node_tunnels(answer.get("node_tunnels"))
+#    except Exception as e:
+#        log_exception("tunnels to the nodes not applied: %s" % e)
+#    try:
+#        apply_exits(answer.get("exits"))
+#    except Exception as e:
+#        log_exception("exits not applied: %s" % e)
+#    try:
+#        apply_customer_exits(answer.get("customer_exits"))
+#    except Exception as e:
+#        log_exception("customers' exits not applied: %s" % e)
+#    try:
+#        apply_tunnel(answer.get("tunnel"))
+#    except Exception as e:
+#        TUNNEL_REPORT["state"] = {"on": False, "error": str(e)[:300]}
+#        log_exception("tunnel not applied: %s" % e)
 #    try:
 #        maybe_bench(answer.get("bench"))
 #    except Exception as e:
 #        log(WARN, "resolvers not timed: %s" % e)
 #    try:
 #        new_upstream = apply_upstream(answer.get("upstream"))
+#        # A single machine joined to another panel is its own exit as well:
+#        # its nginx asks the same resolvers, as a node's does.
+#        if is_single() and not os.path.exists(PANEL_ENV_HERE):
+#            apply_node_resolvers(answer.get("upstream"))
 #    except Exception as e:
 #        new_upstream = False
 #        log_exception("resolvers not applied: %s" % e)
@@ -10597,6 +14311,10 @@ exit 0
 #        write_doh_state(answer.get("doh"), ports or {}, assignment, want)
 #    except Exception as e:
 #        log_exception("DoH state not written: %s" % e)
+#    try:
+#        apply_gate_dns()
+#    except Exception as e:
+#        log_exception("the way back for unregistered addresses not set: %s" % e)
 #
 #    try:
 #        apply_speeds(answer.get("allowed") or [])
@@ -10614,7 +14332,11 @@ exit 0
 #
 #    # After the set is filled, not before: enforcing while the kernel list is
 #    # still empty is refused, and would leave the relay open for another cycle.
-#    close_relay_when_ready(len(want))
+#    if follow_public(bool(answer.get("public")), len(want)):
+#        try:
+#            apply_gate_dns()
+#        except Exception as e:
+#            log_exception("the way back for unregistered addresses not set: %s" % e)
 #    return len(want), len(want - have), len(have - want)
 #
 #
@@ -10650,14 +14372,17 @@ exit 0
 # --faint:#6e7681;--accent:#7dd3a0;--accent2:#58a6ff;--btn:#238636;
 # --btn-hover:#2ea043;--on-btn:#ffffff;--danger:#6e2c2c;--warn:#e3b341;
 # --bad:#f85149;--good-bg:#12261a;--err-bg:#2b1416;--warn-bg:#2b2411;
-# --warn-line:#6e5a2c;--sun:inline;--moon:none"""
+# --warn-line:#6e5a2c;--sun:inline;--moon:none;
+# --shadow:0 1px 2px rgba(0,0,0,.35);--pop:0 10px 30px rgba(0,0,0,.45)"""
 #LIGHT = """color-scheme:light;
 # --bg:#f6f8fa;--card:#ffffff;--line:#d0d7de;--line2:#afb8c1;--row:#eaeef2;
 # --track:#eaeef2;--fg:#1f2328;--head:#24292f;--muted:#59636e;--dim:#57606a;
 # --faint:#6e7781;--accent:#1a7f37;--accent2:#0969da;--btn:#1f883d;
 # --btn-hover:#1a7f37;--on-btn:#ffffff;--danger:#cf222e;--warn:#9a6700;
 # --bad:#cf222e;--good-bg:#dafbe1;--err-bg:#ffebe9;--warn-bg:#fff8c5;
-# --warn-line:#d4a72c;--sun:none;--moon:inline"""
+# --warn-line:#d4a72c;--sun:none;--moon:inline;
+# --shadow:0 1px 2px rgba(31,35,40,.04),0 4px 14px rgba(31,35,40,.05);
+# --pop:0 10px 30px rgba(31,35,40,.15)"""
 #THEME_CSS = (":root{%s}\n"
 #             "@media (prefers-color-scheme: light){:root:not([data-theme=dark]){%s}}\n"
 #             ":root[data-theme=light]{%s}\n" % (DARK, LIGHT, LIGHT))
@@ -10672,7 +14397,12 @@ exit 0
 #    "(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'),"
 #    "n=c=='light'?'dark':'light';r.setAttribute('data-theme',n);"
 #    "try{localStorage.setItem('theme',n)}catch(e){}})(document.documentElement)\">"
-#    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>")
+#    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>"
+#    "<button type='button' class='theme lang' title='English / فارسی'"
+#    " aria-label='English / فارسی' onclick=\"document.cookie='lang='+"
+#    "(document.documentElement.lang=='en'?'fa':'en')+"
+#    "'; path=/; max-age=31536000; samesite=lax';location.reload()\">"
+#    "<span class='fa-only'>EN</span><span class='en-only'>فا</span></button>")
 #
 ## Vazirmatn, served by this panel: every font host worth using is blocked or
 ## slow from Iran. swap: the page is readable in the system font at once, on a
@@ -10786,6 +14516,18 @@ exit 0
 #details.pw>.msg{margin:0 16px 12px}
 #.copy{display:flex;gap:6px;margin:0 16px 10px}
 #.copy input{flex:1;min-width:0;direction:ltr;font-size:12px;padding:9px 10px}
+#.dns>.copy{margin:0 0 10px}
+#form.codebox{display:flex;gap:6px;margin:0 0 10px}
+#form.codebox input{flex:1;min-width:0;padding:9px 10px}
+#form.codebox button{width:auto;margin:0;padding:9px 16px}
+#.dns>label{margin-top:10px}
+#table.moves{width:calc(100% - 32px);margin:0 16px 14px;border-collapse:collapse;
+# font-size:12px}
+#table.moves td{padding:7px 4px;border-bottom:1px solid var(--row);vertical-align:top}
+#table.moves td small{display:block;color:var(--muted)}
+#table.moves td:first-child,table.moves td:last-child{white-space:nowrap}
+#table.moves td:first-child{direction:ltr;text-align:right;color:var(--muted)}
+#table.moves td:last-child{text-align:left}
 #.copy button{width:auto;padding:8px 14px;margin:0;font-size:12px;flex:none}
 #button.small{width:auto;padding:6px 12px;margin:0;font-size:12px}
 #.ok{color:var(--accent)}.bad{color:var(--bad)}.warn{color:var(--warn)}
@@ -10837,6 +14579,8 @@ exit 0
 # font-size:17px;font-weight:400;line-height:1;cursor:pointer}
 #button.theme:hover{background:var(--row)}
 #.theme .sun{display:var(--sun)}.theme .moon{display:var(--moon)}
+#.theme.lang{left:auto;right:14px;font-size:12px;font-weight:700;letter-spacing:.5px}
+#html[lang=en] .fa-only,html:not([lang=en]) .en-only{display:none}
 #"""
 #
 ## Where the installer writes the version it installed. Read per page rather
@@ -10897,8 +14641,101 @@ exit 0
 #PANEL_ENV_HERE = "/etc/smart-dns/panel.env"
 #
 #
+#def is_single():
+#    """One machine that is relay and exit both: with its own panel, or
+#    joined to the panel on another (SINGLE=1 in sync.env). It has no exits
+#    to choose between and no tunnels."""
+#    return os.path.exists(PANEL_ENV_HERE) or (CFG or {}).get("SINGLE") == "1"
+#
+#
+## ---------------------------------------------------------------- English
+## The pages and the bot are written in Persian; English is the same text with
+## every Persian phrase swapped for its English, from one file the installer
+## ships (domains/i18n-en.json). A phrase is a piece of a Persian string in the
+## code, cut where a value goes in and at each tag - tools/i18n-extract.py lists
+## them. What somebody typed - a name, a note - is left as they wrote it.
+#I18N_FILE = "/usr/local/share/smart-dns/i18n-en.json"
+#I18N = {}
+#
+#
+#def english_index():
+#    """The phrases by their first two characters, longest first."""
+#    if "index" not in I18N:
+#        try:
+#            with open(I18N_FILE, encoding="utf-8") as fh:
+#                pairs = json.load(fh)
+#        except (OSError, ValueError):
+#            pairs = {}
+#        index = {}
+#        for k, v in pairs.items():
+#            if len(k) >= 2 and isinstance(v, str):
+#                # Plain text only: the English goes into attributes and
+#                # script strings quoted either way.
+#                v = v.replace("'", "\u2019").replace('"', "\u201d")
+#                index.setdefault(k[:2], []).append((k, v))
+#        for bucket in index.values():
+#            bucket.sort(key=lambda kv: -len(kv[0]))
+#        I18N["index"] = index
+#    return I18N["index"]
+#
+#
+#def fa_letter(c):
+#    """Part of a Persian word: a letter or a mark on one, not the comma,
+#    the semicolon or a digit - "نشد؛" ends a word at the "؛"."""
+#    return "\u0621" <= c <= "\u065f" or "\u066e" <= c <= "\u06d3" or c == "\u200c"
+#
+#
+#def to_english(text):
+#    """`text` with every known Persian phrase in English. A phrase is only
+#    taken whole - never the front of a longer Persian word."""
+#    index = english_index()
+#    if not index or not text or not any("\u0600" <= c <= "\u06ff" for c in text):
+#        return text
+#    out, last, i, n = [], 0, 0, len(text)
+#    while i < n:
+#        bucket = index.get(text[i:i + 2])
+#        if bucket and not (fa_letter(text[i]) and i and fa_letter(text[i - 1])):
+#            for k, v in bucket:
+#                end = i + len(k)
+#                if text.startswith(k, i) and not (
+#                        fa_letter(k[-1]) and end < n and fa_letter(text[end])):
+#                    out.append(text[last:i])
+#                    out.append(v)
+#                    i = last = end
+#                    break
+#            else:
+#                i += 1
+#            continue
+#        i += 1
+#    out.append(text[last:])
+#    # What is left - the quote marks around a name, a digit - in English form.
+#    return "".join(out).translate(ENGLISH_MARKS)
+#
+#
+#ENGLISH_MARKS = str.maketrans({"\u00ab": "\u201c", "\u00bb": "\u201d", "\u060c": ",",
+#                               "\u061b": ";", "\u061f": "?", "\u066a": "%",
+#                               **{chr(0x06f0 + i): str(i) for i in range(10)},
+#                               **{chr(0x0660 + i): str(i) for i in range(10)}})
+#
+#
+#def english_page(page_html):
+#    """A whole page in English, laid out left to right."""
+#    return to_english(page_html).replace('<html lang="fa" dir="rtl">',
+#                                         '<html lang="en" dir="ltr">', 1)
+#
+#
+#def wants_english(headers):
+#    """Whether this browser picked English - a cookie the button sets."""
+#    try:
+#        cookie = http.cookies.SimpleCookie((headers or {}).get("Cookie", "") or "")
+#    except http.cookies.CookieError:
+#        return False
+#    return "lang" in cookie and cookie["lang"].value == "en"
+#
+#
+#
 #def user_page(inner):
-#    if os.path.exists(PANEL_ENV_HERE):
+#    if is_single():
 #        inner = one_server_words(inner)
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
@@ -10943,10 +14780,18 @@ exit 0
 #            % html.escape(brand()))
 #
 #
-#def signup_form(banner=""):
+#REF_RE = re.compile(r"[A-Za-z0-9]{6,16}")
+#
+#
+#def signup_form(banner="", ref=""):
+#    # An invitation code, carried on to the panel with the form. Only its own
+#    # characters, so it goes into the page as it is.
+#    ref = ref if REF_RE.fullmatch(ref or "") else ""
 #    return (banner +
+#            ("<div class='msg good'>🎁 با لینک دعوت یکی از دوستانتان آمده‌اید.</div>"
+#             if ref else "") +
 #            "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
-#            "<form method='post' action='/signup'>"
+#            "<form method='post' action='/signup'>%s"
 #            "<label>نام</label>"
 #            "<input name='name' maxlength='60' autocomplete='name'>"
 #            "<label>نام کاربری</label>"
@@ -10965,7 +14810,8 @@ exit 0
 #            "حروف انگلیسی، عدد، و . _ - ؛ بزرگ و کوچک فرقی ندارد. اگر قبلاً "
 #            "کسی گرفته باشدش، پیغام می‌دهد.</p>"
 #            "<p class='alt'>حساب دارید؟ <a href='/login'>وارد شوید</a></p>"
-#            % html.escape(brand()))
+#            % (html.escape(brand()),
+#               "<input type='hidden' name='ref' value='%s'>" % ref if ref else ""))
 #
 #
 #def login_form(banner=""):
@@ -11150,6 +14996,12 @@ exit 0
 #    same allowance is noise, and the reader stops reading.
 #    """
 #    status = info.get("status")
+#    # Their seller's allowance ran out, not theirs: nothing on this page
+#    # would fix it, so it says whom to ask.
+#    if info.get("seller_stopped") and status == "active":
+#        return ("<div class='msg err'><b>سرویس فروشندهٔ شما موقتاً قطع است.</b> "
+#                "حساب شما سر جایش است؛ برای وصل شدن دوباره با فروشنده‌تان تماس "
+#                "بگیرید.</div>")
 #    # First thing a new customer sees, so it says what to do rather than what
 #    # is wrong. Nothing is wrong: they have an account, and it is waiting.
 #    if status == "pending":
@@ -11222,14 +15074,31 @@ exit 0
 #    return "<br><small class='games'>%s</small>" % "، ".join(shown)
 #
 #
+#def code_box(info):
+#    """A discount code: typed, it reloads the page with the plans' prices
+#    after it, so the customer transfers the right sum."""
+#    msg = info.get("code_message")
+#    return ("<form method='get' action='/' class='codebox'><input name='code' dir='ltr' "
+#            "maxlength='32' placeholder='کد تخفیف' value='%s'><button class='ghost'>اعمال"
+#            "</button></form>%s"
+#            % (html.escape(info.get("code") or ""),
+#               "<div class='msg %s'>%s</div>" % ("good" if info.get("code_ok") else "err",
+#                                                 html.escape(msg)) if msg else ""))
+#
+#
 #def plan_line(p):
 #    """One plan as the customer reads it: what they get and what it costs."""
 #    size = ("%g گیگ" % (p["quota_bytes"] / 1024.0 ** 3)) if p["quota_bytes"] \
 #        else "حجم نامحدود"
 #    bits = [size, "%d روز" % p["days"]]
+#    if (p.get("devices") or 1) > 1:
+#        bits.append("%d دستگاه" % p["devices"])
 #    if p.get("speed_kbps"):
 #        bits.append("تا %g مگابیت" % (p["speed_kbps"] / 1000.0))
-#    return "%s · %s تومان" % ("، ".join(bits), format(p["price"], ","))
+#    if p.get("list_price") and p["list_price"] != p["price"]:
+#        return "%s · <s>%s</s> %s تومان" % (html.escape("، ".join(bits)),
+#                                           format(p["list_price"], ","), format(p["price"], ","))
+#    return "%s · %s تومان" % (html.escape("، ".join(bits)), format(p["price"], ","))
 #
 #
 #def pay_box(info):
@@ -11284,7 +15153,11 @@ exit 0
 #                   " رسید تازه جای آن را می‌گیرد.</div>"
 #                   % (" برای «%s»" % html.escape(waiting["plan"])
 #                      if waiting.get("plan") else "", html.escape(waiting["at"])))
+#    if plans:
+#        out.append(code_box(info))
 #    out.append("<form method='post' action='/receipt' enctype='multipart/form-data'>")
+#    if info.get("code"):
+#        out.append("<input type='hidden' name='code' value='%s'>" % html.escape(info["code"]))
 #    if plans:
 #        out.append("<p class='note' style='margin-top:0'>پلن را انتخاب کنید، مبلغش "
 #                   "را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار "
@@ -11300,7 +15173,7 @@ exit 0
 #                " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
 #                % (p["id"], " checked" if mine else "", html.escape(p["name"]),
 #                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
-#                   html.escape(plan_line(p)),
+#                   plan_line(p),
 #                   plan_games(p) +
 #                   ("<br><small>%s</small>" % html.escape(p["note"])
 #                    if p.get("note") else "")))
@@ -11318,32 +15191,156 @@ exit 0
 #                   + pay_box(info))
 #    out.append("<input type='file' name='file' required "
 #               "accept='image/jpeg,image/png,image/webp,application/pdf'>"
-#               "<button class='ghost'>فرستادن رسید</button></form></div>")
+#               "<button class='ghost'>فرستادن رسید</button>")
+#    wallet = info.get("wallet") or 0
+#    if plans and wallet > 0:
+#        # The same form, the plan chosen above - without the slip.
+#        out.append("<button formaction='/wallet-buy' formnovalidate>💰 پرداخت از کیف پول "
+#                   "(موجودی %s تومان)</button><p class='note'>پلن انتخاب‌شده فوراً فعال "
+#                   "می‌شود و قیمتش از کیف پول کم می‌شود؛ رسید لازم نیست.</p>"
+#                   % format(wallet, ","))
+#    out.append("</form></div>")
 #    return "".join(out)
 #
 #
-#def dns_box():
-#    """The address the customer has to type into their console or router.
+#def money(n):
+#    return format(n or 0, ",")
 #
-#    Served by the relay, so it is this machine's own address - not something
-#    configured twice and able to disagree. A customer on a second relay is
-#    looking at that relay's page and gets that relay's address, which is the
-#    one that will work for them.
 #
-#    Only the first is given. Consoles ask for two, and the honest answer is to
-#    repeat this one: a second, different resolver would answer the sanctioned
-#    names truthfully and the service would fail intermittently in a way nobody
-#    could diagnose.
-#    """
-#    ip = (CFG or {}).get("SELF_IP", "")
-#    if not ip:
+#def wallet_box(info):
+#    """The wallet: what is in it, topping it up with a receipt, and where the
+#    money came from and went."""
+#    moves = info.get("wallet_moves") or []
+#    if not info.get("wallet_on") and not info.get("wallet") and not moves:
 #        return ""
-#    return ("<div class='dns'><div class='k'>آدرس DNS</div>"
-#            "<div class='big'>%s</div>"
-#            "<p class='note'>این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
-#            "به‌عنوان <b>DNS اول</b> بگذارید. اگر DNS دوم هم می‌خواهد، "
-#            "<b>همین آدرس</b> را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود "
-#            "سرویس گاهی کار کند و گاهی نه.</p></div>" % html.escape(ip))
+#    out = ["<div class='dns'><div class='k'>💰 کیف پول</div>"
+#           "<p class='note' style='margin-top:0'>موجودی: <b>%s تومان</b>. با موجودی "
+#           "کیف پول، پلن را از بخش «خرید یا تمدید» بدون رسید و فوری بخرید.</p>"
+#           % money(info.get("wallet"))]
+#    if info.get("wallet_on") and not info.get("telegram_required"):
+#        out.append("<details class='pw'><summary>شارژ کیف پول</summary>"
+#                   "<form method='post' action='/wallet-topup' enctype='multipart/form-data'>"
+#                   "<label>مبلغ (تومان)</label>"
+#                   "<input name='amount' required inputmode='numeric' dir='ltr' "
+#                   "placeholder='%s'>%s"
+#                   "<label>عکس رسید واریز (عکس یا PDF، حداکثر ۴ مگابایت)</label>"
+#                   "<input type='file' name='file' required "
+#                   "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+#                   "<button class='ghost'>فرستادن رسید شارژ</button></form>"
+#                   "<p class='note'>همین مبلغ را واریز کنید و رسیدش را بفرستید؛ بعد از "
+#                   "تأیید، به کیف پولتان اضافه می‌شود. حداقل %s تومان.</p></details>"
+#                   % (money(max(info.get("topup_min") or 0, 100000)), pay_box(info),
+#                      money(info.get("topup_min"))))
+#    if moves:
+#        out.append("<details class='pw'><summary>گردش کیف پول</summary><table class='moves'>")
+#        for m in moves:
+#            out.append("<tr><td>%s</td><td>%s%s</td><td dir='ltr' class='%s'>%s%s</td></tr>"
+#                       % (html.escape((m.get("at") or "")[:10]), html.escape(m.get("what") or ""),
+#                          " <small>%s</small>" % html.escape(m["note"]) if m.get("note") else "",
+#                          "ok" if m["amount"] > 0 else "bad",
+#                          "+" if m["amount"] > 0 else "−", money(abs(m["amount"]))))
+#        out.append("</table></details>")
+#    out.append("</div>")
+#    return "".join(out)
+#
+#
+#def device_box(info):
+#    """An extra device - another address at once - while the operator sells
+#    them: from the wallet, or with a receipt."""
+#    offer = info.get("device_offer")
+#    if not offer:
+#        return ""
+#    out = ["<div class='dns'><div class='k'>📱 دستگاه اضافه</div>"
+#           "<p class='note' style='margin-top:0'>الان %d دستگاه دارید — یعنی %d آی‌پی "
+#           "هم‌زمان. هر دستگاه اضافه %s تومان؛ تا وقتی همین پلن را تمدید کنید می‌ماند.</p>"
+#           % (offer["devices"], offer["devices"], money(offer["price"]))]
+#    if not offer.get("available"):
+#        out.append("<p class='note'>%s</p></div>" % html.escape(offer.get("why") or ""))
+#        return "".join(out)
+#    if (info.get("wallet") or 0) >= offer["price"]:
+#        out.append("<form method='post' action='/device-wallet'><button>💰 خرید از کیف پول "
+#                   "(موجودی %s تومان)</button></form>" % money(info.get("wallet")))
+#    out.append("<details class='pw'><summary>خرید با رسید</summary>"
+#               "<form method='post' action='/device-receipt' enctype='multipart/form-data'>%s"
+#               "<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>"
+#               "<input type='file' name='file' required "
+#               "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+#               "<button class='ghost'>فرستادن رسید</button></form>"
+#               "<p class='note'>%s تومان را واریز کنید و رسیدش را بفرستید؛ بعد از تأیید، یک "
+#               "دستگاه به حسابتان اضافه می‌شود.</p></details></div>"
+#               % (pay_box(info), money(offer["price"])))
+#    return "".join(out)
+#
+#
+#def ref_box(info, host=""):
+#    """The customer's invitation link, while the operator pays for them."""
+#    ref = info.get("ref")
+#    if not ref:
+#        return ""
+#    web = ref.get("web_link") or (
+#        "https://%s/signup?ref=%s" % (host, ref["code"])
+#        if re.fullmatch(r"[A-Za-z0-9.-]{1,253}(:\d{1,5})?", host or "") else "")
+#    out = ["<div class='dns'><div class='k'>🎁 دعوت از دوستان</div>"
+#           "<p class='note' style='margin-top:0'>هر کس با لینک شما حساب بسازد و پلن بخرد، "
+#           "<b>%d٪</b> مبلغ %s به کیف پول شما اضافه می‌شود.</p>"
+#           % (ref["percent"], "اولین خریدش" if ref.get("mode") == "first"
+#              else "هر خرید و تمدیدش")]
+#    if ref.get("bot_link"):
+#        out.append("<label>لینک ربات</label>" + copy_field(ref["bot_link"], "لینک دعوت ربات"))
+#    if web:
+#        out.append("<label>لینک ثبت‌نام در همین سایت</label>"
+#                   + copy_field(web, "لینک دعوت سایت"))
+#    out.append("<p class='note'>تا حالا %d نفر با لینک شما آمده‌اند و %s تومان "
+#               "پورسانت گرفته‌اید.</p></div>" % (ref.get("invited") or 0,
+#                                                money(ref.get("earned"))))
+#    return "".join(out)
+#
+#
+#def dns_box(info=None):
+#    """The addresses the customer types into their console or router: the
+#    relays the admin shows them, as the panel sends them, or this relay's
+#    own when it sends none.
+#
+#    Two of ours may go in as DNS 1 and DNS 2 - they answer alike. What must
+#    not go in second is anybody else's resolver: it answers the sanctioned
+#    names truthfully, and the service fails now and then in a way nobody could
+#    diagnose. So with one address, it is to be typed twice.
+#    """
+#    ips = [ip for ip in (info or {}).get("dns") or []
+#           if isinstance(ip, str) and re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip)]
+#    notes = {str(s.get("ip")): str(s.get("note") or "")[:120]
+#             for s in (info or {}).get("servers") or [] if isinstance(s, dict)}
+#    if not ips and (CFG or {}).get("SELF_IP"):
+#        ips = [CFG["SELF_IP"]]
+#    if not ips:
+#        return ""
+#    if len(ips) == 1:
+#        return ("<div class='dns'><div class='k'>آدرس DNS</div>"
+#                "<div class='big'>%s</div>%s"
+#                "<p class='note'>این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
+#                "به‌عنوان <b>DNS اول</b> بگذارید. اگر DNS دوم هم می‌خواهد، "
+#                "<b>همین آدرس</b> را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود "
+#                "سرویس گاهی کار کند و گاهی نه.</p></div>"
+#                % (html.escape(ips[0]), "<p class='note'>%s</p>" % html.escape(notes[ips[0]])
+#                   if notes.get(ips[0]) else ""))
+#    names = ["DNS اول", "DNS دوم"] + ["DNS پشتیبان"] * (len(ips) - 2)
+#    # The admin's words for a server, where there are any, in place of
+#    # "DNS 1", "DNS 2" - they say which to take better than the order does.
+#    rows = "".join("<div class='row'><span class='k'>%s</span><span class='v big' dir='ltr'>"
+#                   "%s</span></div>" % (html.escape(notes[ip]) if notes.get(ip) else n,
+#                                        html.escape(ip)) for n, ip in zip(names, ips))
+#    if any(notes.get(ip) for ip in ips):
+#        # The words say which to take: one of them, in both boxes.
+#        how = ("<p class='note'>توضیح کنار هر آدرس می‌گوید کدام برای شما بهتر است. همان را در "
+#               "تنظیمات شبکهٔ کنسول، گوشی یا مودم، هم به‌عنوان <b>DNS اول</b> و هم <b>DNS "
+#               "دوم</b> بگذارید. DNS دیگری کنارش نگذارید — سرویس گاهی کار می‌کند و گاهی "
+#               "نه.</p>")
+#    else:
+#        how = ("<p class='note'>این‌ها را در تنظیمات شبکهٔ کنسول، گوشی یا مودم بگذارید: "
+#               "اولی را به‌عنوان <b>DNS اول</b> و دومی را <b>DNS دوم</b>. هر دو مال همین "
+#               "سرویس‌اند و یکسان جواب می‌دهند؛ اگر یکی در دسترس نبود، دستگاه سراغ دیگری "
+#               "می‌رود. DNS دیگری کنارشان نگذارید — سرویس گاهی کار می‌کند و گاهی نه.</p>")
+#    return "<div class='dns'><div class='k'>آدرس‌های DNS</div>%s%s</div>" % (rows, how)
 #
 #
 #def human_fa(n):
@@ -11643,30 +15640,78 @@ exit 0
 #            % (v, html.escape(label)))
 #
 #
-#def windows_command(url):
+#def windows_command(url, me=None):
 #    """PowerShell for Windows 11: register the address as the DoH template
 #    for this relay, and point every connected adapter at the relay."""
-#    me = CFG.get("SELF_IP") or ""
+#    me = me or CFG.get("SELF_IP") or ""
 #    return ('Add-DnsClientDohServerAddress -ServerAddress %s -DohTemplate "%s"'
 #            ' -AllowFallbackToUdp $false -AutoUpgrade $true; '
 #            'Get-NetAdapter | Where-Object Status -eq Up | '
 #            'Set-DnsClientServerAddress -ServerAddresses %s' % (me, url, me))
 #
 #
+#def servers_doh(info):
+#    """The customer's servers that have DoH, as the panel sends them."""
+#    out = []
+#    for s in (info or {}).get("servers") or []:
+#        if not isinstance(s, dict):
+#            continue
+#        ip, host, url = str(s.get("ip") or ""), str(s.get("dot") or ""), str(s.get("doh") or "")
+#        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) and \
+#                re.fullmatch(r"[a-z0-9.-]{3,253}", host) and url.startswith("https://%s/" % host):
+#            out.append({"ip": ip, "dot": host, "doh": url, "n": int(s.get("n") or 0),
+#                        "single": bool(s.get("single")),
+#                        "note": str(s.get("note") or "")[:120]})
+#    return out
+#
+#
+#def servers_doh_box(info, servers):
+#    """Every server of the customer's with DoH on: each one's DoH, DoT, iPhone
+#    profile and Windows command, side by side - when one name is filtered,
+#    the next is right there."""
+#    out = ["<details class='pw doh'><summary>🔒 DNS رمزگذاری‌شده</summary>"
+#           "<p class='note'>همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار "
+#           "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. هر سرور آدرس‌های خودش را دارد؛ اگر یکی فیلتر "
+#           "شد، سراغ دیگری بروید. آدرس‌های DoH مخصوص حساب شماست.</p>"
+#           "<form method='post' action='/doh-reset' style='margin:0 16px 4px' onsubmit="
+#           "\"return confirm('آدرس‌های فعلی از کار می‌افتند و باید آدرس تازه را روی "
+#           "دستگاه‌هایتان بگذارید. ادامه می‌دهید؟')\"><button class='ghost small'>"
+#           "ساختن آدرس تازه</button></form>"]
+#    for s in servers:
+#        out.append("<h3>%s %d — <span dir='ltr'>%s</span></h3>%s"
+#                   % ("تک‌سرور" if s["single"] else "سرور", s["n"], html.escape(s["ip"]),
+#                      "<p class='note' style='margin-top:0'>%s</p>" % html.escape(s["note"])
+#                      if s["note"] else ""))
+#        out.append("<p class='note' style='margin-bottom:2px'><b>DoH</b> — آیفون، ویندوز، "
+#                   "کروم و فایرفاکس</p>" + copy_field(s["doh"], "DoH"))
+#        out.append("<p class='note' style='margin-bottom:2px'><b>DoT</b> — اندروید ← DNS "
+#                   "خصوصی</p>" + copy_field(s["dot"], "DoT (اندروید ← DNS خصوصی)"))
+#        out.append("<a class='btn ghost' href='/doh.mobileconfig?h=%s'>پروفایل آیفون این سرور</a>"
+#                   % urllib.parse.quote(s["dot"]))
+#        out.append("<details><summary class='note'>دستور ویندوز ۱۱</summary>%s</details>"
+#                   % copy_field(windows_command(s["doh"], s["ip"]), "دستور ویندوز"))
+#    out.append("<p class='note'>آیفون: بعد از دانلود پروفایل، تنظیمات ← پروفایل دانلودشده ← "
+#               "نصب. اندروید: تنظیمات ← Private DNS ← نام میزبان، و نام DoT یک سرور. کروم و "
+#               "فایرفاکس: بخش DNS امن تنظیماتشان، و آدرس DoH یک سرور.</p></details>")
+#    return "".join(out)
+#
+#
 #def doh_box(info, profile="/doh.mobileconfig", setup=False):
 #    """The encrypted-DNS section: folded away on the account page, open on
 #    the setup page a browser that opened the DoH address is sent to."""
+#    servers = [] if setup else servers_doh(info)
+#    if servers:
+#        return servers_doh_box(info, servers)
 #    url = doh_url(info)
 #    if not url:
 #        return ""
 #    host = doh_public_name()
 #    return (
-#        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده — وقتی اپراتور DNS را "
-#        "دست‌کاری می‌کند</summary>" % (" open" if setup else "") +
-#        "<p class='note'>برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند: "
-#        "همان سرویس، از راه رمزگذاری‌شده. مثل DNS معمولی فقط روی اینترنتی کار "
-#        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله "
-#        "می‌گوید قالب شما کدام است.</p>"
+#        "<details class='pw doh'%s><summary>🔒 DNS رمزگذاری‌شده</summary>"
+#        % (" open" if setup else "") +
+#        "<p class='note'>همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار "
+#        "می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله می‌گوید "
+#        "قالب شما کدام است.</p>"
 #        "<h3>DoH — DNS over HTTPS</h3>"
 #        + copy_field(url, "آدرس DoH شخصی")
 #        # Not on the setup page: that one is opened by the address itself,
@@ -11700,16 +15745,17 @@ exit 0
 #        "</details>")
 #
 #
-#def mobileconfig(info):
+#def mobileconfig(info, server=None):
 #    """An iOS/macOS profile that turns the personal address on for the whole
-#    device. The UUIDs come from the token, so downloading it again replaces
-#    the profile rather than adding a second one."""
-#    url = doh_url(info)
+#    device - this relay's, or one of the customer's other servers'. The UUIDs
+#    come from the token, so downloading it again replaces the profile rather
+#    than adding a second one."""
+#    url = server["doh"] if server else doh_url(info)
 #    token = info.get("doh_token") or ""
 #    one = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-payload:" + token)).upper()
 #    two = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-profile:" + token)).upper()
 #    name = html.escape(brand())
-#    me = html.escape(CFG.get("SELF_IP") or "")
+#    me = html.escape(server["ip"] if server else (CFG.get("SELF_IP") or ""))
 #    return ("""<?xml version="1.0" encoding="UTF-8"?>
 #<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 #<plist version="1.0">
@@ -12077,7 +16123,10 @@ exit 0
 #        return self.client_address[0]
 #
 #    def send_html(self, body, code=200, headers=None):
-#        blob = user_page(body).encode("utf-8")
+#        page = user_page(body)
+#        if wants_english(getattr(self, "headers", None)):
+#            page = english_page(page)
+#        blob = page.encode("utf-8")
 #        # See send(): a clean buffer, so a failed attempt cannot leave half a
 #        # status line in front of this one.
 #        self._headers_buffer = []
@@ -12145,6 +16194,13 @@ exit 0
 #        raw = self.rfile.read(length).decode("utf-8", "replace")
 #        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 #
+#    def field(self, name):
+#        """A short text field of a multipart form, or ""."""
+#        try:
+#            return self.upload(name)[0].decode("utf-8", "replace").strip()[:40]
+#        except ValueError:
+#            return ""
+#
 #    def cookie_for(self, session):
 #        return ("sdu=%s; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=%d"
 #                % (session, 30 * 86400))
@@ -12192,9 +16248,10 @@ exit 0
 #            # their way to the page that would have given them a new one.
 #            back = ("<p class='alt'><a href='/'>برگشت به حساب</a></p>"
 #                    if self.session() else "")
+#            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 #            return self.send_html(
-#                (signup_form(self.banner()) if path == "/signup"
-#                 else login_form(self.banner())) + back)
+#                (signup_form(self.banner(), (q.get("ref") or [""])[0])
+#                 if path == "/signup" else login_form(self.banner())) + back)
 #
 #        if path == "/register-ip":
 #            if not self.session():
@@ -12267,20 +16324,26 @@ exit 0
 #        if path in ("/signup", "/login"):
 #            form = self.form()
 #            endpoint = "/user-signup" if path == "/signup" else "/user-password-login"
+#            back = path
 #            payload = {"username": form.get("username", ""),
 #                       "password": form.get("password", ""),
 #                       "ip": self.client_ip()}
 #            if path == "/signup":
 #                payload["name"] = form.get("name", "")
+#                # Whose invitation this came by; the panel decides if it counts.
+#                payload["ref"] = form.get("ref", "")[:16]
+#                back = ("/signup?ref=" + urllib.parse.quote(payload["ref"])
+#                        if REF_RE.fullmatch(payload["ref"]) else "/signup")
 #                if form.get("password") != form.get("password2"):
-#                    return self.redirect("/signup", "دو رمز یکی نیستند", bad=True)
+#                    return self.redirect(back, "دو رمز یکی نیستند", bad=True)
 #            try:
 #                res = post(endpoint, payload)
 #            except Exception as e:
 #                log(ERROR, "panel: %s failed: %s" % (endpoint, e))
 #                return self.redirect(path, "الان نشد، چند دقیقه دیگر", bad=True)
 #            if not res.get("ok"):
-#                return self.redirect(path, res.get("message", "خطا"), bad=True)
+#                return self.redirect(back if path == "/signup" else path,
+#                                     res.get("message", "خطا"), bad=True)
 #            # Straight to the address page either way. A new account has no
 #            # address yet, and somebody signing in from a new connection is
 #            # usually signing in precisely because the address changed.
@@ -12425,6 +16488,55 @@ exit 0
 #            return self.redirect("/", res.get("message", ""),
 #                                 bad=not res.get("ok"))
 #
+#        if path in ("/device-wallet", "/device-receipt"):
+#            if not self.session():
+#                return self.redirect("/")
+#            if path == "/device-wallet":
+#                self.form()
+#                res = self.ask_panel("/user-device-wallet", {})
+#            else:
+#                form = self.form()
+#                if form.get("too_big"):
+#                    return self.redirect("/", "فایل خیلی بزرگ است", bad=True)
+#                try:
+#                    blob, kind = self.upload("file")
+#                except ValueError as e:
+#                    return self.redirect("/", str(e), bad=True)
+#                res = self.ask_panel("/user-receipt", {
+#                    "kind": "device", "content_type": kind,
+#                    "data": base64.b64encode(blob).decode("ascii")})
+#            if res is None:
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
+#        if path in ("/wallet-buy", "/wallet-topup"):
+#            if not self.session():
+#                return self.redirect("/")
+#            form = self.form()
+#            if form.get("too_big"):
+#                return self.redirect("/", "فایل خیلی بزرگ است", bad=True)
+#            if path == "/wallet-buy":
+#                try:
+#                    plan = int(self.upload("plan")[0].strip() or 0)
+#                except ValueError:
+#                    plan = 0
+#                if not plan:
+#                    return self.redirect("/", "اول پلن را انتخاب کنید", bad=True)
+#                res = self.ask_panel("/user-wallet-buy", {"plan_id": plan,
+#                                                          "code": self.field("code")})
+#            else:
+#                try:
+#                    blob, kind = self.upload("file")
+#                    amount = self.upload("amount")[0].decode("utf-8", "replace").strip()[:20]
+#                except ValueError as e:
+#                    return self.redirect("/", str(e), bad=True)
+#                res = self.ask_panel("/user-receipt", {
+#                    "kind": "topup", "amount": amount, "content_type": kind,
+#                    "data": base64.b64encode(blob).decode("ascii")})
+#            if res is None:
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
 #        if path == "/receipt":
 #            if not self.session():
 #                return self.redirect("/")
@@ -12447,6 +16559,7 @@ exit 0
 #                    "content_type": kind,
 #                    "data": base64.b64encode(blob).decode("ascii"),
 #                    "plan_id": plan,
+#                    "code": self.field("code"),
 #                })
 #            except Exception as e:
 #                log(ERROR, "panel: receipt failed: %s" % e)
@@ -12660,9 +16773,13 @@ exit 0
 #        except Exception as e:
 #            log(ERROR, "panel: user-info failed: %s" % e)
 #            return self.send_html(NOT_NOW, 502)
-#        if not info.get("ok") or not doh_url(info):
+#        want = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("h")
+#                or [""])[0]
+#        server = next((s for s in servers_doh(info) if s["dot"] == want), None) \
+#            if info.get("ok") and want else None
+#        if not info.get("ok") or not (server or doh_url(info)):
 #            return self.redirect("/")
-#        return self.send(mobileconfig(info), 200, {
+#        return self.send(mobileconfig(info, server), 200, {
 #            "Content-Type": "application/x-apple-aspen-config",
 #            "Content-Disposition": "attachment; filename=doctor-dns.mobileconfig",
 #            "Cache-Control": "no-store"})
@@ -12671,8 +16788,11 @@ exit 0
 #        token = self.session()
 #        if not token:
 #            return self.send_html(landing(self.banner()))
+#        code = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("code")
+#                or [""])[0][:40]
 #        try:
-#            info = post("/user-info", {"session": token, "ip": self.client_ip()})
+#            info = post("/user-info", {"session": token, "ip": self.client_ip(),
+#                                       "code": code})
 #        except Exception as e:
 #            log(ERROR, "panel: user-info failed: %s" % e)
 #            return self.send_html("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
@@ -12693,7 +16813,13 @@ exit 0
 #        if info.get("plan_name"):
 #            rows.append(("پلن", html.escape(info["plan_name"])))
 #        rows += [("قالب", html.escape(info.get("plan") or "-")),
-#                ("آی‌پی ثبت‌شده", "<code>%s</code>" % html.escape(info["ip"] or "ثبت نشده")),
+#                ("آی‌پی ثبت‌شده", " ".join("<code>%s</code>" % html.escape(x)
+#                                           for x in (info.get("ips") or [info["ip"]])
+#                                           if x) or "<code>ثبت نشده</code>")]
+#        if (info.get("devices") or 1) > 1:
+#            rows.append(("دستگاه", "%d از %d" % (len(info.get("ips") or []),
+#                                                 info["devices"])))
+#        rows += [
 #                ("مصرف", human_fa(used))]
 #        if quota:
 #            rows.append(("سهمیه", human_fa(quota)))
@@ -12730,7 +16856,7 @@ exit 0
 #                        "<span class='v'>%s</span></div>" % (k, v))
 #        body.append(gauge)
 #        body.append("<a class='btn ghost' href='/usage'>📊 نمودار مصرف و سرعت</a>")
-#        body.append(dns_box())
+#        body.append(dns_box(info))
 #        body.append(qlog_box(info))
 #
 #        if not info["ip"]:
@@ -12754,6 +16880,9 @@ exit 0
 #        body.append(doh_box(info))
 #        body.append(trial_box(info))
 #        body.append(receipt_box(info))
+#        body.append(wallet_box(info))
+#        body.append(device_box(info))
+#        body.append(ref_box(info, (self.headers.get("Host") or "").strip()))
 #        body.append(support_box(info))
 #        if not info.get("telegram_required"):
 #            body.append(telegram_box(info))
@@ -12777,7 +16906,13 @@ exit 0
 #
 #
 #def main():
-#    global CFG
+#    global CFG, CONFIG
+#    if "--node" in sys.argv[1:]:
+#        CONFIG = NODE_CONFIG
+#        CFG = load_config()
+#        print("node up: every %ds to the panel at %s" % (INTERVAL, CFG["PANEL_HOST"]), flush=True)
+#        node_loop()
+#        return
 #    CFG = load_config()
 #    if not os.path.exists(ACL):
 #        sys.exit("%s is missing - run the installer first" % ACL)
@@ -12921,6 +17056,29 @@ exit 0
 #if __name__ == "__main__":
 #    main()
 #__END_SYNC__
+
+#__BEGIN_NODE_SERVICE__
+#[Unit]
+#Description=doctor dns node - another exit joined to the panel: relays and resolvers in, health and logs out
+#After=network-online.target nginx.service
+#Wants=network-online.target
+#
+#[Service]
+#Type=simple
+## The rule that keeps nginx from proxying to this machine or to private
+## addresses - on a node there is no API port to close. The + runs it as root.
+#ExecStartPre=-+/usr/local/bin/smartdns-api-guard
+#ExecStart=/usr/local/bin/smartdns-sync --node
+#Restart=always
+#RestartSec=10
+## Root: it rewrites nginx's list of relays and its resolvers, and reloads it.
+#NoNewPrivileges=yes
+#ProtectHome=yes
+#PrivateTmp=yes
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_NODE_SERVICE__
 
 #__BEGIN_SYNC_SERVICE__
 #[Unit]
@@ -13594,6 +17752,25 @@ exit 0
 #WantedBy=multi-user.target
 #__END_DNS_PROFILE_UNIT__
 
+#__BEGIN_DNS_GATE_UNIT__
+#[Unit]
+#Description=Smart DNS: the service's own names for addresses not registered yet
+#After=network-online.target
+#PartOf=smartdns-sync.service
+#
+#[Service]
+#Type=simple
+## Its own file only - not /etc/dnsmasq.d, not the templates' shared rules: an
+## address that has not registered gets the customer panel's name and nothing
+## else, so it can reach the page that registers it.
+#ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/smartdns-profiles/gate.conf
+#Restart=always
+#RestartSec=5
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_DNS_GATE_UNIT__
+
 #__BEGIN_CERT__
 ##!/bin/bash
 ## smartdns-cert - obtain and renew the panel's TLS certificate.
@@ -13639,6 +17816,19 @@ exit 0
 #die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 #
 #[ "$(id -u)" = 0 ] || die "run as root"
+#
+## One certbot at a time. The renewal timer can start while this very script
+## is issuing a certificate - the installer restarts that timer on every run,
+## and it fires at once - and a second certbot refuses to run beside the
+## first: "Another instance of Certbot is already running". So each run of
+## this waits for the one before it, then for any other certbot on the
+## machine, before it starts.
+#exec 9>/run/smartdns-cert.lock
+#flock -w 600 9 || die "another certificate run did not finish in ten minutes"
+#for _ in $(seq 1 60); do
+#    pgrep -x certbot >/dev/null 2>&1 || break
+#    sleep 5
+#done
 #
 #open_port80() {
 #    nft add table ip $NAT_TABLE 2>/dev/null
@@ -13803,17 +17993,20 @@ exit 0
 #font and stylesheet host worth using is either blocked or slow.
 #"""
 #
+#import glob
 #import hashlib
 #import hmac
 #import html
 #import http.cookies
 #import http.server
+#import io
 #import ipaddress
 #import json
 #import math
 #import os
 #import re
 #import secrets
+#import shutil
 #import socket
 #import sqlite3
 #import ssl
@@ -13831,6 +18024,7 @@ exit 0
 #DB = "/var/lib/smart-dns/panel.db"
 #SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
 #GAMES_FILE = "/usr/local/share/smart-dns/games.json"
+#BLOCKS_FILE = "/usr/local/share/smart-dns/blocks.json"
 ## Put there by the installer and served from here - see above about CDNs. The
 ## version goes in the font's address, so a browser's kept copy is never stale.
 #FONT_FILE = "/usr/local/share/smart-dns/Vazirmatn.woff2"
@@ -13873,10 +18067,12 @@ exit 0
 #
 #
 #def human(n):
+#    """A size, isolated left to right: in a Persian sentence "30.00 GB" would
+#    otherwise come out as "GB 30.00"."""
 #    n = float(n or 0)
 #    for unit in ("B", "KB", "MB", "GB", "TB"):
 #        if n < 1024 or unit == "TB":
-#            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+#            return "⁦%s⁩" % (("%d %s" if unit == "B" else "%.2f %s") % (n, unit))
 #        n /= 1024
 #
 #
@@ -13966,6 +18162,60 @@ exit 0
 #        self.db.execute(
 #            "CREATE TABLE IF NOT EXISTS admin_sessions ("
 #            " token TEXT PRIMARY KEY, expires_at TEXT NOT NULL)")
+#        self.db.execute("""CREATE TABLE IF NOT EXISTS admins (
+#    id             INTEGER PRIMARY KEY,
+#    username       TEXT NOT NULL UNIQUE,
+#    password_hash  TEXT NOT NULL,
+#    password_salt  TEXT NOT NULL,
+#    perms          TEXT NOT NULL DEFAULT '[]',
+#    own_only       INTEGER NOT NULL DEFAULT 0,
+#    can_route      INTEGER NOT NULL DEFAULT 0,
+#    max_users      INTEGER,
+#    cap_bytes      INTEGER,
+#    used_bytes     INTEGER NOT NULL DEFAULT 0,
+#    expires_at     TEXT,
+#    templates_mode TEXT NOT NULL DEFAULT 'pick',
+#    templates      TEXT,
+#    templates_max  INTEGER NOT NULL DEFAULT 1,
+#    ref_code       TEXT UNIQUE,
+#    disabled       INTEGER NOT NULL DEFAULT 0,
+#    warned         INTEGER NOT NULL DEFAULT 0,
+#    created_at     TEXT NOT NULL
+#)""")
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(admin_sessions)")}
+#        for col in ("admin_id", "view_as"):
+#            if col not in have:
+#                self.db.execute("ALTER TABLE admin_sessions ADD COLUMN %s INTEGER" % col)
+#        for table in ("users", "plans", "templates"):
+#            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
+#            if have and "owner_admin" not in have:
+#                self.db.execute("ALTER TABLE %s ADD COLUMN owner_admin INTEGER" % table)
+#        for table in ("users", "admins"):
+#            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
+#            if have and "reset_days" not in have:
+#                self.db.execute("ALTER TABLE %s ADD COLUMN reset_days INTEGER" % table)
+#            if have and "reset_next" not in have:
+#                self.db.execute("ALTER TABLE %s ADD COLUMN reset_next TEXT" % table)
+#        self.db.execute("""CREATE TABLE IF NOT EXISTS broadcasts (
+#    id          INTEGER PRIMARY KEY,
+#    text        TEXT NOT NULL,
+#    target      TEXT NOT NULL,
+#    recipients  INTEGER NOT NULL,
+#    first_row   INTEGER,
+#    last_row    INTEGER,
+#    created_at  TEXT NOT NULL
+#)""")
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(broadcasts)")}
+#        if "admin_id" not in have:
+#            self.db.execute("ALTER TABLE broadcasts ADD COLUMN admin_id INTEGER")
+#        # The panel's too; here as well so a wallet page opened before the
+#        # panel has started after an upgrade finds it.
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS wallet_moves ("
+#            " id INTEGER PRIMARY KEY,"
+#            " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+#            " at TEXT NOT NULL, amount INTEGER NOT NULL, balance INTEGER NOT NULL,"
+#            " kind TEXT NOT NULL, note TEXT, transaction_id INTEGER, other_user INTEGER)")
 #        self.db.commit()
 #
 #    def q(self, sql, args=()):
@@ -13978,7 +18228,14 @@ exit 0
 #
 #    def run(self, sql, args=()):
 #        with self.lock:
-#            cur = self.db.execute(sql, args)
+#            try:
+#                cur = self.db.execute(sql, args)
+#            except Exception:
+#                # A statement that failed - a name that is taken, say - must
+#                # not leave its transaction open: until something commits,
+#                # the other process could not write to the database at all.
+#                self.db.rollback()
+#                raise
 #            self.db.commit()
 #            return cur
 #
@@ -14025,6 +18282,16 @@ exit 0
 #                " ELSE 'active' END WHERE id = ?",
 #                (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
 #                 until.isoformat(timespec="seconds"), uid))
+#            # The plan's devices, and those bought on top, which a renewal
+#            # keeps and another plan ends.
+#            extra = (user["extra_devices"] or 0) if renewing and \
+#                "extra_devices" in user.keys() else 0
+#            set_devices(self.db, uid, plan_devices(plan) + extra, extra)
+#            # A plan sold with an exit of its own puts the customer on it, on
+#            # every relay; one sold with all of them leaves their exit alone.
+#            if "exit" in plan.keys() and plan["exit"]:
+#                self.db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
+#                                (plan["exit"], uid))
 #            self.db.commit()
 #        return ("پلن «%s» تمدید شد تا %s" if renewing
 #                else "پلن «%s» فعال شد تا %s") % (plan["name"],
@@ -14183,6 +18450,239 @@ exit 0
 #        # belongs to the delimiter, not to the file.
 #        return data[:-2] if data.endswith(b"\r\n") else data
 #    raise ValueError("no file was chosen")
+#
+#
+## ------------------------------------------------------------------ backups
+## The whole panel in one file, for the operator's bot to send them every few
+## days: the database, the key its pictures are sealed with, and what a new
+## machine needs to be this panel for the relays - panel.env with the secret
+## they share, the sync API's key and certificate they pin, the admin panel's
+## and the bot's settings. Encrypted with a password only the operator has,
+## because it sits in a Telegram chat: openssl's AES-256, which any machine
+## with openssl opens again -
+##     openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in FILE -out backup.tar.gz
+#BACKUP_PASS_FILE = "/etc/smart-dns/backup.pass"
+#BUNDLE_FILES = (("panel.env", "/etc/smart-dns/panel.env"),
+#                ("sync.key", "/etc/smart-dns/sync.key"),
+#                ("sync.crt", "/etc/smart-dns/sync.crt"),
+#                ("admin.env", "/etc/smart-dns/admin.env"),
+#                ("doctor-dns-bot.env", "/etc/doctor-dns-bot.env"),
+#                ("db.key", "/etc/smart-dns/db.key"))
+#TELEGRAM_MAX = 49 * 1024 * 1024
+#OPENSSL_ENC = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000"]
+#
+#
+#def backup_password():
+#    try:
+#        with open(BACKUP_PASS_FILE, encoding="utf-8") as fh:
+#            return fh.read().strip()
+#    except OSError:
+#        return ""
+#
+#
+#def make_bundle(password):
+#    """The panel, whole, as encrypted bytes."""
+#    import tarfile
+#    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+#    snap = os.path.join(os.path.dirname(DB), ".bundle-%s.db" % stamp)
+#    buf = io.BytesIO()
+#    try:
+#        STORE.snapshot(snap)
+#        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+#            tar.add(snap, arcname="panel.db")
+#            for name, path in BUNDLE_FILES:
+#                if os.path.exists(path):
+#                    tar.add(path, arcname=name)
+#            # The resellers' own bots.
+#            for path in sorted(glob.glob(BOT_SELLER_ENV.replace("%d", "*"))):
+#                tar.add(path, arcname=os.path.basename(path))
+#    finally:
+#        try:
+#            os.unlink(snap)
+#        except OSError:
+#            pass
+#    r = subprocess.run(OPENSSL_ENC + ["-salt", "-pass", "env:DDNS_BACKUP_PASS"],
+#                       input=buf.getvalue(), capture_output=True, timeout=300,
+#                       env=dict(os.environ, DDNS_BACKUP_PASS=password))
+#    if r.returncode != 0 or not r.stdout.startswith(b"Salted__"):
+#        raise RuntimeError("openssl: %s" % r.stderr.decode(errors="replace").strip()[-200:])
+#    return r.stdout
+#
+#
+#def open_bundle(blob, password):
+#    """{name: bytes} out of an encrypted bundle; ValueError when the password
+#    is wrong or the file is not one."""
+#    import tarfile
+#    r = subprocess.run(OPENSSL_ENC + ["-d", "-pass", "env:DDNS_BACKUP_PASS"], input=blob,
+#                       capture_output=True, timeout=300,
+#                       env=dict(os.environ, DDNS_BACKUP_PASS=password))
+#    if r.returncode != 0:
+#        raise ValueError("رمز درست نیست، یا این فایل بکاپ پنل نیست")
+#    try:
+#        with tarfile.open(fileobj=io.BytesIO(r.stdout), mode="r:gz") as tar:
+#            return {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
+#    except (tarfile.TarError, OSError) as e:
+#        raise ValueError("فایل باز شد ولی خراب است: %s" % e)
+#
+#
+#def telegram_send_document(blob, filename, caption):
+#    """Send a file to every admin the bot knows, through the bot. "" or why not."""
+#    env = read_env(BOT_ENV)
+#    token = env.get("BOT_TOKEN") or ""
+#    admins = re.findall(r"\d+", env.get("ADMIN_IDS") or "")
+#    if not token or not admins:
+#        return "ربات یا ادمین آن تعیین نشده (صفحهٔ «ربات»)"
+#    if len(blob) > TELEGRAM_MAX:
+#        return "فایل %s است؛ ربات تلگرام بیشتر از ۵۰ مگ نمی‌فرستد" % human(len(blob))
+#    failed = []
+#    for chat in admins:
+#        boundary = "----ddns" + secrets.token_hex(12)
+#        parts = []
+#        for name, value in (("chat_id", chat), ("caption", caption)):
+#            parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+#                          % (boundary, name, value)).encode())
+#        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"document\"; "
+#                      "filename=\"%s\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+#                      % (boundary, filename)).encode() + blob + b"\r\n")
+#        parts.append(("--%s--\r\n" % boundary).encode())
+#        req = urllib.request.Request(
+#            "https://api.telegram.org/bot%s/sendDocument" % token, b"".join(parts),
+#            {"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+#        try:
+#            with urllib.request.urlopen(req, timeout=180) as res:
+#                if not json.loads(res.read() or b"{}").get("ok"):
+#                    failed.append(chat)
+#        except Exception as e:
+#            failed.append("%s (%s)" % (chat, str(e).replace(token, "<token>")[:80]))
+#    return "به %s نرسید" % "، ".join(failed) if failed else ""
+#
+#
+#def run_backup():
+#    """Build the bundle and send it; what happened, kept for the settings page."""
+#    password = backup_password()
+#    stamp = datetime.now(TEHRAN).strftime("%Y-%m-%d-%H%M")
+#    try:
+#        if not password:
+#            raise RuntimeError("رمز بکاپ تعیین نشده")
+#        blob = make_bundle(password)
+#        why = telegram_send_document(
+#            blob, "doctor-dns-backup-%s.enc" % stamp,
+#            "🗄 بکاپ پنل — %s (%s). با رمز بکاپ باز می‌شود؛ برای بازگردانی در صفحهٔ "
+#            "«تنظیمات» بفرستیدش." % (stamp, human(len(blob))))
+#        result = {"at": now(), "ok": not why, "error": why, "size": len(blob)}
+#    except Exception as e:
+#        result = {"at": now(), "ok": False, "error": str(e)[:300], "size": 0}
+#    STORE.run("INSERT INTO settings (key, value) VALUES ('backup_last', ?)"
+#              " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#              (json.dumps(result, ensure_ascii=False),))
+#    log(INFO if result["ok"] else WARN, "backup to telegram: %s" % (
+#        "sent, %d bytes" % result["size"] if result["ok"] else result["error"]))
+#    return result
+#
+#
+#def backup_due():
+#    """Whether the operator's backup is due: turned on, and the days since
+#    the last one that went out have passed."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'backup_every_days'")
+#    try:
+#        every = int(row["value"]) if row and row["value"] else 0
+#    except ValueError:
+#        every = 0
+#    if not every:
+#        return False
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'backup_last'")
+#    try:
+#        last = json.loads(row["value"]) if row and row["value"] else {}
+#    except ValueError:
+#        last = {}
+#    at = parse_ts(last.get("at")) if last else None
+#    if not at:
+#        return True
+#    # A failed one is tried again after an hour, not after the whole interval.
+#    wait = timedelta(days=every) if last.get("ok") else timedelta(hours=1)
+#    return datetime.now(timezone.utc) - at >= wait
+#
+#
+#STANDBY_BUNDLE = "/var/lib/smart-dns/standby-bundle.enc"
+#STANDBY_EVERY = timedelta(hours=6)
+#
+#
+#def refresh_standby(force=False):
+#    """The bundle the standby keeps, made again every six hours - with the
+#    backup password, which the standby asks for when it takes over."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'standby'")
+#    password = backup_password()
+#    if not (row and row["value"]) or not password:
+#        return
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'standby_made'")
+#    made = parse_ts(row["value"]) if row and row["value"] else None
+#    if not force and made and datetime.now(timezone.utc) - made < STANDBY_EVERY:
+#        return
+#    blob = make_bundle(password)
+#    with open(STANDBY_BUNDLE + ".tmp", "wb") as fh:
+#        fh.write(blob)
+#    os.chmod(STANDBY_BUNDLE + ".tmp", 0o600)
+#    os.replace(STANDBY_BUNDLE + ".tmp", STANDBY_BUNDLE)
+#    STORE.run("INSERT INTO settings (key, value) VALUES ('standby_made', ?)"
+#              " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (now(),))
+#
+#
+#def backup_loop():
+#    while True:
+#        time.sleep(600)
+#        try:
+#            if backup_due():
+#                run_backup()
+#        except Exception as e:
+#            log(WARN, "backup check failed: %r" % e)
+#        try:
+#            refresh_standby()
+#        except Exception as e:
+#            log(WARN, "standby's backup not made: %r" % e)
+#
+#
+#def backup_card(p):
+#    """The settings page's card for the backup the bot sends."""
+#    env = read_env(BOT_ENV)
+#    ready = env.get("BOT_TOKEN") and re.search(r"\d", env.get("ADMIN_IDS") or "")
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'backup_every_days'")
+#    every = (row["value"] if row else "") or ""
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'backup_last'")
+#    try:
+#        last = json.loads(row["value"]) if row and row["value"] else {}
+#    except ValueError:
+#        last = {}
+#    out = ["<div class='card'><h2>بکاپ خودکار در تلگرام</h2>"]
+#    if not ready:
+#        out.append("<p class='muted'>اول ربات را در صفحهٔ «ربات» راه بیندازید و آی‌دی تلگرام "
+#                   "ادمین را تعیین کنید؛ بکاپ برای ادمین‌های ربات فرستاده می‌شود.</p></div>")
+#        return "".join(out)
+#    if last:
+#        out.append("<p>%s — %s</p>" % (
+#            html.escape(ago(last.get("at"))),
+#            "<span class='ok'>فرستاده شد (%s)</span>" % human(last.get("size") or 0)
+#            if last.get("ok") else "<span class='warn'>نشد: %s</span>" % html.escape(
+#                last.get("error") or "")))
+#    out.append(
+#        "<form method='post' action='/%s/backup-auto'>"
+#        "<label style='display:block'><input type='checkbox' name='on' value='1'%s> هر "
+#        "<input name='days' value='%s' dir='ltr' style='width:50px'> روز یک بار، برای "
+#        "ادمین‌های ربات بفرست</label>"
+#        "<label style='display:block'>رمز بکاپ: <input name='password' type='password' "
+#        "autocomplete='new-password' dir='ltr' placeholder='%s'></label>"
+#        "<button class='ghost'>ذخیره</button></form>"
+#        "<form method='post' action='/%s/backup-now' style='margin-top:8px'>"
+#        "<button class='ghost'>همین حالا بفرست</button></form>"
+#        "<p class='muted'>یک فایل، رمزگذاری‌شده با همین رمز: دیتابیس، کلید عکس‌ها، و آنچه "
+#        "برای بالا آوردن همین پنل روی سرور دیگری لازم است. رمز را جایی جدا نگه دارید؛ "
+#        "بدون آن فایل باز نمی‌شود و این‌جا هم نشان داده نمی‌شود. برای بازگردانی، فایل را "
+#        "با همین رمز در کارت «نسخهٔ پشتیبان» بفرستید؛ یا روی هر سیستمی با openssl:</p>"
+#        "<pre dir='ltr' style='white-space:pre-wrap'>openssl enc -d -aes-256-cbc -pbkdf2 "
+#        "-iter 200000 -in FILE.enc -out backup.tar.gz</pre></div>"
+#        % (p, " checked" if every else "", every or 3,
+#           "رمز گذاشته شده؛ خالی بگذارید تا بماند" if backup_password() else "دست‌کم ۸ نویسه",
+#           p))
+#    return "".join(out)
 #
 #
 ## A checked backup waiting for the operator to confirm. In memory on purpose:
@@ -14538,17 +19038,62 @@ exit 0
 #            "days": series("1d", now_t - timedelta(days=30), "%Y-%m-%d")}
 #
 #
-#def total_usage():
-#    """Everybody's usage added up, from the same tables as a customer's own
-#    charts: five minutes for a day, hours for a week, days for two months -
-#    two, so this month can be set against the one before."""
+#def owner_filter(owner, column):
+#    """The join that keeps one seller's customers (an id), the owner's own -
+#    those of no seller ("own") - or everybody (None)."""
+#    if owner == "own":
+#        return " JOIN users u ON u.id = %s AND u.owner_admin IS NULL" % column, ()
+#    if owner:
+#        return " JOIN users u ON u.id = %s AND u.owner_admin = ?" % column, (owner,)
+#    return "", ()
+#
+#
+#def usage_shares(p):
+#    """Everybody's usage split by whose customers they are: the owner's own,
+#    and each seller's - today, over seven days and over thirty."""
+#    today = datetime.now(TEHRAN).date()
+#    spans = [(today.strftime("%Y-%m-%d"), "امروز"),
+#             ((today - timedelta(days=6)).strftime("%Y-%m-%d"), "۷ روز اخیر"),
+#             ((today - timedelta(days=29)).strftime("%Y-%m-%d"), "۳۰ روز اخیر")]
+#    figures = {}
+#    for since, _ in spans:
+#        for r in STORE.q("SELECT COALESCE(u.owner_admin, 0) o, SUM(g.up + g.down) b"
+#                         " FROM usage g JOIN users u ON u.id = g.user_id"
+#                         " WHERE g.grain = '1d' AND g.bucket >= ? GROUP BY o", (since,)):
+#            figures.setdefault(r["o"], {})[since] = r["b"] or 0
+#    sellers = STORE.q("SELECT id, username FROM admins WHERE own_only = 1 ORDER BY id")
+#    whole = sum(v.get(spans[2][0], 0) for v in figures.values()) or 1
+#    rows = [(0, "مشتری‌های خودم", None)] + [(s["id"], s["username"], s["id"]) for s in sellers]
+#    out = ["<h3 class='chart-h'>سهم هر کدام</h3><table><tr><th></th>%s<th>سهم ۳۰ روز</th></tr>"
+#           % "".join("<th>%s</th>" % label for _, label in spans)]
+#    for key, name, sid in rows:
+#        f = figures.get(key, {})
+#        month = f.get(spans[2][0], 0)
+#        who = ("<a href='/%s/admins?stats=%d'><code>%s</code></a>"
+#               % (p, sid, html.escape(name)) if sid else "<b>%s</b>" % name)
+#        out.append("<tr><td>%s</td>%s<td style='min-width:140px'>%d٪%s</td></tr>"
+#                   % (who, "".join("<td dir='ltr'>%s</td>" % human(f.get(since, 0))
+#                                   for since, _ in spans),
+#                      round(100.0 * month / whole),
+#                      "<div class='bar'><i style='width:%d%%'></i></div>"
+#                      % round(100.0 * month / whole)))
+#    out.append("</table>")
+#    return "".join(out)
+#
+#
+#def total_usage(owner=None):
+#    """Everybody's usage added up - or one seller's customers' - from the same
+#    tables as a customer's own charts: five minutes for a day, hours for a
+#    week, days for two months - two, so this month can be set against the one
+#    before."""
 #    now_t = datetime.now(TEHRAN)
+#    join, first = owner_filter(owner, "g.user_id")
 #
 #    def series(grain, since, fmt):
 #        return [(r["bucket"], r["up"], r["down"]) for r in STORE.q(
-#            "SELECT bucket, SUM(up) up, SUM(down) down FROM usage WHERE grain = ?"
-#            " AND bucket >= ? GROUP BY bucket ORDER BY bucket",
-#            (grain, since.strftime(fmt)))]
+#            "SELECT g.bucket bucket, SUM(g.up) up, SUM(g.down) down FROM usage g" + join +
+#            " WHERE g.grain = ? AND g.bucket >= ? GROUP BY g.bucket ORDER BY g.bucket",
+#            first + (grain, since.strftime(fmt)))]
 #
 #    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
 #            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
@@ -14565,16 +19110,36 @@ exit 0
 #    return "%d٪ %s از %s قبل" % (abs(pct), "بیشتر" if pct > 0 else "کمتر", word)
 #
 #
-#def total_usage_card(p):
+#def total_usage_card(p, owner=None, title="مصرف کل — همهٔ مشتری‌ها", extra=""):
 #    """The home page's picture of the whole service: every customer's usage
-#    together, and who used the most - each name a link to their own charts."""
+#    together, and who used the most - each name a link to their own charts.
+#    With `owner`, one seller's customers."""
 #    try:
-#        view = total_usage()
+#        view = total_usage(owner)
 #    except sqlite3.OperationalError:
 #        return ""          # a panel that has not made the table yet
 #    if not view["days"] and not view["five"]:
-#        return ("<div class='card'><h2>مصرف کل</h2><p class='muted'>هنوز مصرفی ثبت نشده. "
+#        return ("<div class='card'><h2>" + html.escape(title) + "</h2><p class='muted'>"
+#                "هنوز مصرفی ثبت نشده. "
 #                "نمودارها از اولین همگام‌سازی رله بعد از این نسخه پر می‌شوند.</p></div>")
+#    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+#    mine_only = (" AND u.owner_admin IS NULL" if owner == "own" else
+#                 " AND u.owner_admin = ?" if owner else "")
+#    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
+#                  " WHERE g.grain = '1d' AND g.bucket >= ?" + mine_only + " GROUP BY u.id"
+#                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10",
+#                  (since,) + ((owner,) if owner and owner != "own" else ()))
+#    card = usage_card(p, title, view, top)
+#    if extra and card.endswith("</div>"):
+#        card = card[:-len("</div>")] + extra + "</div>"
+#    return card
+#
+#
+#def usage_card(p, title, view, top):
+#    """Usage drawn as the home page draws it - now, today, the week and the
+#    month, then the charts and who used the most - for any set of figures:
+#    the whole service, or one server."""
 #    today = datetime.now(TEHRAN).date()
 #    by = {b: (u, d) for b, u, d in view["days"]}
 #
@@ -14598,7 +19163,7 @@ exit 0
 #        took = max(30.0, (now_t - current).total_seconds())
 #        live_bps = "↓ %s · ↑ %s Mbps" % (mbit(live[2] * 8 / took), mbit(live[1] * 8 / took))
 #
-#    out = ["<div class='card'><h2>مصرف کل — همهٔ مشتری‌ها</h2><div class='grid'>"]
+#    out = ["<div class='card'><h2>%s</h2><div class='grid'>" % html.escape(title)]
 #    for n, l, note in (
 #            (live_bps or "-", "سرعت الان", "میانگین ۵ دقیقهٔ اخیر"),
 #            (human(now_up + now_down), "امروز", "دانلود %s، آپلود %s" % (human(now_down), human(now_up))),
@@ -14611,12 +19176,6 @@ exit 0
 #    out.append("<h3 class='chart-h'>روزانه</h3>" + legend() + days_svg)
 #    out.append("<h3 class='chart-h'>سرعت کل ۲۴ ساعت اخیر</h3>" + legend() + speed_chart(view["five"]))
 #    out.append("<h3 class='chart-h'>ساعت‌های پرمصرف — ۷ روز اخیر</h3>" + heat_chart(view["hours"]))
-#
-#    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
-#    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
-#                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
-#                  " WHERE g.grain = '1d' AND g.bucket >= ? GROUP BY u.id"
-#                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10", (since,))
 #    if top:
 #        total = sum(week) or 1
 #        out.append("<h3 class='chart-h'>پرمصرف‌ترین‌ها — ۷ روز اخیر</h3><table><tr><th>مشتری</th>"
@@ -14839,6 +19398,13 @@ exit 0
 ## installer, so an upgrade does not put the defaults back.
 #NGINX_CONF = "/etc/nginx/nginx.conf"
 #UPSTREAM_FILE = "/etc/smart-dns/upstream"
+## The relays this exit serves: RELAY_IP in the panel's own settings - the
+## sync API and its firewall rule read it - and one allow line each in the
+## file nginx includes on every port it proxies.
+#PANEL_ENV = "/etc/smart-dns/panel.env"
+#RELAYS_CONF = "/etc/nginx/smartdns-relays.conf"
+#SYNC_CRT = "/etc/smart-dns/sync.crt"
+#INSTALL_STATE = "/var/lib/smart-dns/install-state"
 #RESOLVER_LINE = re.compile(r"(\bresolver )[0-9. ]+?( ipv[46]=off;)")
 #
 #
@@ -14917,6 +19483,1430 @@ exit 0
 #            log(WARN, "resolvers not timed here: %r" % e)
 #        EXIT_BENCH["wake"].wait(600)
 #        EXIT_BENCH["wake"].clear()
+#
+#
+#def relay_list():
+#    ips = []
+#    for ip in (read_env(PANEL_ENV).get("RELAY_IP") or "").split(","):
+#        ip = ip.strip()
+#        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) and ip not in ips:
+#            ips.append(ip)
+#    return ips
+#
+#
+#def exit_address():
+#    """This exit's public address, as the installer recorded it."""
+#    try:
+#        with open(INSTALL_STATE, encoding="utf-8") as fh:
+#            found = [l.split()[1] for l in fh if l.startswith("exit-ip ") and len(l.split()) > 1]
+#        return found[-1] if found else ""
+#    except OSError:
+#        return ""
+#
+#
+#def pairing_token():
+#    """The token a new relay is installed with: the sync secret and the
+#    fingerprint of this exit's API certificate. Without the tunnel part the
+#    installer adds for the first relay - this exit's tunnel reaches that one
+#    relay only, so another goes straight to it until each gets its own."""
+#    import hashlib
+#    secret = read_env(PANEL_ENV).get("SYNC_SECRET") or ""
+#    try:
+#        with open(SYNC_CRT, encoding="utf-8") as fh:
+#            der = ssl.PEM_cert_to_DER_cert(fh.read())
+#    except (OSError, ValueError):
+#        return ""
+#    return "%s.%s" % (secret, hashlib.sha256(der).hexdigest()) if secret else ""
+#
+#
+#def set_relays(ips):
+#    """Serve exactly these relays: nginx first, checked by nginx -t and put
+#    back if refused, then the panel's list - the panel restarts on it, which
+#    reloads the sync API's list and its firewall rule. "" or why not."""
+#    body = ("# The relays this exit lets in: written by the installer and the admin panel.\n"
+#            + "".join("allow %s;\n" % ip for ip in ips))
+#    try:
+#        with open(RELAYS_CONF, encoding="utf-8") as fh:
+#            before = fh.read()
+#    except OSError:
+#        before = None
+#    with open(RELAYS_CONF, "w", encoding="utf-8") as fh:
+#        fh.write(body)
+#    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=30)
+#    if test.returncode != 0:
+#        if before is None:
+#            os.unlink(RELAYS_CONF)
+#        else:
+#            with open(RELAYS_CONF, "w", encoding="utf-8") as fh:
+#                fh.write(before)
+#        return "nginx نپذیرفت؛ چیزی عوض نشد: %s" % test.stderr.strip()[-200:]
+#    subprocess.run(["systemctl", "reload", "nginx"], capture_output=True, timeout=60)
+#    lines = []
+#    try:
+#        with open(PANEL_ENV, encoding="utf-8") as fh:
+#            lines = [l.rstrip("\n") for l in fh if not l.startswith("RELAY_IP=")]
+#    except OSError:
+#        pass
+#    lines = [l for l in lines if l.strip()] + ["RELAY_IP=" + ",".join(ips)]
+#    tmp = PANEL_ENV + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write("\n".join(lines) + "\n")
+#    os.chmod(tmp, 0o600)
+#    os.replace(tmp, PANEL_ENV)
+#    systemctl("restart", "smartdns-panel")
+#    return ""
+#
+#
+#def relays_cell(p, user, ips):
+#    """The users table's DNS column: the relays this customer is given as
+#    DNS 1 and DNS 2 - all of them until the admin picks some."""
+#    if len(ips) < 2:
+#        return "<span class='muted'>-</span>"
+#    own = [x for x in ((user["relays"] if "relays" in user.keys() else None) or "").split(",")
+#           if x in ips]
+#    shown = [ip for ip in ips if ip in own] or list(ips)
+#    every = len(shown) == len(ips)
+#    boxes = "".join("<label><input type='checkbox' name='ip' value='%s'%s>"
+#                    " <code dir='ltr'>%s</code></label>"
+#                    % (ip, " checked" if ip in shown else "", ip) for ip in ips)
+#    summary = ("همه (%d)" % len(ips) if every else
+#               "<span dir='ltr'>%s</span>" % shown[0] if len(shown) == 1
+#               else "%d رله" % len(shown))
+#    return ("<details><summary title='%s'>%s</summary>"
+#            "<form method='post' action='/%s/user-relays'>"
+#            "<input type='hidden' name='id' value='%d'>"
+#            "<label><input type='checkbox'%s onchange=\"for (const b of "
+#            "this.form.querySelectorAll('input[name=ip]')) b.checked = this.checked\"> همه</label>"
+#            "%s<button class='ghost'>ذخیره</button></form></details>"
+#            % ("، ".join(shown), summary, p, user["id"], " checked" if every else "", boxes))
+#
+#
+## ------------------------------------------------------------------ tunnels
+## A tunnel to each relay, set here: one BackPack per relay on this exit, each
+## from its own directory, and the relay's end set up by its own sync from what
+## the panel sends it. The first relay's tunnel, while the installer made one,
+## stays the installer's - changed with --tunnel, and only shown here.
+#RELAY_TUNNELS = "/etc/smart-dns/relay-tunnels"
+#TUNNEL_INSTANCE_UNIT = "/etc/systemd/system/smartdns-tunnel@.service"
+#BACKPACK_BIN = "/usr/local/lib/smart-dns/backpack"
+#TUNNEL_TRANSPORTS = {
+#    "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
+#                "wsmux", "xdi", "udp"),
+#    "direct": ("stealth", "wss", "tcp", "ws"),
+#}
+#TRANSPORT_WORDS = {
+#    "stealth": "رمزشده، شبیه بایت‌های تصادفی — پیشنهادی",
+#    "wss": "شبیه یک سایت HTTPS معمولی",
+#    "wssmux": "همان، روی چند اتصال مشترک",
+#    "tcp": "ساده — رمز ندارد، نام سایت‌ها پیداست",
+#    "tcpmux": "ساده و مشترک — رمز ندارد",
+#    "kcp": "روی UDP، برای مسیری که بسته گم می‌کند",
+#    "pck": "برای مسیری که TCP وصل می‌شود و بعد می‌میرد",
+#    "quic": "روی UDP — در آزمایش ما وصل نشد",
+#    "ws": "وب‌سوکت — رمز ندارد",
+#    "wsmux": "وب‌سوکت مشترک — رمز ندارد",
+#    "xdi": "داخل پینگ — برای جایی که فقط پینگ رد می‌شود",
+#    "udp": "دیتاگرام خام — در آزمایش ما وصل نشد",
+#}
+## The ports a tunnel may not take - the installer's list, on either machine.
+#TUNNEL_RESERVED = {22: "ssh", 53: "DNS", 80: "پراکسی", 443: "پراکسی", 853: "DoT",
+#                   8443: "API همگام‌سازی و پنل مشتری", 8445: "API ربات",
+#                   8446: "راه گوگل روی IPv6", 18119: "Battle.net", 1119: "Battle.net",
+#                   4070: "Spotify", 8402: "گواهی", 3478: "STUN", 18443: "سر تونل روی رله",
+#                   18080: "سر تونل روی رله", 18843: "سر تونل روی رله",
+#                   14070: "سر تونل روی رله", 11119: "سر تونل روی رله"}
+#
+#
+#def installer_tunnel():
+#    """The installer's tunnel, to the first relay: its settings, or None."""
+#    env = read_env(PANEL_ENV)
+#    if env.get("TUNNEL") != "backpack":
+#        return None
+#    return {"transport": env.get("TUNNEL_TRANSPORT") or "", "port": env.get("TUNNEL_PORT") or "",
+#            "direction": env.get("TUNNEL_DIRECTION") or "", "relay": (relay_list() or [""])[0]}
+#
+#
+#def relay_tunnel(ip, to=None):
+#    """The tunnel the admin set from relay `ip` to exit `to` - this one by
+#    default, or a node - or {} for none."""
+#    key = "relay_tunnel:" + ip if not to or to == exit_address() else \
+#        "relay_tunnel:%s:%s" % (ip, to)
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#    try:
+#        spec = json.loads(row["value"]) if row and row["value"] else {}
+#    except ValueError:
+#        spec = {}
+#    return spec if isinstance(spec, dict) and spec.get("transport") else {}
+#
+#
+## Each node's tunnels end on the relay on ports of their own, from its slot:
+## 20000 + slot * 10, and the next three.
+#NODE_TUNNEL_BASE = 20000
+#
+#
+#def node_slot(ip, create=True):
+#    """The slot a node's tunnels use on the relays - given once and kept."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", ("node_slot:" + ip,))
+#    if row and row["value"]:
+#        return int(row["value"])
+#    if not create:
+#        return None
+#    taken = {int(r["value"]) for r in STORE.q(
+#        "SELECT value FROM settings WHERE key LIKE 'node_slot:%'")}
+#    slot = next(n for n in range(1, 100) if n not in taken)
+#    STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)", ("node_slot:" + ip, str(slot)))
+#    return slot
+#
+#
+#def all_tunnels():
+#    """Every tunnel there is: (relay, exit, spec) - the installer's too."""
+#    here, out = exit_address(), []
+#    mine = installer_tunnel()
+#    if mine and mine["port"].isdigit():
+#        out.append((mine["relay"], here, {"direction": mine["direction"],
+#                                          "port": int(mine["port"])}))
+#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'relay_tunnel:%'"):
+#        parts = r["key"].split(":")
+#        try:
+#            spec = json.loads(r["value"] or "{}")
+#        except ValueError:
+#            continue
+#        if isinstance(spec, dict) and spec.get("transport"):
+#            out.append((parts[1], parts[2] if len(parts) > 2 else here, spec))
+#    return out
+#
+#
+#def tunnel_port_problem(port, ip, direction, to=None):
+#    """Why this port cannot carry the tunnel from relay `ip` to exit `to`, or
+#    "". The end that listens is the relay for a reverse tunnel and the exit
+#    for a direct one, and one machine cannot listen twice on a port."""
+#    if not 1 <= port <= 65535:
+#        return "درگاه باید عددی بین ۱ و ۶۵۵۳۵ باشد"
+#    if port in TUNNEL_RESERVED:
+#        return "درگاه %d مال %s است" % (port, TUNNEL_RESERVED[port])
+#    if 5299 <= port <= 5999:
+#        return "درگاه‌های ۵۲۹۹ تا ۵۹۹۹ مال DNS قالب‌ها روی رله است"
+#    if NODE_TUNNEL_BASE <= port < NODE_TUNNEL_BASE + 1000:
+#        return "درگاه‌های ۲۰۰۰۰ تا ۲۰۹۹۹ مال سر تونل نودها روی رله است"
+#    if str(port) == str((CFG or {}).get("ADMIN_PORT")):
+#        return "درگاه %d مال همین پنل است" % port
+#    to = to or exit_address()
+#    listens = ip if direction == "reverse" else to
+#    for relay, exit_, spec in all_tunnels():
+#        if (relay, exit_) == (ip, to) or spec.get("port") != port:
+#            continue
+#        if (relay if spec.get("direction") == "reverse" else exit_) == listens:
+#            return "درگاه %d روی %s را تونل رلهٔ %s به %s گرفته است" % (port, listens, relay,
+#                                                                       exit_)
+#    return ""
+#
+#
+#def tunnel_token(secret):
+#    return hashlib.sha256(("doctor-dns-tunnel:%s" % secret).encode()).hexdigest()[:48]
+#
+#
+#def exit_tunnel_toml(ip, spec, secret, where):
+#    out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
+#    if spec["direction"] == "reverse":
+#        out.append('[client]\nremote_addr = "%s:%d"\n' % (ip, spec["port"]))
+#    else:
+#        out.append('[direct]\nrole = "kharej"\naddr = "0.0.0.0:%d"\n' % spec["port"])
+#        if spec["transport"] in ("wss", "wssmux"):
+#            c, k = where + "/tls.crt", where + "/tls.key"
+#            if not os.path.exists(c):
+#                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+#                                "-days", "3650", "-subj", "/CN=localhost", "-keyout", k,
+#                                "-out", c], capture_output=True, timeout=60)
+#            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
+#    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+#    if spec["direction"] == "reverse":
+#        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
+#    return "".join(out)
+#
+#
+#def tunnel_nft_path(ip):
+#    return "/etc/nftables.d/41-smartdns-tunnel-%s.conf" % ip
+#
+#
+#def tunnel_nft_table(ip):
+#    return "smartdns_tunnel_" + ip.replace(".", "_")
+#
+#
+#def apply_exit_tunnel(ip):
+#    """This exit's end of the tunnel to one relay, as the panel has it set:
+#    running, or gone. "" or why not."""
+#    spec = relay_tunnel(ip)
+#    unit = "smartdns-tunnel@%s.service" % ip
+#    where = os.path.join(RELAY_TUNNELS, ip)
+#    nft_path, table = tunnel_nft_path(ip), tunnel_nft_table(ip)
+#    if not spec:
+#        if os.path.isdir(where) or os.path.exists(nft_path):
+#            subprocess.run(["systemctl", "disable", "--now", unit], capture_output=True, timeout=60)
+#            shutil.rmtree(where, ignore_errors=True)
+#            if os.path.exists(nft_path):
+#                os.unlink(nft_path)
+#            subprocess.run(["nft", "delete", "table", "inet", table], capture_output=True,
+#                           timeout=30)
+#            log(INFO, "tunnel to relay %s taken down" % ip)
+#        return ""
+#    if not os.access(BACKPACK_BIN, os.X_OK) or not os.path.exists(TUNNEL_INSTANCE_UNIT):
+#        return ("BackPack یا سرویس تونل روی این سرور نصب نیست؛ نصب‌کنندهٔ نسخهٔ تازه را یک بار "
+#                "دیگر روی همین سرور اجرا کنید")
+#    secret = read_env(PANEL_ENV).get("SYNC_SECRET") or ""
+#    if not secret:
+#        return "SYNC_SECRET در panel.env نیست"
+#    os.makedirs(where, mode=0o700, exist_ok=True)
+#    path = os.path.join(where, "tunnel.toml")
+#    text = exit_tunnel_toml(ip, spec, secret, where)
+#    try:
+#        with open(path, encoding="utf-8") as fh:
+#            changed = fh.read() != text
+#    except OSError:
+#        changed = True
+#    if changed:
+#        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+#            fh.write(text)
+#        os.chmod(path + ".tmp", 0o600)
+#        os.replace(path + ".tmp", path)
+#    if spec["direction"] == "direct":
+#        # This end listens: its port answers that relay and nobody else.
+#        port = spec["port"]
+#        rules = ("# written by the doctor dns admin panel: the tunnel's port answers %s only\n"
+#                 "table inet %s\ndelete table inet %s\ntable inet %s {\n    chain input {\n"
+#                 "        type filter hook input priority -5 ; policy accept ;\n"
+#                 "        tcp dport %d ip saddr != %s drop\n"
+#                 "        udp dport %d ip saddr != %s drop\n"
+#                 "        meta nfproto ipv6 tcp dport %d drop\n"
+#                 "        meta nfproto ipv6 udp dport %d drop\n    }\n}\n"
+#                 % (ip, table, table, table, port, ip, port, ip, port, port))
+#        os.makedirs(os.path.dirname(nft_path), exist_ok=True)
+#        with open(nft_path, "w", encoding="utf-8") as fh:
+#            fh.write(rules)
+#        subprocess.run(["nft", "-f", nft_path], capture_output=True, timeout=30)
+#    elif os.path.exists(nft_path):
+#        os.unlink(nft_path)
+#        subprocess.run(["nft", "delete", "table", "inet", table], capture_output=True, timeout=30)
+#    subprocess.run(["systemctl", "enable", unit], capture_output=True, timeout=60)
+#    active = subprocess.run(["systemctl", "is-active", "--quiet", unit], timeout=30).returncode == 0
+#    if changed or not active:
+#        subprocess.run(["systemctl", "restart", unit], capture_output=True, timeout=60)
+#        log(INFO, "tunnel to relay %s: %s, %s, port %d"
+#            % (ip, spec["transport"], spec["direction"], spec["port"]))
+#    return ""
+#
+#
+#def apply_exit_tunnels():
+#    """Every relay's tunnel as set, and none for a relay no longer served -
+#    when the panel starts, so an installer run in between changes nothing."""
+#    ips = relay_list()
+#    mine = installer_tunnel()
+#    for ip in ips:
+#        if mine and ip == mine["relay"]:
+#            # The installer's now: one tunnel to a relay, not two.
+#            if os.path.isdir(os.path.join(RELAY_TUNNELS, ip)):
+#                STORE.run("DELETE FROM settings WHERE key = ?", ("relay_tunnel:" + ip,))
+#                apply_exit_tunnel(ip)
+#            continue
+#        try:
+#            why = apply_exit_tunnel(ip)
+#            if why and relay_tunnel(ip):
+#                log(WARN, "tunnel to relay %s: %s" % (ip, why))
+#        except Exception as e:
+#            log(WARN, "tunnel to relay %s not set up: %r" % (ip, e))
+#    try:
+#        left = [d for d in os.listdir(RELAY_TUNNELS) if d not in ips]
+#    except OSError:
+#        left = []
+#    for ip in left:
+#        STORE.run("DELETE FROM settings WHERE key = ?", ("relay_tunnel:" + ip,))
+#        apply_exit_tunnel(ip)
+#
+#
+#def tunnel_cell(p, ip):
+#    """The relays card's tunnel column for one relay: one line for each exit
+#    it can have a tunnel to - this one, and every node."""
+#    here = exit_address()
+#    return "".join(tunnel_block(p, ip, to) for to in [here] + node_list())
+#
+#
+#def tunnel_block(p, ip, to):
+#    """The tunnel from relay `ip` to exit `to`: what it is, how it is going,
+#    and a form to change it."""
+#    here = exit_address()
+#    main = to == here
+#    label = ("<b dir='ltr'>%s</b>: " % html.escape(to)) if node_list() else ""
+#    mine = installer_tunnel()
+#    if main and mine and ip == mine["relay"]:
+#        return ("<div>%s<span class='muted'>BackPack، %s، %s، درگاه %s — از نصب‌کننده؛ با "
+#                "<code>--tunnel</code> عوض می‌شود</span></div>"
+#                % ((label,) + tuple(html.escape(mine[k]) for k in ("transport", "direction",
+#                                                                    "port"))))
+#    spec = relay_tunnel(ip, to)
+#    key = "relay_tunnel_state:" + ip if main else "relay_tunnel_state:%s:%s" % (ip, to)
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#    try:
+#        seen = json.loads(row["value"]) if row and row["value"] else {}
+#    except ValueError:
+#        seen = {}
+#    if spec:
+#        if main:
+#            there = subprocess.run(["systemctl", "is-active", "--quiet",
+#                                    "smartdns-tunnel@%s" % ip], timeout=30).returncode == 0
+#        else:
+#            row = STORE.one("SELECT value FROM settings WHERE key = ?",
+#                            ("node_tunnel_state:%s:%s" % (to, ip),))
+#            there = bool(row and row["value"] == "1")
+#        words = {"reverse": "معکوس", "direct": "مستقیم"}
+#        summary = "%s، %s، درگاه %d" % (spec["transport"], words.get(spec["direction"], ""),
+#                                         spec["port"])
+#        if seen.get("error"):
+#            state = "<span class='warn'>رله: %s</span>" % html.escape(seen["error"])
+#        elif not seen.get("on"):
+#            state = "<span class='warn'>رله هنوز نگرفته است</span>"
+#        elif there and seen.get("running"):
+#            state = "<span class='ok'>روشن در هر دو سر</span>"
+#        else:
+#            state = "<span class='warn'>%s</span>" % (
+#                "سرویس روی سرور خارج کار نمی‌کند" if not there else "سرویس روی رله کار نمی‌کند")
+#        summary = "%s — %s" % (html.escape(summary), state)
+#    else:
+#        summary = "خاموش — مستقیم" + (
+#            " <span class='warn'>(%s)</span>" % html.escape(seen["error"])
+#            if seen.get("error") else "")
+#    direction = spec.get("direction") or "reverse"
+#    options = "".join(
+#        "<option value='%s'%s>%s — %s</option>"
+#        % (t, " selected" if t == spec.get("transport", "stealth") else "", t,
+#           TRANSPORT_WORDS.get(t, "")) for t in TUNNEL_TRANSPORTS["reverse"])
+#    return (
+#        "<details><summary>%s%s</summary>"
+#        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px'>"
+#        "<input type='hidden' name='ip' value='%s'><input type='hidden' name='exit' value='%s'>"
+#        "<label style='display:block'><input type='radio' name='on' value='0'%s> خاموش — رله "
+#        "مستقیم به سرور خارج وصل شود</label>"
+#        "<label style='display:block'><input type='radio' name='on' value='1'%s> تونل BackPack</label>"
+#        "<label style='display:block'>کدام سر وصل شود: <select name='direction'>"
+#        "<option value='reverse'%s>معکوس — سرور خارج به رله وصل می‌شود</option>"
+#        "<option value='direct'%s>مستقیم — رله به سرور خارج وصل می‌شود</option></select></label>"
+#        "<label style='display:block'>ترنسپورت: <select name='transport'>%s</select></label>"
+#        "<label style='display:block'>درگاه: <input name='port' value='%s' dir='ltr' "
+#        "style='width:90px'></label>"
+#        "<p class='muted'>حالت مستقیم فقط stealth، wss، tcp و ws را دارد. در حالت معکوس این "
+#        "درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، "
+#        "بازش کنید. تا وقتی تونل وصل نیست، رله مستقیم به سرور خارج می‌رود.</p>"
+#        "<button class='ghost'>ذخیرهٔ تونل</button></form></details>"
+#        % (label, summary, p, ip, html.escape(to), "" if spec else " checked",
+#           " checked" if spec else "",
+#           " selected" if direction == "reverse" else "",
+#           " selected" if direction == "direct" else "", options,
+#           spec.get("port") or 8444))
+#
+#def save_node_tunnel(ip, to, one):
+#    """The tunnel from relay `ip` to node `to`: kept here, and built by
+#    the two of them from what their syncs are told. Where to go next."""
+#    if to not in node_list():
+#        return "nodes?m=!این سرور خارج در فهرست نیست"
+#    key = "relay_tunnel:%s:%s" % (ip, to)
+#    STORE.run("DELETE FROM settings WHERE key = ?", ("relay_tunnel_state:%s:%s" % (ip, to),))
+#    if one("on") != "1":
+#        STORE.run("DELETE FROM settings WHERE key = ?", (key,))
+#        return ("nodes?m=تونل رلهٔ %s به %s خاموش شد؛ تا یک دقیقه دیگر "
+#                             "مستقیم وصل می‌شود" % (ip, to))
+#    direction, transport = one("direction"), one("transport")
+#    if direction not in TUNNEL_TRANSPORTS:
+#        return "nodes?m=!جهت تونل را انتخاب کنید"
+#    if transport not in TUNNEL_TRANSPORTS[direction]:
+#        return "nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد"
+#    try:
+#        port = int(one("port").strip())
+#    except ValueError:
+#        return "nodes?m=!درگاه را عددی بنویسید"
+#    why = tunnel_port_problem(port, ip, direction, to)
+#    if why:
+#        return ("nodes?m=!%s" % why)
+#    spec = {"transport": transport, "direction": direction, "port": port, "exit": to,
+#            "slot": node_slot(to)}
+#    STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#              " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#              (key, json.dumps(spec, sort_keys=True)))
+#    return ("nodes?m=تونل رلهٔ %s به %s ذخیره شد؛ رله و نود تا یک دقیقه دیگر "
+#                         "تونل را از سمت خودشان راه می‌اندازند؛ وضعیتش را همین‌جا ببینید"
+#                         % (ip, to))
+#
+#
+#def server_link(kind, ip, text=None):
+#    """A server's name, linked to its own page of figures."""
+#    return ("<a href='/%s/server?k=%s&amp;h=%s' dir='ltr'><code>%s</code></a>"
+#            % (CFG["ADMIN_PATH"], kind, ip, html.escape(text or ip)))
+#
+#
+#def server_totals(kind):
+#    """{server: (today, thirty days)} through servers of this kind."""
+#    now_t = datetime.now(TEHRAN)
+#    today = now_t.strftime("%Y-%m-%d")
+#    since = (now_t - timedelta(days=29)).strftime("%Y-%m-%d")
+#    return {r["server"]: (r["t"] or 0, r["m"] or 0) for r in STORE.q(
+#        "SELECT server, SUM(CASE WHEN bucket = ? THEN up + down ELSE 0 END) t,"
+#        " SUM(up + down) m FROM server_usage WHERE grain = '1d' AND kind = ?"
+#        " AND bucket >= ? GROUP BY server", (today, kind, since))}
+#
+#
+#def health_cells(host):
+#    """A server's last health sample, as table cells: CPU, memory, disk, network."""
+#    m = STORE.one("SELECT * FROM metrics WHERE host = ? ORDER BY at DESC LIMIT 1", (host,))
+#    if not m:
+#        return "<td colspan='4' class='muted'>هنوز آماری نرسیده</td>"
+#    seen = parse_ts(m["at"])
+#    gone = seen and (datetime.now(timezone.utc) - seen).total_seconds() > 120
+#    return ("<td>%s%%%s</td><td>%s</td><td>%s</td><td class='muted' dir='ltr'>"
+#            "↓%s/s ↑%s/s</td>"
+#            % (m["cpu"] if m["cpu"] is not None else "-",
+#               " <span class='bad'>قطع</span>" if gone else "",
+#               bar(m["mem_used"], m["mem_total"]), bar(m["disk_used"], m["disk_total"]),
+#               human(m["rx_bps"] or 0), human(m["tx_bps"] or 0)))
+#
+#
+#def servers_card():
+#    """Every server on one table: how much went through it, and how it is -
+#    each name a link to its own page."""
+#    here, nodes, relays = exit_address(), node_list(), relay_list()
+#    exits, via = server_totals("exit"), server_totals("relay")
+#    out = ["<div class='card'><h2>مصرف و آمار هر سرور</h2>"
+#           "<table><tr><th>سرور</th><th></th><th>مصرف امروز</th><th>۳۰ روز</th>"
+#           "<th>CPU</th><th>RAM</th><th>دیسک</th><th>شبکه</th><th>ترافیک این ماه</th></tr>"]
+#    rows = ([("exit", ip, "exit" if ip == here else ip,
+#              "سرور خارج — پنل" if ip == here else "نود", exits.get(ip))
+#             for ip in [here] + nodes]
+#            + [("relay", ip, ip, "تک‌سرور" if is_single_server(ip) else "رله", via.get(ip))
+#               for ip in relays])
+#    for kind, ip, host, label, used in rows:
+#        today, month = used or (0, 0)
+#        out.append("<tr><td>%s</td><td>%s</td><td dir='ltr'>%s</td><td dir='ltr'>%s</td>%s"
+#                   "<td>%s</td></tr>"
+#                   % (server_link(kind, ip) if ip else "?", label, human(today),
+#                      human(month), health_cells(host),
+#                      cap_cell(CFG["ADMIN_PATH"], host, kind == "exit")))
+#    out.append("</table><p class='muted'>«ترافیک این ماه» از شمارندهٔ کارت شبکهٔ خود سرور "
+#               "است، همان چیزی که سرویس‌دهنده حساب می‌کند؛ رویش بزنید تا سقف ماهانه، روز شروع "
+#               "دوره و کاری که با رسیدن به سقف بشود را تعیین کنید. هشدار در ۸۰ و ۹۵ و ۱۰۰ درصد "
+#               "می‌آید.</p><p class='muted'>روی نام هر سرور بزنید تا نمودارها و مشتری‌هایش را "
+#               "ببینید. مصرف مشتری‌های ثبت‌شده: روی رله از شمارندهٔ خود رله (همانی که حجم "
+#               "مشتری از آن کم می‌شود)، و روی سرور خارج از روی اینکه رله‌ها هر اتصال را از "
+#               "کدام سرور فرستاده‌اند. روز به وقت تهران.</p></div>")
+#    return "".join(out)
+#
+#
+#def cap_cell(p, host, exit_kind):
+#    """A server's month against its cap, and the form to set the cap."""
+#    try:
+#        cap = json.loads((STORE.one("SELECT value FROM settings WHERE key = ?",
+#                                    ("cap:" + host,)) or {"value": ""})["value"] or "{}")
+#        state = json.loads((STORE.one("SELECT value FROM settings WHERE key = ?",
+#                                      ("net_month:" + host,)) or {"value": ""})["value"] or "{}")
+#    except (ValueError, TypeError):
+#        cap, state = {}, {}
+#    used = state.get("out", 0) + (0 if cap.get("count") == "out" else state.get("in", 0))
+#    limit = float(cap.get("gb") or 0) * 1e9
+#    if limit:
+#        pct = int(100 * used / limit)
+#        shown = "<span class='%s' dir='ltr'>%.1f از %s GB (%d٪)</span>" % (
+#            "bad" if pct >= 100 else "warn" if pct >= 80 else "ok", used / 1e9,
+#            cap.get("gb"), pct)
+#    else:
+#        shown = "<span class='muted' dir='ltr'>%.1f GB — بی‌سقف</span>" % (used / 1e9)
+#    action = ("<label style='display:block'>وقتی به سقف رسید: <select name='action'>"
+#              "<option value='alert'%s>فقط هشدار</option>"
+#              "<option value='move'%s>رله‌ها از سرورهای خارج دیگر بروند</option></select></label>"
+#              % ("" if cap.get("action") == "move" else " selected",
+#                 " selected" if cap.get("action") == "move" else "")) if exit_kind else ""
+#    return (
+#        "<details><summary>%s</summary><form method='post' action='/%s/cap-save'>"
+#        "<input type='hidden' name='host' value='%s'>"
+#        "<label style='display:block'>سقف ماهانه (گیگ): <input name='gb' value='%s' dir='ltr' "
+#        "style='width:80px' placeholder='خالی = بی‌سقف'></label>"
+#        "<label style='display:block'>دوره از روز <input name='day' value='%s' dir='ltr' "
+#        "style='width:50px'> هر ماه شروع می‌شود</label>"
+#        "<label style='display:block'>شمرده می‌شود: <select name='count'>"
+#        "<option value='both'%s>دانلود و آپلود</option>"
+#        "<option value='out'%s>فقط خروجی</option></select></label>%s"
+#        "<button class='ghost'>ذخیره</button></form></details>"
+#        % (shown, p, html.escape(host), cap.get("gb") or "", cap.get("day") or 1,
+#           "" if cap.get("count") == "out" else " selected",
+#           " selected" if cap.get("count") == "out" else "", action))
+#
+#
+#def server_view(kind, server):
+#    """One server's usage in the grains the home page draws everybody's in."""
+#    now_t = datetime.now(TEHRAN)
+#
+#    def series(grain, since, fmt):
+#        return [(r["bucket"], r["up"], r["down"]) for r in STORE.q(
+#            "SELECT bucket, up, down FROM server_usage WHERE grain = ? AND kind = ?"
+#            " AND server = ? AND bucket >= ? ORDER BY bucket",
+#            (grain, kind, server, since.strftime(fmt)))]
+#
+#    return {"five": series("5m", now_t - timedelta(hours=24), "%Y-%m-%dT%H:%M"),
+#            "hours": series("1h", now_t - timedelta(days=7), "%Y-%m-%dT%H:00"),
+#            "days": series("1d", now_t - timedelta(days=60), "%Y-%m-%d")}
+#
+#
+#def user_servers_card(uid):
+#    """One customer's usage, through each relay and each exit."""
+#    now_t = datetime.now(TEHRAN)
+#    days = [(now_t - timedelta(days=n)).strftime("%Y-%m-%d") for n in (0, 6, 29)]
+#    parts = []
+#    for kind, title in (("relay", "رله"), ("exit", "سرور خارج")):
+#        rows = STORE.q(
+#            "SELECT server, SUM(CASE WHEN day = ? THEN up + down ELSE 0 END) t,"
+#            " SUM(CASE WHEN day >= ? THEN up + down ELSE 0 END) w,"
+#            " SUM(down) d, SUM(up) u FROM user_server_usage"
+#            " WHERE user_id = ? AND kind = ? AND day >= ? GROUP BY server"
+#            " ORDER BY SUM(up + down) DESC", (days[0], days[1], uid, kind, days[2]))
+#        if not rows:
+#            continue
+#        parts.append(
+#            "<table><tr><th>%s</th><th>امروز</th><th>۷ روز</th><th>۳۰ روز — دانلود</th>"
+#            "<th>۳۰ روز — آپلود</th></tr>%s</table>"
+#            % (title, "".join("<tr><td>%s</td><td dir='ltr'>%s</td><td dir='ltr'>%s</td>"
+#                              "<td dir='ltr'>%s</td><td dir='ltr'>%s</td></tr>"
+#                              % (server_link(kind, r["server"]), human(r["t"] or 0),
+#                                 human(r["w"] or 0), human(r["d"] or 0), human(r["u"] or 0))
+#                              for r in rows)))
+#    if not parts:
+#        return ""
+#    return ("<div class='card'><h2>مصرف به تفکیک سرور</h2>%s<p class='muted'>روی هر سرور "
+#            "بزنید تا نمودارهای خودش را ببینید. روز به وقت تهران.</p></div>" % "".join(parts))
+#
+#
+#def alerts_card(always=True):
+#    """What is wrong with the servers now, and what changed lately."""
+#    open_ = [r["key"][len("alert_state:"):] for r in STORE.q(
+#        "SELECT key FROM settings WHERE key LIKE 'alert_state:%' AND value = 'down'")]
+#    try:
+#        recent = STORE.q("SELECT * FROM alerts ORDER BY id DESC LIMIT 15")
+#    except sqlite3.OperationalError:
+#        recent = []         # a panel that has not made the table yet
+#    if not open_ and not always:
+#        return ""
+#    out = ["<div class='card'><h2>هشدارها</h2>"]
+#    if open_:
+#        for key in open_:
+#            row = STORE.one("SELECT text, at FROM alerts WHERE key = ? ORDER BY id DESC LIMIT 1",
+#                            (key,))
+#            if row:
+#                out.append("<div class='msg err'>%s <span class='muted'>(%s)</span></div>"
+#                           % (html.escape(row["text"]), html.escape(ago(row["at"]))))
+#    else:
+#        out.append("<p class='ok'>همهٔ سرورها سالم‌اند.</p>")
+#    if recent:
+#        out.append("<details><summary>رویدادهای اخیر</summary><table>%s</table></details>"
+#                   % "".join("<tr><td class='muted'>%s</td><td>%s</td></tr>"
+#                             % (html.escape(ago(r["at"])), html.escape(r["text"]))
+#                             for r in recent))
+#    out.append("<p class='muted'>هر رله هر نیم دقیقه از راه هر سرور خارج یک سایت را "
+#               "امتحان می‌کند؛ اگر دو بار پشت هم جواب نگیرد، آن سرور را برای مشتری‌هایش "
+#               "آخر صف می‌گذارد تا وقتی دوباره جواب بدهد. این‌ها هم این‌جا می‌آیند: سروری "
+#               "که ۳ دقیقه گزارش ندهد، دیسک بالای ۹۰٪، جدول اتصال‌ها بالای ۸۰٪، گواهی HTTPS "
+#               "که کمتر از ۱۴ روز مانده و تمدید نشده، و رم یا پردازندهٔ بالای ۹۰٪ در ۱۰ دقیقه. "
+#               "هر تغییر یک بار به ادمین‌های ربات هم فرستاده می‌شود.</p></div>")
+#    return "".join(out)
+#
+#
+#INSTALLER_COPY = "/var/lib/smart-dns/installer/doctor-dns.sh"
+#
+#
+#def installer_version():
+#    """The version of the installer this exit kept for the others, or ""."""
+#    try:
+#        with open(INSTALLER_COPY, "rb") as fh:
+#            m = re.search(rb'^VERSION="([0-9.]+)"', fh.read(), re.M)
+#        return m.group(1).decode() if m else ""
+#    except OSError:
+#        return ""
+#
+#
+#def version_key(v):
+#    try:
+#        return tuple(int(x) for x in str(v).split("."))
+#    except ValueError:
+#        return ()
+#
+#
+## ---------------------------------------------------------- from GitHub
+## A new release on GitHub, found by this panel and installed here with one
+## button, then on the other servers one by one as before. The installer is
+## taken only when its hash is the one GitHub publishes for it - or, where a
+## release carries none, when it is byte for byte the one on the main branch.
+#GITHUB_REPO = "mehdi047/doctor-dns"
+#GITHUB_API = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+#GITHUB_RAW = "https://raw.githubusercontent.com/%s/main/doctor-dns.sh" % GITHUB_REPO
+#SELF_UPGRADE_DIR = "/var/lib/smart-dns/self-upgrade"
+#SELF_UPGRADE_UNIT = "smartdns-self-upgrade"
+#RELEASE_MAX = 30 * 1024 * 1024
+#UPDATE_CHECK_HOURS = 12
+#
+#
+#def github_latest(opener=None):
+#    """The latest release: {"version", "url", "sha", "page"}, or raises."""
+#    opener = opener or urllib.request.urlopen
+#    req = urllib.request.Request(GITHUB_API, headers={
+#        "Accept": "application/vnd.github+json", "User-Agent": "doctor-dns"})
+#    with opener(req, timeout=30) as r:
+#        rel = json.loads(r.read(2 * 1024 * 1024))
+#    version = str(rel.get("tag_name") or "").lstrip("vV")
+#    if not version_key(version):
+#        raise RuntimeError("the latest release has no version: %r" % rel.get("tag_name"))
+#    asset = next((a for a in rel.get("assets") or [] if a.get("name") == "doctor-dns.sh"), None)
+#    if not asset:
+#        raise RuntimeError("the release %s has no doctor-dns.sh" % version)
+#    digest = str(asset.get("digest") or "")
+#    return {"version": version, "url": asset.get("browser_download_url"),
+#            "sha": digest[7:] if digest.startswith("sha256:") else None,
+#            "page": rel.get("html_url") or ""}
+#
+#
+#def fetch_release(rel, opener=None):
+#    """The release's installer, checked: its bytes, or raises."""
+#    opener = opener or urllib.request.urlopen
+#
+#    def get(url):
+#        req = urllib.request.Request(url, headers={"User-Agent": "doctor-dns"})
+#        with opener(req, timeout=120) as r:
+#            blob = r.read(RELEASE_MAX + 1)
+#        if len(blob) > RELEASE_MAX:
+#            raise RuntimeError("the installer is too large")
+#        return blob
+#
+#    blob = get(rel["url"])
+#    sha = hashlib.sha256(blob).hexdigest()
+#    if rel.get("sha"):
+#        if sha != rel["sha"]:
+#            raise RuntimeError("the installer is not the one GitHub published (sha256 %s)"
+#                               % sha[:16])
+#    elif hashlib.sha256(get(GITHUB_RAW)).hexdigest() != sha:
+#        raise RuntimeError("the release carries no hash and its installer is not the one on "
+#                           "the main branch - not taken")
+#    if ('VERSION="%s"' % rel["version"]).encode() not in blob:
+#        raise RuntimeError("the installer does not say version %s" % rel["version"])
+#    return blob
+#
+#
+#def check_github(opener=None):
+#    """Look for a new release and note what was found, for the nodes page."""
+#    state = {"checked_at": now()}
+#    try:
+#        state.update(github_latest(opener))
+#    except Exception as e:
+#        state["error"] = str(e)[:200]
+#    put_setting("github_latest", json.dumps(state))
+#    return state
+#
+#
+#def github_state():
+#    try:
+#        return json.loads(setting("github_latest") or "{}")
+#    except ValueError:
+#        return {}
+#
+#
+#def update_check_loop():
+#    while True:
+#        try:
+#            state = github_state()
+#            last = parse_ts(state.get("checked_at"))
+#            if not last or datetime.now(timezone.utc) - last > timedelta(
+#                    hours=UPDATE_CHECK_HOURS):
+#                check_github()
+#        except Exception as e:
+#            log(WARN, "release check: %r" % e)
+#        time.sleep(600)
+#
+#
+#def self_upgrade_state():
+#    """(exit code or None while running or never run, the log's end)."""
+#    try:
+#        with open(os.path.join(SELF_UPGRADE_DIR, "rc")) as fh:
+#            rc = int(fh.read().strip() or "1")
+#    except (OSError, ValueError):
+#        rc = None
+#    try:
+#        with open(os.path.join(SELF_UPGRADE_DIR, "run.log"), errors="replace") as fh:
+#            text = fh.read()[-4000:]
+#    except OSError:
+#        text = ""
+#    return rc, text
+#
+#
+#def start_self_upgrade(blob, version):
+#    """Run the new installer on this machine, as a unit of its own that
+#    outlives this panel's restart; the other servers follow when it is back."""
+#    os.makedirs(SELF_UPGRADE_DIR, exist_ok=True)
+#    for name in ("rc", "run.log"):
+#        try:
+#            os.remove(os.path.join(SELF_UPGRADE_DIR, name))
+#        except OSError:
+#            pass
+#    path = os.path.join(SELF_UPGRADE_DIR, "doctor-dns.sh")
+#    with open(path + ".tmp", "wb") as fh:
+#        fh.write(blob)
+#    os.replace(path + ".tmp", path)
+#    put_setting("upgrade_others_after", version)
+#    subprocess.run(["systemctl", "reset-failed", SELF_UPGRADE_UNIT], capture_output=True)
+#    return subprocess.run(
+#        ["systemd-run", "--unit=" + SELF_UPGRADE_UNIT, "--collect", "/bin/bash", "-c",
+#         'ASSUME_YES=1 bash "%s" > "%s/run.log" 2>&1; echo $? > "%s/rc"'
+#         % (path, SELF_UPGRADE_DIR, SELF_UPGRADE_DIR)], capture_output=True, text=True)
+#
+#
+#def start_upgrade_job():
+#    """Every server behind the installer this exit keeps, one at a time: a
+#    message for the page, or None when there is nothing to do."""
+#    have = installer_version()
+#    if not have:
+#        return "!نصب‌کننده‌ای روی این سرور نگه داشته نشده"
+#    with open(INSTALLER_COPY, "rb") as fh:
+#        sha = hashlib.sha256(fh.read()).hexdigest()
+#    queue = []
+#    for h in relay_list() + node_list():
+#        row = STORE.one("SELECT value FROM settings WHERE key = ?", ("version:" + h,))
+#        if version_key(row["value"] if row else "") < version_key(have):
+#            queue.append(h)
+#    if not queue:
+#        return "همهٔ سرورها روی همین نسخه‌اند"
+#    job = {"version": have, "sha": sha, "queue": queue[1:], "current": queue[0],
+#           "asked_at": now(), "done": [], "logs": {}, "stopped": ""}
+#    put_setting("upgrade_job", json.dumps(job, ensure_ascii=False, sort_keys=True))
+#    return "آپدیت شروع شد: اول %s، بعد بقیه یکی‌یکی" % queue[0]
+#
+#
+#def continue_after_self_upgrade():
+#    """Back from upgrading itself: the other servers now, once."""
+#    want = setting("upgrade_others_after")
+#    if not want:
+#        return None
+#    if version_key(app_version()) >= version_key(want):
+#        STORE.run("DELETE FROM settings WHERE key = 'upgrade_others_after'")
+#        msg = start_upgrade_job()
+#        log(INFO, "upgraded to %s from GitHub; the others: %s" % (want, msg))
+#        return msg
+#    return None
+#
+#
+#SERVER_NOTE_MAX = 80
+#
+#
+#def ordered_servers():
+#    """The servers in the order customers see them, and which are hidden."""
+#    try:
+#        order = [str(x) for x in json.loads(setting("server_order") or "[]")]
+#    except (ValueError, TypeError):
+#        order = []
+#    try:
+#        hidden = {str(x) for x in json.loads(setting("server_hidden") or "[]")}
+#    except (ValueError, TypeError):
+#        hidden = set()
+#    relays = relay_list()
+#    rank = {ip: n for n, ip in enumerate(order)}
+#    return sorted(relays, key=lambda ip: (rank.get(ip, len(order)), relays.index(ip))), hidden
+#
+#
+#def customer_servers_card(p):
+#    """How the servers are shown to customers: in which order, with what
+#    words beside each, and which are hidden from everyone for now."""
+#    servers, hidden = ordered_servers()
+#    if not servers:
+#        return ""
+#    rows = []
+#    domains = not one_server()
+#    for n, ip in enumerate(servers, 1):
+#        rows.append(
+#            "<tr%s><td><input form='srvlist' name='order_%s' value='%d' size='2' dir='ltr' "
+#            "inputmode='numeric'></td><td dir='ltr'><code>%s</code></td><td>%s</td>"
+#            "%s<td><input form='srvlist' name='note_%s' value='%s' maxlength='%d' "
+#            "style='width:100%%' placeholder='مثلاً مخصوص ایرانسل'></td>"
+#            "<td><label style='display:inline'><input form='srvlist' type='checkbox' "
+#            "name='hide_%s' value='1'%s> پنهان</label></td></tr>"
+#            % (" class='off'" if ip in hidden else "", ip, n, ip,
+#               "تک‌سرور" if setting("single:" + ip) == "1" else "رله",
+#               domain_cell(ip) if domains else "",
+#               ip, html.escape(setting("server_note:" + ip) or "", quote=True),
+#               SERVER_NOTE_MAX, ip, " checked" if ip in hidden else ""))
+#    return ("<div class='card'><h2>سرورها برای مشتری</h2>"
+#            "<form id='srvlist' method='post' action='/%s/server-list-save'></form>"
+#            "<table><tr><th>ترتیب</th><th>سرور</th><th></th>%s<th>توضیح برای مشتری</th>"
+#            "<th></th></tr>%s</table><button form='srvlist'>ذخیره</button>"
+#            "<p class='muted'>مشتری سرورها را به همین ترتیب می‌بیند، با شماره و توضیح هر کدام "
+#            "(در ربات و پنل خودش، کنار DNS، DoT و DoH آن سرور)؛ اولی را معمولاً برمی‌دارد. "
+#            "«پنهان» سرور را از فهرست همهٔ مشتری‌ها برمی‌دارد، مثلاً وقتی در حال تعمیر است، "
+#            "بدون اینکه تیک مشتری‌ها عوض شود. سرور پنهان هنوز کار می‌کند؛ فقط نشان داده "
+#            "نمی‌شود. فروشنده‌ای که اجازهٔ انتخاب رله دارد، می‌تواند برای مشتری‌های خودش "
+#            "توضیح خودش را بنویسد.</p>%s</div>"
+#            % (p, "<th>دامنه (DoH و DoT)</th>" if domains else "", "".join(rows),
+#               "<p class='muted'>دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و "
+#               "پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. "
+#               "سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند "
+#               "دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث "
+#               "می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا "
+#               "گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.</p>" if domains else ""))
+#
+#
+#def domain_cell(ip):
+#    """A server's domain: the one it has, the one asked for and how it is
+#    going, and the box to give it one."""
+#    have = setting("doh_host:" + ip) or ""
+#    want = setting("domain_want:" + ip) or ""
+#    try:
+#        state = json.loads(setting("domain_state:" + ip) or "{}")
+#    except ValueError:
+#        state = {}
+#    if want and (have == want or state.get("ok") and state.get("name") == want):
+#        note = "<span class='ok'>✓ DoH و DoT روشن</span>"
+#    elif want and state.get("name") == want and not state.get("ok"):
+#        note = ("<span class='bad'>نشد: %s</span>%s" % (
+#            html.escape(state.get("error") or ""),
+#            "<details><summary>لاگ</summary><pre dir='ltr' style='white-space:pre-wrap;"
+#            "max-height:40vh;overflow:auto'>%s</pre></details>" % html.escape(state["log"])
+#            if state.get("log") else ""))
+#    elif want:
+#        note = "<span class='warn'>در حال گرفتن گواهی…</span>"
+#    elif have:
+#        note = "<span class='ok'>✓ DoH و DoT روشن</span>"
+#    else:
+#        note = "<span class='muted'>بدون دامنه: فقط DNS معمولی</span>"
+#    return ("<td><input form='srvlist' name='domain_%s' value='%s' dir='ltr' "
+#            "style='width:100%%;min-width:160px' placeholder='dns1.example.com'><br>"
+#            "<small>%s</small></td>" % (ip, html.escape(want or have, quote=True), note))
+#
+#
+#def seller_notes_card(p, s):
+#    """A seller who may pick servers: their own words about each, for their
+#    customers only."""
+#    if not s["can_route"]:
+#        return ""
+#    servers, hidden = ordered_servers()
+#    servers = [ip for ip in servers if ip not in hidden]
+#    if not servers:
+#        return ""
+#    rows = "".join(
+#        "<tr><td dir='ltr'><code>%s</code></td><td><input name='note_%s' value='%s' "
+#        "maxlength='%d' style='width:100%%' placeholder='%s'></td></tr>"
+#        % (ip, ip, html.escape(setting("server_note:%d:%s" % (s["id"], ip)) or "", quote=True),
+#           SERVER_NOTE_MAX, html.escape(setting("server_note:" + ip) or "توضیح مالک پنل",
+#                                        quote=True))
+#        for ip in servers)
+#    return ("<div class='card'><h2>توضیح سرورها برای مشتری‌های شما</h2>"
+#            "<form method='post' action='/%s/seller-server-notes'><table><tr><th>سرور</th>"
+#            "<th>توضیح</th></tr>%s</table><button>ذخیره</button></form>"
+#            "<p class='muted'>فقط مشتری‌های شما این‌ها را می‌بینند. خالی بگذارید تا توضیح "
+#            "مالک پنل (خاکستری) نشان داده شود.</p></div>" % (p, rows))
+#
+#
+#def public_dns_card(p):
+#    """Public DNS: a button that opens every relay to everyone."""
+#    on = setting("public_dns") == "1"
+#    if on:
+#        form = ("<form method='post' action='/%s/public-dns'><input type='hidden' name='to' "
+#                "value='0'><button>خاموش کردن DNS عمومی</button></form>" % p)
+#        state = ("<p class='warn'>🌍 DNS عمومی روشن است: هر کسی آدرس رله را بگذارد، بدون "
+#                 "ثبت‌نام و ثبت آی‌پی سرویس می‌گیرد.</p>")
+#    else:
+#        ask = ("DNS عمومی روشن شود؟ هر کسی آدرس رله را بگذارد، بدون ثبت‌نام و بدون هیچ "
+#               "محدودیتی سرویس می‌گیرد و مصرفش جایی شمرده نمی‌شود.")
+#        form = ("<form method='post' action='/%s/public-dns' onsubmit='return confirm(%s)'>"
+#                "<input type='hidden' name='to' value='1'><button class='ghost'>روشن کردن DNS "
+#                "عمومی</button></form>"
+#                % (p, html.escape(json.dumps(ask, ensure_ascii=False), quote=True)))
+#        state = ("<p class='muted'>خاموش است: فقط آی‌پی‌هایی که مشتری‌ها ثبت کرده‌اند سرویس "
+#                 "می‌گیرند.</p>")
+#    return ("<div class='card'><h2>DNS عمومی</h2>%s%s<p class='muted'>وقتی روشن باشد، DNS "
+#            "برای همه باز است: کسی لازم نیست ثبت‌نام کند یا آی‌پی ثبت کند، و سهمیه، تاریخ پایان "
+#            "و مسدود بودن مشتری‌ها هم جلوی کسی را نمی‌گیرد. مصرف کسانی که آی‌پی ثبت نکرده‌اند "
+#            "جایی شمرده نمی‌شود. تا یک دقیقه روی همهٔ رله‌ها و تک‌سرورها اعمال می‌شود؛ با "
+#            "خاموش کردنش همه‌چیز مثل قبل می‌شود. DoH و DoT همچنان فقط برای مشتری‌ها کار "
+#            "می‌کنند.</p></div>" % (state, form))
+#
+#
+#def github_card(p):
+#    """The nodes page: a newer release on GitHub, and the one button."""
+#    state = github_state()
+#    mine = app_version()
+#    rc, text = self_upgrade_state()
+#    waiting = setting("upgrade_others_after")
+#    out = ["<div class='card'><h2>🆕 نسخهٔ تازه از گیت‌هاب</h2>"
+#           "<p>این سرور: <b dir='ltr'>%s</b>" % html.escape(mine or "?")]
+#    if state.get("version"):
+#        out.append(" · آخرین نسخه در گیت‌هاب: <b dir='ltr'>%s</b>%s"
+#                   % (html.escape(state["version"]),
+#                      " (<a href='%s' target='_blank' rel='noopener'>یادداشت نسخه</a>)"
+#                      % html.escape(state["page"], quote=True) if state.get("page") else ""))
+#    out.append(" <span class='muted'>— بررسی: %s</span></p>"
+#               % html.escape((state.get("checked_at") or "هنوز نه")[:16].replace("T", " ")))
+#    if state.get("error"):
+#        out.append("<p class='warn'>گیت‌هاب جواب درستی نداد: %s</p>" % html.escape(state["error"]))
+#    if waiting and rc is None:
+#        out.append("<p class='warn'>در حال آپدیت همین سرور به %s… پنل چند ثانیه‌ای قطع می‌شود و "
+#                   "بعد خودش بقیهٔ سرورها را آپدیت می‌کند.</p><script>setTimeout(function(){"
+#                   "location.reload()},15000)</script>" % html.escape(waiting))
+#    elif rc not in (None, 0):
+#        out.append("<p class='bad'>آپدیت همین سرور نشد (کد %d).</p><details><summary>لاگ"
+#                   "</summary><pre dir='ltr' style='white-space:pre-wrap;max-height:40vh;"
+#                   "overflow:auto'>%s</pre></details>" % (rc, html.escape(text)))
+#    newer = state.get("version") and version_key(state["version"]) > version_key(mine)
+#    table, behind, running = servers_versions(p)
+#    if newer and not (waiting and rc is None) and not running:
+#        out.append("<form method='post' action='/%s/self-upgrade' onsubmit=\"return confirm("
+#                   "'این سرور و بعد همهٔ رله‌ها، نودها و تک‌سرورها به نسخهٔ %s آپدیت شوند؟')\">"
+#                   "<button>آپدیت همه به %s</button></form>"
+#                   % (p, html.escape(state["version"]), html.escape(state["version"])))
+#    elif behind and not running and not (waiting and rc is None):
+#        # This server has it already; the others that do not are brought up
+#        # to it by the same button.
+#        out.append("<form method='post' action='/%s/self-upgrade' onsubmit=\"return confirm("
+#                   "'%d سرور دیگر به نسخهٔ %s آپدیت شوند؟')\"><button>آپدیت همه به %s</button>"
+#                   "</form>" % (p, len(behind), html.escape(mine), html.escape(mine)))
+#    elif not newer and state.get("version") and not running:
+#        out.append("<p class='ok'>همهٔ سرورها آخرین نسخه را دارند.</p>" if not behind
+#                   else "")
+#    out.append(table)
+#    out.append("<form method='post' action='/%s/update-check' style='margin-top:8px'>"
+#               "<button class='ghost'>بررسی دوباره</button></form>"
+#               "<p class='muted'>پنل هر %d ساعت یک بار گیت‌هاب doctor-dns را چک می‌کند. با زدن "
+#               "دکمه، نصب‌کننده از خود ریلیز دانلود می‌شود و فقط وقتی نصب می‌شود که هشش با هشی "
+#               "که گیت‌هاب منتشر کرده یکی باشد. اول همین سرور آپدیت می‌شود و بعد بقیهٔ سرورها "
+#               "یکی‌یکی. نسخهٔ قدیمی‌تر هیچ‌وقت نصب نمی‌شود.</p></div>"
+#               % (p, UPDATE_CHECK_HOURS))
+#    return "".join(out)
+#
+#
+#def servers_versions(p):
+#    """Under the GitHub card: every other server's version, where the
+#    upgrade of them has got to, and a way to stop it. (the table, the
+#    servers behind this one, whether an upgrade is running)"""
+#    have = installer_version()
+#    try:
+#        job = json.loads((STORE.one("SELECT value FROM settings WHERE key = 'upgrade_job'")
+#                          or {"value": ""})["value"] or "{}")
+#    except (ValueError, TypeError):
+#        job = {}
+#    hosts = relay_list() + node_list()
+#    if not hosts or not have:
+#        return "", [], False
+#    out = []
+#    rows, behind = [], []
+#    for h in hosts:
+#        row = STORE.one("SELECT value FROM settings WHERE key = ?", ("version:" + h,))
+#        v = row["value"] if row else ""
+#        if version_key(v) < version_key(have):
+#            behind.append(h)
+#        state = ""
+#        if job.get("current") == h and not job.get("stopped"):
+#            state = "<span class='warn'>در حال آپدیت…</span>"
+#        elif h in (job.get("done") or []) and job.get("version") == have:
+#            state = "<span class='ok'>آپدیت شد</span>"
+#        elif job.get("stopped") and h in (job.get("logs") or {}) and h not in (job.get("done") or []):
+#            state = "<span class='bad'>نشد</span>"
+#        log_text = (job.get("logs") or {}).get(h)
+#        rows.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td><td dir='ltr'>%s</td>"
+#                    "<td>%s%s</td></tr>" % (
+#                        h, server_word(h), html.escape(v or "?"), state,
+#                        "<details><summary>لاگ</summary><pre dir='ltr' style='white-space:"
+#                        "pre-wrap;max-height:40vh;overflow:auto'>%s</pre></details>"
+#                        % html.escape(log_text) if log_text else ""))
+#    out.append("<h3 class='chart-h'>سرورهای دیگر</h3>")
+#    out.append("<table><tr><th>سرور</th><th></th><th>نسخه</th><th></th></tr>%s</table>"
+#               % "".join(rows))
+#    running = job.get("current") and not job.get("stopped")
+#    if job.get("stopped"):
+#        out.append("<p class='warn'>کار آپدیت متوقف شد: %s</p>" % html.escape(job["stopped"]))
+#    if running:
+#        out.append("<form method='post' action='/%s/upgrade-stop'><button class='danger'>"
+#                   "توقف</button></form><script>setTimeout(function(){location.reload()},"
+#                   "20000)</script>" % p)
+#    out.append("<p class='muted'>هر سرور نصب‌کننده را از همین پنل می‌گیرد، هشش را چک می‌کند "
+#               "و اجرایش می‌کند. سرور بعدی فقط وقتی شروع می‌شود که قبلی موفق شده باشد. اگر یکی "
+#               "خطا بدهد یا ۲۰ دقیقه جواب ندهد، کار متوقف می‌شود و هشدار می‌آید. نسخهٔ قدیمی‌تر "
+#               "هیچ‌وقت روی نسخهٔ جدیدتر نصب نمی‌شود.</p>")
+#    return "".join(out), behind, bool(running)
+#
+#
+#def standby_card(p):
+#    """Which node takes the panel over when this machine is gone, how ready
+#    it is, and what to do on the day."""
+#    nodes = node_list()
+#    row = STORE.one("SELECT value FROM settings WHERE key = 'standby'")
+#    standby = (row["value"] if row else "") or ""
+#    out = ["<div class='card'><h2>انتقال پنل — سرور پشتیبان</h2>"]
+#    if not nodes:
+#        out.append("<p class='muted'>سرور پشتیبان یکی از نودهاست؛ اول یک نود اضافه کنید.</p></div>")
+#        return "".join(out)
+#    options = "<option value=''%s>هیچ‌کدام</option>" % ("" if standby else " selected")
+#    options += "".join("<option value='%s'%s>%s</option>" % (n, " selected" if n == standby
+#                                                              else "", n) for n in nodes)
+#    out.append("<form method='post' action='/%s/standby-save' class='row'>سرور پشتیبان: "
+#               "<select name='ip' dir='ltr'>%s</select><button class='ghost'>ذخیره</button>"
+#               "</form>" % (p, options))
+#    if standby:
+#        if not backup_password():
+#            out.append("<p class='warn'>برای آماده کردن پشتیبان، اول در «تنظیمات» رمز بکاپ "
+#                       "بگذارید؛ بکاپی که پشتیبان نگه می‌دارد با همان رمز باز می‌شود.</p>")
+#        row = STORE.one("SELECT value FROM settings WHERE key = 'standby_kept'")
+#        try:
+#            kept = json.loads(row["value"]) if row and row["value"] else {}
+#        except ValueError:
+#            kept = {}
+#        row = STORE.one("SELECT value FROM settings WHERE key = 'standby_made'")
+#        made = row["value"] if row else ""
+#        if kept.get("bundle") and kept.get("installer"):
+#            out.append("<p class='ok'>آماده: آخرین بکاپ و نصب‌کننده روی %s است (بکاپ %s ساخته "
+#                       "شد، %s گرفت).</p>" % (html.escape(standby), html.escape(ago(made)),
+#                                              html.escape(ago(kept.get("at")))))
+#        else:
+#            out.append("<p class='warn'>هنوز آماده نیست: %s تا چند دقیقهٔ دیگر بکاپ و "
+#                       "نصب‌کننده را می‌گیرد.</p>" % html.escape(standby))
+#        dom = ""
+#        m = re.search(r"/live/([^/]+)/", CFG.get("ADMIN_CERT") or "")
+#        if m:
+#            dom = m.group(1)
+#        out.append(
+#            "<details><summary>روزی که این سرور از دست رفت</summary><ol>"
+#            "<li>رکورد DNS دامنهٔ پنل ادمین%s را به آی‌پی <code dir='ltr'>%s</code> بدهید.</li>"
+#            "<li>به %s وصل شوید و اجرا کنید:<pre dir='ltr'>sudo bash "
+#            "/var/lib/smart-dns/standby/doctor-dns.sh --take-over</pre>رمز بکاپ را می‌پرسد.</li>"
+#            "<li>رله‌ها و نودها ظرف یک دقیقه خودشان پنل تازه را پیدا می‌کنند و از آن به بعد "
+#            "فقط با آن حرف می‌زنند؛ این سرور اگر برگردد، دیگر کسی سراغش نمی‌آید.</li>"
+#            "<li>بعد تونل‌های «مستقیم» رله‌ها به این سرور را از ستون «تونل» دوباره ذخیره "
+#            "کنید.</li></ol></details>"
+#            % (" (<code dir='ltr'>%s</code>)" % html.escape(dom) if dom else "",
+#               html.escape(standby), html.escape(standby)))
+#    out.append("<p class='muted'>پشتیبان هر ۶ ساعت آخرین بکاپ پنل (رمزگذاری‌شده با رمز بکاپ) و "
+#               "نصب‌کننده را از همین سرور می‌گیرد و نگه می‌دارد. همهٔ رله‌ها و نودها هم آدرسش را "
+#               "می‌دانند.</p></div>")
+#    return "".join(out)
+#
+#
+#def nodes_page():
+#    """The relays this exit serves and their tunnels - a page of its own, not
+#    part of the settings."""
+#    if one_server():
+#        return ("<div class='card'><h2>نود</h2><p class='muted'>این سرور تک‌سرور است و رلهٔ "
+#                "جدایی ندارد.</p></div>")
+#    return (alerts_card() + servers_card() + nodes_card(CFG["ADMIN_PATH"])
+#            + singles_card(CFG["ADMIN_PATH"]) + relays_card(CFG["ADMIN_PATH"])
+#            + customer_servers_card(CFG["ADMIN_PATH"])
+#            + standby_card(CFG["ADMIN_PATH"]))
+#
+#
+#def node_list():
+#    """The other exits joined to this panel, from panel.env's NODE_IP."""
+#    ips = []
+#    for ip in (read_env(PANEL_ENV).get("NODE_IP") or "").split(","):
+#        ip = ip.strip()
+#        if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) and ip not in ips:
+#            ips.append(ip)
+#    return ips
+#
+#
+#def set_env_list(key, ips):
+#    """Rewrite one list in panel.env, the rest as it was."""
+#    lines = []
+#    try:
+#        with open(PANEL_ENV, encoding="utf-8") as fh:
+#            lines = [l.rstrip("\n") for l in fh if not l.startswith(key + "=")]
+#    except OSError:
+#        pass
+#    lines = [l for l in lines if l.strip()] + ["%s=%s" % (key, ",".join(ips))]
+#    tmp = PANEL_ENV + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write("\n".join(lines) + "\n")
+#    os.chmod(tmp, 0o600)
+#    os.replace(tmp, PANEL_ENV)
+#
+#
+#def set_nodes(ips):
+#    """These nodes and no others: the panel restarts on it, which lets them
+#    through its firewall rule and into its API."""
+#    set_env_list("NODE_IP", ips)
+#    systemctl("restart", "smartdns-panel")
+#
+#
+#def seen_cell(host):
+#    """When a server last reported, as the relays and nodes cards show it."""
+#    row = STORE.one("SELECT MAX(at) at FROM metrics WHERE host = ?", (host,))
+#    seen = row["at"] if row and row["at"] else None
+#    fresh = seen and parse_ts(seen) and \
+#        (datetime.now(timezone.utc) - parse_ts(seen)).total_seconds() < 120
+#    if fresh:
+#        return "<span class='ok'>وصل — %s</span>" % html.escape(ago(seen))
+#    return "<span class='warn'>%s</span>" % (
+#        "آخرین بار " + html.escape(ago(seen)) if seen else "هنوز گزارشی نداده")
+#
+#
+#def is_single_server(ip):
+#    """A single machine joined to this panel - relay and exit both."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", ("single:" + ip,))
+#    return bool(row and row["value"] == "1")
+#
+#
+#def server_word(ip):
+#    """What a server that reports here is, in a word: this one, a node, a
+#    single server joined to this panel, or a relay."""
+#    if ip in ("exit", exit_address()):
+#        return "این سرور"
+#    if ip in node_list():
+#        return "نود"
+#    return "تک‌سرور" if is_single_server(ip) else "رله"
+#
+#
+## What the kernel says that matters here, and not the hardware notes every
+## machine prints at boot: memory running out and what was killed for it, the
+## connection table full and dropping packets, crashes, a disk failing.
+#KERNEL_TROUBLE = re.compile(r"(?i)(out of memory|invoked oom-killer|oom-kill:|killed process|"
+#                            r"nf_conntrack: table full|dropping packet|segfault|"
+#                            r"general protection|hung task|i/o error|ext4-fs error|"
+#                            r"blk_update_request|soft lockup)")
+## A log line worth a second look...
+#LOG_TROUBLE = re.compile(r"(?i)\b(error|errors|failed|failure|fail|refused|denied|panic|"
+#                         r"killed|oom|out of memory|dropping packet|timed out|warn)")
+## ...unless it is one every machine prints and nothing is wrong: resolvconf
+## on each dnsmasq restart, dnsmasq's standing advice about binding and its
+## note that it reads no resolv.conf, which is how it is set up.
+#LOG_HARMLESS = re.compile(r"resolvconf\[\d+\]: Failed to (set|revert)|"
+#                          r"LOUD WARNING: (use --bind-dynamic|listening on)|"
+#                          r"ignoring resolv-file flag because no-resolv")
+#
+#
+#def log_section(label, text, pre):
+#    """One part of a server's logs, folded, with how many lines look wrong."""
+#    text = text or ""
+#    bad = sum(1 for line in text.splitlines()
+#              if LOG_TROUBLE.search(line) and not LOG_HARMLESS.search(line))
+#    note = ("<span class='warn'>%d خط خطا یا هشدار</span>" % bad if bad
+#            else "<span class='muted'>%s</span>" % ("بی‌خطا" if text.strip() else "چیزی نیست"))
+#    return ("<details><summary>%s — %s</summary>%s</details>"
+#            % (html.escape(label), note, pre(text or "(چیزی نیست)")))
+#
+#
+#def server_logs_card(r, pre):
+#    """What one relay, node or single server last sent of its logs, a part
+#    of the machine at a time."""
+#    ip = r["relay"]
+#    word = server_word(ip)
+#    title = {"رله": "سرور ایران", "نود": "سرور خارج (نود)"}.get(word, word)
+#    keys = r.keys()
+#    try:
+#        parts = json.loads(r["parts"]) if "parts" in keys and r["parts"] else None
+#    except ValueError:
+#        parts = None
+#    sections = [(label, text) for _, label, text in parts] if parts \
+#        else [("همه", r["text"])]
+#    if "tunnel" in keys and r["tunnel"] and r["tunnel"].strip():
+#        sections.append(("تونل‌ها", r["tunnel"]))
+#    if "nginx" in keys and r["nginx"] and r["nginx"].strip():
+#        sections.append(("خطاهای nginx — اگر مشتری به سایتی وصل نمی‌شود، دلیلش معمولاً "
+#                         "این‌جاست", r["nginx"]))
+#    return ("<div class='card'><h2>%s <code>%s</code></h2><p class='muted'>آخرین بار %s — "
+#            "هر ۵ دقیقه تازه می‌شود. روی خود سرور: <code>sudo smartdns-logs</code></p>%s</div>"
+#            % (title, html.escape(ip), html.escape(ago(r["at"])),
+#               "".join(log_section(label, text, pre) for label, text in sections)))
+#
+#
+#def relay_exit(ip):
+#    """The exit this relay's traffic goes to: this one, unless another."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", ("relay_exit:" + ip,))
+#    picked = row["value"] if row else ""
+#    return picked if picked in node_list() else exit_address()
+#
+#
+#def exit_cell(p, ip):
+#    """The relays card's column for which exit a relay goes through."""
+#    here, nodes = exit_address(), node_list()
+#    now = relay_exit(ip)
+#    options = "".join("<option value='%s'%s>%s</option>" % (
+#        x, " selected" if x == now else "", "%s — این سرور" % x if x == here else x)
+#        for x in [here] + nodes)
+#    return ("<form method='post' action='/%s/relay-exit'><input type='hidden' name='ip' "
+#            "value='%s'><select name='exit' dir='ltr' onchange='this.form.submit()'>%s</select>"
+#            "</form>" % (p, ip, options))
+#
+#
+#def user_exits(user, relays):
+#    """{relay: the exit the admin picked for this customer on it, or ""}."""
+#    keys = user.keys()
+#    every = (user["exit"] if "exit" in keys else None) or ""
+#    try:
+#        own = json.loads((user["relay_exits"] if "relay_exits" in keys else None) or "{}")
+#    except ValueError:
+#        own = {}
+#    own = own if isinstance(own, dict) else {}
+#    exits = [exit_address()] + node_list()
+#    return {r: (own.get(r) if own.get(r) in exits else every if every in exits else "")
+#            for r in relays}
+#
+#
+#def user_exit_cell(p, user, relays):
+#    """The users table's column for which exit a customer goes through on
+#    each relay: the relay's own, or one the admin picked."""
+#    here, nodes = exit_address(), node_list()
+#    picked = user_exits(user, relays)
+#
+#    def select(name, now, extra=""):
+#        options = ["<option value=''%s>پیش‌فرض رله</option>" % ("" if now else " selected")]
+#        options += ["<option value='%s'%s>%s</option>" % (
+#            x, " selected" if x == now else "", "%s — این سرور" % x if x == here else x)
+#            for x in [here] + nodes]
+#        return "<select name='%s' dir='ltr'%s>%s</select>" % (name, extra, "".join(options))
+#
+#    # What each relay does for this customer, closed: one line when all alike.
+#    shown = {r: picked[r] or relay_exit(r) for r in relays}
+#    title = "، ".join("%s ← %s" % (e, r) for r, e in shown.items())
+#    if len(set(shown.values())) <= 1:
+#        summary = "<span dir='ltr'>%s</span>" % html.escape(
+#            next(iter(shown.values()), "") or "-")
+#    else:
+#        summary = "%d سرور" % len(set(shown.values()))
+#    alike = len(set(picked.values())) == 1
+#    rows = "".join("<label><code dir='ltr'>%s</code> %s</label>"
+#                   % (r, select("r_" + r, picked[r])) for r in relays)
+#    every = select("every", next(iter(picked.values()), "") if alike else "",
+#                   " onchange=\"for (const s of this.form.querySelectorAll('select[name^=r_]'))"
+#                   " s.value = this.value\"")
+#    return ("<details><summary title='%s'>%s</summary>"
+#            "<form method='post' action='/%s/user-exit'>"
+#            "<input type='hidden' name='id' value='%d'>"
+#            "<label>همهٔ رله‌ها %s</label>%s"
+#            "<button class='ghost'>ذخیره</button></form></details>"
+#            % (html.escape(title, quote=True), summary, p, user["id"], every, rows))
+#
+#
+#def nodes_card(p):
+#    """The exits: this one, which the panel is on, and the nodes joined to it."""
+#    here, nodes = exit_address(), node_list()
+#    out = ["<div class='card'><h2>سرورهای خارج (%d)</h2>" % (1 + len(nodes)),
+#           "<table><tr><th>سرور</th><th></th><th>آخرین گزارش</th><th>رله‌هایی که از آن "
+#           "می‌روند</th><th></th></tr>"]
+#    relays = relay_list()
+#    for ip in [here] + nodes:
+#        users = [r for r in relays if relay_exit(r) == ip]
+#        if ip == here:
+#            kind, seen, remove = "این سرور — پنل", seen_cell("exit"), ""
+#        else:
+#            row = STORE.one("SELECT value FROM settings WHERE key = ?", ("node_resolvers:" + ip,))
+#            try:
+#                res = json.loads(row["value"]) if row and row["value"] else {}
+#            except ValueError:
+#                res = {}
+#            kind = "نود" + (" <span class='warn'>(DNS: %s)</span>" % html.escape(res["error"])
+#                            if res.get("error") else "")
+#            seen = seen_cell(ip)
+#            remove = ("<form method='post' action='/%s/node-del' onsubmit=\"return confirm("
+#                      "'این سرور از پنل جدا می‌شود و رله‌هایی که از آن می‌روند به این سرور "
+#                      "برمی‌گردند. ادامه؟')\"><input type='hidden' name='ip' value='%s'>"
+#                      "<button class='danger'>برداشتن</button></form>" % (p, ip))
+#        out.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td><td>%s</td>"
+#                   "<td dir='ltr'>%s</td><td>%s</td></tr>"
+#                   % (html.escape(ip or "?"), kind, seen,
+#                      html.escape(", ".join(users)) or "<span class='muted'>-</span>", remove))
+#    out.append("</table>")
+#    out.append("<form method='post' action='/%s/node-add' class='row' style='margin-top:12px'>"
+#               "<input name='ip' dir='ltr' placeholder='آی‌پی سرور خارج تازه' "
+#               "style='min-width:200px'><button>افزودن سرور</button></form>" % p)
+#    token = pairing_token()
+#    if token:
+#        out.append(
+#            "<details style='margin-top:12px'><summary>نصب یک سرور خارج تازه</summary>"
+#            "<ol class='muted'><li>آی‌پی سرور تازه را این بالا اضافه کنید.</li>"
+#            "<li>روی آن سرور، با فایل نصب‌کنندهٔ همین نسخه، این را اجرا کنید:</li></ol>"
+#            "<pre dir='ltr' style='white-space:pre-wrap;word-break:break-all'>"
+#            "sudo env ROLE=node PANEL_IP=%s SYNC_TOKEN=%s bash doctor-dns.sh</pre>"
+#            "<p class='muted'>وقتی در این جدول «وصل» شد، از ستون «سرور خارج» جدول رله‌ها "
+#            "رله‌هایی را که باید از آن بروند انتخاب کنید. توکن را فقط به خودتان بدهید.</p>"
+#            "</details>" % (html.escape(here or "آی‌پی-همین-سرور"), html.escape(token)))
+#    out.append("<p class='muted'>هر رله از سرور خارجی که برایش انتخاب شده می‌رود؛ اگر آن "
+#               "سرور در دسترس نباشد، خودکار از بقیه می‌رود. مشتری‌ها و حجمشان بین همه "
+#               "مشترک است.</p></div>")
+#    return "".join(out)
+#
+#
+#def singles_card(p):
+#    """Single servers joined to this panel - relay and exit both, customers
+#    connecting to them straight: their own list, form and install command."""
+#    ips = [ip for ip in relay_list() if is_single_server(ip)]
+#    out = ["<div class='card'><h2>تک‌سرورها (%d)</h2>" % len(ips)]
+#    if ips:
+#        out.append("<table><tr><th>تک‌سرور</th><th>آخرین گزارش</th><th></th></tr>")
+#        for ip in ips:
+#            remove = ("" if len(relay_list()) < 2 else
+#                      "<form method='post' action='/%s/relay-del' onsubmit=\"return confirm("
+#                      "'این تک‌سرور از پنل جدا می‌شود و مشتری‌هایی که DNS را رویش گذاشته‌اند "
+#                      "قطع می‌شوند. ادامه؟')\"><input type='hidden' name='ip' value='%s'>"
+#                      "<button class='danger'>برداشتن</button></form>" % (p, ip))
+#            out.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+#                       % (ip, seen_cell(ip), remove))
+#        out.append("</table>")
+#    out.append("<form method='post' action='/%s/single-add' class='row' style='margin-top:12px'>"
+#               "<input name='ip' dir='ltr' placeholder='آی‌پی تک‌سرور تازه' "
+#               "style='min-width:200px'><button>افزودن تک‌سرور</button></form>" % p)
+#    token, here = pairing_token(), exit_address()
+#    if token:
+#        out.append(
+#            "<details style='margin-top:12px'><summary>نصب یک تک‌سرور تازه</summary>"
+#            "<ol class='muted'><li>آی‌پی آن را این بالا اضافه کنید.</li>"
+#            "<li>روی آن سرور، با فایل نصب‌کنندهٔ همین نسخه، این را اجرا کنید:</li></ol>"
+#            "<pre dir='ltr' style='white-space:pre-wrap;word-break:break-all'>sudo env ROLE=single "
+#            "PANEL_IP=%s SYNC_TOKEN=%s bash doctor-dns.sh</pre>"
+#            "<p class='muted'>توکن را فقط به خودتان بدهید.</p></details>"
+#            % (html.escape(here or "آی‌پی-همین-سرور"), html.escape(token)))
+#    out.append("<p class='muted'>تک‌سرور یک سرور در کشوری دیگر است که هم ورودی است و هم "
+#               "خروجی: مشتری DNS را مستقیم روی خودش می‌گذارد و رله لازم ندارد. مشتری‌ها، حجمشان "
+#               "و تنظیمات همین پنل را دارد؛ مصرف روی آن از همان حجم مشترک کم می‌شود.</p></div>")
+#    return "".join(out)
+#
+#
+#def relays_card(p):
+#    """The node page's card for the relays this exit serves - the single
+#    servers have their own."""
+#    ips = [ip for ip in relay_list() if not is_single_server(ip)]
+#    exits = bool(node_list())
+#    out = ["<div class='card'><h2>رله‌ها (%d)</h2>" % len(ips)]
+#    if ips:
+#        out.append("<table><tr><th>رله</th><th>آخرین گزارش</th>%s<th>تونل</th><th></th></tr>"
+#                   % ("<th>سرور خارج</th>" if exits else ""))
+#        for ip in ips:
+#            state = seen_cell(ip)
+#            remove = ("" if len(relay_list()) < 2 else
+#                      "<form method='post' action='/%s/relay-del' onsubmit=\"return confirm("
+#                      "'این رله دیگر به این سرور راه ندارد و مشتری‌هایی که DNS را رویش گذاشته‌اند "
+#                      "قطع می‌شوند. ادامه؟')\"><input type='hidden' name='ip' value='%s'>"
+#                      "<button class='danger'>برداشتن</button></form>" % (p, ip))
+#            out.append("<tr><td dir='ltr'><code>%s</code></td><td>%s</td>%s<td>%s</td>"
+#                       "<td>%s</td></tr>" % (
+#                           ip, state, "<td>%s</td>" % exit_cell(p, ip) if exits else "",
+#                           tunnel_cell(p, ip), remove))
+#        out.append("</table>")
+#        if len(ips) > 1:
+#            out.append("<p class='muted'>کدام رله‌ها به هر مشتری به‌عنوان DNS اول و دوم نشان "
+#                       "داده شوند، از ستون «DNS» صفحهٔ کاربران.</p>")
+#    out.append("<form method='post' action='/%s/relay-add' class='row' style='margin-top:12px'>"
+#               "<input name='ip' dir='ltr' placeholder='آی‌پی رلهٔ تازه' style='min-width:200px'>"
+#               "<button>افزودن رله</button></form>" % p)
+#    token, here = pairing_token(), exit_address()
+#    if token:
+#        out.append(
+#            "<details style='margin-top:12px'><summary>نصب یک رلهٔ تازه</summary>"
+#            "<ol class='muted'><li>آی‌پی رلهٔ تازه را این بالا اضافه کنید.</li>"
+#            "<li>روی رله نصب‌کننده را اجرا کنید و «relay» را انتخاب کنید؛ آدرس این سرور "
+#            "<code dir='ltr'>%s</code> است.</li>"
+#            "<li>وقتی توکن جفت‌کردن خواست، این را بدهید:</li></ol>"
+#            "<pre dir='ltr' style='white-space:pre-wrap;word-break:break-all'>%s</pre>"
+#            "<p class='muted'>وقتی رله در جدول «وصل» شد، اگر تونل می‌خواهد، از ستون «تونل» "
+#            "روشنش کنید؛ رله تا یک دقیقه بعد خودش آن را برپا می‌کند.</p>"
+#
+#            "<p class='muted'>توکن را فقط به خودتان بدهید — با آن هر کسی می‌تواند رله‌ای بسازد "
+#            "که به این پنل وصل شود.</p></details>"
+#            % (html.escape(here or "آی‌پی همین سرور"), html.escape(token)))
+#    out.append("<p class='muted'>هر رله یک در ورود مشتری‌هاست؛ همهٔ رله‌ها مشتری‌ها و حجم "
+#               "مشترک دارند. مشتری می‌تواند یکی را DNS اول و دیگری را DNS دوم بگذارد.</p></div>")
+#    return "".join(out)
 #
 #
 #def resolver_name(ip):
@@ -15154,14 +21144,17 @@ exit 0
 # --faint:#6e7681;--accent:#7dd3a0;--accent2:#58a6ff;--btn:#238636;
 # --btn-hover:#2ea043;--on-btn:#ffffff;--danger:#6e2c2c;--warn:#e3b341;
 # --bad:#f85149;--good-bg:#12261a;--err-bg:#2b1416;--warn-bg:#2b2411;
-# --warn-line:#6e5a2c;--sun:inline;--moon:none"""
+# --warn-line:#6e5a2c;--sun:inline;--moon:none;
+# --shadow:0 1px 2px rgba(0,0,0,.35);--pop:0 10px 30px rgba(0,0,0,.45)"""
 #LIGHT = """color-scheme:light;
 # --bg:#f6f8fa;--card:#ffffff;--line:#d0d7de;--line2:#afb8c1;--row:#eaeef2;
 # --track:#eaeef2;--fg:#1f2328;--head:#24292f;--muted:#59636e;--dim:#57606a;
 # --faint:#6e7781;--accent:#1a7f37;--accent2:#0969da;--btn:#1f883d;
 # --btn-hover:#1a7f37;--on-btn:#ffffff;--danger:#cf222e;--warn:#9a6700;
 # --bad:#cf222e;--good-bg:#dafbe1;--err-bg:#ffebe9;--warn-bg:#fff8c5;
-# --warn-line:#d4a72c;--sun:none;--moon:inline"""
+# --warn-line:#d4a72c;--sun:none;--moon:inline;
+# --shadow:0 1px 2px rgba(31,35,40,.04),0 4px 14px rgba(31,35,40,.05);
+# --pop:0 10px 30px rgba(31,35,40,.15)"""
 #THEME_CSS = (":root{%s}\n"
 #             "@media (prefers-color-scheme: light){:root:not([data-theme=dark]){%s}}\n"
 #             ":root[data-theme=light]{%s}\n" % (DARK, LIGHT, LIGHT))
@@ -15176,25 +21169,43 @@ exit 0
 #    "(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'),"
 #    "n=c=='light'?'dark':'light';r.setAttribute('data-theme',n);"
 #    "try{localStorage.setItem('theme',n)}catch(e){}})(document.documentElement)\">"
-#    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>")
+#    "<span class='sun'>☀️</span><span class='moon'>🌙</span></button>"
+#    "<button type='button' class='theme lang' title='English / فارسی'"
+#    " aria-label='English / فارسی' onclick=\"document.cookie='lang='+"
+#    "(document.documentElement.lang=='en'?'fa':'en')+"
+#    "'; path=/; max-age=31536000; samesite=lax';location.reload()\">"
+#    "<span class='fa-only'>EN</span><span class='en-only'>فا</span></button>")
 #
 #CSS = THEME_CSS + """
 #*{box-sizing:border-box}
 #body{margin:0;background:var(--bg);color:var(--fg);
 # font:14px/1.7 Vazirmatn,system-ui,'Segoe UI',Tahoma,sans-serif;position:relative}
 #a{color:var(--accent);text-decoration:none}
-#.wrap{max-width:1000px;margin:0 auto;padding:24px}
-#header{display:flex;align-items:center;justify-content:space-between;
-# border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:22px;flex-wrap:wrap;gap:12px}
-#h1{font-size:18px;margin:0;font-weight:600}
-#nav a{margin-left:16px;color:var(--dim);font-size:14px}
-#nav a.on{color:var(--accent);font-weight:600}
-#.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
-#.card h2{font-size:15px;margin:0 0 14px;font-weight:600;color:var(--head)}
-#table{width:100%;border-collapse:collapse;font-size:13px}
-#th{text-align:right;color:var(--muted);font-weight:500;padding:8px 6px;border-bottom:1px solid var(--line)}
-#td{padding:9px 6px;border-bottom:1px solid var(--row)}
+#.wrap{max-width:1320px;margin:0 auto;padding:20px 24px 24px}
+#header{display:flex;align-items:center;gap:8px 18px;flex-wrap:wrap;
+# background:var(--card);border:1px solid var(--line);border-radius:14px;
+# padding:8px 16px 8px 8px;margin-bottom:20px;box-shadow:var(--shadow)}
+#h1{font-size:16px;margin:0;font-weight:700;white-space:nowrap}
+#nav{display:flex;flex-wrap:wrap;gap:2px;flex:1}
+#nav a{padding:6px 11px;border-radius:8px;color:var(--dim);font-size:13px;white-space:nowrap}
+#nav a:hover{background:var(--row);color:var(--fg)}
+#nav a.on{background:var(--good-bg);color:var(--accent);font-weight:600}
+#nav a.out{margin-right:auto;color:var(--muted)}
+#nav a.out:hover{color:var(--bad)}
+#.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+# padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow);overflow-x:auto}
+#.card h2{font-size:15px;margin:0 0 14px;font-weight:700;color:var(--head)}
+#.card>p.muted,.card>.muted{line-height:1.9}
+#.card>p.muted:last-child{margin-bottom:0}
+#table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+#th{text-align:right;color:var(--muted);font-weight:500;font-size:12px;padding:9px 8px;
+# background:var(--bg);border-bottom:1px solid var(--line);white-space:nowrap}
+#th:first-child{border-radius:0 8px 0 0}th:last-child{border-radius:8px 0 0 0}
+#td{padding:9px 8px;border-bottom:1px solid var(--row);vertical-align:middle}
 #tr:last-child td{border-bottom:0}
+#tr:hover>td{background:color-mix(in srgb,var(--row) 40%,transparent)}
+#td input,td select{padding:5px 8px;font-size:13px;border-radius:6px}
+#td button{padding:5px 10px;font-size:12px}
 #code{background:var(--bg);padding:2px 6px;border-radius:5px;color:var(--accent);font-size:12px}
 #.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
 #.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px}
@@ -15205,16 +21216,27 @@ exit 0
 #.bar i.warn{background:var(--warn)}
 #.bar i.hot{background:var(--bad)}
 #input,select,button,textarea{font:inherit;background:var(--bg);color:var(--fg);
-# border:1px solid var(--line2);border-radius:7px;padding:8px 10px}
-#button{background:var(--btn);border-color:var(--btn);color:var(--on-btn);cursor:pointer;font-weight:600}
+# border:1px solid var(--line2);border-radius:8px;padding:8px 10px}
+#input:focus,select:focus,textarea:focus{outline:0;border-color:var(--accent2);
+# box-shadow:0 0 0 3px color-mix(in srgb,var(--accent2) 22%,transparent)}
+#button{background:var(--btn);border-color:var(--btn);color:var(--on-btn);cursor:pointer;font-weight:600;
+# transition:background .12s,border-color .12s}
 #button:hover{background:var(--btn-hover)}
-#button.danger{background:var(--danger);border-color:var(--danger)}
+#button.danger{background:var(--err-bg);border-color:color-mix(in srgb,var(--bad) 55%,transparent);
+# color:var(--bad)}
+#button.danger:hover{background:var(--bad);border-color:var(--bad);color:var(--on-btn)}
 #button.ghost{background:transparent;border-color:var(--line2);color:var(--dim);font-weight:400}
+#button.ghost:hover{background:var(--row);color:var(--fg)}
 #button.del{background:transparent;border-color:var(--bad);color:var(--bad);font-weight:400}
 #button.del:hover{background:var(--err-bg)}
 #.onetime code{display:inline-block;direction:ltr;font-size:22px;letter-spacing:1px;
 # padding:8px 14px}
-#form.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#form.row,div.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#div.row>form{display:inline-flex;gap:6px;align-items:center;margin:0}
+#input[type=checkbox],input[type=radio]{padding:0;width:auto;accent-color:var(--btn);
+# vertical-align:middle}
+#td label{display:inline-flex;align-items:center;gap:4px;margin:4px 0 0;white-space:nowrap;
+# color:var(--dim)}
 #.muted{color:var(--muted);font-size:12px}
 #.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-bottom:4px}
 #.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-left:6px;
@@ -15246,7 +21268,58 @@ exit 0
 #tr.off td{opacity:.55}
 #td.acts{white-space:nowrap}
 #td.acts form{display:inline}
-#td.acts button{padding:6px 10px;font-size:12px;margin-right:4px}
+#td.acts button{padding:5px 10px;font-size:12px;margin-right:4px}
+#/* A choice folded into a users-table cell: one short line until it is
+#   opened, and then a small panel over the table rather than a taller row. */
+#table.users details>summary{list-style:none;cursor:pointer;display:inline-flex;
+# align-items:center;gap:6px;padding:3px 10px;border:1px solid var(--line2);border-radius:999px;
+# font-size:12px;white-space:nowrap;color:var(--fg);background:var(--card)}
+#table.users details>summary::-webkit-details-marker{display:none}
+#table.users details>summary::after{content:'▾';color:var(--muted);font-size:10px}
+#table.users details>summary:hover{background:var(--row)}
+#table.users details[open]>summary{border-color:var(--accent2)}
+#table.users details>form,table.users details>.menu{margin-top:8px;padding:10px 12px;
+# border:1px solid var(--line2);border-radius:10px;background:var(--card);min-width:210px;
+# white-space:normal;text-align:right}
+#table.users details>form label{display:flex;align-items:center;gap:8px;margin:0 0 6px;
+# color:var(--fg);font-size:12px;white-space:nowrap}
+#table.users details>form label select{margin-right:auto}
+#table.users details>form button{margin-top:4px}
+#table.users td.acts details.more{display:inline-block;vertical-align:middle}
+#table.users td.acts details.more>summary{padding:4px 11px;margin-right:4px}
+#table.users td.acts details.more>summary::after{content:''}
+#table.users td.acts .menu{display:flex;flex-direction:column;gap:6px;min-width:150px}
+#table.users td.acts .menu form{display:block}
+#table.users td.acts .menu button{width:100%;margin:0}
+#table.users td.acts .menu form.resetdays{display:flex;flex-wrap:wrap;align-items:center;
+# gap:4px;max-width:150px;font-size:12px;border-top:1px solid var(--line2);padding-top:6px}
+#table.users td.acts .menu form.resetdays label{flex-basis:100%;margin:0;font-size:12px}
+#table.users td.acts .menu form.resetdays input{width:44px;padding:3px 6px}
+#table.users td.acts .menu form.resetdays button{width:auto;flex:1}
+#table.users td.acts .menu form.resetdays small{flex-basis:100%}
+#@media (min-width:1300px){
+# .card.wide{overflow:visible}
+# table.users details{position:relative}
+# table.users details>form,table.users details>.menu{position:absolute;z-index:30;
+#  top:calc(100% + 4px);right:0;box-shadow:var(--pop)}
+# table.users td.acts details>.menu{right:auto;left:0}
+#}
+#.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;
+# white-space:nowrap;background:var(--row);color:var(--dim)}
+#.pill.ok{background:var(--good-bg);color:var(--accent)}
+#.pill.warn{background:var(--warn-bg);color:var(--warn)}
+#.pill.bad{background:var(--err-bg);color:var(--bad)}
+#.card details>summary{cursor:pointer}
+#.who small{display:block;color:var(--muted);font-size:11px}
+#.card.wide{padding:16px 12px}
+#table.users td{padding:8px 5px}
+#table.users th{padding:9px 5px}
+#table.users td.who{max-width:118px;overflow:hidden;text-overflow:ellipsis}
+#table.users td.who code{white-space:nowrap}
+#table.users input[name=quota_gb],table.users input[name=speed_mb]{width:52px}
+#table.users input[name=days]{width:66px}
+#table.users select{max-width:120px}
+#table.users td.num{white-space:nowrap;direction:ltr;text-align:right}
 #a.dl{display:inline-block;background:var(--btn);color:var(--on-btn);font-weight:600;
 # padding:9px 16px;border-radius:7px;text-decoration:none}
 #a.dl:hover{background:var(--btn-hover)}
@@ -15270,6 +21343,9 @@ exit 0
 # white-space:nowrap}
 #.doms input{margin:0}
 #.optin{display:block;font-size:11px;color:var(--warn);font-weight:400;margin-top:2px}
+#label.fulllist{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 4px;
+# padding:10px 12px;border:1px dashed var(--line2);border-radius:9px;color:var(--fg);
+# font-size:13px}
 #.pick{margin-right:auto;display:flex;gap:6px}
 #.pick button{padding:3px 10px;font-size:11px;font-weight:400;
 # background:transparent;border:1px solid var(--line2);color:var(--muted)}
@@ -15292,7 +21368,7 @@ exit 0
 #h3.sec{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em;
 # margin:24px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--row)}
 #h3.sec:first-of-type{margin-top:6px}
-#.brand{text-align:center;margin:4px 0 26px;direction:ltr;line-height:1.15}
+#.brand{text-align:center;margin:0 0 18px;direction:ltr;line-height:1.15}
 #.brand .mark{font-size:clamp(28px,6vw,38px);vertical-align:middle;margin-right:10px}
 #.brand .name{display:inline-block;vertical-align:middle;font-size:clamp(34px,8vw,50px);
 # font-weight:800;letter-spacing:1.5px;color:var(--accent);
@@ -15305,6 +21381,24 @@ exit 0
 # font-size:17px;font-weight:400;line-height:1;cursor:pointer}
 #button.theme:hover{background:var(--row)}
 #.theme .sun{display:var(--sun)}.theme .moon{display:var(--moon)}
+#.theme.lang{left:auto;right:14px;font-size:12px;font-weight:700;letter-spacing:.5px}
+#html[lang=en] .fa-only,html:not([lang=en]) .en-only{display:none}
+#html[dir=ltr] th{text-align:left}
+#html[dir=ltr] th:first-child{border-radius:8px 0 0 0}
+#html[dir=ltr] th:last-child{border-radius:0 8px 0 0}
+#html[dir=ltr] nav a.out{margin-right:0;margin-left:auto}
+#html[dir=ltr] .pick{margin-right:0;margin-left:auto}
+#html[dir=ltr] table.users td.num{text-align:left}
+#html[dir=ltr] table.users details>form,html[dir=ltr] table.users details>.menu{text-align:left}
+#@media (max-width:700px){
+# .wrap{padding:14px 10px}
+# header{padding:8px;border-radius:12px}
+# nav{flex-wrap:nowrap;overflow-x:auto;width:100%;scrollbar-width:none}
+# nav::-webkit-scrollbar{display:none}
+# .card{padding:14px;border-radius:12px}
+# .grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+# .stat .n{font-size:18px}
+#}
 #"""
 #
 ## Where the installer writes the version it installed. Read per page rather
@@ -15459,15 +21553,27 @@ exit 0
 #TICKET_IMAGE_MAX = 4 * 1024 * 1024
 #
 #
+#def bot_keys(seller_id=None):
+#    """The keys a customer's message goes to: their reseller's own bot when
+#    there is one, else the owner's - as the panel's bot_keys()."""
+#    base = ("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+#            " AND COALESCE(webhook_url, '') != ''")
+#    if seller_id:
+#        rows = STORE.q(base + " AND admin_id = ?", (seller_id,))
+#        if rows:
+#            return rows
+#    return STORE.q(base + " AND admin_id IS NULL")
+#
+#
 #def emit(event, user_id, data):
 #    """Queue something for every bot with a webhook - the panel's worker sends
 #    it. The same as the panel's own emit(), for what happens on this side."""
 #    try:
-#        user = STORE.one("SELECT id, telegram_id FROM users WHERE id = ?", (user_id,))
+#        user = STORE.one("SELECT id, telegram_id, owner_admin FROM users WHERE id = ?",
+#                         (user_id,))
 #        if not user or not user["telegram_id"]:
 #            return
-#        keys = STORE.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
-#                       " AND COALESCE(webhook_url, '') != ''")
+#        keys = bot_keys(user["owner_admin"])
 #        stamp = now()
 #        payload = json.dumps({"event": event, "created_at": stamp,
 #                              "telegram_id": user["telegram_id"], "user_id": user["id"],
@@ -15481,6 +21587,135 @@ exit 0
 #        log(WARN, "could not queue %s for user #%s: %r" % (event, user_id, e))
 #
 #
+#MAX_DEVICES = 10
+#
+#
+#def plan_devices(plan):
+#    try:
+#        return max(1, min(5, int(plan["devices"] or 1)))
+#    except (KeyError, IndexError, TypeError, ValueError):
+#        return 1
+#
+#
+#def set_devices(db, uid, total, extra=None):
+#    """The panel's set_devices: an account's addresses at once, and its
+#    oldest let go when that went down. Inside the caller's transaction."""
+#    total = max(1, min(MAX_DEVICES, int(total)))
+#    if extra is None:
+#        db.execute("UPDATE users SET max_ips = ? WHERE id = ?", (total, uid))
+#    else:
+#        db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
+#                   (total, max(0, int(extra)), uid))
+#    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
+#                     (uid,)).fetchall()
+#    for row in ips[total:]:
+#        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
+#    return total
+#
+#
+#def devices_card(p):
+#    """The plans page's foot: extra devices on sale, and how often a customer
+#    may register a new address."""
+#    price = setting("device_price")
+#    limit = setting("ip_changes_per_day")
+#    return (
+#        "<div class='card'><h2>📱 دستگاه‌ها و تغییر آی‌پی</h2>"
+#        "<form method='post' action='/%s/devices-settings'><div class='row'>"
+#        "<div class='f'><label>قیمت هر دستگاه اضافه (تومان)</label>"
+#        "<input name='price' value='%s' size='10' dir='ltr' placeholder='خالی = فروخته نمی‌شود'>"
+#        "</div><div class='f'><label>حداکثر آی‌پی تازه در ۲۴ ساعت</label>"
+#        "<input name='limit' value='%s' size='6' dir='ltr' placeholder='خالی = بی‌نهایت'></div>"
+#        "<button class='ghost'>ذخیره</button></div></form>"
+#        "<p class='muted'>هر پلن تعداد دستگاه خودش را دارد (ستون «دستگاه»)، یعنی چند آی‌پی "
+#        "هم‌زمان می‌توانند وصل باشند. اگر آی‌پی تازه‌ای بیاید و جا نباشد، قدیمی‌ترین آی‌پی "
+#        "حذف می‌شود. مشتری روی پلن فعالش می‌تواند از پنل یا ربات دستگاه اضافه بخرد، با رسید "
+#        "یا از کیف پول. دستگاه اضافه تا وقتی همان پلن را تمدید کند می‌ماند و با خرید پلن "
+#        "دیگر از بین می‌رود. حداکثر %d دستگاه. تعداد دستگاه هر کاربر را در صفحهٔ کاربران "
+#        "(روی آی‌پی‌اش) دستی هم می‌توانید عوض کنید. سقف آی‌پی تازه فقط برای خود مشتری است؛ "
+#        "آی‌پی‌هایی که شما ثبت می‌کنید شمرده نمی‌شوند.</p></div>"
+#        % (p, html.escape(price, quote=True), html.escape(limit, quote=True), MAX_DEVICES))
+#
+#
+#def devices_cell(p, r):
+#    """The users table's address, with the account's devices: how many of
+#    them it holds, every address, and a way to change the number."""
+#    ips = [x["ip"] for x in STORE.q("SELECT ip FROM ips WHERE user_id = ? ORDER BY added_at",
+#                                    (r["id"],))]
+#    total = r["max_ips"] or 1
+#    return ("<details><summary title='دستگاه‌ها'>📱 %d/%d</summary>"
+#            "<form method='post' action='/%s/user-devices'>"
+#            "<input type='hidden' name='id' value='%d'>%s"
+#            "<label>تعداد دستگاه <input name='devices' value='%d' size='2' dir='ltr'></label>"
+#            "<button class='ghost'>ذخیره</button></form></details>"
+#            % (len(ips), total, p, r["id"],
+#               "".join("<label><code dir='ltr'>%s</code></label>" % html.escape(x)
+#                       for x in ips) or "<label class='muted'>آی‌پی ثبت نشده</label>",
+#               total))
+#
+#
+#def discounts_card(p):
+#    """The plans page's discount codes: each with its terms and its uses, and
+#    a form for a new one."""
+#    try:
+#        rows = STORE.q("SELECT * FROM discount_codes ORDER BY active DESC, id DESC")
+#    except sqlite3.OperationalError:
+#        return ""
+#    plans = {r["id"]: r["name"] for r in STORE.q("SELECT id, name FROM plans WHERE is_trial = 0")}
+#    out = ["<div class='card'><h2>🏷 کدهای تخفیف (%d)</h2>" % len(rows)]
+#    if rows:
+#        out.append("<table><tr><th>کد</th><th>تخفیف</th><th>تا</th><th>استفاده</th>"
+#                   "<th>هر مشتری</th><th>پلن‌ها</th><th></th></tr>")
+#        for r in rows:
+#            try:
+#                only = json.loads(r["plans"]) if r["plans"] else None
+#            except ValueError:
+#                only = None
+#            out.append(
+#                "<tr%s><td><code dir='ltr'>%s</code></td><td>%s</td><td>%s</td>"
+#                "<td>%d%s</td><td>%s</td><td>%s</td><td class='acts'>"
+#                "<form method='post' action='/%s/discount-active'>"
+#                "<input type='hidden' name='id' value='%d'><input type='hidden' name='to' "
+#                "value='%d'><button class='ghost'>%s</button></form>"
+#                "<form method='post' action='/%s/discount-delete' onsubmit=\"return confirm("
+#                "'این کد حذف شود؟')\"><input type='hidden' name='id' value='%d'>"
+#                "<button class='del'>حذف</button></form></td></tr>"
+#                % ("" if r["active"] else " class='off'", html.escape(r["code"]),
+#                   "%d٪" % r["value"] if r["kind"] == "percent"
+#                   else "%s تومان" % format(r["value"], ","),
+#                   html.escape((r["expires_at"] or "")[:10]) or "بی‌مهلت",
+#                   r["uses"], " از %d" % r["max_uses"] if r["max_uses"] else "",
+#                   "یک بار" if r["once"] else "بی‌حد",
+#                   "، ".join(html.escape(plans.get(i, "#%d" % i)) for i in only)
+#                   if only else "همه",
+#                   p, r["id"], 0 if r["active"] else 1, "خاموش" if r["active"] else "روشن",
+#                   p, r["id"]))
+#        out.append("</table>")
+#    boxes = "".join("<label style='display:inline;margin-left:10px'><input type='checkbox' "
+#                    "name='plan' value='%d'> %s</label>" % (i, html.escape(n))
+#                    for i, n in sorted(plans.items()))
+#    out.append(
+#        "<h3 class='chart-h'>کد تازه</h3>"
+#        "<form method='post' action='/%s/discount-save'><div class='row'>"
+#        "<div class='f'><label>کد</label><input name='code' dir='ltr' required "
+#        "placeholder='NOROOZ30' size='14'></div>"
+#        "<div class='f'><label>تخفیف</label><input name='value' dir='ltr' required size='8'>"
+#        " <select name='kind'><option value='percent'>درصد</option>"
+#        "<option value='amount'>تومان</option></select></div>"
+#        "<div class='f'><label>چند روز اعتبار</label><input name='days' dir='ltr' size='5' "
+#        "placeholder='خالی = بی‌مهلت'></div>"
+#        "<div class='f'><label>سقف استفادهٔ کل</label><input name='max_uses' dir='ltr' "
+#        "size='5' placeholder='خالی = بی‌حد'></div></div>"
+#        "<p><label style='display:inline'><input type='checkbox' name='once' value='1' "
+#        "checked> هر مشتری فقط یک بار</label></p>"
+#        "<p class='muted' style='margin:6px 0'>فقط برای این پلن‌ها (هیچ‌کدام = همه): %s</p>"
+#        "<button>ساختن کد</button></form>"
+#        "<p class='muted'>مشتری کد را موقع خرید (در پنل خودش یا ربات) وارد می‌کند و قیمت "
+#        "تخفیف‌خورده را می‌بیند؛ همان مبلغ را واریز می‌کند یا از کیف پول می‌پردازد. هر "
+#        "استفاده فقط وقتی شمرده می‌شود که خرید تأیید شود. پورسانت دعوت هم از مبلغی حساب "
+#        "می‌شود که واقعاً پرداخت شده.</p></div>" % (p, boxes or "<span class='muted'>هنوز پلنی نیست</span>"))
+#    return "".join(out)
+#
+#
 #def plan_event(uid):
 #    """What a bot needs to say about a plan that has just been put on."""
 #    row = STORE.one("SELECT u.expires_at, u.quota_bytes, p.id AS pid, p.name"
@@ -15490,6 +21725,221 @@ exit 0
 #        return {}
 #    return {"plan": {"id": row["pid"], "name": row["name"]} if row["pid"] else None,
 #            "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
+#
+#
+## ------------------------------------------------------- wallet and invites
+## The panel's rules, word for word in effect - tools/test-wallet.py holds the
+## two to the same answers.
+#TOPUP_MAX = 100_000_000
+#MONEY_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+#WALLET_KINDS = {"topup": "شارژ کیف پول", "purchase": "خرید پلن",
+#                "referral": "پورسانت دعوت", "admin": "تغییر به دست مدیر"}
+#
+#
+#def toman(text):
+#    raw = str(text if text is not None else "").translate(MONEY_DIGITS)
+#    raw = re.sub(r"[\s,٬،]", "", raw)
+#    return int(raw) if raw.isdigit() and len(raw) < 16 else None
+#
+#
+#def setting(key, default=""):
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#    return row["value"] if row and row["value"] is not None else default
+#
+#
+#def put_setting(key, value):
+#    STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#              " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
+#
+#
+#def referral_terms():
+#    if setting("ref_on") != "1":
+#        return None
+#    try:
+#        pct = int(setting("ref_percent") or 0)
+#    except ValueError:
+#        return None
+#    if not 0 < pct <= 100:
+#        return None
+#    return pct, ("first" if setting("ref_mode") == "first" else "every")
+#
+#
+#def move_wallet(db, uid, amount, kind, note="", tid=None, other=None):
+#    """The panel's move_wallet: under STORE.lock, inside the caller's
+#    transaction; never below zero."""
+#    cur = db.execute("UPDATE users SET wallet = wallet + ? WHERE id = ? AND wallet + ? >= 0",
+#                     (amount, uid, amount))
+#    if not cur.rowcount:
+#        return None
+#    balance = db.execute("SELECT wallet FROM users WHERE id = ?", (uid,)).fetchone()[0]
+#    db.execute("INSERT INTO wallet_moves (user_id, at, amount, balance, kind, note,"
+#               " transaction_id, other_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+#               (uid, now(), amount, balance, kind, (note or "")[:200], tid, other))
+#    return balance
+#
+#
+#def pay_referral(buyer_id, amount, tid):
+#    """The inviter's share of a plan bought, into their wallet: the share, or
+#    None."""
+#    terms = referral_terms()
+#    if not terms or amount <= 0:
+#        return None
+#    pct, mode = terms
+#    buyer = STORE.one("SELECT referred_by FROM users WHERE id = ?", (buyer_id,))
+#    if not buyer or not buyer["referred_by"]:
+#        return None
+#    if mode == "first" and STORE.one(
+#            "SELECT 1 FROM transactions WHERE user_id = ? AND id != ? AND status = 'approved'"
+#            " AND plan_id IS NOT NULL AND kind != 'topup'", (buyer_id, tid)):
+#        return None
+#    share = amount * pct // 100
+#    if share <= 0:
+#        return None
+#    with STORE.lock:
+#        balance = move_wallet(STORE.db, buyer["referred_by"], share, "referral",
+#                              "%d٪ از خرید %s تومانی" % (pct, format(amount, ",")),
+#                              tid=tid, other=buyer_id)
+#        STORE.db.commit()
+#    if balance is None:
+#        return None
+#    log(INFO, "invitation: user #%d earned %d for #%d's purchase"
+#        % (buyer["referred_by"], share, buyer_id))
+#    emit("wallet.referral", buyer["referred_by"], {
+#        "amount": share, "balance": balance,
+#        "text": "🎉 یکی از کسانی که با لینک دعوت شما آمده بود خرید کرد؛ %s تومان به "
+#                "کیف پولتان اضافه شد.\nموجودی: %s تومان"
+#                % (format(share, ","), format(balance, ","))})
+#    return share
+#
+#
+#def wallet_settings_card(p):
+#    """The Payment page's wallet and invitation settings."""
+#    wallet = setting("wallet_on") == "1"
+#    ref = setting("ref_on") == "1"
+#    pct = setting("ref_percent") or "10"
+#    mode = setting("ref_mode") or "every"
+#    return (
+#        "<div class='card'><h2>💰 کیف پول</h2>"
+#        "<form method='post' action='/%s/wallet-settings'>"
+#        "<label style='display:inline'><input type='checkbox' name='on' value='1'%s>"
+#        " مشتری بتواند کیف پولش را شارژ کند</label> <button class='ghost'>ذخیره</button>"
+#        "</form>"
+#        "<p class='muted'>مشتری مبلغی را که می‌خواهد می‌نویسد و عکس رسید واریز را می‌فرستد. "
+#        "این رسید در صفحهٔ رسیدها با برچسب «شارژ کیف پول» می‌آید و با تأیید شما، همان مبلغ به "
+#        "کیف پولش اضافه می‌شود (اگر مبلغ رسید فرق داشت، همان‌جا درستش کنید). بعد مشتری با "
+#        "موجودی کیف پول، پلن را بدون رسید و فوری می‌خرد. خرید از کیف پول همیشه باز است، حتی "
+#        "وقتی شارژ بسته باشد؛ چون پورسانت دعوت و پولی که خودتان به کیف پول کسی اضافه "
+#        "کرده‌اید هم قابل خرج است.</p></div>"
+#        "<div class='card'><h2>🎁 دعوت از دوستان</h2>"
+#        "<form method='post' action='/%s/ref-settings'>"
+#        "<p><label style='display:inline'><input type='checkbox' name='on' value='1'%s>"
+#        " هر مشتری لینک دعوت خودش را بگیرد</label></p>"
+#        "<div class='row'><div class='f'><label>درصد از مبلغ خرید</label>"
+#        "<input name='percent' value='%s' size='4' dir='ltr'></div>"
+#        "<div class='f'><label>برای کدام خریدها</label><select name='mode'>"
+#        "<option value='every'%s>همهٔ خریدها و تمدیدها</option>"
+#        "<option value='first'%s>فقط اولین خرید</option></select></div>"
+#        "<button class='ghost'>ذخیره</button></div></form>"
+#        "<p class='muted'>وقتی کسی با لینک دعوت یک مشتری (لینک ربات یا لینک ثبت‌نام) حساب "
+#        "بسازد و پلن بخرد، این درصد از قیمت پلن به کیف پول همان مشتری اضافه می‌شود؛ فرقی "
+#        "نمی‌کند با رسید خریده باشد یا از کیف پول. شارژ کیف پول پورسانت ندارد، تا یک پول دو "
+#        "بار حساب نشود. دعوت‌کننده فقط موقع ساختن حساب ثبت می‌شود و بعداً عوض نمی‌شود، و "
+#        "هیچ‌کس نمی‌تواند خودش را دعوت کند. هر مشتری لینک دعوتش را در ربات (بخش کیف پول) و "
+#        "در پنل خودش می‌بیند.</p></div>"
+#        % (p, " checked" if wallet else "", p, " checked" if ref else "",
+#           html.escape(pct, quote=True), " selected" if mode != "first" else "",
+#           " selected" if mode == "first" else ""))
+#
+#
+## ---------------------------------------------------------------- broadcasts
+## One message to many customers, through the bot: whoever of them has a
+## Telegram. Queued like any other message to the bot, one per customer, and
+## the bot sends them one after another at a pace Telegram accepts.
+#BROADCAST_MAX = 3000
+#
+#
+#def broadcast_targets():
+#    """(key, label, SQL condition, arguments) for each audience - a
+#    reseller's among their own customers only."""
+#    s = seller()
+#    out = broadcast_all_targets(s)
+#    if s is None:
+#        return out
+#    return [(k, l, "(%s) AND owner_admin = ?" % c, a + (s["id"],)) for k, l, c, a in out]
+#
+#
+#def broadcast_all_targets(s):
+#    stamp = datetime.now(timezone.utc)
+#    soon = lambda d: (stamp + timedelta(days=d)).isoformat(timespec="seconds")
+#    out = [("all", "همهٔ مشتری‌ها", "1", ()),
+#           ("active", "مشتری‌های فعال", "status IN ('active', 'over_quota')", ()),
+#           ("expiring3", "دوره‌شان تا ۳ روز دیگر تمام می‌شود",
+#            "status IN ('active', 'over_quota') AND expires_at IS NOT NULL"
+#            " AND expires_at <= ?", (soon(3),)),
+#           ("expiring7", "دوره‌شان تا ۷ روز دیگر تمام می‌شود",
+#            "status IN ('active', 'over_quota') AND expires_at IS NOT NULL"
+#            " AND expires_at <= ?", (soon(7),)),
+#           ("expired", "دوره‌شان تمام شده", "status = 'expired'", ()),
+#           ("noplan", "هنوز پلن نخریده‌اند", "status = 'pending'", ())]
+#    for plan in STORE.q("SELECT id, name FROM plans WHERE is_trial = 0"
+#                        " AND COALESCE(owner_admin, 0) = ? ORDER BY id", (s["id"] if s else 0,)):
+#        out.append(("plan:%d" % plan["id"], "مشتری‌های پلن «%s»" % plan["name"],
+#                    "plan_id = ? AND status IN ('active', 'over_quota')", (plan["id"],)))
+#    return out
+#
+#
+#def broadcast_audience(target):
+#    """(ids of the customers the message reaches, how many of the target
+#    have no Telegram), or None for a target that is not one."""
+#    for key, _label, cond, args in broadcast_targets():
+#        if key == target:
+#            rows = STORE.q("SELECT id, telegram_id FROM users WHERE " + cond, args)
+#            return ([r["id"] for r in rows if r["telegram_id"]],
+#                    sum(1 for r in rows if not r["telegram_id"]))
+#    return None
+#
+#
+#def broadcast_card(p):
+#    """The bot page's broadcast: the message, who gets it - with the count
+#    beside each choice - and the last ones sent."""
+#    options = []
+#    for key, label, _cond, _args in broadcast_targets():
+#        reach, without = broadcast_audience(key)
+#        options.append("<option value='%s'>%s — %d نفر%s</option>"
+#                       % (key, html.escape(label), len(reach),
+#                          " (%d نفر دیگر تلگرام ندارند)" % without if without else ""))
+#    out = ["<div class='card'><h2>📣 پیام همگانی</h2>"
+#           "<form method='post' action='/%s/broadcast-send' onsubmit=\"return confirm("
+#           "'این پیام برای همه‌ی کسانی که انتخاب کرده‌اید فرستاده شود؟')\">"
+#           "<div class='f'><label>متن پیام</label><textarea name='text' rows='5' "
+#           "maxlength='%d' required style='width:100%%'></textarea></div>"
+#           "<div class='f'><label>برای</label><select name='target'>%s</select></div>"
+#           "<button>فرستادن</button></form>"
+#           "<p class='muted'>پیام فقط به مشتری‌هایی می‌رسد که تلگرامشان به ربات وصل است. ربات "
+#           "پیام‌ها را یکی‌یکی و با فاصله می‌فرستد تا تلگرام محدودش نکند؛ برای همین اگر مشتری "
+#           "زیاد باشد، چند دقیقه طول می‌کشد. عدد کنار هر گزینه، تعداد همین لحظه است.</p>"
+#           % (p, BROADCAST_MAX, "".join(options))]
+#    try:
+#        rows = STORE.q("SELECT * FROM broadcasts WHERE COALESCE(admin_id, 0) = ?"
+#                       " ORDER BY id DESC LIMIT 10", (seller_id() or 0,))
+#    except sqlite3.OperationalError:
+#        rows = []
+#    if rows:
+#        out.append("<h3 class='chart-h'>فرستاده‌شده‌ها</h3><table><tr><th>زمان</th><th>برای</th>"
+#                   "<th>متن</th><th>رسیده به ربات</th></tr>")
+#        labels = {k: l for k, l, _c, _a in broadcast_targets()}
+#        for r in rows:
+#            done = STORE.one("SELECT count(*) c FROM webhook_outbox WHERE id BETWEEN ? AND ?"
+#                             " AND delivered_at IS NOT NULL",
+#                             (r["first_row"] or 0, r["last_row"] or -1))["c"]
+#            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+#                       % (html.escape(r["created_at"][:16].replace("T", " ")),
+#                          html.escape(labels.get(r["target"], r["target"])),
+#                          html.escape(r["text"][:80] + ("…" if len(r["text"]) > 80 else "")),
+#                          "%d از %d" % (done, r["recipients"])))
+#        out.append("</table>")
+#    out.append("</div>")
+#    return "".join(out)
 #
 #
 #def webhook_url_ok(url):
@@ -15529,6 +21979,9 @@ exit 0
 #BOT_ENV = "/etc/doctor-dns-bot.env"
 #BOT_UNIT = "doctor-dns-bot"
 #BOT_LISTEN = "127.0.0.1:18990"
+## A reseller's bot: its own settings, and a port of its own from here up.
+#BOT_SELLER_ENV = "/etc/doctor-dns-bot-%d.env"
+#BOT_SELLER_PORT = 19000
 #TELEGRAM_API = "https://api.telegram.org"
 #
 #
@@ -15571,17 +22024,18 @@ exit 0
 #BOT_LOG_LINES = 200
 #
 #
-#def bot_journal(lines):
+#def bot_journal(lines, s=None):
 #    """The bot's last lines from the journal, the token masked - this page is
 #    for looking at, and a screenshot of it may well be sent to somebody."""
+#    env_path, unit, _ = bot_place(s)
 #    try:
-#        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", str(lines), "-o",
+#        r = subprocess.run(["journalctl", "-u", unit, "-n", str(lines), "-o",
 #                            "short-iso", "--no-pager"], capture_output=True, text=True,
 #                           timeout=15)
 #        text = r.stdout
 #    except Exception as e:
 #        return "journalctl: %s" % e
-#    token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+#    token = read_env(env_path).get("BOT_TOKEN", "")
 #    return text.replace(token, "<token>") if token else text
 #
 #
@@ -15886,7 +22340,8 @@ exit 0
 #    if not sources:
 #        return "".join(out)
 #    label = {"exit": "از سرور خارج"}
-#    label.update({s: "از مسیر مشتری — رله %s" % s for s in sources if s != "exit"})
+#    label.update({s: "از مسیر مشتری — %s %s" % (server_word(s), s)
+#                  for s in sources if s != "exit"})
 #    services = {}
 #    for key, name, domain, host in job.get("items") or []:
 #        services.setdefault((key, name), []).append((domain, host))
@@ -15992,12 +22447,13 @@ exit 0
 #            " · <span class='warn'>در حال ضبط؛ این صفحه خودش تازه می‌شود</span>"
 #            if waiting else ""))
 #        for r in results:
-#            out.append("<p class='muted'>سرور ایران <code>%s</code> — %s</p>%s"
-#                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
+#            out.append("<p class='muted'>%s <code>%s</code> — %s</p>%s"
+#                       % ("تک‌سرور" if is_single_server(r["relay"]) else "سرور ایران",
+#                          html.escape(r["relay"]), html.escape(ago(r["at"])),
 #                          pre(r["text"])))
 #        if not results and not waiting:
-#            out.append("<p class='muted'>جوابی از سرورهای ایران نیامد. سرور ایران باید "
-#                       "روی نسخهٔ تازه باشد.</p>")
+#            out.append("<p class='muted'>جوابی از رله‌ها نیامد. رله‌ها باید روی نسخهٔ تازه "
+#                       "باشند.</p>")
 #        if waiting:
 #            out.append("<script>setTimeout(function(){location.reload()},15000)</script>")
 #    out.append("</div>")
@@ -16006,19 +22462,33 @@ exit 0
 ## -- actions ----------------------------------------------------------
 #
 #
-#def bot_state():
+#def bot_place(s=None):
+#    """(settings file, unit, where it listens) of the owner's bot, or of a
+#    reseller's: one unit of the template each, on a port of its own."""
+#    if s is None:
+#        return BOT_ENV, BOT_UNIT, BOT_LISTEN
+#    return (BOT_SELLER_ENV % s["id"], "doctor-dns-bot@%d" % s["id"],
+#            "127.0.0.1:%d" % (BOT_SELLER_PORT + s["id"]))
+#
+#
+#def bot_setting(name, s=None):
+#    return "%s:%d" % (name, s["id"]) if s else name
+#
+#
+#def bot_state(s=None):
 #    """(installed, set up, running, a line of what it last said)."""
+#    env_path, unit, _ = bot_place(s)
 #    installed = os.path.exists(BOT_BIN)
-#    configured = bool(read_env(BOT_ENV).get("BOT_TOKEN"))
+#    configured = bool(read_env(env_path).get("BOT_TOKEN"))
 #    running = False
 #    last = ""
 #    try:
-#        running = subprocess.run(["systemctl", "is-active", "--quiet", BOT_UNIT],
+#        running = subprocess.run(["systemctl", "is-active", "--quiet", unit],
 #                                 timeout=10).returncode == 0
-#        r = subprocess.run(["journalctl", "-u", BOT_UNIT, "-n", "3", "-o", "cat",
+#        r = subprocess.run(["journalctl", "-u", unit, "-n", "3", "-o", "cat",
 #                            "--no-pager"], capture_output=True, text=True, timeout=10)
 #        last = r.stdout.strip()
-#        token = read_env(BOT_ENV).get("BOT_TOKEN", "")
+#        token = read_env(env_path).get("BOT_TOKEN", "")
 #        if token:
 #            last = last.replace(token, "<token>")
 #    except Exception:
@@ -16100,10 +22570,19 @@ exit 0
 #    return "<br><span class='muted'>%s</span>" % html.escape(name or "سایر")
 #
 #
-#def plan_fields(form, tpls, plan=None):
+#def plan_fields(form, tpls, plan=None, exits=None):
 #    """The inputs of one plan, bound to the form with that id - a row of
-#    the table or the new-plan card use the same ones."""
+#    the table or the new-plan card use the same ones. With `exits`, the
+#    servers abroad, a column to sell the plan on one of them or on all."""
 #    plan = plan or {}
+#    where = ""
+#    if exits:
+#        here, now = exits[0], plan.get("exit") or ""
+#        where = "<td><select form='%s' name='exit' dir='ltr'>%s</select></td>" % (
+#            form, "<option value=''%s>همه</option>" % ("" if now in exits else " selected")
+#            + "".join("<option value='%s'%s>%s</option>" % (
+#                x, " selected" if x == now else "", "%s — این سرور" % x if x == here else x)
+#                for x in exits))
 #    tid = plan.get("template_id")
 #    sel = "".join("<option value='%d'%s>%s</option>"
 #                  % (t["id"], " selected" if t["id"] == tid else "",
@@ -16129,8 +22608,10 @@ exit 0
 #        " 🎁 تست رایگان</label></td>"
 #        "<td><input form='%s' name='speed_mb' value='%s' size='3'"
 #        " inputmode='decimal' title='مگابیت بر ثانیه؛ خالی یا ۰ یعنی بی‌حد'></td>"
+#        "<td><input form='%s' name='devices' value='%s' size='2' inputmode='numeric'"
+#        " title='چند آی‌پی هم‌زمان، ۱ تا ۵'></td>"
 #        "<td><input form='%s' name='note' value='%s' size='14' maxlength='120'"
-#        " placeholder='اختیاری'></td>"
+#        " placeholder='اختیاری'></td>%s"
 #        % (form, html.escape(plan.get("name") or "", quote=True),
 #           form, sel,
 #           form, plan.get("days") or "",
@@ -16139,7 +22620,8 @@ exit 0
 #           form, plan.get("price") if plan else "",
 #           form, " checked" if plan.get("is_trial") else "",
 #           form, ("%g" % (kbps / 1000.0)) if kbps else "",
-#           form, html.escape(plan.get("note") or "", quote=True)))
+#           form, plan.get("devices") or 1,
+#           form, html.escape(plan.get("note") or "", quote=True), where))
 #
 #
 #def plan_cell(user, plans):
@@ -16151,21 +22633,41 @@ exit 0
 #    opts = "".join("<option value='%d'>%s%s</option>"
 #                   % (x["id"], html.escape(x["name"]),
 #                      "" if x["active"] else " (خاموش)") for x in plans)
-#    return ("<div class='muted'>%s</div>"
-#            "<form method='post' action='/%s/user-plan' class='row'"
+#    return ("<details><summary>%s</summary>"
+#            "<form method='post' action='/%s/user-plan'"
 #            " onsubmit='return confirm(\"این پلن به این کاربر داده شود؟ همان پلن "
 #            "تمدید می‌شود و پلن دیگر از همین حالا از نو شروع می‌شود.\")'>"
 #            "<input type='hidden' name='id' value='%d'>"
-#            "<select name='plan_id' required><option value=''>دادن پلن…</option>"
-#            "%s</select><button class='ghost'>اعمال</button></form>"
-#            % ("پلن: " + html.escape(held) if held else "بدون پلن",
+#            "<label>دادن پلن بدون رسید</label>"
+#            "<select name='plan_id' required><option value=''>انتخاب پلن…</option>"
+#            "%s</select> <button class='ghost'>اعمال</button></form></details>"
+#            % (html.escape(held) if held else "<span class='muted'>بدون پلن</span>",
 #               CFG["ADMIN_PATH"], user["id"], opts))
+#
+#
+## What one template in use costs every relay: its own resolver, measured at
+## about this much memory with the full block lists loaded.
+#TEMPLATE_MB = 8
+#
+#
+#def templates_in_use_note(default_id):
+#    """How many templates have customers - each is a resolver on every relay
+#    - and what that costs, for the admin to weigh before making another."""
+#    rows = STORE.q("SELECT DISTINCT COALESCE(template_id, ?) t FROM users"
+#                   " WHERE status IN ('active', 'over_quota')", (default_id,))
+#    n = sum(1 for r in rows if r["t"] != default_id)
+#    return ("<p class='muted'>⚠️ هر قالبی که مشتری دارد، روی هر رله و تک‌سرور یک DNS جدا "
+#            "اجرا می‌کند که حدود %d مگابایت رم می‌گیرد. الان %d قالب مشتری دارند؛ یعنی حدود "
+#            "%d مگابایت روی هر رله. قالبی که مشتری ندارد رم نمی‌گیرد.</p>"
+#            % (TEMPLATE_MB, n, n * TEMPLATE_MB))
 #
 #
 #def tickets_waiting():
 #    """Tickets whose turn it is here, for the count beside the menu item."""
 #    try:
-#        return STORE.one("SELECT count(*) c FROM tickets WHERE status = 'open'")["c"]
+#        extra, args = mine()
+#        return STORE.one("SELECT count(*) c FROM tickets t JOIN users u ON u.id = t.user_id"
+#                         " WHERE t.status = 'open'" + extra, args)["c"]
 #    except Exception:
 #        return 0
 #
@@ -16199,6 +22701,92 @@ exit 0
 #    return text
 #
 #
+## ---------------------------------------------------------------- English
+## The pages and the bot are written in Persian; English is the same text with
+## every Persian phrase swapped for its English, from one file the installer
+## ships (domains/i18n-en.json). A phrase is a piece of a Persian string in the
+## code, cut where a value goes in and at each tag - tools/i18n-extract.py lists
+## them. What somebody typed - a name, a note - is left as they wrote it.
+#I18N_FILE = "/usr/local/share/smart-dns/i18n-en.json"
+#I18N = {}
+#
+#
+#def english_index():
+#    """The phrases by their first two characters, longest first."""
+#    if "index" not in I18N:
+#        try:
+#            with open(I18N_FILE, encoding="utf-8") as fh:
+#                pairs = json.load(fh)
+#        except (OSError, ValueError):
+#            pairs = {}
+#        index = {}
+#        for k, v in pairs.items():
+#            if len(k) >= 2 and isinstance(v, str):
+#                # Plain text only: the English goes into attributes and
+#                # script strings quoted either way.
+#                v = v.replace("'", "\u2019").replace('"', "\u201d")
+#                index.setdefault(k[:2], []).append((k, v))
+#        for bucket in index.values():
+#            bucket.sort(key=lambda kv: -len(kv[0]))
+#        I18N["index"] = index
+#    return I18N["index"]
+#
+#
+#def fa_letter(c):
+#    """Part of a Persian word: a letter or a mark on one, not the comma,
+#    the semicolon or a digit - "نشد؛" ends a word at the "؛"."""
+#    return "\u0621" <= c <= "\u065f" or "\u066e" <= c <= "\u06d3" or c == "\u200c"
+#
+#
+#def to_english(text):
+#    """`text` with every known Persian phrase in English. A phrase is only
+#    taken whole - never the front of a longer Persian word."""
+#    index = english_index()
+#    if not index or not text or not any("\u0600" <= c <= "\u06ff" for c in text):
+#        return text
+#    out, last, i, n = [], 0, 0, len(text)
+#    while i < n:
+#        bucket = index.get(text[i:i + 2])
+#        if bucket and not (fa_letter(text[i]) and i and fa_letter(text[i - 1])):
+#            for k, v in bucket:
+#                end = i + len(k)
+#                if text.startswith(k, i) and not (
+#                        fa_letter(k[-1]) and end < n and fa_letter(text[end])):
+#                    out.append(text[last:i])
+#                    out.append(v)
+#                    i = last = end
+#                    break
+#            else:
+#                i += 1
+#            continue
+#        i += 1
+#    out.append(text[last:])
+#    # What is left - the quote marks around a name, a digit - in English form.
+#    return "".join(out).translate(ENGLISH_MARKS)
+#
+#
+#ENGLISH_MARKS = str.maketrans({"\u00ab": "\u201c", "\u00bb": "\u201d", "\u060c": ",",
+#                               "\u061b": ";", "\u061f": "?", "\u066a": "%",
+#                               **{chr(0x06f0 + i): str(i) for i in range(10)},
+#                               **{chr(0x0660 + i): str(i) for i in range(10)}})
+#
+#
+#def english_page(page_html):
+#    """A whole page in English, laid out left to right."""
+#    return to_english(page_html).replace('<html lang="fa" dir="rtl">',
+#                                         '<html lang="en" dir="ltr">', 1)
+#
+#
+#def wants_english(headers):
+#    """Whether this browser picked English - a cookie the button sets."""
+#    try:
+#        cookie = http.cookies.SimpleCookie((headers or {}).get("Cookie", "") or "")
+#    except http.cookies.CookieError:
+#        return False
+#    return "lang" in cookie and cookie["lang"].value == "en"
+#
+#
+#
 ## Whether this is a single machine: the relay's half lives here too.
 #SYNC_ENV_HERE = "/etc/smart-dns/sync.env"
 #
@@ -16207,26 +22795,724 @@ exit 0
 #    return os.path.exists(SYNC_ENV_HERE)
 #
 #
+## ------------------------------------------------------------------ admins
+## The owner signs in with the password in admin.env and a username of their
+## choosing; the admins they make sign in with their own, and see only the
+## parts of the panel ticked for them. A reseller - "own customers only" -
+## sees only the customers they brought.
+#REQ = threading.local()
+#OWNER = "owner"
+#ANYONE = "anyone"
+#ADMIN_SECTIONS = (("users", "کاربران"), ("receipts", "رسیدها و کیف پول"),
+#                  ("tickets", "تیکت‌ها"), ("plans", "پلن‌ها و پرداخت"),
+#                  ("templates", "قالب‌ها و دامنه‌ها"), ("bot", "ربات و API"),
+#                  ("nodes", "نود و سرورها"), ("settings", "تنظیمات"),
+#                  ("logs", "لاگ و عیب‌یابی"))
+#PAGE_SECTION = {"": ANYONE, "index": ANYONE, "me": ANYONE, "users": "users",
+#                "wallet": "users", "usage": "users", "receipts": "receipts",
+#                "plans": "plans", "pay": "plans", "tickets": "tickets",
+#                "templates": "templates", "domains": "templates", "bot": "bot", "api": "bot",
+#                "nodes": "nodes", "server": "nodes", "settings": "settings", "logs": "logs",
+#                "diagnose": "logs", "admins": OWNER, "restore": OWNER}
+#ACTION_SECTION = {
+#    "user-save": "users", "user-status": "users", "user-template": "users",
+#    "user-plan": "users", "user-reset": "users", "user-delete": "users",
+#    "user-relays": "users", "user-exit": "users", "user-devices": "users",
+#    "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
+#    "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
+#    "plan-save": "plans", "plan-active": "plans", "plan-delete": "plans", "pay-save": "plans",
+#    "discount-save": "plans", "discount-active": "plans", "discount-delete": "plans",
+#    "devices-settings": "plans", "wallet-settings": "plans", "ref-settings": "plans",
+#    "template-new": "templates", "template-save": "templates", "template-delete": "templates",
+#    "template-rules": "templates", "template-blocklists": "templates",
+#    "domain-add": "templates", "domain-del": "templates", "blocked-add": "templates",
+#    "blocked-del": "templates", "forward-add": "templates", "forward-del": "templates",
+#    "bot-setup": "bot", "bot-power": "bot", "bot-test": "bot", "bot-link-save": "bot",
+#    "broadcast-send": "bot", "api-key-new": "bot", "api-key-revoke": "bot",
+#    "api-webhook-save": "bot", "api-webhook-test": "bot",
+#    "node-add": "nodes", "node-del": "nodes", "relay-add": "nodes", "relay-del": "nodes",
+#    "single-add": "nodes", "relay-exit": "nodes", "relay-tunnel": "nodes", "cap-save": "nodes",
+#    "upgrade-start": "nodes", "upgrade-stop": "nodes", "update-check": "settings",
+#    "public-dns": "settings", "server-list-save": "nodes", "seller-server-notes": ANYONE,
+#    "dns-bench": "settings", "dns-upstream": "settings", "doh-name": "settings",
+#    "telegram-required": "settings", "watch-start": "logs", "diagnose-start": "logs",
+#    "me-password": ANYONE, "view-as-stop": ANYONE}
+## Everything else - the owner's password, the panel's address, backups and
+## restoring them, the standby, upgrading from GitHub, the admins - is the
+## owner's alone.
+#
+#
+#def me():
+#    """The admin this request speaks for - a row - or None for the owner."""
+#    return getattr(REQ, "admin", None)
+#
+#
+#def is_owner():
+#    return me() is None
+#
+#
+#def admin_perms(row):
+#    try:
+#        return set(json.loads(row["perms"] or "[]"))
+#    except (ValueError, TypeError):
+#        return set()
+#
+#
+#def may(section):
+#    """Whether the admin of this request may use this part of the panel."""
+#    if section == ANYONE:
+#        return True
+#    row = me()
+#    if row is None:
+#        return True
+#    if section == OWNER or section is None:
+#        return False
+#    if row["own_only"] and section not in RESELLER_SECTIONS:
+#        return False
+#    return section in admin_perms(row)
+#
+#
+## What a reseller can be given: the parts about their own customers. The
+## rest - servers, settings, logs - shows everybody's, so it stays the owner's.
+#RESELLER_SECTIONS = {"users", "receipts", "tickets", "plans", "templates", "bot"}
+## And inside those, what is set for every customer at once.
+#RESELLER_NEVER = {"domains", "discount-save", "discount-active", "discount-delete",
+#                  "devices-settings", "wallet-settings", "ref-settings", "domain-add",
+#                  "domain-del", "blocked-add", "blocked-del", "forward-add", "forward-del",
+#                  # The bot page is their own bot; the API page is every key.
+#                  "api", "api-key-new", "api-key-revoke", "api-webhook-save",
+#                  "api-webhook-test", "bot-link-save"}
+#
+#
+#def seller():
+#    """The reseller this request speaks for, or None."""
+#    row = me()
+#    return row if row is not None and row["own_only"] else None
+#
+#
+#def seller_id():
+#    s = seller()
+#    return s["id"] if s else None
+#
+#
+#def mine(alias="u"):
+#    """A reseller's own customers only: the SQL to add, and its argument."""
+#    s = seller()
+#    if s is None:
+#        return "", ()
+#    return " AND %s.owner_admin = ?" % alias, (s["id"],)
+#
+#
+#def owns(sql, *args):
+#    """Whether the row this query finds - joined to its customer as u - is
+#    one of this reseller's; always, for everybody else."""
+#    extra, more = mine()
+#    return bool(STORE.one(sql + extra, args + more))
+#
+#
+#def seller_templates(s):
+#    """The templates a seller may give: those the owner ticked for them -
+#    the default one among them only when ticked - and their own when they
+#    make their own."""
+#    try:
+#        ids = {int(x) for x in json.loads(s["templates"] or "[]")}
+#    except (ValueError, TypeError):
+#        ids = set()
+#    if s["templates_mode"] == "own":
+#        ids |= {r["id"] for r in STORE.q("SELECT id FROM templates WHERE owner_admin = ?",
+#                                        (s["id"],))}
+#    return ids
+#
+#
+#def templates_for_me():
+#    tpls = STORE.q("SELECT * FROM templates ORDER BY id")
+#    s = seller()
+#    if s is None:
+#        return tpls
+#    ok = seller_templates(s)
+#    return [t for t in tpls if t["id"] in ok]
+#
+#
+#def seller_refuses(rest, one):
+#    """Why a reseller may not do this, or None: what is set for everyone,
+#    and anything about a customer, a receipt, a ticket, a plan or a
+#    template that is not theirs."""
+#    s = seller()
+#    if s is None:
+#        return None
+#    if rest in RESELLER_NEVER:
+#        return "این کار فقط با مالک پنل است"
+#
+#    def num(key):
+#        raw = (one(key) or "").strip()
+#        return int(raw) if raw.isdigit() else 0
+#
+#    if ACTION_SECTION.get(rest) == "users":
+#        if rest in ("user-relays", "user-exit") and not s["can_route"]:
+#            return "انتخاب رله و سرور خارج برای حساب شما باز نیست"
+#        if not owns("SELECT 1 FROM users u WHERE u.id = ?", num("id")):
+#            return "این کاربر مال شما نیست"
+#        if rest == "user-template" and num("template_id") not in seller_templates(s):
+#            return "این قالب برای شما نیست"
+#        if rest == "user-plan" and not STORE.one(
+#                "SELECT 1 FROM plans WHERE id = ? AND owner_admin = ?", (num("plan_id"), s["id"])):
+#            return "این پلن مال شما نیست"
+#    if rest == "receipt-decide" and not owns(
+#            "SELECT 1 FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.id = ?",
+#            num("id")):
+#        return "این رسید مال مشتری‌های شما نیست"
+#    if rest == "ticket-status" and not owns(
+#            "SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id WHERE t.id = ?", num("id")):
+#        return "این تیکت مال مشتری‌های شما نیست"
+#    if rest in ("plan-active", "plan-delete") or (rest == "plan-save" and num("id")):
+#        if not STORE.one("SELECT 1 FROM plans WHERE id = ? AND owner_admin = ?",
+#                         (num("id"), s["id"])):
+#            return "این پلن مال شما نیست"
+#    if rest == "plan-save":
+#        if num("template_id") not in seller_templates(s):
+#            return "این قالب برای شما نیست"
+#        if one("trial") == "1":
+#            return "تست رایگان فقط با مالک پنل است"
+#    if rest in ("template-save", "template-delete", "template-rules", "template-blocklists"):
+#        if s["templates_mode"] != "own" or not STORE.one(
+#                "SELECT 1 FROM templates WHERE id = ? AND owner_admin = ?", (num("id"), s["id"])):
+#            return "این قالب مال شما نیست"
+#    if rest == "template-new":
+#        if s["templates_mode"] != "own":
+#            return "ساختن قالب برای حساب شما باز نیست"
+#        made = STORE.one("SELECT count(*) c FROM templates WHERE owner_admin = ?",
+#                         (s["id"],))["c"]
+#        if made >= (s["templates_max"] or 1):
+#            return "به سقف %d قالب رسیده‌اید" % (s["templates_max"] or 1)
+#    return None
+#
+#
+#def page_allowed(path):
+#    if seller() is not None and path in RESELLER_NEVER:
+#        return False
+#    return may(PAGE_SECTION.get(path, OWNER))
+#
+#
+#def seller_card(p, s):
+#    """A reseller's own account: their customers, their traffic and days,
+#    what they sold this month, and the link that brings customers to them."""
+#    n = STORE.one("SELECT count(*) c FROM users WHERE owner_admin = ?", (s["id"],))["c"]
+#    month = datetime.now(timezone.utc).strftime("%Y-%m-01")
+#    sold = STORE.one("SELECT COALESCE(sum(t.amount), 0) s FROM transactions t"
+#                     " JOIN users u ON u.id = t.user_id WHERE u.owner_admin = ?"
+#                     " AND t.status = 'approved' AND t.kind != 'topup'"
+#                     " AND COALESCE(t.decided_at, t.created_at) >= ?", (s["id"], month))["s"]
+#    left = "—"
+#    if s["expires_at"]:
+#        delta = parse_ts(s["expires_at"]) - datetime.now(timezone.utc)
+#        left = str(max(0, delta.days + (1 if delta.seconds else 0)))
+#    stats = ((("%d از %d" % (n, s["max_users"])) if s["max_users"] else str(n), "مشتری"),
+#             ("%s از %s" % (human(s["used_bytes"]), human(s["cap_bytes"]))
+#              if s["cap_bytes"] else human(s["used_bytes"]), "مصرف مشتری‌ها"),
+#             (left, "روز مانده"), (format(sold, ","), "فروش این ماه (تومان)"))
+#    out = ["<div class='card'><h2>حساب فروشنده</h2>"]
+#    stopped = (s["cap_bytes"] and s["used_bytes"] >= s["cap_bytes"]) or (
+#        s["expires_at"] and s["expires_at"] <= now())
+#    if stopped:
+#        out.append("<div class='msg err'>حجم یا روزهای شما تمام شده و سرویس همهٔ مشتری‌هایتان "
+#                   "قطع است؛ برای تمدید به مالک پنل بگویید.</div>")
+#    out.append("<div class='grid'>")
+#    for v, label in stats:
+#        out.append("<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>"
+#                   % (html.escape(v), label))
+#    out.append("</div>")
+#    if s["cap_bytes"]:
+#        out.append("<p>%s</p>" % bar(s["used_bytes"], s["cap_bytes"]))
+#    web = setting("customer_panel_url") or ""
+#    bot = setting("bot_link:%d" % s["id"]) or setting("bot_link") or ""
+#    code = s["ref_code"] or ""
+#    links = []
+#    if code and web:
+#        links.append("<code dir='ltr'>%ssignup?ref=%s</code>" % (html.escape(web), code))
+#    if code and bot:
+#        links.append("<code dir='ltr'>%s?start=ref_%s</code>" % (html.escape(bot), code))
+#    out.append("<h3 class='chart-h'>لینک ثبت‌نام مشتری‌های شما</h3>")
+#    out.append("<p>%s</p>" % "<br>".join(links) if links else
+#               "<p class='muted'>مالک پنل هنوز آدرس پنل مشتری را نگذاشته.</p>")
+#    out.append("<p class='muted'>هر کس با این لینک ثبت‌نام کند، مشتری شما می‌شود و پلن‌ها و "
+#               "اطلاعات پرداخت شما را می‌بیند.</p></div>")
+#    return "".join(out)
+#
+#
+#def sellers_summary_card(p):
+#    """On the owner's home page: each reseller, their customers, their
+#    traffic and days - and who is stopped."""
+#    rows = STORE.q("SELECT * FROM admins WHERE own_only = 1 ORDER BY id")
+#    if not rows:
+#        return ""
+#    out = ["<div class='card'><h2>فروشنده‌ها</h2><table><tr><th>نام کاربری</th><th>مشتری</th>"
+#           "<th>حجم</th><th>روز مانده</th><th>وضعیت</th></tr>"]
+#    for s in rows:
+#        n = STORE.one("SELECT count(*) c FROM users WHERE owner_admin = ?", (s["id"],))["c"]
+#        left = "—"
+#        if s["expires_at"]:
+#            delta = parse_ts(s["expires_at"]) - datetime.now(timezone.utc)
+#            left = str(max(0, delta.days + (1 if delta.seconds else 0)))
+#        if s["disabled"]:
+#            state = "<span class='pill'>غیرفعال</span>"
+#        elif (s["cap_bytes"] and s["used_bytes"] >= s["cap_bytes"]) or (
+#                s["expires_at"] and s["expires_at"] <= now()):
+#            state = "<span class='pill bad'>قطع</span>"
+#        else:
+#            state = "<span class='pill ok'>فعال</span>"
+#        out.append("<tr><td><a href='/%s/admins?stats=%d'><code>%s</code></a></td><td>%s</td>"
+#                   "<td>%s</td><td>%s</td><td>%s</td></tr>"
+#                   % (p, s["id"], html.escape(s["username"]),
+#                      "%d%s" % (n, " از %d" % s["max_users"] if s["max_users"] else ""),
+#                      bar(s["used_bytes"], s["cap_bytes"]) if s["cap_bytes"]
+#                      else human(s["used_bytes"]), left, state))
+#    out.append("</table></div>")
+#    return "".join(out)
+#
+#
+#def pay_key():
+#    """Where this admin's card number is kept: a reseller's customers pay
+#    the reseller."""
+#    s = seller()
+#    return "pay_text:%d" % s["id"] if s else "pay_text"
+#
+#
+#def give_seller_code(aid):
+#    """The code in a reseller's sign-up link, once. Unlike every customer's
+#    own invitation code, so a link can only mean one of them."""
+#    for _ in range(8):
+#        code = secrets.token_hex(5)
+#        if STORE.one("SELECT 1 FROM users WHERE ref_code = ?", (code,)):
+#            continue
+#        try:
+#            STORE.run("UPDATE admins SET ref_code = ? WHERE id = ? AND ref_code IS NULL",
+#                      (code, aid))
+#            return
+#        except sqlite3.IntegrityError:
+#            continue
+#
+#
+#def owner_name():
+#    """The owner's username: chosen when the installer ran, kept in admin.env
+#    beside the password's hash."""
+#    return (CFG.get("ADMIN_USER") or setting("owner_username") or "").strip().lower()
+#
+#
+#def move_owner_name():
+#    """A panel from before the username lived in admin.env kept it in the
+#    database: moved over once, so the name the owner chose stays theirs."""
+#    old = (setting("owner_username") or "").strip().lower()
+#    if old:
+#        set_config_key("ADMIN_USER", old)
+#        CFG["ADMIN_USER"] = old
+#        STORE.run("DELETE FROM settings WHERE key = 'owner_username'")
+#
+#
+#def denied_page(why=None):
+#    return ("<div class='card'><h2>دسترسی ندارید</h2><p class='muted'>%s</p></div>"
+#            % html.escape(why or "این بخش برای حساب شما باز نیست؛ اگر لازمش دارید، به مالک "
+#                                 "پنل بگویید."))
+#
+#
+#def admin_row_buttons(p, r, back):
+#    """Beside an admin: disable or enable, their usage back to zero (a
+#    seller's), and delete - each asked about first - without opening their
+#    form. `back` is where the answer comes back to."""
+#    n = STORE.one("SELECT count(*) c FROM users WHERE owner_admin = ?", (r["id"],))["c"]
+#    seller = r["own_only"]
+#    hidden = ("<input type='hidden' name='id' value='%d'><input type='hidden' name='back' "
+#              "value='%s'>" % (r["id"], back))
+#    ask_js = lambda text: html.escape(json.dumps(text, ensure_ascii=False), quote=True)
+#    out = []
+#    if r["disabled"]:
+#        out.append("<form method='post' action='/%s/admin-disable'>%s<input type='hidden' "
+#                   "name='to' value='0'><button class='ghost'>فعال کردن</button></form>"
+#                   % (p, hidden))
+#    else:
+#        out.append("<form method='post' action='/%s/admin-disable' onsubmit='return confirm(%s)'>"
+#                   "%s<input type='hidden' name='to' value='1'><button class='ghost'>غیرفعال "
+#                   "کردن</button></form>" % (p, ask_js(
+#                       "این فروشنده غیرفعال شود؟ دیگر نمی‌تواند وارد شود، سرویس همهٔ %d "
+#                       "مشتری‌اش قطع می‌شود، چیزی از او فروخته نمی‌شود و رباتش خاموش می‌شود. "
+#                       "با «فعال کردن» همه‌چیز برمی‌گردد." % n if seller
+#                       else "این ادمین غیرفعال شود؟ دیگر نمی‌تواند وارد شود."), hidden))
+#    if seller:
+#        out.append("<form method='post' action='/%s/admin-reset-usage' onsubmit='return "
+#                   "confirm(%s)'>%s<button class='ghost'>صفر کردن مصرف</button></form>"
+#                   % (p, ask_js("مصرف این فروشنده صفر شود؟"), hidden))
+#    out.append("<form method='post' action='/%s/admin-delete' onsubmit='return confirm(%s)'>"
+#               "%s<button class='del'>حذف همیشگی</button></form>" % (p, ask_js(
+#                   "این فروشنده و همه‌چیزش برای همیشه پاک شود؟ %d مشتری با رسیدها و "
+#                   "تیکت‌هایشان، و پلن‌ها، قالب‌ها و رباتش پاک می‌شوند و قابل برگشت نیست." % n
+#                   if seller else "این ادمین برای همیشه حذف شود؟"), hidden))
+#    return "".join(out)
+#
+#
+#def admin_stats_page(p, r):
+#    """One admin's page, as the home page is the whole panel's: for a seller
+#    their customers, traffic, days and sales, their customers' usage and
+#    latest receipts; for anybody, what they may do - and every button."""
+#    r = dict(r)
+#    seller = r["own_only"]
+#    stopped = seller and ((r["cap_bytes"] and r["used_bytes"] >= r["cap_bytes"])
+#                          or (r["expires_at"] and r["expires_at"] <= now()))
+#    state = ("<span class='pill'>غیرفعال</span>" if r["disabled"] else
+#             "<span class='pill bad'>قطع</span>" if stopped else "<span class='pill ok'>فعال</span>")
+#    out = ["<p><a href='/%s/admins'>‹ برگشت به ادمین‌ها</a></p>" % p,
+#           "<div class='card'><h2><code>%s</code> %s %s</h2><p class='muted'>%s · دسترسی: %s"
+#           "</p><div class='row' style='gap:6px;align-items:center'>%s"
+#           "<a class='dl' href='/%s/admins?id=%d'>ویرایش</a>"
+#           "<form method='post' action='/%s/admin-view-as'><input type='hidden' name='id' "
+#           "value='%d'><button class='ghost'>دیدن به‌جای او</button></form></div></div>"
+#           % (html.escape(r["username"]),
+#              "<span class='pill warn'>فروشنده</span>" if seller else "", state,
+#              "ساخته شده %s" % html.escape((r["created_at"] or "")[:10]),
+#              html.escape("، ".join(dict(ADMIN_SECTIONS)[k] for k in ADMIN_SECTIONS_ORDER
+#                                   if k in admin_perms(r)
+#                                   and (not seller or k in RESELLER_SECTIONS)) or "—"),
+#              admin_row_buttons(p, r, "stats"), p, r["id"], p, r["id"])]
+#    if not seller:
+#        out.append("<div class='card'><p class='muted'>کارمند است و مشتری مال خودش ندارد؛ "
+#                   "همهٔ مشتری‌ها را در بخش‌هایی که برایش تیک خورده می‌بیند. هر کاری که "
+#                   "کرده با نام کاربری‌اش در صفحهٔ <a href='/%s/logs'>لاگ</a> ثبت شده.</p></div>"
+#                   % p)
+#        return "".join(out)
+#    sid = r["id"]
+#    one_n = lambda sql, args=(): STORE.one(sql, args)[0] or 0
+#    month = datetime.now(timezone.utc).strftime("%Y-%m-01")
+#    tx = ("SELECT %s FROM transactions t JOIN users u ON u.id = t.user_id"
+#          " WHERE u.owner_admin = ? AND ")
+#    customers = one_n("SELECT count(*) FROM users WHERE owner_admin = ?", (sid,))
+#    stats = (
+#        ("%d از %d" % (customers, r["max_users"]) if r["max_users"] else str(customers),
+#         "مشتری"),
+#        (str(one_n("SELECT count(*) FROM users WHERE owner_admin = ? AND status = 'active'",
+#                   (sid,))), "فعال"),
+#        (str(one_n("SELECT count(*) FROM ips i JOIN users u ON u.id = i.user_id"
+#                   " WHERE u.owner_admin = ?", (sid,))), "آی‌پی ثبت‌شده"),
+#        ("%s از %s" % (human(r["used_bytes"]), human(r["cap_bytes"])) if r["cap_bytes"]
+#         else human(r["used_bytes"]), "مصرف این دوره"),
+#        (str(max(0, (parse_ts(r["expires_at"]) - datetime.now(timezone.utc)).days))
+#         if r["expires_at"] else "بی‌پایان", "روز مانده"),
+#        (format(one_n(tx % "sum(t.amount)" + "t.status = 'approved' AND t.kind != 'topup'"
+#                      " AND COALESCE(t.decided_at, t.created_at) >= ?", (sid, month)), ","),
+#         "فروش این ماه (تومان)"),
+#        (format(one_n(tx % "sum(t.amount)" + "t.status = 'approved' AND t.kind != 'topup'",
+#                      (sid,)), ","), "فروش کل (تومان)"),
+#        (str(one_n(tx % "count(*)" + "t.status = 'pending'", (sid,))), "رسید در انتظار"),
+#        (str(one_n("SELECT count(*) FROM tickets t JOIN users u ON u.id = t.user_id"
+#                   " WHERE u.owner_admin = ? AND t.status = 'open'", (sid,))), "تیکت باز"),
+#        (str(one_n("SELECT count(*) FROM plans WHERE owner_admin = ? AND active = 1",
+#                   (sid,))), "پلن فعال"))
+#    out.append("<div class='card'><h2>خلاصه</h2><div class='grid'>")
+#    for v, label in stats:
+#        out.append("<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>"
+#                   % (html.escape(v), label))
+#    out.append("</div>")
+#    if r["cap_bytes"]:
+#        out.append("<p>%s</p>" % bar(r["used_bytes"], r["cap_bytes"]))
+#    out.append("</div>")
+#    out.append(total_usage_card(p, sid, "مصرف مشتری‌های %s" % r["username"]))
+#    rows = STORE.q("SELECT t.id, t.amount, t.kind, t.status, t.created_at, u.username,"
+#                   " u.first_name, u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
+#                   " WHERE u.owner_admin = ? ORDER BY t.id DESC LIMIT 10", (sid,))
+#    if rows:
+#        kinds = {"topup": "شارژ کیف پول", "device": "دستگاه اضافه", "wallet": "از کیف پول"}
+#        states = {"pending": "<span class='pill warn'>در انتظار</span>",
+#                  "approved": "<span class='pill ok'>تأیید شده</span>",
+#                  "rejected": "<span class='pill bad'>رد شده</span>"}
+#        out.append("<div class='card'><h2>آخرین خریدها</h2><table><tr><th>زمان</th>"
+#                   "<th>مشتری</th><th>چه</th><th>مبلغ</th><th></th></tr>")
+#        for t in rows:
+#            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+#                       % (html.escape(t["created_at"][:16].replace("T", " ")),
+#                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
+#                          kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
+#                          states.get(t["status"], html.escape(t["status"]))))
+#        out.append("</table></div>")
+#    return "".join(out)
+#
+#
+#def admins_card(p):
+#    """The owner's page of admins: each, what they may see, and for a
+#    reseller their customers, their traffic and until when."""
+#    rows = STORE.q("SELECT * FROM admins ORDER BY id")
+#    out = ["<div class='card'><h2>ادمین‌ها (%d)</h2>" % len(rows)]
+#    if not rows:
+#        out.append("<p class='muted'>هنوز ادمینی نساخته‌اید.</p>")
+#    else:
+#        out.append("<table><tr><th>نام کاربری</th><th>دسترسی</th><th>مشتری</th><th>حجم</th>"
+#                   "<th>تا</th><th></th></tr>")
+#        labels = dict(ADMIN_SECTIONS)
+#        for r in rows:
+#            n = STORE.one("SELECT count(*) c FROM users WHERE owner_admin = ?", (r["id"],))["c"]
+#            perms = "، ".join(labels.get(x, x) for x in ADMIN_SECTIONS_ORDER
+#                              if x in admin_perms(r)) or "—"
+#            out.append(
+#                "<tr%s><td><a href='/%s/admins?stats=%d' title='آمار و کارها'><code>%s</code>"
+#                "</a>%s</td><td class='muted'>%s</td><td>%s</td><td>%s</td>"
+#                "<td>%s</td><td class='acts'><div style='display:flex;gap:6px;"
+#                "align-items:center;flex-wrap:wrap'>%s"
+#                "<a href='/%s/admins?id=%d'>ویرایش</a>"
+#                "<form method='post' action='/%s/admin-view-as'><input type='hidden' name='id' "
+#                "value='%d'><button class='ghost' title='پنل را همان‌طور ببینید که او می‌بیند'>"
+#                "دیدن به‌جای او</button></form></div></td></tr>"
+#                % (" class='off'" if r["disabled"] else "", p, r["id"],
+#                   html.escape(r["username"]),
+#                   " <span class='pill warn'>فروشنده</span>" if r["own_only"] else "",
+#                   html.escape(perms),
+#                   "%d%s" % (n, " از %d" % r["max_users"] if r["max_users"] else "")
+#                   if r["own_only"] else "—",
+#                   ("%s از %s" % (human(r["used_bytes"]), human(r["cap_bytes"]))
+#                    if r["cap_bytes"] else "—") if r["own_only"] else "—",
+#                   html.escape((r["expires_at"] or "")[:10]) or "—",
+#                   admin_row_buttons(p, r, "list"),
+#                   p, r["id"], p, r["id"]))
+#        out.append("</table><p class='muted'>روی نام هر ادمین بزنید تا آمار و کارهایش را "
+#                   "ببینید.</p>")
+#    out.append("<p><a class='dl' href='/%s/admins?id=0'>ادمین تازه</a></p></div>" % p)
+#    return "".join(out)
+#
+#
+#ADMIN_SECTIONS_ORDER = [k for k, _ in ADMIN_SECTIONS]
+#
+#
+#def reset_days_form(p, user):
+#    """In a customer's menu: their usage back to zero every so many days."""
+#    days = user["reset_days"] if "reset_days" in user.keys() else None
+#    nxt = (user["reset_next"] or "")[:10] if days else ""
+#    return ("<form method='post' action='/%s/user-reset-days' class='resetdays'>"
+#            "<input type='hidden' name='id' value='%d'>"
+#            "<label>ریست خودکار مصرف هر</label>"
+#            "<input name='days' size='3' dir='ltr' inputmode='numeric' value='%s' "
+#            "placeholder='—'> روز <button class='ghost'>ذخیره</button>%s</form>"
+#            % (p, user["id"], days or "",
+#               "<small class='muted'>بعدی: %s</small>" % nxt if nxt else ""))
+#
+#
+#def reset_next_value(days, old_days, old_next):
+#    """When the next reset is, after the admin set `days`: kept while the
+#    number is the same, from today when it is new."""
+#    if not days:
+#        return None
+#    if days == old_days and old_next:
+#        return old_next
+#    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds")
+#
+#
+#def admin_form(p, row):
+#    """Making an admin, or changing one."""
+#    row = dict(row) if row else {}
+#    perms = admin_perms(row) if row else set()
+#    # The default one too: whether a seller may give it is the owner's to say.
+#    tpls = STORE.q("SELECT id, name FROM templates WHERE owner_admin IS NULL ORDER BY id")
+#    try:
+#        picked = set(json.loads(row.get("templates") or "[]"))
+#    except ValueError:
+#        picked = set()
+#    days = ""
+#    if row.get("expires_at"):
+#        left = parse_ts(row["expires_at"]) - datetime.now(timezone.utc)
+#        days = str(max(0, left.days + (1 if left.seconds else 0)))
+#    boxes = "".join("<label style='display:inline;margin-left:14px'><input type='checkbox' "
+#                    "name='perm' value='%s'%s> %s</label>"
+#                    % (k, " checked" if k in perms else "", html.escape(label))
+#                    for k, label in ADMIN_SECTIONS)
+#    tboxes = "".join("<label style='display:inline;margin-left:14px'><input type='checkbox' "
+#                     "name='tpl' value='%d'%s> %s</label>"
+#                     % (t["id"], " checked" if t["id"] in picked else "", html.escape(t["name"]))
+#                     for t in tpls)
+#    return (
+#        "<div class='card'><h2>%s</h2><p><a href='/%s/admins'>‹ برگشت به ادمین‌ها</a></p>"
+#        "<form method='post' action='/%s/admin-save'>"
+#        "<input type='hidden' name='id' value='%d'>"
+#        "<div class='row'><div class='f'><label>نام کاربری</label><input name='username' "
+#        "dir='ltr' required value='%s'></div>"
+#        "<div class='f'><label>رمز%s</label><input name='password' type='password' "
+#        "autocomplete='new-password' dir='ltr'%s></div></div>"
+#        "<h3 class='chart-h'>چه بخش‌هایی را ببیند</h3><p>%s</p>"
+#        "<h3 class='chart-h'>فروشنده</h3>"
+#        "<p><label style='display:inline'><input type='checkbox' name='own_only' value='1'%s>"
+#        " <b>فروشنده است</b> — سرویس را از شما می‌خرد و به مشتری‌های خودش می‌فروشد."
+#        " فقط مشتری‌هایی را می‌بیند که خودش آورده؛ پلن و قیمت و شماره کارت هم مال خودش."
+#        " بدون این تیک، مثل کارمند شماست و همهٔ مشتری‌ها را می‌بیند.</label></p>"
+#        # Only a seller's: shown while "is a seller" is ticked.
+#        "<style>form:has(input[name=own_only]:not(:checked)) .route-tick{display:none}</style>"
+#        "<p class='route-tick'><label style='display:inline'><input type='checkbox' "
+#        "name='can_route' value='1'%s> رله و سرور خارج مشتری‌هایش را خودش انتخاب کند"
+#        "</label></p>"
+#        "<div class='row'><div class='f'><label>سقف تعداد مشتری</label><input name='max_users' "
+#        "dir='ltr' size='6' style='width:100%%' value='%s' placeholder='خالی = بی‌حد'></div>"
+#        "<div class='f'><label>سقف حجم کل مشتری‌ها (گیگ)</label><input name='cap_gb' dir='ltr' "
+#        "size='8' style='width:100%%' value='%s' placeholder='خالی = بی‌حد'></div>"
+#        "<div class='f'><label>چند روز دیگر</label><input name='days' dir='ltr' size='6' "
+#        "style='width:100%%' value='%s' placeholder='خالی = بی‌پایان'></div>"
+#        "<div class='f'><label>ریست خودکار مصرف هر چند روز</label><input name='reset_days' "
+#        "dir='ltr' size='6' style='width:100%%' value='%s' placeholder='خالی = خاموش'>%s</div></div>"
+#        "%s"
+#        "<h3 class='chart-h'>قالب‌ها</h3>"
+#        "<p><label style='display:inline'><input type='radio' name='templates_mode' "
+#        "value='pick'%s> فقط از قالب‌های تیک‌خورده</label> "
+#        "<label style='display:inline;margin-right:14px'><input type='radio' "
+#        "name='templates_mode' value='own'%s> خودش قالب بسازد، تا "
+#        "<input name='templates_max' dir='ltr' size='3' value='%s'> قالب</label></p><p>%s</p>"
+#        "<button>ذخیره</button></form>"
+#        "<p class='muted'>فروشنده فقط مشتری‌هایی را می‌بیند که خودش آورده (با لینک یا ربات "
+#        "خودش)، همراه با رسیدها، تیکت‌ها و کیف پولشان. پلن‌ها و قیمت‌هایش را هم خودش می‌سازد. "
+#        "اگر مصرف مشتری‌هایش روی هم به سقف حجم برسد یا روزهایش تمام شود، سرویس همهٔ "
+#        "مشتری‌هایش قطع می‌شود تا تمدیدش کنید. هر تغییری در این صفحه، آن ادمین را از همهٔ "
+#        "دستگاه‌ها بیرون می‌برد.</p>%s</div>"
+#        % ("ویرایش %s" % html.escape(row["username"]) if row else "ادمین تازه", p, p,
+#           row.get("id") or 0, html.escape(row.get("username") or "", quote=True),
+#           " (خالی = همین بماند)" if row else "", "" if row else " required", boxes,
+#           " checked" if row.get("own_only") else "", " checked" if row.get("can_route") else "",
+#           row.get("max_users") or "",
+#           ("%g" % (row["cap_bytes"] / GB)) if row.get("cap_bytes") else "", days,
+#           row.get("reset_days") or "",
+#           " <small class='muted'>بعدی: %s</small>" % row["reset_next"][:10]
+#           if row.get("reset_days") and row.get("reset_next") else "",
+#           # Renewing: the usage so far back to nothing, by its own button.
+#           ("<p><span class='muted'>مصرف تا حالا: %s</span> <button class='ghost' "
+#            "formaction='/%s/admin-reset-usage' formnovalidate onclick=\"return confirm("
+#            "'مصرف این فروشنده صفر شود؟')\">صفر کردن مصرف</button></p>"
+#            % (human(row.get("used_bytes") or 0), p)) if row else "",
+#           "" if row.get("templates_mode") == "own" else " checked",
+#           " checked" if row.get("templates_mode") == "own" else "",
+#           row.get("templates_max") or 1,
+#           tboxes or "<span class='muted'>هنوز قالبی نیست</span>",
+#           admin_danger_buttons(p, row) if row else ""))
+#
+#
+#def delete_admin_and_all(row):
+#    """An admin gone, and with a seller everything that was theirs: their
+#    customers with what cascades from them, their plans and templates, their
+#    bot with its key and queue, their settings. The number of customers."""
+#    aid = row["id"]
+#    env_path, unit, _ = bot_place(row)
+#    if os.path.exists(env_path):
+#        systemctl("disable", "--now", unit)
+#        try:
+#            os.remove(env_path)
+#        except OSError:
+#            pass
+#    STORE.run("DELETE FROM admin_sessions WHERE admin_id = ? OR view_as = ?", (aid, aid))
+#    customers = [r["id"] for r in STORE.q("SELECT id FROM users WHERE owner_admin = ?", (aid,))]
+#    for uid in customers:
+#        STORE.delete_user(uid)
+#    STORE.run("DELETE FROM plans WHERE owner_admin = ?", (aid,))
+#    for t in STORE.q("SELECT id FROM templates WHERE owner_admin = ? AND is_default = 0",
+#                     (aid,)):
+#        # Nobody is left on it - its customers went above - but the owner's
+#        # may have been given it by hand.
+#        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
+#        STORE.run("UPDATE users SET template_id = ? WHERE template_id = ?",
+#                  (default["id"] if default else None, t["id"]))
+#        STORE.run("UPDATE plans SET template_id = ? WHERE template_id = ?",
+#                  (default["id"] if default else None, t["id"]))
+#        STORE.run("DELETE FROM template_services WHERE template_id = ?", (t["id"],))
+#        STORE.run("DELETE FROM settings WHERE key = ?", ("blocks:%d" % t["id"],))
+#        STORE.run("DELETE FROM templates WHERE id = ?", (t["id"],))
+#    for k in STORE.q("SELECT id FROM api_tokens WHERE admin_id = ?", (aid,)):
+#        STORE.run("DELETE FROM webhook_outbox WHERE token_id = ?", (k["id"],))
+#        STORE.run("DELETE FROM api_idempotency WHERE token_id = ?", (k["id"],))
+#        STORE.run("DELETE FROM api_tokens WHERE id = ?", (k["id"],))
+#    STORE.run("DELETE FROM broadcasts WHERE admin_id = ?", (aid,))
+#    for key in ("pay_text", "bot_link", "bot_username"):
+#        STORE.run("DELETE FROM settings WHERE key = ?", ("%s:%d" % (key, aid),))
+#    STORE.run("DELETE FROM admins WHERE id = ?", (aid,))
+#    log(INFO, "admin %s deleted with %d customer(s)" % (row["username"], len(customers)))
+#    return len(customers)
+#
+#
+#def admin_back(back, aid):
+#    """The page an admin's button was pressed on, to come back to."""
+#    return {"list": "admins?", "stats": "admins?stats=%d&" % aid}.get(back,
+#                                                                     "admins?id=%d&" % aid)
+#
+#
+#def admin_danger_buttons(p, row):
+#    """Disabling and deleting an admin - buttons of their own, each asked
+#    about first, saying what goes with it."""
+#    n = STORE.one("SELECT count(*) c FROM users WHERE owner_admin = ?", (row["id"],))["c"]
+#    seller = row.get("own_only")
+#    if row.get("disabled"):
+#        toggle = ("<form method='post' action='/%s/admin-disable'><input type='hidden' "
+#                  "name='id' value='%d'><input type='hidden' name='to' value='0'>"
+#                  "<button class='ghost'>فعال کردن</button></form>" % (p, row["id"]))
+#    else:
+#        ask = ("این فروشنده غیرفعال شود؟ دیگر نمی‌تواند وارد شود، سرویس همهٔ %d مشتری‌اش "
+#               "قطع می‌شود، چیزی از او فروخته نمی‌شود و رباتش خاموش می‌شود. با «فعال کردن» "
+#               "همه‌چیز برمی‌گردد."
+#               % n if seller else "این ادمین غیرفعال شود؟ دیگر نمی‌تواند وارد شود.")
+#        toggle = ("<form method='post' action='/%s/admin-disable' onsubmit='return confirm(%s)'>"
+#                  "<input type='hidden' name='id' value='%d'><input type='hidden' name='to' "
+#                  "value='1'><button class='ghost'>غیرفعال کردن</button></form>"
+#                  % (p, html.escape(json.dumps(ask, ensure_ascii=False), quote=True), row["id"]))
+#    ask = ("این فروشنده و همه‌چیزش برای همیشه پاک شود؟ %d مشتری با رسیدها و تیکت‌هایشان، "
+#           "و پلن‌ها، قالب‌ها و رباتش پاک می‌شوند و قابل برگشت نیست." % n if seller
+#           else "این ادمین برای همیشه حذف شود؟")
+#    delete = ("<form method='post' action='/%s/admin-delete' onsubmit='return confirm(%s)'>"
+#              "<input type='hidden' name='id' value='%d'><button class='del'>حذف همیشگی"
+#              "</button></form>"
+#              % (p, html.escape(json.dumps(ask, ensure_ascii=False), quote=True), row["id"]))
+#    return ("<div class='row' style='margin-top:14px'>%s%s</div>%s"
+#            % (toggle, delete, "<p class='bad'>این ادمین غیرفعال است%s.</p>"
+#               % ("؛ مشتری‌هایش سرویس ندارند" if seller else "") if row.get("disabled") else ""))
+#
+#
+#def me_card(p):
+#    """An admin's own page: who they are, what they may see, their password."""
+#    row = me()
+#    if row is None:
+#        return ("<div class='card'><h2>حساب من</h2><p>شما مالک این پنل هستید: <code>%s</code>"
+#                "</p></div>" % html.escape(owner_name() or "—"))
+#    labels = dict(ADMIN_SECTIONS)
+#    return (seller_card(p, row) + seller_notes_card(p, row) if row["own_only"] else "") + (
+#            "<div class='card'><h2>حساب من — %s</h2><p class='muted'>دسترسی: %s</p>"
+#            "<h3 class='chart-h'>تغییر رمز</h3><form method='post' action='/%s/me-password'>"
+#            "<div class='row'><input name='current' type='password' placeholder='رمز فعلی' "
+#            "required><input name='new' type='password' placeholder='رمز تازه (دست‌کم ۸ نویسه)'"
+#            " required minlength='8'><button class='ghost'>تغییر رمز</button></div></form></div>"
+#            % (html.escape(row["username"]),
+#               html.escape("، ".join(labels[k] for k in ADMIN_SECTIONS_ORDER
+#                                    if k in admin_perms(row)
+#                                    and (not row["own_only"] or k in RESELLER_SECTIONS))
+#                               or "—"), p))
+#
+#
 #def page(title, body, cfg, active="", msg=None, msg_kind="good"):
 #    nav = ""
 #    waiting = tickets_waiting()
 #    for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
 #                        ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
 #                        ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
-#                        ("bot", "ربات"), ("api", "API"), ("settings", "تنظیمات"),
-#                        ("logs", "لاگ"), ("diagnose", "عیب‌یابی")):
+#                        ("bot", "ربات"), ("api", "API"), ("nodes", "نود"), ("settings", "تنظیمات"),
+#                        ("logs", "لاگ"), ("diagnose", "عیب‌یابی"), ("admins", "ادمین‌ها"),
+#                        ("me", "حساب من")):
+#        # A single machine has no relays of its own to manage.
+#        if path == "nodes" and one_server():
+#            continue
+#        # Only what this admin may use; the owner has no "my account".
+#        if not page_allowed(path) or (path == "me" and is_owner()):
+#            continue
 #        cls = " class='on'" if active == path else ""
 #        nav += "<a href='/%s/%s'%s>%s</a>" % (cfg["ADMIN_PATH"], path, cls, label)
 #    banner = ""
 #    if msg:
 #        banner = "<div class='msg %s'>%s</div>" % (msg_kind, html.escape(msg))
+#    viewing = getattr(REQ, "viewing", None)
+#    if viewing is not None:
+#        banner = ("<div class='msg warnbox'>👁 پنل را همان‌طور می‌بینید که <b>%s</b> می‌بیند. "
+#                  "<form method='post' action='/%s/view-as-stop' style='display:inline'>"
+#                  "<button class='ghost'>برگشت به حساب خودم</button></form></div>"
+#                  % (html.escape(viewing["username"]), cfg["ADMIN_PATH"])) + banner
 #    if one_server():
 #        body, banner = one_server_words(body), one_server_words(banner)
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<link rel="icon" href="data:,">
 #<title>%s</title>%s<style>%s</style></head><body>%s<div class="wrap">%s
-#<header><h1>%s</h1><nav>%s<a href='/%s/logout'>خروج</a></nav></header>
+#<header><h1>%s</h1><nav>%s<a class='out' href='/%s/logout'>خروج</a></nav></header>
 #%s%s%s</div></body></html>""" % (html.escape(title), THEME_HEAD,
 #                                 font_face("/" + cfg["ADMIN_PATH"]) + CSS,
 #                                 THEME_BUTTON, brand_html(),
@@ -16245,8 +23531,11 @@ exit 0
 #<title>ورود</title>%s<style>%s</style></head><body>%s<div class="wrap">%s
 #<div class="login" style="margin-top:6vh">
 #<div class="card"><h2>پنل مدیریت</h2>%s
-#<form method="post" action="/%s/"><div class="f"><label>رمز عبور</label>
-#<input type="password" name="password" autofocus style="width:100%%"></div>
+#<form method="post" action="/%s/"><div class="f"><label>نام کاربری</label>
+#<input name="username" autocomplete="username" dir="ltr" autocapitalize="none"
+#spellcheck="false" autofocus style="width:100%%"></div>
+#<div class="f"><label>رمز عبور</label>
+#<input type="password" name="password" autocomplete="current-password" style="width:100%%"></div>
 #<button type="submit" style="width:100%%">ورود</button></form></div>
 #</div>%s</div></body></html>""" % (THEME_HEAD,
 #                                   font_face("/" + cfg["ADMIN_PATH"]) + CSS,
@@ -16595,6 +23884,8 @@ exit 0
 #
 #    # -- plumbing ---------------------------------------------------------
 #    def send(self, body, code=200, headers=None):
+#        if isinstance(body, str) and wants_english(getattr(self, "headers", None)):
+#            body = english_page(body)
 #        blob = body.encode("utf-8") if isinstance(body, str) else body
 #        # Start the header buffer clean. Nothing reaches the socket until
 #        # end_headers(), so a send() that raised part-way through leaves a
@@ -16727,13 +24018,13 @@ exit 0
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
 #            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
-#            " u.plan_id AS holds, length(t.receipt_blob) AS size,"
+#            " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
 #            " p.name AS plan_name, p.days AS plan_days,"
 #            " p.quota_bytes AS plan_quota"
 #            " FROM transactions t JOIN users u ON u.id = t.user_id"
-#            " LEFT JOIN plans p ON p.id = t.plan_id"
+#            " LEFT JOIN plans p ON p.id = t.plan_id WHERE 1 = 1" + mine()[0] +
 #            " ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,"
-#            " t.created_at DESC LIMIT 100")
+#            " t.created_at DESC LIMIT 100", mine()[1])
 #        pending = [r for r in rows if r["status"] == "pending"]
 #        out = ["<div class='card'><h2>رسیدهای در انتظار (%d)</h2>" % len(pending)]
 #        if not pending:
@@ -16742,7 +24033,16 @@ exit 0
 #            who = (r["first_name"] or "") + " · " + (
 #                r["username"] or r["phone"]
 #                or str(r["telegram_id"] or "#%d" % r["user_id"]))
-#            if r["plan_name"]:
+#            topup = r["kind"] == "topup"
+#            if r["kind"] == "device":
+#                bought = ("<div class='bought'>📱 دستگاه اضافه · %s تومان<span class='muted'>"
+#                          " — با تأیید، یک دستگاه به حسابش اضافه می‌شود</span></div>"
+#                          % format(r["amount"], ","))
+#            elif topup:
+#                bought = ("<div class='bought'>💰 شارژ کیف پول · مبلغی که مشتری نوشته: "
+#                          "%s تومان<span class='muted'> — موجودی فعلی: %s تومان</span>"
+#                          "</div>" % (format(r["amount"], ","), format(r["wallet"] or 0, ",")))
+#            elif r["plan_name"]:
 #                bought = ("<div class='bought'>پلن «%s» · %s · %s روز · %s تومان"
 #                          "<span class='muted'> — %s</span></div>"
 #                          % (html.escape(r["plan_name"]),
@@ -16750,6 +24050,13 @@ exit 0
 #                             r["plan_days"], format(r["amount"], ","),
 #                             "تمدید همان پلن" if r["holds"] == r["plan_id"]
 #                             else "با تأیید، خودکار فعال می‌شود"))
+#                if r["code_id"]:
+#                    code = STORE.one("SELECT code FROM discount_codes WHERE id = ?",
+#                                     (r["code_id"],))
+#                    bought += ("<div class='bought'>🏷 با کد تخفیف <code dir='ltr'>%s</code> — "
+#                               "قیمت پلن %s تومان</div>"
+#                               % (html.escape(code["code"] if code else "?"),
+#                                  format(r["list_price"] or 0, ",")))
 #            elif r["plan_id"]:
 #                bought = ("<div class='bought bad'>پلنی که انتخاب کرده بود حذف شده؛ "
 #                          "بعد از تأیید، سهمیه و زمان را خودتان بگذارید</div>")
@@ -16763,7 +24070,7 @@ exit 0
 #                "<div class='row' style='margin-top:10px'>"
 #                "<form method='post' action='/%s/receipt-decide'>"
 #                "<input type='hidden' name='id' value='%d'>"
-#                "<input type='hidden' name='to' value='approved'>"
+#                "<input type='hidden' name='to' value='approved'>%s"
 #                "<button>تأیید</button></form>"
 #                "<form method='post' action='/%s/receipt-decide'>"
 #                "<input type='hidden' name='id' value='%d'>"
@@ -16773,7 +24080,11 @@ exit 0
 #                "</div></div>"
 #                % (html.escape(who), html.escape(r["created_at"][:16]),
 #                   human(r["size"] or 0), bought,
-#                   p, r["id"], p, r["id"], p, r["id"], p, r["id"], p))
+#                   p, r["id"], p, r["id"], p, r["id"],
+#                   ("<input name='amount' value='%d' size='10' dir='ltr' title='مبلغی که "
+#                    "به کیف پول اضافه می‌شود؛ اگر رسید چیز دیگری می‌گوید درستش کنید'> تومان "
+#                    % r["amount"]) if topup else "",
+#                   p, r["id"], p))
 #        out.append("<p class='muted'>با تأیید، پلنی که مشتری انتخاب کرده خودکار "
 #                   "روی حسابش می‌نشیند: قالب، حجم، مدت و سرعتش. رسیدِ بدون پلن فقط "
 #                   "ثبت می‌شود و سهمیه و زمان را خودتان در صفحهٔ کاربران می‌گذارید. "
@@ -16790,7 +24101,13 @@ exit 0
 #                           % (html.escape((r["first_name"] or "") + " · " +
 #                                          (r["username"] or r["phone"] or "")),
 #                              html.escape(r["created_at"][:16]),
-#                              html.escape(r["plan_name"] or "-"),
+#                              html.escape(
+#                                  "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
+#                                  if r["kind"] == "topup" else
+#                                  "دستگاه اضافه · %s تومان" % format(r["amount"], ",")
+#                                  if r["kind"] == "device" else
+#                                  "%s · از کیف پول" % (r["plan_name"] or "پلن")
+#                                  if r["kind"] == "wallet" else r["plan_name"] or "-"),
 #                              "ok" if r["status"] == "approved" else "bad",
 #                              "تأیید شد" if r["status"] == "approved" else "رد شد",
 #                              html.escape((r["decided_at"] or "")[:16])))
@@ -16808,6 +24125,25 @@ exit 0
 #            return self.redirect("settings?m=!فایل خالی بود")
 #        if len(blob) >= MAX_UPLOAD:
 #            return self.redirect("settings?m=!فایل خیلی بزرگ است")
+#        # A bundle the bot sent: opened with its password, its database
+#        # restored as any other, and its sealing key kept for when it is.
+#        key = None
+#        if blob.startswith(b"Salted__"):
+#            try:
+#                password = parse_upload(getattr(self, "raw_body", b""),
+#                                        self.headers.get("Content-Type"),
+#                                        "password").decode("utf-8", "replace").strip()
+#            except ValueError:
+#                password = ""
+#            if not password:
+#                return self.redirect("settings?m=!این بکاپ رمزگذاری شده؛ رمزش را هم بنویسید")
+#            try:
+#                files = open_bundle(blob, password)
+#            except ValueError as e:
+#                return self.redirect("settings?m=!%s" % e)
+#            if "panel.db" not in files:
+#                return self.redirect("settings?m=!دیتابیس در این بکاپ نیست")
+#            blob, key = files["panel.db"], files.get("db.key")
 #
 #        path = os.path.join(os.path.dirname(DB),
 #                            ".restore-%s.db" % secrets.token_hex(6))
@@ -16822,7 +24158,7 @@ exit 0
 #        old = PENDING.pop("path", None)
 #        if old and os.path.exists(old):
 #            os.unlink(old)
-#        PENDING.update({"path": path, "counts": counts, "size": len(blob)})
+#        PENDING.update({"path": path, "counts": counts, "size": len(blob), "key": key})
 #        return self.redirect("restore")
 #
 #    def restore_page(self):
@@ -16907,6 +24243,21 @@ exit 0
 #            systemctl("stop", "smartdns-panel")
 #            STORE.close()
 #            os.replace(path, DB)
+#            # The bundle's sealing key, so its pictures open here; this
+#            # machine's own, if different, kept beside it.
+#            key = PENDING.get("key")
+#            if key:
+#                try:
+#                    with open(KEY_FILE, "rb") as fh:
+#                        mine = fh.read()
+#                except OSError:
+#                    mine = None
+#                if mine != key:
+#                    if mine is not None:
+#                        os.replace(KEY_FILE, KEY_FILE + ".before-restore")
+#                    with open(KEY_FILE, "wb") as fh:
+#                        fh.write(key)
+#                    os.chmod(KEY_FILE, 0o600)
 #            for suffix in ("-wal", "-shm"):
 #                try:
 #                    os.unlink(DB + suffix)
@@ -16948,16 +24299,31 @@ exit 0
 #        return cookie["sdns"].value if "sdns" in cookie else ""
 #
 #    def session_ok(self):
+#        """Whether this request is signed in - and, as a side effect, who it
+#        is: REQ.admin, None for the owner; REQ.viewing while the owner looks
+#        at the panel as an admin sees it."""
+#        REQ.admin, REQ.viewing = None, None
 #        token = self.session_token()
 #        if not token:
 #            return False
-#        row = STORE.one("SELECT expires_at FROM admin_sessions WHERE token = ?",
-#                        (token,))
+#        row = STORE.one("SELECT * FROM admin_sessions WHERE token = ?", (token,))
 #        if not row:
 #            return False
-#        if (parse_ts(row["expires_at"]) or datetime.now(timezone.utc))                 <= datetime.now(timezone.utc):
+#        if (parse_ts(row["expires_at"]) or datetime.now(timezone.utc)) \
+#                <= datetime.now(timezone.utc):
 #            STORE.run("DELETE FROM admin_sessions WHERE token = ?", (token,))
 #            return False
+#        keys = row.keys()
+#        if "admin_id" in keys and row["admin_id"]:
+#            admin = STORE.one("SELECT * FROM admins WHERE id = ?", (row["admin_id"],))
+#            if not admin or admin["disabled"]:
+#                STORE.run("DELETE FROM admin_sessions WHERE token = ?", (token,))
+#                return False
+#            REQ.admin = admin
+#        elif "view_as" in keys and row["view_as"]:
+#            admin = STORE.one("SELECT * FROM admins WHERE id = ?", (row["view_as"],))
+#            if admin:
+#                REQ.admin, REQ.viewing = admin, admin
 #        return True
 #
 #    def locked_out(self):
@@ -17015,6 +24381,22 @@ exit 0
 #            return self.redirect("", {"Set-Cookie": "sdns=; Max-Age=0; Path=/"})
 #        if not self.session_ok():
 #            return self.send(login_page(CFG))
+#        special = ("receipts" if rest.startswith("receipt/") else
+#                   "tickets" if rest.startswith("ticket-image/") else
+#                   OWNER if rest in ("backup.db", "db.key") else
+#                   PAGE_SECTION.get(rest, OWNER))
+#        if not may(special) or (seller() is not None and rest in RESELLER_NEVER):
+#            return self.send(page("دسترسی ندارید", denied_page(), CFG), 403)
+#        ident = rest.split("/", 1)[1] if "/" in rest else ""
+#        ident = int(ident) if ident.isdigit() else 0
+#        if rest.startswith("receipt/") and not owns(
+#                "SELECT 1 FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.id = ?",
+#                ident):
+#            return self.send("<h1>404</h1>", 404)
+#        if rest.startswith("ticket-image/") and not owns(
+#                "SELECT 1 FROM ticket_messages m JOIN tickets t ON t.id = m.ticket_id"
+#                " JOIN users u ON u.id = t.user_id WHERE m.id = ?", ident):
+#            return self.send("<h1>404</h1>", 404)
 #        if rest == "backup.db":
 #            return self.send_backup()
 #        if rest == "db.key":
@@ -17042,22 +24424,34 @@ exit 0
 #                return self.send(login_page(
 #                    CFG, "تلاش‌های ناموفق زیاد. چند دقیقه صبر کنید."))
 #            given = self.one(params, "password")
+#            name = self.one(params, "username").lower()
 #            want = CFG["ADMIN_HASH"]
-#            if given and hmac.compare_digest(
+#            who = False                 # False: nobody; None: the owner; else an admin's id
+#            owner = owner_name()
+#            if given and (not owner or name == owner) and hmac.compare_digest(
 #                    hash_password(given, CFG["ADMIN_SALT"]), want):
+#                who = None
+#            elif given and name:
+#                row = STORE.one("SELECT * FROM admins WHERE username = ? AND disabled = 0",
+#                                (name,))
+#                if row and hmac.compare_digest(hash_password(given, row["password_salt"]),
+#                                               row["password_hash"]):
+#                    who = row["id"]
+#            if who is not False:
 #                token = secrets.token_urlsafe(32)
 #                STORE.run(
-#                    "INSERT OR REPLACE INTO admin_sessions (token, expires_at)"
-#                    " VALUES (?, ?)",
+#                    "INSERT OR REPLACE INTO admin_sessions (token, expires_at, admin_id)"
+#                    " VALUES (?, ?, ?)",
 #                    (token, (datetime.now(timezone.utc)
 #                             + timedelta(hours=SESSION_HOURS)).isoformat(
-#                                 timespec="seconds")))
+#                                 timespec="seconds"), who))
 #                # Tidy up whatever has run out, so the table cannot grow
 #                # forever on a panel that is logged into daily.
 #                STORE.run("DELETE FROM admin_sessions WHERE expires_at <= ?",
 #                          (now(),))
 #                ATTEMPTS.pop(self.client_address[0], None)
-#                log(INFO, "admin login from %s" % self.client_address[0])
+#                log(INFO, "admin login from %s: %s" % (self.client_address[0],
+#                                                       "owner" if who is None else name))
 #                return self.redirect("", {
 #                    "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
 #                                  % token})
@@ -17066,11 +24460,22 @@ exit 0
 #                log(WARN, "admin login failed from %s (%d in a row)"
 #                    % (self.client_address[0],
 #                       ATTEMPTS.get(self.client_address[0], (0, 0))[0]))
-#            return self.send(login_page(CFG, "رمز اشتباه است."))
+#            return self.send(login_page(CFG, "نام کاربری یا رمز اشتباه است."))
 #        # What was done, before doing it - so an action that then fails is
 #        # still on the record, next to the error it caused.
 #        self._action = rest
-#        log(INFO, "admin action %s%s" % (rest, describe(params)))
+#        log(INFO, "admin action %s%s%s" % (
+#            "" if is_owner() else "(%s) " % me()["username"], rest, describe(params)))
+#        section = ACTION_SECTION.get(rest, OWNER)
+#        if rest == "view-as-stop":
+#            section = ANYONE if getattr(REQ, "viewing", None) is not None else OWNER
+#        elif getattr(REQ, "viewing", None) is not None and section == ANYONE:
+#            section = OWNER         # the admin's own password is theirs to change
+#        if not may(section):
+#            return self.send(page("دسترسی ندارید", denied_page(), CFG), 403)
+#        why = seller_refuses(rest, lambda key: self.one(params, key))
+#        if why:
+#            return self.send(page("دسترسی ندارید", denied_page(why), CFG), 403)
 #        try:
 #            return self.action(rest, params)
 #        except Exception as e:
@@ -17098,25 +24503,65 @@ exit 0
 #                 "restore": ("بازگردانی", self.restore_page),
 #                 "logs": ("لاگ", self.logs),
 #                 "diagnose": ("عیب‌یابی", diagnose_page),
-#                 "usage": ("مصرف کاربر", self.user_usage_page)}
+#                 "nodes": ("نود", nodes_page),
+#                 "server": ("آمار سرور", self.server_page),
+#                 "usage": ("مصرف کاربر", self.user_usage_page),
+#                 "wallet": ("کیف پول کاربر", self.wallet_page),
+#                 "admins": ("ادمین‌ها", self.admins_page),
+#                 "me": ("حساب من", lambda: me_card(CFG["ADMIN_PATH"]))}
 #        if rest not in pages:
 #            return self.lost()
 #        title, fn = pages[rest]
 #        active = "" if rest == "index" else rest
 #        return self.send(page(title, fn(), CFG, active, msg, kind))
 #
+#    def admins_page(self):
+#        p = CFG["ADMIN_PATH"]
+#        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        st = query.get("stats")
+#        if st and st[0].isdigit():
+#            row = STORE.one("SELECT * FROM admins WHERE id = ?", (int(st[0]),))
+#            if row:
+#                return admin_stats_page(p, row)
+#        q = query.get("id")
+#        if q and q[0].isdigit():
+#            row = STORE.one("SELECT * FROM admins WHERE id = ?", (int(q[0]),)) \
+#                if int(q[0]) else None
+#            return admin_form(p, row)
+#        return admins_card(p)
+#
 #    def home(self):
-#        u = STORE.one("SELECT count(*) c, COALESCE(sum(used_bytes),0) b FROM users")
-#        act = STORE.one("SELECT count(*) c FROM users WHERE status = 'active'")
-#        ips = STORE.one("SELECT count(*) c FROM ips")
+#        extra, args = mine()
+#        u = STORE.one("SELECT count(*) c, COALESCE(sum(used_bytes),0) b FROM users u"
+#                      " WHERE 1 = 1" + extra, args)
+#        act = STORE.one("SELECT count(*) c FROM users u WHERE status = 'active'" + extra, args)
+#        ips = STORE.one("SELECT count(*) c FROM ips i JOIN users u ON u.id = i.user_id"
+#                        " WHERE 1 = 1" + extra, args)
 #        out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
 #        for n, l in ((u["c"], "کاربر"), (act["c"], "فعال"),
 #                     (ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")):
 #            out.append("<div class='stat'><div class='n'>%s</div>"
 #                       "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
 #        out.append("</div></div>")
+#        s = seller()
+#        if s is not None:
+#            # Their own customers' usage, drawn as the owner's home page draws
+#            # everybody's.
+#            return (seller_card(CFG["ADMIN_PATH"], s) + "".join(out)
+#                    + total_usage_card(CFG["ADMIN_PATH"], s["id"], "مصرف مشتری‌های من"))
+#        if me() is not None and not may("nodes"):
+#            return "".join(out)
+#        out.append(sellers_summary_card(CFG["ADMIN_PATH"]))
 #
-#        out.append(total_usage_card(CFG["ADMIN_PATH"]))
+#        if not one_server():
+#            out.append(alerts_card(always=False))
+#        if STORE.one("SELECT 1 FROM admins WHERE own_only = 1"):
+#            out.append(total_usage_card(CFG["ADMIN_PATH"], None,
+#                                        "مصرف کل — مشتری‌های شما و فروشنده‌ها",
+#                                        usage_shares(CFG["ADMIN_PATH"])))
+#            out.append(total_usage_card(CFG["ADMIN_PATH"], "own", "مصرف مشتری‌های خودم"))
+#        else:
+#            out.append(total_usage_card(CFG["ADMIN_PATH"]))
 #        out.append(doh_card())
 #
 #        rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
@@ -17135,12 +24580,13 @@ exit 0
 #                    stale = " <span class='bad'>قطع</span>"
 #                swap = (bar(r["swap_used"], r["swap_total"]) if r["swap_total"]
 #                        else "<span class='muted'>ندارد</span>")
+#                who = exit_address() if r["host"] == "exit" else r["host"]
 #                out.append(
-#                    "<tr><td><code>%s</code>%s</td><td>%s%%</td><td>%s</td>"
+#                    "<tr><td><code>%s</code> <span class='muted'>%s</span>%s</td><td>%s%%</td><td>%s</td>"
 #                    "<td>%s</td><td>%s</td>"
 #                    "<td class='muted'>↓%s/s ↑%s/s</td>"
 #                    "<td class='muted'>%d روز</td></tr>"
-#                    % (html.escape(r["host"]), stale, r["cpu"],
+#                    % (html.escape(who or r["host"]), server_word(r["host"]), stale, r["cpu"],
 #                       bar(r["mem_used"], r["mem_total"]), swap,
 #                       bar(r["disk_used"], r["disk_total"]),
 #                       human(r["rx_bps"]), human(r["tx_bps"]),
@@ -17149,13 +24595,45 @@ exit 0
 #        out.append("</div>")
 #        return "".join(out)
 #
+#    def server_page(self):
+#        """One server: its health now, its usage charts, and its customers."""
+#        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        kind = (q.get("k") or [""])[0]
+#        ip = (q.get("h") or [""])[0]
+#        here = exit_address()
+#        known = [here] + node_list() if kind == "exit" else relay_list() if kind == "relay" else []
+#        if ip not in known:
+#            return "<div class='card'><p class='muted'>این سرور پیدا نشد.</p></div>"
+#        p = CFG["ADMIN_PATH"]
+#        label = ("سرور خارج — پنل" if ip == here else "نود") if kind == "exit" else "رله"
+#        out = ["<div class='card'><h2>%s <code dir='ltr'>%s</code></h2>"
+#               "<p class='muted'><a href='/%s/nodes'>‹ برگشت به نود</a></p>"
+#               "<table><tr><th>CPU</th><th>RAM</th><th>دیسک</th><th>شبکه</th></tr>"
+#               "<tr>%s</tr></table></div>"
+#               % (label, html.escape(ip), p,
+#                  health_cells("exit" if kind == "exit" and ip == here else ip))]
+#        view = server_view(kind, ip)
+#        since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
+#        top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#                      " SUM(g.down) down, SUM(g.up) up FROM user_server_usage g"
+#                      " JOIN users u ON u.id = g.user_id WHERE g.kind = ? AND g.server = ?"
+#                      " AND g.day >= ? GROUP BY u.id ORDER BY SUM(g.down) + SUM(g.up) DESC"
+#                      " LIMIT 50", (kind, ip, since))
+#        if not view["days"] and not view["five"]:
+#            out.append("<div class='card'><h2>مصرف</h2><p class='muted'>هنوز مصرفی از این "
+#                       "سرور ثبت نشده.</p></div>")
+#        else:
+#            out.append(usage_card(p, "مصرف — %s" % ip, view, top))
+#        return "".join(out)
+#
 #    def user_usage_page(self):
 #        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 #        try:
 #            uid = int((q.get("u") or ["0"])[0])
 #        except ValueError:
 #            uid = 0
-#        user = STORE.one("SELECT * FROM users WHERE id = ?", (uid,))
+#        extra, args = mine()
+#        user = STORE.one("SELECT * FROM users u WHERE id = ?" + extra, (uid,) + args)
 #        if not user:
 #            return "<div class='card'><p class='muted'>این کاربر پیدا نشد.</p></div>"
 #        view = user_usage(uid)
@@ -17178,6 +24656,7 @@ exit 0
 #                   % (legend(), speed_chart(view["five"])))
 #        out.append("<div class='card'><h2>ساعت‌های پرمصرف — ۷ روز اخیر</h2>%s</div>"
 #                   % heat_chart(view["hours"]))
+#        out.append(user_servers_card(uid))
 #        out.append(qlog_card(user))
 #        table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
 #                        % (d.strftime("%Y-%m-%d"), human(dn), human(u))
@@ -17188,19 +24667,31 @@ exit 0
 #        return "".join(out)
 #
 #    def users(self):
-#        plans = STORE.q("SELECT id, name, active FROM plans"
-#                        " ORDER BY active DESC, template_id, price")
-#        tpls = STORE.q("SELECT * FROM templates ORDER BY id")
+#        s = seller()
+#        plans = STORE.q("SELECT id, name, active FROM plans WHERE COALESCE(owner_admin, 0) = ?"
+#                        " ORDER BY active DESC, template_id, price", (s["id"] if s else 0,))
+#        tpls = templates_for_me()
 #        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
 #        did = default["id"] if default else 0
+#        extra, args = mine()
 #        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
-#                       " ip FROM users u ORDER BY u.created_at DESC")
-#        out = ["<div class='card'><h2>کاربران (%d)</h2>" % len(rows)]
+#                       " ip FROM users u WHERE 1 = 1" + extra + " ORDER BY u.created_at DESC",
+#                       args)
+#        out = ["<div class='card wide'><h2>کاربران (%d)</h2>" % len(rows)]
 #        if not rows:
 #            return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
-#        out.append("<table><tr><th>نام کاربری</th><th>آی‌پی</th><th>مصرف</th>"
-#                   "<th>سهمیه (گیگ)</th><th>سرعت Mb/s</th><th>زمان (روز)</th>"
-#                   "<th>قالب</th><th>وضعیت</th><th></th></tr>")
+#        # Where a customer goes out is the owner's to choose, or a
+#        # reseller's when the owner let them.
+#        route = s is None or bool(s["can_route"])
+#        relays = relay_list() if route else []
+#        out.append("<table class='users'><tr><th>نام کاربری</th><th>آی‌پی</th><th>مصرف</th>"
+#                   "<th>کیف پول</th>"
+#                   "<th title='گیگابایت'>سهمیه GB</th><th title='مگابیت بر ثانیه'>سرعت Mb</th>"
+#                   "<th title='از امروز چند روز دیگر'>روز</th>"
+#                   "<th>قالب</th><th>پلن</th>%s%s<th>وضعیت</th><th></th></tr>"
+#                   % ("<th>DNS</th>" if len(relays) > 1 else "",
+#                      "<th>سرور خارج</th>" if node_list() and route else ""))
+#        exits = bool(node_list()) and route
 #        p = CFG["ADMIN_PATH"]
 #        for r in rows:
 #            tid = r["template_id"] or did
@@ -17253,56 +24744,63 @@ exit 0
 #                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
 #                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
-#                "<tr><td><code>%s</code><br><span class='muted'>%s</span></td>"
-#                "<td><code>%s</code>%s</td><td>%s</td>"
+#                "<tr><td class='who' title='%s'><code>%s</code><small>%s</small></td>"
+#                "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
 #                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
 #                "<input form='u%d' type='hidden' name='id' value='%d'>"
-#                "<input form='u%d' name='quota_gb' value='%s' size='4'"
+#                "<input form='u%d' name='quota_gb' value='%s' size='3'"
 #                " title='گیگابایت، ۰=نامحدود'></td>"
-#                "<td><input form='u%d' name='speed_mb' value='%s' size='4'"
+#                "<td><input form='u%d' name='speed_mb' value='%s' size='3'"
 #                " title='مگابیت بر ثانیه، ۰=بی‌حد'></td>"
-#                "<td><input form='u%d' name='days' size='4' placeholder='%s'"
+#                "<td><input form='u%d' name='days' size='5' placeholder='%s'"
 #                " title='از امروز چند روز دیگر'></td>"
 #                "<td><form method='post' action='/%s/user-template'>"
 #                "<input type='hidden' name='id' value='%d'>"
 #                "<select name='template_id' onchange='this.form.submit()'>%s</select>"
-#                "</form>%s</td>"
-#                "<td class='%s'>%s</td>"
+#                "</form></td><td>%s</td>%s"
+#                "<td><span class='pill %s'>%s</span></td>"
 #                "<td class='acts'><button form='u%d' title='ذخیره'>ثبت</button>"
 #                "<form method='post' action='/%s/user-status'>"
 #                "<input type='hidden' name='id' value='%d'>"
 #                "<input type='hidden' name='to' value='%s'>"
 #                "<button class='%s' title='%s'>%s</button></form>"
+#                "<details class='more'><summary title='کارهای دیگر'>⋯</summary><div class='menu'>"
 #                "<form method='post' action='/%s/user-reset'"
 #                " onsubmit='return confirm(\"مصرف این کاربر صفر شود؟\")'>"
 #                "<input type='hidden' name='id' value='%d'>"
-#                "<button class='ghost' title='صفر کردن مصرف'>صفر</button></form>"
+#                "<button class='ghost' title='صفر کردن مصرف'>صفر کردن مصرف</button></form>"
 #                "%s"
 #                "<form method='post' action='/%s/user-delete'"
 #                " onsubmit='return confirm(%s)'>"
 #                "<input type='hidden' name='id' value='%d'>"
-#                "<button class='del' title='حذف همیشگی این کاربر'>حذف</button></form>"
-#                "</td></tr>"
+#                "<button class='del' title='حذف همیشگی این کاربر'>حذف کاربر</button></form>"
+#                "</div></details></td></tr>"
 #                # What a customer signs in with. Accounts opened before this
 #                # was a username have a phone number instead, and the ones
 #                # that came through the bot have neither - so the column shows
 #                # whichever this account actually has.
-#                % (html.escape(who),
+#                % (html.escape(who, quote=True), html.escape(who),
 #                   html.escape(r["first_name"] or ""),
-#                   html.escape(r["ip"] or "-"), operator_label(r["ip"]),
+#                   html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
 #                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
 #                   % (p, r["id"], human(r["used_bytes"])),
+#                   "<a href='/%s/wallet?u=%d' title='کیف پول و دعوت'>%s</a>"
+#                   % (p, r["id"], format(r["wallet"] or 0, ",")),
 #                   r["id"], p, r["id"], r["id"], r["id"], quota_gb,
 #                   r["id"], speed_mb, r["id"], left,
-#                   p, r["id"], sel, plan_cell(r, plans), cls, html.escape(label),
+#                   p, r["id"], sel, plan_cell(r, plans),
+#                   ("<td>%s</td>" % relays_cell(p, r, relays) if len(relays) > 1 else "")
+#                   + ("<td>%s</td>" % user_exit_cell(
+#                       p, r, [x for x in relays if not is_single_server(x)]) if exits else ""),
+#                   cls, html.escape(label),
 #                   r["id"],
 #                   p, r["id"],
 #                   "active" if r["status"] == "suspended" else "suspended",
-#                   "ghost" if r["status"] == "suspended" else "danger",
+#                   "ghost" if r["status"] == "suspended" else "del",
 #                   "برگرداندن" if r["status"] == "suspended" else "مسدود کردن",
-#                   "فعال" if r["status"] == "suspended" else "مسدود",
+#                   "فعال" if r["status"] == "suspended" else "مسدود کن",
 #                   p, r["id"],
-#                   reset,
+#                   reset_days_form(p, r) + reset,
 #                   p, ask, r["id"]))
 #        out.append("</table><p class='muted'>ثبت‌نام تازه با وضعیت «در انتظار "
 #                   "پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی "
@@ -17315,14 +24813,20 @@ exit 0
 #        return "".join(out)
 #
 #    def plans(self):
-#        tpls = STORE.q("SELECT id, name FROM templates ORDER BY id")
+#        s = seller()
+#        tpls = templates_for_me()
 #        rows = STORE.q("SELECT p.*, (SELECT count(*) FROM users u"
 #                       " WHERE u.plan_id = p.id) AS holders FROM plans p"
-#                       " ORDER BY p.active DESC, p.template_id, p.price, p.id")
+#                       " WHERE COALESCE(p.owner_admin, 0) = ?"
+#                       " ORDER BY p.active DESC, p.template_id, p.price, p.id",
+#                       (s["id"] if s else 0,))
 #        p = CFG["ADMIN_PATH"]
+#        exits = [exit_address()] + node_list() if node_list() and (
+#            s is None or s["can_route"]) else None
 #        head = ("<tr><th>نام</th><th>قالب</th><th>روز</th><th>حجم (گیگ)</th>"
-#                "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>توضیح برای مشتری</th>"
-#                "<th>%s</th><th></th></tr>")
+#                "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>دستگاه</th>"
+#                "<th>توضیح برای مشتری</th>"
+#                + ("<th>سرور خارج</th>" if exits else "") + "<th>%s</th><th></th></tr>")
 #        out = ["<div class='card'><h2>پلن‌ها (%d)</h2>" % len(rows)]
 #        if not rows:
 #            out.append("<p class='muted'>هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، "
@@ -17348,7 +24852,7 @@ exit 0
 #                    "<input type='hidden' name='id' value='%d'>"
 #                    "<button class='del'>حذف</button></form></td></tr>"
 #                    % ("" if r["active"] else " class='off'",
-#                       plan_fields(form, tpls, dict(r)), r["holders"],
+#                       plan_fields(form, tpls, dict(r), exits), r["holders"],
 #                       form, p, r["id"], form,
 #                       p, r["id"], 0 if r["active"] else 1,
 #                       "دیگر فروخته نشود؛ دارندگانش تا آخر دوره می‌مانند"
@@ -17373,7 +24877,10 @@ exit 0
 #                   "تلگرامِ وصل‌شده است، و هر تلگرام و هر حساب فقط یک بار. کسی که همین "
 #                   "حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. "
 #                   "یک پلن تست در یک زمان.</p></div>"
-#                   % (p, head % "", plan_fields("pnew", tpls)))
+#                   % (p, head % "", plan_fields("pnew", tpls, exits=exits)))
+#        if s is None:
+#            out.append(devices_card(p))
+#            out.append(discounts_card(p))
 #        return "".join(out)
 #
 #    def queue_bot_test(self, key_id, wait=0):
@@ -17407,16 +24914,16 @@ exit 0
 #        if wanted and wanted[0].isdigit():
 #            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
 #                            " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
-#                            " WHERE t.id = ?", (int(wanted[0]),))
+#                            " WHERE t.id = ?" + mine()[0], (int(wanted[0]),) + mine()[1])
 #            if row:
 #                return self.ticket_page(row)
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
 #            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
-#            " FROM tickets t JOIN users u ON u.id = t.user_id"
+#            " FROM tickets t JOIN users u ON u.id = t.user_id WHERE 1 = 1" + mine()[0] +
 #            " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
-#            " t.updated_at DESC LIMIT 200")
+#            " t.updated_at DESC LIMIT 200", mine()[1])
 #        waiting = sum(1 for r in rows if r["status"] == "open")
 #        out = ["<div class='card'><h2>تیکت‌ها%s</h2>"
 #               % (" — %d منتظر جواب شما" % waiting if waiting else "")]
@@ -17482,6 +24989,7 @@ exit 0
 #
 #    def bot_page(self):
 #        p = CFG["ADMIN_PATH"]
+#        s = seller()
 #        if urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("log"):
 #            return ("<div class='card'><h2>لاگ ربات — %d خط آخر</h2>"
 #                    "<p><a href='/%s/bot'>برگشت به ربات</a> · <a href='/%s/bot?log=1'>تازه کردن</a>"
@@ -17491,10 +24999,12 @@ exit 0
 #                    "(با <code>-f</code> زنده، با <code>-e</code> فقط خطاها). توکن ربات همه‌جا "
 #                    "با &lt;token&gt; پوشانده می‌شود.</p></div>"
 #                    % (BOT_LOG_LINES, p, p,
-#                       html.escape(bot_journal(BOT_LOG_LINES).strip() or "هنوز چیزی نیست")))
-#        installed, configured, running, last = bot_state()
-#        env = read_env(BOT_ENV)
-#        name = STORE.one("SELECT value FROM settings WHERE key = 'bot_username'")
+#                       html.escape(bot_journal(BOT_LOG_LINES, s).strip()
+#                                   or "هنوز چیزی نیست")))
+#        installed, configured, running, last = bot_state(s)
+#        env = read_env(bot_place(s)[0])
+#        name = STORE.one("SELECT value FROM settings WHERE key = ?",
+#                         (bot_setting("bot_username", s),))
 #        name = name["value"] if name and name["value"] else ""
 #        out = ["<div class='card'><h2>ربات تلگرام</h2>"]
 #        if not installed:
@@ -17540,9 +25050,12 @@ exit 0
 #            "<input name='admins' dir='ltr' value='%s' placeholder='123456789'></div>"
 #            "<div class='f'><label>متن راهنما (اختیاری، زیر «راهنما» در ربات)</label>"
 #            "<input name='support' value='%s' maxlength='200' style='width:100%%'></div>"
+#            "<div class='f'><label>زبان ربات</label><select name='lang'>"
+#            "<option value='fa'%s>فارسی</option><option value='en'%s>English</option>"
+#            "</select></div>"
 #            "<button>%s</button></form>"
 #            "<p class='muted'>شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از "
-#            "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد (صفحهٔ API)، "
+#            "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد%s، "
 #            "آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را "
 #            "روشن می‌کند.</p></div>"
 #            % ("تنظیمات ربات" if configured else "راه‌اندازی",
@@ -17550,13 +25063,18 @@ exit 0
 #               if token else "", "" if token else " required",
 #               html.escape(env.get("ADMIN_IDS", ""), quote=True),
 #               html.escape(env.get("SUPPORT_TEXT", "").replace("\\n", " "), quote=True),
-#               "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات"))
+#               "" if env.get("BOT_LANG") == "en" else " selected",
+#               " selected" if env.get("BOT_LANG") == "en" else "",
+#               "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات",
+#               " که فقط مشتری‌ها، پلن‌ها و کارت شما را می‌بیند" if s else " (صفحهٔ API)"))
+#        if configured:
+#            out.append(broadcast_card(p))
 #        return "".join(out)
 #
 #    def pay_page(self):
 #        """Where customers send the money - its own page, beside the plans."""
 #        p = CFG["ADMIN_PATH"]
-#        pay = STORE.one("SELECT value FROM settings WHERE key = 'pay_text'")
+#        pay = STORE.one("SELECT value FROM settings WHERE key = ?", (pay_key(),))
 #        text = pay["value"] if pay and pay["value"] else ""
 #        out = ["<div class='card'><h2>اطلاعات پرداخت</h2>"
 #               "<p>وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و در ربات همین را می‌بیند: "
@@ -17576,6 +25094,80 @@ exit 0
 #        else:
 #            out.append("<div class='card'><p class='warn'>هنوز چیزی ننوشته‌اید؛ مشتری موقع خرید "
 #                       "نمی‌داند کجا واریز کند.</p></div>")
+#        if seller() is None:
+#            out.append(wallet_settings_card(p))
+#        return "".join(out)
+#
+#    def wallet_page(self):
+#        """One customer's wallet: the balance, a hand to change it, where it
+#        came from, and who they invited."""
+#        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+#        try:
+#            uid = int((q.get("u") or ["0"])[0])
+#        except ValueError:
+#            uid = 0
+#        extra, args = mine()
+#        user = STORE.one("SELECT * FROM users u WHERE id = ?" + extra, (uid,) + args)
+#        if not user:
+#            return "<div class='card'><p class='muted'>این کاربر پیدا نشد.</p></div>"
+#        p = CFG["ADMIN_PATH"]
+#        who = user["username"] or user["phone"] or user["telegram_id"] or "#%d" % uid
+#        out = ["<div class='card'><h2>کیف پول %s</h2>" % html.escape(str(who)),
+#               "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a></p>" % p,
+#               "<div class='grid'><div class='stat'><div class='n'>%s</div>"
+#               "<div class='l'>موجودی (تومان)</div></div>" % format(user["wallet"] or 0, ",")]
+#        invited = STORE.q("SELECT id, username, phone, telegram_id, first_name, status"
+#                          " FROM users WHERE referred_by = ? ORDER BY id DESC", (uid,))
+#        earned = STORE.one("SELECT COALESCE(sum(amount), 0) s FROM wallet_moves"
+#                           " WHERE user_id = ? AND kind = 'referral'", (uid,))["s"]
+#        out.append("<div class='stat'><div class='n'>%d</div><div class='l'>دعوت‌شده</div>"
+#                   "</div><div class='stat'><div class='n'>%s</div>"
+#                   "<div class='l'>پورسانت گرفته (تومان)</div></div></div>"
+#                   % (len(invited), format(earned, ",")))
+#        if user["referred_by"]:
+#            by = STORE.one("SELECT id, username, phone, telegram_id FROM users WHERE id = ?",
+#                           (user["referred_by"],))
+#            out.append("<p>با دعوت: %s</p>" % (
+#                "<a href='/%s/wallet?u=%d'>%s</a>" % (
+#                    p, by["id"], html.escape(str(by["username"] or by["phone"]
+#                                                 or by["telegram_id"] or "#%d" % by["id"])))
+#                if by else "<span class='muted'>حسابی که دیگر نیست</span>"))
+#        out.append("<form method='post' action='/%s/wallet-adjust' class='row'>"
+#                   "<input type='hidden' name='id' value='%d'>"
+#                   "<input name='amount' size='12' dir='ltr' required placeholder='50000 یا -50000'>"
+#                   "<input name='note' maxlength='200' placeholder='دلیل (به مشتری هم گفته می‌شود)'>"
+#                   "<button class='ghost'>ثبت</button></form>"
+#                   "<p class='muted'>عدد مثبت به موجودی اضافه می‌کند و عدد منفی از آن کم "
+#                   "می‌کند؛ موجودی کمتر از صفر نمی‌شود. به مشتری هم پیام می‌رود.</p></div>"
+#                   % (p, uid))
+#        moves = STORE.q("SELECT * FROM wallet_moves WHERE user_id = ? ORDER BY id DESC"
+#                        " LIMIT 100", (uid,))
+#        out.append("<div class='card'><h2>گردش کیف پول</h2>")
+#        if not moves:
+#            out.append("<p class='muted'>هنوز چیزی نیامده و نرفته.</p>")
+#        else:
+#            out.append("<table><tr><th>زمان</th><th>چه</th><th>مبلغ</th><th>موجودی بعدش</th>"
+#                       "<th>توضیح</th></tr>")
+#            for m in moves:
+#                out.append("<tr><td>%s</td><td>%s</td><td class='%s' dir='ltr'>%s</td>"
+#                           "<td>%s</td><td>%s</td></tr>"
+#                           % (html.escape(m["at"][:16].replace("T", " ")),
+#                              WALLET_KINDS.get(m["kind"], html.escape(m["kind"])),
+#                              "ok" if m["amount"] > 0 else "bad",
+#                              ("+" if m["amount"] > 0 else "−") + format(abs(m["amount"]), ","),
+#                              format(m["balance"], ","), html.escape(m["note"] or "")))
+#            out.append("</table>")
+#        out.append("</div>")
+#        if invited:
+#            out.append("<div class='card'><h2>دعوت‌شده‌ها (%d)</h2><table><tr><th>کاربر</th>"
+#                       "<th>وضعیت</th></tr>" % len(invited))
+#            for r in invited:
+#                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a> <span class='muted'>%s"
+#                           "</span></td><td>%s</td></tr>"
+#                           % (p, r["id"], html.escape(str(r["username"] or r["phone"]
+#                                                          or r["telegram_id"] or "#%d" % r["id"])),
+#                              html.escape(r["first_name"] or ""), html.escape(r["status"])))
+#            out.append("</table></div>")
 #        return "".join(out)
 #
 #    def api_keys(self):
@@ -17723,7 +25315,8 @@ exit 0
 #        return self.template_list()
 #
 #    def template_list(self):
-#        tpls = STORE.q("SELECT * FROM templates ORDER BY id")
+#        s = seller()
+#        tpls = templates_for_me()
 #        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
 #        did = default["id"] if default else 0
 #        p = CFG["ADMIN_PATH"]
@@ -17731,9 +25324,11 @@ exit 0
 #               "<table><tr><th>نام</th><th>کاربر</th><th>سرویس‌ها</th>"
 #               "<th>دامنه‌ها</th><th></th></tr>"]
 #        for t in tpls:
-#            users = STORE.one("SELECT count(*) c FROM users"
-#                              " WHERE COALESCE(template_id, ?) = ?",
-#                              (did, t["id"]))["c"]
+#            # A seller counts their own customers only.
+#            extra, more = mine()
+#            users = STORE.one("SELECT count(*) c FROM users u"
+#                              " WHERE COALESCE(u.template_id, ?) = ?" + extra,
+#                              (did, t["id"]) + more)["c"]
 #            name = html.escape(t["name"])
 #            if t["is_default"]:
 #                out.append("<tr><td>%s <span class='muted'>(پیش‌فرض)</span></td>"
@@ -17752,19 +25347,33 @@ exit 0
 #                        n_dom += sum(1 for d in g["domains"] if d not in off)
 #            out.append("<tr><td>%s</td><td>%d</td><td>%d</td>"
 #                       "<td>%d <span class='muted'>از %d</span></td>"
-#                       "<td><a href='/%s/templates?t=%d'>ویرایش</a></td></tr>"
-#                       % (name, users, n_groups, n_dom, total_dom, p, t["id"]))
+#                       "<td>%s</td></tr>"
+#                       % (name, users, n_groups, n_dom, total_dom,
+#                          "<a href='/%s/templates?t=%d'>ویرایش</a>" % (p, t["id"])
+#                          if s is None or t["owner_admin"] == s["id"] else ""))
 #        out.append("</table></div>")
+#        if s is not None:
+#            made = sum(1 for t in tpls if t["owner_admin"] == s["id"])
+#            if s["templates_mode"] != "own":
+#                return "".join(out) + ("<div class='card'><p class='muted'>این‌ها قالب‌هایی "
+#                                       "است که می‌توانید به مشتری‌ها و پلن‌هایتان بدهید.</p>"
+#                                       "</div>")
+#            if made >= (s["templates_max"] or 1):
+#                return "".join(out) + ("<div class='card'><p class='muted'>به سقف %d قالب "
+#                                       "رسیده‌اید.</p></div>" % (s["templates_max"] or 1))
 #        out.append("<div class='card'><h2>قالب تازه</h2>"
 #                   "<form method='post' action='/%s/template-new' class='row'>"
 #                   "<input name='name' placeholder='نام قالب'><button>ساختن</button>"
 #                   "</form><p class='muted'>قالب تازه با همهٔ سرویس‌ها ساخته می‌شود؛ "
-#                   "بعد تیک‌ها را بردارید. هر قالبِ در حال استفاده یک resolver روی هر "
-#                   "رله است، پس حداکثر ۸ تا.</p></div>" % p)
+#                   "بعد تیک‌ها را بردارید.</p>%s</div>"
+#                   % (p, templates_in_use_note(did) if s is None else ""))
 #        return "".join(out)
 #
 #    def template_editor(self, t):
 #        p = CFG["ADMIN_PATH"]
+#        s = seller()
+#        if s is not None and t["owner_admin"] != s["id"]:
+#            return self.template_list()
 #        back = "<p><a href='/%s/templates'>‹ برگشت به فهرست قالب‌ها</a></p>" % p
 #        if t["is_default"]:
 #            return (back + "<div class='card'><h2>%s (پیش‌فرض)</h2>"
@@ -17775,7 +25384,8 @@ exit 0
 #                    "علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. "
 #                    "برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید."
 #                    "</p></div>"
-#                    % html.escape(t["name"])) + template_rules_card(t, p)
+#                    % html.escape(t["name"])) + template_rules_card(t, p) \
+#                + template_lists_card(t, p)
 #
 #        groups = STORE.template_groups(t["id"])
 #        off = STORE.template_domains_off(t["id"])
@@ -17877,7 +25487,7 @@ exit 0
 #  }
 #  document.addEventListener('click', function (e) {
 #    var b = e.target.closest('.pick button');
-#    if (b) {
+#    if (b && !b.closest('.blk')) {
 #      // Inside a <summary>, so the drawer would otherwise open and close
 #      // under the operator every time they pressed one of these.
 #      e.preventDefault();
@@ -17903,7 +25513,7 @@ exit 0
 #      }
 #      return count(d3);
 #    }
-#    if (e.target.matches('.doms input')) {
+#    if (e.target.matches('details.svc:not(.blk) .doms input')) {
 #      var d2 = e.target.closest('details');
 #      // Ticking a domain in a service that is switched off is a request for
 #      // that service, so switch it on rather than silently ignoring it.
@@ -17916,7 +25526,7 @@ exit 0
 #  // A hundred and thirty rows is too many to scroll. The box matches on the
 #  // game names, the group's label and every domain in it, so both "والورانت"
 #  // and "riotgames.com" land on the same row.
-#  var rows = [].slice.call(document.querySelectorAll('details.svc'));
+#  var rows = [].slice.call(document.querySelectorAll('details.svc:not(.blk)'));
 #
 #  var search = document.querySelector('.gsearch');
 #  if (search) {
@@ -17957,6 +25567,7 @@ exit 0
 #})();
 #</script>""")
 #        out.append(template_rules_card(t, p))
+#        out.append(template_lists_card(t, p))
 #        return "".join(out)
 #
 #    def domains(self):
@@ -17999,10 +25610,19 @@ exit 0
 #            "<p><a class='dl' href='/%s/backup.db'>دانلود نسخهٔ پشتیبان</a></p>"
 #            "<h2 style='margin-top:22px'>بازگردانی</h2>"
 #            "<form method='post' action='/%s/restore' enctype='multipart/form-data' "
-#            "class='row'><input type='file' name='file' accept='.db' required>"
+#            "class='row'><input type='file' name='file' accept='.db,.enc' required>"
+#            "<input name='password' type='password' autocomplete='off' dir='ltr' "
+#            "placeholder='رمز، برای بکاپ تلگرام'>"
 #            "<button class='ghost'>بررسی فایل</button></form>"
 #            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
-#            "تأیید می‌خواهد.</p>%s</div>" % (p, p, sealing_note(p)))
+#            "تأیید می‌خواهد. بکاپی که ربات فرستاده (<code>.enc</code>) با رمز بکاپش "
+#            "باز می‌شود.</p>%s</div>" % (p, p, sealing_note(p)))
+#        out.append(backup_card(p))
+#        out.append(github_card(p))
+#        out.append(public_dns_card(p))
+#        if one_server():
+#            # No nodes page here: its one server's words for customers live here.
+#            out.append(customer_servers_card(p))
 #
 #        need = STORE.one("SELECT value FROM settings WHERE key = 'require_telegram'")
 #        bot = STORE.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
@@ -18046,6 +25666,13 @@ exit 0
 #                      p, html.escape(CFG["ADMIN_PORT"]),
 #                      p, html.escape(CFG["ADMIN_PATH"])))
 #
+#        out.append("<div class='card'><h2>نام کاربری این پنل</h2>"
+#                   "<form method='post' action='/%s/owner-name-save' class='row'>"
+#                   "<input name='username' dir='ltr' required value='%s'>"
+#                   "<button>تغییر نام کاربری</button></form>"
+#                   "<p class='muted'>۳ تا ۳۲ حرف انگلیسی کوچک، عدد، نقطه، خط تیره یا زیرخط. "
+#                   "از روی سرور هم: <code>smartdns-access username</code></p></div>"
+#                   % (p, html.escape(owner_name(), quote=True)))
 #        out.append("<div class='card'><h2>رمز این پنل</h2>"
 #                   "<form method='post' action='/%s/password'>"
 #                   "<div class='f'><label>رمز تازه (دست‌کم ۸ نویسه)</label>"
@@ -18070,13 +25697,17 @@ exit 0
 #            return box % html.escape(text.replace(token, "<token>") if token else text)
 #        out = ["<div class='card'><p class='muted'>پرش به: <a href='#watch'>دامنه‌های "
 #               "مشتری</a> · <a href='#exit'>سرور خارج</a> · <a href='#bot'>ربات</a> · "
-#               "<a href='#relays'>سرورهای ایران</a></p></div>"]
+#               "<a href='#relays'>%s</a></p></div>"
+#               % ("سرورهای ایران" if not node_list() and not any(
+#                   is_single_server(ip) for ip in relay_list()) else "رله‌ها و سرورهای دیگر")]
 #        out.append(watch_card(pre))
 #        out.append("<div id='exit'></div>")
 #        units = [("smartdns-panel", "پنل و API — سرور خارج"),
 #                 ("smartdns-admin", "پنل ادمین — سرور خارج")]
 #        if os.path.exists("/etc/systemd/system/smartdns-tunnel.service"):
 #            units.append(("smartdns-tunnel", "تونل — سرور خارج"))
+#        if os.path.isdir(RELAY_TUNNELS) and os.listdir(RELAY_TUNNELS):
+#            units.append(("smartdns-tunnel@*", "تونل رله‌ها — سرور خارج"))
 #        # Renewing the certificates: when this fails, the panels show a
 #        # certificate error some weeks later, so it is worth seeing early.
 #        units.append(("smartdns-cert", "تمدید گواهی HTTPS — سرور خارج"))
@@ -18097,6 +25728,18 @@ exit 0
 #        if errors:
 #            out.append("<div class='card'><h2>خطاهای nginx — سرور خارج <span class='muted'>"
 #                       "(/var/log/nginx/error.log)</span></h2>%s</div>" % pre(errors))
+#        # The kernel's warnings: memory running out and what it killed for
+#        # it, the connection table filling up - nothing a unit's log says.
+#        try:
+#            kernel = subprocess.run(["journalctl", "-k", "-p", "warning", "-n", "2000",
+#                                     "--no-pager", "-o", "short-iso"], capture_output=True,
+#                                    text=True, timeout=20).stdout
+#        except Exception as e:
+#            kernel = str(e)
+#        kernel = "\n".join([l for l in kernel.splitlines() if KERNEL_TROUBLE.search(l)][-40:])
+#        out.append("<div class='card'><h2>هشدارهای هستهٔ لینوکس — سرور خارج <span class='muted'>"
+#                   "(journalctl -k)</span></h2>%s</div>" % log_section(
+#                       "کم آمدن حافظه، پر شدن جدول اتصال‌ها", kernel, pre))
 #
 #        out.append("<div id='bot'></div><div class='card'><h2>ربات تلگرام "
 #                   "<span class='muted'>(doctor-dns-bot)</span></h2>")
@@ -18115,21 +25758,7 @@ exit 0
 #                       "نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ "
 #                       "سرورهای قدیمی‌تر بعد از ارتقا.</p></div>")
 #        for r in rows:
-#            out.append("<div class='card'><h2>سرور ایران <code>%s</code></h2>"
-#                       "<p class='muted'>آخرین بار %s — هر ۵ دقیقه تازه می‌شود. DNS، "
-#                       "DNS امن (DoH و DoT)، همگام‌سازی، پنل مشتری، nginx، STUN، تمدید "
-#                       "گواهی و تونل. روی خود سرور: "
-#                       "<code>sudo smartdns-logs</code></p>%s</div>"
-#                       % (html.escape(r["relay"]), html.escape(ago(r["at"])),
-#                          pre(r["text"] or "(چیزی نیست)")))
-#            if r["tunnel"] and r["tunnel"].strip():
-#                out.append("<div class='card'><h2>تونل — سرور ایران <code>%s</code></h2>%s</div>"
-#                           % (html.escape(r["relay"]), pre(r["tunnel"])))
-#            if r["nginx"] and r["nginx"].strip():
-#                out.append("<div class='card'><h2>خطاهای nginx — سرور ایران <code>%s</code>"
-#                           "</h2><p class='muted'>اگر مشتری به سایتی وصل نمی‌شود، دلیلش "
-#                           "معمولاً این‌جاست.</p>%s</div>"
-#                           % (html.escape(r["relay"]), pre(r["nginx"])))
+#            out.append(server_logs_card(r, pre))
 #        return "".join(out)
 #
 #    def action(self, rest, params):
@@ -18214,12 +25843,60 @@ exit 0
 #            to = one("to")
 #            if to not in ("approved", "rejected"):
 #                return self.redirect("receipts?m=!تصمیم نامعتبر")
-#            row = STORE.one("SELECT user_id, plan_id, status FROM transactions"
-#                            " WHERE id = ?", (tid,))
+#            row = STORE.one("SELECT user_id, plan_id, status, kind, amount, code_id"
+#                            " FROM transactions WHERE id = ?", (tid,))
 #            # Only once. A second click - a double tap, the back button - on a
 #            # receipt already decided must not renew the plan a second time.
 #            if not row or row["status"] != "pending":
 #                return self.redirect("receipts?m=!این رسید قبلاً بررسی شده")
+#            if row["kind"] == "device" and to == "approved":
+#                with STORE.lock:
+#                    cur = STORE.db.execute(
+#                        "UPDATE transactions SET status = ?, decided_at = ?, receipt_blob = NULL"
+#                        " WHERE id = ? AND status = 'pending'", (to, now(), tid))
+#                    total = None
+#                    if cur.rowcount:
+#                        u = STORE.db.execute("SELECT max_ips, extra_devices FROM users"
+#                                             " WHERE id = ?", (row["user_id"],)).fetchone()
+#                        total = set_devices(STORE.db, row["user_id"], (u[0] or 1) + 1,
+#                                            (u[1] or 0) + 1)
+#                    STORE.db.commit()
+#                if not cur.rowcount:
+#                    return self.redirect("receipts?m=!این رسید قبلاً بررسی شده")
+#                emit("receipt.approved", row["user_id"], {
+#                    "receipt_id": tid, "devices": total,
+#                    "text": "رسید شما تأیید شد؛ یک دستگاه اضافه شد و حالا %d دستگاه دارید."
+#                            % total})
+#                terms = referral_terms()
+#                if terms and terms[1] == "every":
+#                    pay_referral(row["user_id"], row["amount"], tid)
+#                return self.redirect("receipts?m=رسید تأیید شد؛ یک دستگاه اضافه شد (%d)"
+#                                     % total)
+#            if row["kind"] == "topup" and to == "approved":
+#                credit = toman(one("amount")) if one("amount") else row["amount"]
+#                if not credit or credit > TOPUP_MAX:
+#                    return self.redirect("receipts?m=!مبلغ شارژ درست نیست")
+#                # The decision and the money in one transaction: approving it
+#                # here and from the bot at once must not pay twice.
+#                with STORE.lock:
+#                    cur = STORE.db.execute(
+#                        "UPDATE transactions SET status = ?, decided_at = ?, amount = ?,"
+#                        " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+#                        (to, now(), credit, tid))
+#                    balance = move_wallet(STORE.db, row["user_id"], credit, "topup",
+#                                          "رسید #%d" % tid, tid=tid) if cur.rowcount else None
+#                    STORE.db.commit()
+#                if not cur.rowcount:
+#                    return self.redirect("receipts?m=!این رسید قبلاً بررسی شده")
+#                log(INFO, "receipt #%d approved: user #%d, wallet +%d"
+#                    % (tid, row["user_id"], credit))
+#                emit("receipt.approved", row["user_id"], {
+#                    "receipt_id": tid, "amount": credit, "balance": balance,
+#                    "text": "رسید شما تأیید شد؛ %s تومان به کیف پولتان اضافه شد.\n"
+#                            "موجودی: %s تومان" % (format(credit, ","),
+#                                                  format(balance or 0, ","))})
+#                return self.redirect("receipts?m=رسید تأیید شد؛ %s تومان به کیف پول "
+#                                     "اضافه شد" % format(credit, ","))
 #            # The image goes with the decision. It was evidence for a judgement
 #            # that has now been made, and keeping every customer's bank slip
 #            # for ever is a liability rather than a record.
@@ -18236,13 +25913,21 @@ exit 0
 #                return self.redirect("receipts?m=رسید رد شد")
 #            if row["plan_id"]:
 #                done = STORE.apply_plan(row["user_id"], row["plan_id"])
+#                if row["code_id"]:
+#                    STORE.run("INSERT INTO discount_uses (code_id, user_id, transaction_id, at)"
+#                              " VALUES (?, ?, ?, ?)", (row["code_id"], row["user_id"], tid, now()))
+#                    STORE.run("UPDATE discount_codes SET uses = uses + 1 WHERE id = ?",
+#                              (row["code_id"],))
 #                if done:
 #                    log(INFO, "receipt #%d approved: user #%d, plan #%d"
 #                        % (tid, row["user_id"], row["plan_id"]))
 #                    emit("receipt.approved", row["user_id"],
 #                         dict(plan_event(row["user_id"]), receipt_id=tid,
 #                              text="رسید پرداخت شما تأیید شد. %s" % done))
-#                    return self.redirect("receipts?m=رسید تأیید شد؛ %s" % done)
+#                    share = pay_referral(row["user_id"], row["amount"], tid)
+#                    return self.redirect("receipts?m=رسید تأیید شد؛ %s%s" % (
+#                        done, "؛ %s تومان پورسانت به کیف پول دعوت‌کننده‌اش اضافه شد"
+#                        % format(share, ",") if share else ""))
 #                emit("receipt.approved", row["user_id"], {
 #                    "receipt_id": tid,
 #                    "text": "رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود."})
@@ -18288,20 +25973,30 @@ exit 0
 #            speed = number(one("speed_mb") or "0")
 #            if speed is None or speed < 0:
 #                return self.redirect("plans?m=!سرعت باید عدد باشد؛ خالی یعنی بی‌حد")
+#            devices = number(one("devices") or "1")
+#            if devices is None or devices != int(devices) or not 1 <= devices <= 5:
+#                return self.redirect("plans?m=!تعداد دستگاه باید از ۱ تا ۵ باشد")
+#            # The server abroad it is sold on; empty for all of them.
+#            where = one("exit").strip()
+#            if where and where not in [exit_address()] + node_list():
+#                return self.redirect("plans?m=!این سرور خارج در فهرست نیست")
 #            values = (name, tid, int(days), quota, int(price), int(speed * 1000),
-#                      one("note").strip()[:120], 1 if trial else 0)
+#                      one("note").strip()[:120], 1 if trial else 0, where or None,
+#                      int(devices))
 #            if pid:
 #                cur = STORE.run("UPDATE plans SET name = ?, template_id = ?, days = ?,"
 #                                " quota_bytes = ?, price = ?, speed_kbps = ?, note = ?,"
-#                                " is_trial = ? WHERE id = ?", values + (pid,))
+#                                " is_trial = ?, exit = ?, devices = ? WHERE id = ?",
+#                                values + (pid,))
 #                if not cur.rowcount:
 #                    return self.redirect("plans?m=!این پلن پیدا نشد")
 #                # Those who hold it keep what they bought; the change is for the
 #                # next purchase or renewal.
 #                return self.redirect("plans?m=پلن ذخیره شد؛ برای خریدهای بعدی")
 #            STORE.run("INSERT INTO plans (name, template_id, days, quota_bytes, price,"
-#                      " speed_kbps, note, is_trial, active, created_at)"
-#                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)", values + (now(),))
+#                      " speed_kbps, note, is_trial, exit, devices, active, created_at,"
+#                      " owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+#                      values + (now(), seller()["id"] if seller() else None))
 #            return self.redirect("plans?m=%s" % (
 #                "پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش"
 #                if trial else "پلن ساخته شد و در پنل مشتری دیده می‌شود"))
@@ -18351,7 +26046,8 @@ exit 0
 #
 #            tid = int(field("id") or 0) if field("id").strip().isdigit() else 0
 #            text = field("body").replace("\r\n", "\n").strip()[:TICKET_BODY_MAX]
-#            if not STORE.one("SELECT 1 FROM tickets WHERE id = ?", (tid,)):
+#            if not owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
+#                        " WHERE t.id = ?", tid):
 #                return self.redirect("tickets?m=!این تیکت پیدا نشد")
 #            if not text:
 #                return self.redirect("tickets?t=%d&m=!متن جواب را بنویسید" % tid)
@@ -18411,20 +26107,29 @@ exit 0
 #            STORE.run("INSERT INTO settings (key, value) VALUES ('watch_job', ?)"
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 #                      (json.dumps(job),))
-#            return self.redirect("logs?m=درخواست رفت؛ تا ۳۰ ثانیه دیگر سرورهای ایران شروع "
+#            return self.redirect("logs?m=درخواست رفت؛ تا ۳۰ ثانیه دیگر رله‌ها شروع "
 #                                 "می‌کنند. از مشتری بخواهید سرویس را باز کند")
 #
 #        if rest == "bot-setup":
 #            if not os.path.exists(BOT_BIN):
 #                return self.redirect("bot?m=!فایل ربات روی این سرور نیست؛ نصب‌کننده را "
 #                                     "دوباره اجرا کنید")
-#            env = read_env(BOT_ENV)
+#            s = seller()
+#            env_path, unit, listen = bot_place(s)
+#            env = read_env(env_path)
 #            token = one("token").strip() or env.get("BOT_TOKEN", "")
 #            if not re.fullmatch(r"\d{5,15}:[A-Za-z0-9_-]{30,50}", token):
 #                return self.redirect("bot?m=!توکن درست نیست؛ از @BotFather کپی کنید")
 #            admins = ",".join(re.findall(r"\d{4,15}", one("admins")))
 #            if not admins:
 #                return self.redirect("bot?m=!آیدی عددی تلگرام خودتان را بنویسید")
+#            # One bot, one panel account: the same token in two units would
+#            # have them take each other's messages.
+#            for other in [BOT_ENV] + [BOT_SELLER_ENV % r["id"] for r in STORE.q(
+#                    "SELECT id FROM admins")]:
+#                if other != env_path and read_env(other).get("BOT_TOKEN") == token:
+#                    return self.redirect("bot?m=!این ربات برای حساب دیگری روی همین پنل کار "
+#                                         "می‌کند؛ یک ربات تازه از @BotFather بگیرید")
 #            username, why = bot_getme(token)
 #            if why:
 #                return self.redirect("bot?m=!%s" % why)
@@ -18437,25 +26142,28 @@ exit 0
 #                if key else None
 #            if not row:
 #                key = "dd_" + secrets.token_urlsafe(32)
-#                STORE.run("INSERT INTO api_tokens (name, token_hash, created_at, scope)"
-#                          " VALUES (?, ?, ?, 'admin')",
+#                STORE.run("INSERT INTO api_tokens (name, token_hash, created_at, scope,"
+#                          " admin_id) VALUES (?, ?, ?, 'admin', ?)",
 #                          ("ربات تلگرام @%s" % username,
-#                           hashlib.sha256(key.encode("utf-8")).hexdigest(), now()))
+#                           hashlib.sha256(key.encode("utf-8")).hexdigest(), now(),
+#                           s["id"] if s else None))
 #                row = STORE.one("SELECT * FROM api_tokens WHERE token_hash = ?",
 #                                (hashlib.sha256(key.encode("utf-8")).hexdigest(),))
 #            secret = row["webhook_secret"] or "whsec_" + secrets.token_urlsafe(24)
 #            STORE.run("UPDATE api_tokens SET webhook_url = ?, webhook_secret = ?, scope = 'admin'"
-#                      " WHERE id = ?", ("http://%s/" % BOT_LISTEN, secret, row["id"]))
+#                      " WHERE id = ?", ("http://%s/" % listen, secret, row["id"]))
 #            for k, v in (("bot_link", "https://t.me/%s" % username),
 #                         ("bot_username", username)):
 #                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
-#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, v))
-#            write_env(BOT_ENV, {
+#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                          (bot_setting(k, s), v))
+#            write_env(env_path, {
 #                "BOT_TOKEN": token, "API_URL": bot_api_url().rstrip("/"), "API_KEY": key,
-#                "WEBHOOK_SECRET": secret, "LISTEN": BOT_LISTEN, "ADMIN_IDS": admins,
-#                "PAY_TEXT": "", "SUPPORT_TEXT": " ".join(one("support").split())[:200]})
-#            systemctl("enable", BOT_UNIT)
-#            started = systemctl("restart", BOT_UNIT)
+#                "WEBHOOK_SECRET": secret, "LISTEN": listen, "ADMIN_IDS": admins,
+#                "PAY_TEXT": "", "SUPPORT_TEXT": " ".join(one("support").split())[:200],
+#                "BOT_LANG": "en" if one("lang") == "en" else "fa"})
+#            systemctl("enable", unit)
+#            started = systemctl("restart", unit)
 #            log(INFO, "telegram bot @%s set up for admin(s) %s" % (username, admins))
 #            if started:
 #                self.queue_bot_test(row["id"], wait=10)
@@ -18463,17 +26171,236 @@ exit 0
 #                "ربات @%s روشن شد؛ یک پیام آزمایشی به تلگرامتان رفت" % username if started
 #                else "!تنظیمات ذخیره شد ولی ربات روشن نشد؛ پیام‌های پایین صفحه را ببینید"))
 #
+#        if rest == "owner-name-save":
+#            name = one("username").strip().lower()
+#            if not re.fullmatch(r"[a-z0-9._-]{3,32}", name):
+#                return self.redirect("settings?m=!۳ تا ۳۲ حرف انگلیسی کوچک، عدد، . - _")
+#            if STORE.one("SELECT 1 FROM admins WHERE username = ?", (name,)):
+#                return self.redirect("settings?m=!یک ادمین این نام کاربری را دارد")
+#            set_config_key("ADMIN_USER", name)
+#            CFG["ADMIN_USER"] = name
+#            STORE.run("DELETE FROM settings WHERE key = 'owner_username'")
+#            return self.redirect("settings?m=نام کاربری شما %s است؛ از این به بعد با آن وارد "
+#                                 "شوید" % name)
+#
+#        if rest == "admin-save":
+#            aid = int(one("id") or 0)
+#            name = one("username").strip().lower()
+#            if not re.fullmatch(r"[a-z0-9._-]{3,32}", name):
+#                return self.redirect("admins?id=%d&m=!نام کاربری ۳ تا ۳۲ حرف انگلیسی کوچک، عدد، "
+#                                     ". - _ است" % aid)
+#            if name == owner_name():
+#                return self.redirect("admins?id=%d&m=!این نام کاربری مال مالک است" % aid)
+#            password = one("password")
+#            if (not aid or password) and len(password) < 8:
+#                return self.redirect("admins?id=%d&m=!رمز دست‌کم ۸ نویسه باشد" % aid)
+#            perms = [k for k in ADMIN_SECTIONS_ORDER if k in (params.get("perm") or [])]
+#            numbers = {}
+#            for key in ("max_users", "cap_gb", "days", "templates_max", "reset_days"):
+#                raw = one(key).strip()
+#                if raw and number(raw) is None:
+#                    return self.redirect("admins?id=%d&m=!عددها را درست بنویسید" % aid)
+#                numbers[key] = number(raw) if raw else None
+#            tpls = sorted(int(x) for x in params.get("tpl") or [] if x.isdigit())
+#            values = {
+#                "username": name, "perms": json.dumps(perms),
+#                "own_only": 1 if one("own_only") else 0,
+#                "can_route": 1 if one("can_route") and one("own_only") else 0,
+#                "max_users": int(numbers["max_users"]) if numbers["max_users"] else None,
+#                "cap_bytes": int(numbers["cap_gb"] * GB) if numbers["cap_gb"] else None,
+#                "templates_mode": "own" if one("templates_mode") == "own" else "pick",
+#                "templates": json.dumps(tpls),
+#                "templates_max": max(1, int(numbers["templates_max"] or 1))}
+#            old = STORE.one("SELECT reset_days, reset_next FROM admins WHERE id = ?", (aid,)) \
+#                if aid else None
+#            reset = int(numbers["reset_days"] or 0) or None
+#            values["reset_days"] = reset
+#            values["reset_next"] = reset_next_value(
+#                reset, old["reset_days"] if old else None, old["reset_next"] if old else None)
+#            if numbers["days"] is not None:
+#                values["expires_at"] = (datetime.now(timezone.utc) + timedelta(
+#                    days=numbers["days"])).isoformat(timespec="seconds")
+#            elif not aid:
+#                values["expires_at"] = None
+#            elif one("days").strip() == "":
+#                values["expires_at"] = None
+#            if password:
+#                salt = secrets.token_hex(16)
+#                values["password_salt"] = salt
+#                values["password_hash"] = hash_password(password, salt)
+#            try:
+#                if aid:
+#                    sets = ", ".join("%s = ?" % k for k in values)
+#                    cur = STORE.run("UPDATE admins SET %s WHERE id = ?" % sets,
+#                                    tuple(values.values()) + (aid,))
+#                    if not cur.rowcount:
+#                        return self.redirect("admins?m=!این ادمین پیدا نشد")
+#                else:
+#                    values["created_at"] = now()
+#                    cols = ", ".join(values)
+#                    aid = STORE.run("INSERT INTO admins (%s) VALUES (%s)"
+#                                    % (cols, ", ".join("?" for _ in values)),
+#                                    tuple(values.values())).lastrowid
+#            except sqlite3.IntegrityError:
+#                return self.redirect("admins?id=%d&m=!ادمینی با این نام کاربری هست" % aid)
+#            if values["own_only"]:
+#                give_seller_code(aid)
+#            # New days: the warnings about the old end are due again.
+#            if "expires_at" in values:
+#                STORE.run("UPDATE admins SET warned = warned & ~24 WHERE id = ?", (aid,))
+#            # Whatever changed, it applies from now: out of every device.
+#            STORE.run("DELETE FROM admin_sessions WHERE admin_id = ? OR view_as = ?",
+#                      (aid, aid))
+#            return self.redirect("admins?m=ادمین %s ذخیره شد" % name)
+#
+#        if rest == "user-reset-days":
+#            uid = int(one("id") or 0)
+#            raw = one("days").strip()
+#            days = number(raw) if raw else 0
+#            if days is None or days != int(days) or not 0 <= days <= 3650:
+#                return self.redirect("users?m=!تعداد روز ریست را با عدد بنویسید؛ خالی یعنی خاموش")
+#            row = STORE.one("SELECT reset_days, reset_next FROM users WHERE id = ?", (uid,))
+#            if not row:
+#                return self.redirect("users?m=!این کاربر پیدا نشد")
+#            days = int(days) or None
+#            STORE.run("UPDATE users SET reset_days = ?, reset_next = ? WHERE id = ?",
+#                      (days, reset_next_value(days, row["reset_days"], row["reset_next"]), uid))
+#            return self.redirect("users?m=%s" % (
+#                "مصرف این کاربر هر %d روز یک بار صفر می‌شود" % days if days
+#                else "ریست خودکار مصرف این کاربر خاموش شد"))
+#
+#        if rest == "admin-reset-usage":
+#            aid = int(one("id") or 0)
+#            cur = STORE.run("UPDATE admins SET used_bytes = 0, warned = warned & ~7"
+#                            " WHERE id = ?", (aid,))
+#            if not cur.rowcount:
+#                return self.redirect("admins?m=!این ادمین پیدا نشد")
+#            return self.redirect(admin_back(one("back"), aid) + "m=" + "مصرف صفر شد")
+#
+#        if rest == "admin-disable":
+#            aid = int(one("id") or 0)
+#            row = STORE.one("SELECT * FROM admins WHERE id = ?", (aid,))
+#            if not row:
+#                return self.redirect("admins?m=!این ادمین پیدا نشد")
+#            off = one("to") == "1"
+#            STORE.run("UPDATE admins SET disabled = ? WHERE id = ?", (1 if off else 0, aid))
+#            env_path, unit, _ = bot_place(row)
+#            if off:
+#                STORE.run("DELETE FROM admin_sessions WHERE admin_id = ? OR view_as = ?",
+#                          (aid, aid))
+#                if os.path.exists(env_path):
+#                    systemctl("disable", "--now", unit)
+#            elif os.path.exists(env_path) and read_env(env_path).get("BOT_TOKEN"):
+#                systemctl("enable", "--now", unit)
+#            log(INFO, "admin %s %s" % (row["username"], "disabled" if off else "enabled"))
+#            return self.redirect(admin_back(one("back"), aid) + "m=%s" % ((
+#                "غیرفعال شد" + ("؛ سرویس مشتری‌هایش تا ۳۰ ثانیه دیگر قطع می‌شود"
+#                                if row["own_only"] else "")) if off else
+#                "فعال شد" + ("؛ مشتری‌هایش دوباره سرویس می‌گیرند" if row["own_only"] else "")))
+#
+#        if rest == "admin-delete":
+#            aid = int(one("id") or 0)
+#            gone = STORE.one("SELECT * FROM admins WHERE id = ?", (aid,))
+#            if gone is None:
+#                return self.redirect("admins?m=!این ادمین پیدا نشد")
+#            n = delete_admin_and_all(gone)
+#            return self.redirect("admins?m=ادمین %s حذف شد%s" % (
+#                gone["username"], " با %d مشتری و همهٔ پلن‌ها، قالب‌ها و رباتش" % n
+#                if gone["own_only"] else ""))
+#
+#        if rest == "admin-view-as":
+#            aid = int(one("id") or 0)
+#            if not STORE.one("SELECT 1 FROM admins WHERE id = ?", (aid,)):
+#                return self.redirect("admins?m=!این ادمین پیدا نشد")
+#            STORE.run("UPDATE admin_sessions SET view_as = ? WHERE token = ?",
+#                      (aid, self.session_token()))
+#            return self.redirect("")
+#
+#        if rest == "view-as-stop":
+#            STORE.run("UPDATE admin_sessions SET view_as = NULL WHERE token = ?",
+#                      (self.session_token(),))
+#            return self.redirect("admins")
+#
+#        if rest == "me-password":
+#            row = me()
+#            if row is None:
+#                return self.redirect("settings")
+#            if not hmac.compare_digest(hash_password(one("current"), row["password_salt"]),
+#                                       row["password_hash"]):
+#                return self.redirect("me?m=!رمز فعلی درست نیست")
+#            if len(one("new")) < 8:
+#                return self.redirect("me?m=!رمز تازه دست‌کم ۸ نویسه باشد")
+#            salt = secrets.token_hex(16)
+#            STORE.run("UPDATE admins SET password_hash = ?, password_salt = ? WHERE id = ?",
+#                      (hash_password(one("new"), salt), salt, row["id"]))
+#            STORE.run("DELETE FROM admin_sessions WHERE admin_id = ? AND token != ?",
+#                      (row["id"], self.session_token()))
+#            return self.redirect("me?m=رمز عوض شد؛ از بقیهٔ دستگاه‌ها بیرون آمدید")
+#
+#        if rest == "broadcast-send":
+#            text = one("text").replace("\r\n", "\n").strip()
+#            if not text:
+#                return self.redirect("bot?m=!متن پیام را بنویسید")
+#            if len(text) > BROADCAST_MAX:
+#                return self.redirect("bot?m=!پیام بیشتر از %d نویسه است" % BROADCAST_MAX)
+#            audience = broadcast_audience(one("target"))
+#            if audience is None:
+#                return self.redirect("bot?m=!گیرنده‌ها را انتخاب کنید")
+#            ids, _without = audience
+#            keys = bot_keys(seller_id())
+#            if seller_id() and not STORE.q("SELECT 1 FROM api_tokens WHERE admin_id = ?"
+#                                           " AND revoked_at IS NULL", (seller_id(),)):
+#                keys = []
+#            if not keys:
+#                return self.redirect("bot?m=!رباتی به پنل وصل نیست")
+#            if not ids:
+#                return self.redirect("bot?m=!این گروه کسی با تلگرام ندارد")
+#            # Each through the bot they talk to - looked up before the lock,
+#            # which the lookups themselves take.
+#            owners = {r["id"]: r["owner_admin"] for r in STORE.q(
+#                "SELECT id, owner_admin FROM users WHERE id IN (%s)"
+#                % ",".join("?" * len(ids)), tuple(ids))}
+#            by_seller = {o: keys if seller_id() else bot_keys(o)
+#                         for o in set(owners.values())}
+#            stamp = now()
+#            first = last = None
+#            with STORE.lock:
+#                cur = STORE.db.execute("INSERT INTO broadcasts (text, target, recipients,"
+#                                       " created_at, admin_id) VALUES (?, ?, ?, ?, ?)",
+#                                       (text, one("target"), len(ids), stamp, seller_id()))
+#                bid = cur.lastrowid
+#                for uid in ids:
+#                    tg = STORE.db.execute("SELECT telegram_id, owner_admin FROM users"
+#                                          " WHERE id = ?", (uid,)).fetchone()
+#                    payload = json.dumps({"event": "broadcast", "created_at": stamp,
+#                                          "telegram_id": tg[0], "user_id": uid,
+#                                          "data": {"broadcast_id": bid, "text": text}},
+#                                         ensure_ascii=False)
+#                    for k in by_seller.get(tg[1], keys):
+#                        row = STORE.db.execute(
+#                            "INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
+#                            " next_at) VALUES (?, 'broadcast', ?, ?, ?)",
+#                            (k["id"], payload, stamp, stamp)).lastrowid
+#                        first = first or row
+#                        last = row
+#                STORE.db.execute("UPDATE broadcasts SET first_row = ?, last_row = ?"
+#                                 " WHERE id = ?", (first, last, bid))
+#                STORE.db.commit()
+#            log(INFO, "broadcast #%d to %d customers (%s)" % (bid, len(ids), one("target")))
+#            return self.redirect("bot?m=پیام برای %d نفر در صف فرستادن است" % len(ids))
+#
 #        if rest == "bot-power":
 #            on = one("to") == "on"
-#            if on and not read_env(BOT_ENV).get("BOT_TOKEN"):
+#            env_path, unit, _ = bot_place(seller())
+#            if on and not read_env(env_path).get("BOT_TOKEN"):
 #                return self.redirect("bot?m=!اول ربات را راه‌اندازی کنید")
-#            ok = systemctl("enable" if on else "disable", "--now", BOT_UNIT)
+#            ok = systemctl("enable" if on else "disable", "--now", unit)
 #            return self.redirect("bot?m=%s%s" % (
 #                "" if ok else "!", ("ربات روشن شد" if on else "ربات خاموش شد") if ok
 #                else "نشد؛ پیام‌های ربات را ببینید"))
 #
 #        if rest == "bot-test":
-#            env = read_env(BOT_ENV)
+#            env = read_env(bot_place(seller())[0])
 #            row = STORE.one("SELECT id FROM api_tokens WHERE token_hash = ? AND revoked_at"
 #                            " IS NULL", (hashlib.sha256(env.get("API_KEY", "").encode(
 #                                "utf-8")).hexdigest(),))
@@ -18613,6 +26540,36 @@ exit 0
 #            # The relays learn it at their next sync, like a block does.
 #            return self.redirect("users?m=کاربر حذف شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود")
 #
+#        if rest == "user-exit":
+#            exits, relays = [exit_address()] + node_list(), relay_list()
+#            picked = {r: one("r_" + r).strip() for r in relays}
+#            if any(to and to not in exits for to in picked.values()):
+#                return self.redirect("users?m=!این سرور خارج در فهرست نیست")
+#            # The same on every relay is kept as the customer's one exit, so a
+#            # relay added later sends them there too.
+#            alike = len(set(picked.values())) <= 1
+#            every = next(iter(picked.values()), "") if alike else ""
+#            own = {} if alike else {r: to for r, to in picked.items() if to}
+#            STORE.run("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
+#                      (every or None, json.dumps(own, sort_keys=True) if own else None,
+#                       int(one("id") or 0)))
+#            return self.redirect("users?m=%s" % (
+#                "این مشتری تا یک دقیقه دیگر روی همهٔ رله‌ها از %s می‌رود" % every if every
+#                else "سرور خارج این مشتری برای هر رله ذخیره شد" if own
+#                else "این مشتری از سرور خارج هر رله می‌رود"))
+#
+#        if rest == "user-relays":
+#            ips = relay_list()
+#            picked = [ip for ip in ips if ip in (params.get("ip") or [])]
+#            # All of them is kept as none picked, so a relay added later is
+#            # given to this customer too.
+#            STORE.run("UPDATE users SET relays = ? WHERE id = ?",
+#                      (",".join(picked) if 0 < len(picked) < len(ips) else None,
+#                       int(one("id") or 0)))
+#            return self.redirect("users?m=%s" % (
+#                "DNSهای این مشتری ذخیره شد" if picked
+#                else "هیچ رله‌ای تیک نخورده بود؛ همه به این مشتری نشان داده می‌شوند"))
+#
 #        if rest == "user-template":
 #            STORE.run("UPDATE users SET template_id = ? WHERE id = ?",
 #                      (int(one("template_id") or 0), int(one("id") or 0)))
@@ -18622,13 +26579,10 @@ exit 0
 #            name = one("name")
 #            if not name:
 #                return self.redirect("templates?m=!نام لازم است")
-#            count = STORE.one("SELECT count(*) c FROM templates")["c"]
-#            if count >= 8:
-#                return self.redirect("templates?m=!سقف ۸ قالب پر است؛ هر قالب یک "
-#                                     "resolver روی هر رله است")
 #            try:
-#                cur = STORE.run("INSERT INTO templates (name, is_default, created_at)"
-#                                " VALUES (?, 0, ?)", (name, now()))
+#                cur = STORE.run("INSERT INTO templates (name, is_default, created_at,"
+#                                " owner_admin) VALUES (?, 0, ?, ?)",
+#                                (name, now(), seller()["id"] if seller() else None))
 #            except sqlite3.IntegrityError:
 #                return self.redirect("templates?m=!قالبی با این نام هست")
 #            # Everything except the opt-in groups. A new template starting
@@ -18706,6 +26660,7 @@ exit 0
 #            STORE.run("UPDATE users SET template_id = ? WHERE template_id = ?",
 #                      (default["id"] if default else None, tid))
 #            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
+#            STORE.run("DELETE FROM settings WHERE key = ?", ("blocks:%d" % tid,))
 #            STORE.run("DELETE FROM templates WHERE id = ?", (tid,))
 #            return self.redirect("templates?m=قالب حذف شد و کاربرانش به پیش‌فرض برگشتند")
 #
@@ -18751,6 +26706,37 @@ exit 0
 #            return self.redirect("domains?m=%s مسدود شد%s" % (
 #                domain, "؛ جزو %s هم بود و دیگر از رله نمی‌رود" % "، ".join(also[:3])
 #                if also else ""))
+#
+#        if rest == "template-blocklists":
+#            tid = int(one("id") or 0)
+#            ids = [r["id"] for r in STORE.q("SELECT id FROM templates ORDER BY id")]
+#            if tid not in ids:
+#                return self.redirect("templates?m=!قالب پیدا نشد")
+#            # The rows ticked, and the domains taken out of them.
+#            rows = set(params.get("bg") or []) & {b["key"] for b in BLOCKS}
+#            doms = set(params.get("bd") or [])
+#            off = sorted({d for b in BLOCKS if b["key"] in rows
+#                          for d in b.get("domains") or [] if d not in doms})
+#            if rows:
+#                put_setting("blocks:%d" % tid, json.dumps({"on": sorted(rows), "off": off}))
+#            else:
+#                STORE.run("DELETE FROM settings WHERE key = ?", ("blocks:%d" % tid,))
+#            ticked = set(params.get("l") or [])
+#            for name, _icon, _label, _about in BLOCKLISTS:
+#                mode, have, _meta = blocklist_state(name)
+#                on, want = mode == "all" or tid in have, name in ticked
+#                if on == want:
+#                    continue
+#                if want:
+#                    set_blocklist(name, "some", set(have) | {tid})
+#                elif mode == "all":
+#                    # "Every template but this one" - which from now on does
+#                    # not take in templates made later.
+#                    set_blocklist(name, "some", [i for i in ids if i != tid])
+#                else:
+#                    set_blocklist(name, "some", set(have) - {tid})
+#            return self.redirect("templates?t=%d&m=ذخیره شد؛ چند دقیقه‌ای طول می‌کشد تا "
+#                                 "روی رله‌ها اعمال شود" % tid)
 #
 #        if rest == "forward-add":
 #            try:
@@ -18834,6 +26820,36 @@ exit 0
 #        if rest == "restore":
 #            return self.take_upload()
 #
+#        if rest == "backup-auto":
+#            days = one("days").strip()
+#            password = one("password")
+#            if one("on"):
+#                if not days.isdigit() or not 1 <= int(days) <= 60:
+#                    return self.redirect("settings?m=!هر چند روز: عددی بین ۱ و ۶۰")
+#                if password and len(password) < 8:
+#                    return self.redirect("settings?m=!رمز بکاپ دست‌کم ۸ نویسه باشد")
+#                if not password and not backup_password():
+#                    return self.redirect("settings?m=!برای بکاپ یک رمز بگذارید")
+#            if password:
+#                if len(password) < 8:
+#                    return self.redirect("settings?m=!رمز بکاپ دست‌کم ۸ نویسه باشد")
+#                with open(BACKUP_PASS_FILE + ".tmp", "w", encoding="utf-8") as fh:
+#                    fh.write(password + "\n")
+#                os.chmod(BACKUP_PASS_FILE + ".tmp", 0o600)
+#                os.replace(BACKUP_PASS_FILE + ".tmp", BACKUP_PASS_FILE)
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('backup_every_days', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      (days if one("on") else "",))
+#            return self.redirect("settings?m=%s" % (
+#                "بکاپ خودکار روشن شد: هر %s روز یک بار" % days if one("on")
+#                else "بکاپ خودکار خاموش شد"))
+#
+#        if rest == "backup-now":
+#            result = run_backup()
+#            return self.redirect("settings?m=%s" % (
+#                "بکاپ برای ادمین‌های ربات فرستاده شد (%s)" % human(result["size"])
+#                if result["ok"] else "!بکاپ نشد: %s" % result["error"]))
+#
 #        if rest == "restore-apply":
 #            return self.apply_restore()
 #
@@ -18906,6 +26922,285 @@ exit 0
 #                "از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد" if on
 #                else "وصل کردن تلگرام دیگر اجباری نیست"))
 #
+#        if rest in ("node-add", "node-del"):
+#            ip = one("ip").strip()
+#            nodes = node_list()
+#            if rest == "node-add":
+#                try:
+#                    good = ipaddress.ip_address(ip).version == 4 and \
+#                        ipaddress.ip_address(ip).is_global
+#                except ValueError:
+#                    good = False
+#                if not good:
+#                    return self.redirect("nodes?m=!آی‌پی عمومی سرور را بنویسید، مثل 5.6.7.8")
+#                if ip in nodes:
+#                    return self.redirect("nodes?m=!%s از قبل در فهرست است" % ip)
+#                if ip == exit_address():
+#                    return self.redirect("nodes?m=!این آی‌پی خود همین سرور است")
+#                if ip in relay_list():
+#                    return self.redirect("nodes?m=!%s یکی از رله‌هاست" % ip)
+#                set_nodes(nodes + [ip])
+#                node_slot(ip)
+#                return self.redirect("nodes?m=سرور %s اضافه شد؛ حالا نصب‌کننده را روی آن اجرا "
+#                                     "کنید" % ip)
+#            if ip not in nodes:
+#                return self.redirect("nodes?m=!این سرور در فهرست نیست")
+#            # Its relays go back to this exit first.
+#            STORE.run("DELETE FROM settings WHERE key LIKE 'relay_exit:%' AND value = ?", (ip,))
+#            STORE.run("UPDATE users SET exit = NULL WHERE exit = ?", (ip,))
+#            STORE.run("UPDATE plans SET exit = NULL WHERE exit = ?", (ip,))
+#            STORE.run("UPDATE settings SET value = '' WHERE key = 'standby' AND value = ?", (ip,))
+#            for u in STORE.q("SELECT id, relay_exits FROM users WHERE relay_exits LIKE ?",
+#                             ("%" + ip + "%",)):
+#                try:
+#                    own = {r: e for r, e in json.loads(u["relay_exits"]).items() if e != ip}
+#                except (ValueError, AttributeError):
+#                    own = {}
+#                STORE.run("UPDATE users SET relay_exits = ? WHERE id = ?",
+#                          (json.dumps(own, sort_keys=True) if own else None, u["id"]))
+#            STORE.run("DELETE FROM settings WHERE key = ?", ("node_resolvers:" + ip,))
+#            STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ? OR key LIKE ?"
+#                      " OR key = ?", ("relay_tunnel:%%:" + ip, "relay_tunnel_state:%%:" + ip,
+#                                      "node_tunnel_state:%s:%%" % ip, "node_slot:" + ip))
+#            set_nodes([n for n in nodes if n != ip])
+#            return self.redirect("nodes?m=سرور %s برداشته شد" % ip)
+#
+#        if rest == "standby-save":
+#            ip = one("ip").strip()
+#            if ip and ip not in node_list():
+#                return self.redirect("nodes?m=!پشتیبان باید یکی از نودها باشد")
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('standby', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (ip,))
+#            STORE.run("DELETE FROM settings WHERE key = 'standby_kept'")
+#            if ip:
+#                try:
+#                    refresh_standby(force=True)
+#                except Exception as e:
+#                    return self.redirect("nodes?m=!بکاپ پشتیبان ساخته نشد: %s" % e)
+#            return self.redirect("nodes?m=%s" % (
+#                "سرور پشتیبان: %s — تا چند دقیقهٔ دیگر آماده می‌شود" % ip if ip
+#                else "سرور پشتیبانی تعیین نشده"))
+#
+#        if rest == "upgrade-start":
+#            return self.redirect("settings?m=" + start_upgrade_job())
+#
+#        if rest == "server-list-save":
+#            servers, _ = ordered_servers()
+#            ranked = []
+#            for n, ip in enumerate(servers):
+#                raw = one("order_" + ip).strip()
+#                ranked.append((int(raw) if raw.isdigit() else 10 ** 6 + n, n, ip))
+#                note = " ".join(one("note_" + ip).split())[:SERVER_NOTE_MAX]
+#                if (setting("server_note:" + ip) or "") != note:
+#                    put_setting("server_note:" + ip, note)
+#            put_setting("server_order", json.dumps([ip for _, _, ip in sorted(ranked)]))
+#            bad = []
+#            if not one_server():
+#                taken = {}
+#                for ip in servers:
+#                    raw = one("domain_" + ip).strip().lower().rstrip(".")
+#                    have = setting("doh_host:" + ip) or ""
+#                    if not raw or raw == have and not setting("domain_want:" + ip):
+#                        continue          # nothing new; a domain is not taken away here
+#                    if not DOMAIN_RE.fullmatch(raw) or raw in taken:
+#                        bad.append(raw)
+#                        continue
+#                    taken[raw] = ip
+#                    if (setting("domain_want:" + ip) or "") != raw:
+#                        put_setting("domain_want:" + ip, raw)
+#                        STORE.run("DELETE FROM settings WHERE key = ?", ("domain_state:" + ip,))
+#                        log(INFO, "domain %s asked for on %s" % (raw, ip))
+#            if bad:
+#                return self.redirect("nodes?m=!این دامنه درست نیست یا برای دو سرور نوشته شده: %s"
+#                                     % "، ".join(bad))
+#            put_setting("server_hidden", json.dumps([ip for ip in servers if one("hide_" + ip)]))
+#            return self.redirect(("settings" if one_server() else "nodes")
+#                                 + "?m=سرورها برای مشتری ذخیره شد")
+#
+#        if rest == "seller-server-notes":
+#            s = seller()
+#            if s is None or not s["can_route"]:
+#                return self.send(page("دسترسی ندارید", denied_page(), CFG), 403)
+#            servers, hidden = ordered_servers()
+#            for ip in servers:
+#                if ip in hidden:
+#                    continue
+#                note = " ".join(one("note_" + ip).split())[:SERVER_NOTE_MAX]
+#                key = "server_note:%d:%s" % (s["id"], ip)
+#                if (setting(key) or "") != note:
+#                    put_setting(key, note)
+#            return self.redirect("me?m=توضیح سرورها ذخیره شد")
+#
+#        if rest == "public-dns":
+#            on = one("to") == "1"
+#            put_setting("public_dns", "1" if on else "0")
+#            log(INFO, "public DNS %s" % ("on" if on else "off"))
+#            return self.redirect("settings?m=%s" % (
+#                "DNS عمومی روشن شد؛ تا یک دقیقه دیگر رله‌ها برای همه باز می‌شوند" if on else
+#                "DNS عمومی خاموش شد؛ تا یک دقیقه دیگر فقط آی‌پی‌های ثبت‌شده سرویس می‌گیرند"))
+#
+#        if rest == "update-check":
+#            state = check_github()
+#            return self.redirect("settings?m=%s" % (
+#                "!گیت‌هاب جواب درستی نداد: %s" % state["error"] if state.get("error")
+#                else "آخرین نسخه در گیت‌هاب: %s" % state.get("version")))
+#
+#        if rest == "self-upgrade":
+#            try:
+#                rel = github_latest()
+#            except Exception as e:
+#                return self.redirect("settings?m=!گیت‌هاب جواب درستی نداد: %s" % str(e)[:150])
+#            if version_key(rel["version"]) <= version_key(app_version()):
+#                if servers_versions(CFG["ADMIN_PATH"])[1]:
+#                    return self.redirect("settings?m=" + start_upgrade_job())
+#                return self.redirect("settings?m=!همهٔ سرورها همین حالا %s یا تازه‌تر را دارند"
+#                                     % rel["version"])
+#            try:
+#                blob = fetch_release(rel)
+#            except Exception as e:
+#                return self.redirect("settings?m=!نصب‌کننده گرفته نشد: %s" % str(e)[:150])
+#            r = start_self_upgrade(blob, rel["version"])
+#            if r.returncode != 0:
+#                return self.redirect("settings?m=!آپدیت شروع نشد: %s" % (r.stderr or "")[:150])
+#            log(INFO, "self-upgrade to %s from GitHub started" % rel["version"])
+#            return self.redirect("settings?m=آپدیت این سرور به %s شروع شد؛ پنل چند ثانیه‌ای قطع "
+#                                 "می‌شود و بعد خودش بقیهٔ سرورها را آپدیت می‌کند"
+#                                 % rel["version"])
+#
+#        if rest == "upgrade-stop":
+#            row = STORE.one("SELECT value FROM settings WHERE key = 'upgrade_job'")
+#            try:
+#                job = json.loads(row["value"]) if row and row["value"] else {}
+#            except ValueError:
+#                job = {}
+#            if job.get("current"):
+#                job.update(stopped="ادمین متوقفش کرد (%s ممکن است همین حالا در حال آپدیت "
+#                                   "باشد)" % job["current"], current=None)
+#                STORE.run("UPDATE settings SET value = ? WHERE key = 'upgrade_job'",
+#                          (json.dumps(job, ensure_ascii=False, sort_keys=True),))
+#            return self.redirect("nodes?m=کار آپدیت متوقف شد")
+#
+#        if rest == "cap-save":
+#            host = one("host").strip()
+#            if host != "exit" and host not in relay_list() + node_list():
+#                return self.redirect("nodes?m=!این سرور در فهرست نیست")
+#            raw = one("gb").strip()
+#            if not raw:
+#                STORE.run("DELETE FROM settings WHERE key = ?", ("cap:" + host,))
+#                return self.redirect("nodes?m=سقف ترافیک این سرور برداشته شد")
+#            try:
+#                gb, day = float(raw), int(one("day").strip() or 1)
+#            except ValueError:
+#                return self.redirect("nodes?m=!سقف و روز را عددی بنویسید")
+#            if gb <= 0 or not 1 <= day <= 28:
+#                return self.redirect("nodes?m=!سقف باید بیشتر از صفر و روز بین ۱ و ۲۸ باشد")
+#            cap = {"gb": ("%g" % gb), "day": day,
+#                   "count": "out" if one("count") == "out" else "both",
+#                   "action": "move" if one("action") == "move" else "alert"}
+#            STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      ("cap:" + host, json.dumps(cap, sort_keys=True)))
+#            return self.redirect("nodes?m=سقف ترافیک ذخیره شد: %s گیگ در ماه" % cap["gb"])
+#
+#        if rest == "relay-exit":
+#            ip, to = one("ip").strip(), one("exit").strip()
+#            if ip not in relay_list():
+#                return self.redirect("nodes?m=!این رله در فهرست نیست")
+#            if to not in [exit_address()] + node_list():
+#                return self.redirect("nodes?m=!این سرور خارج در فهرست نیست")
+#            if to == exit_address():
+#                STORE.run("DELETE FROM settings WHERE key = ?", ("relay_exit:" + ip,))
+#            else:
+#                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                          ("relay_exit:" + ip, to))
+#            return self.redirect("nodes?m=رلهٔ %s تا یک دقیقه دیگر از %s می‌رود" % (ip, to))
+#
+#        if rest == "relay-tunnel":
+#            ip = one("ip").strip()
+#            if ip not in relay_list():
+#                return self.redirect("nodes?m=!این رله در فهرست نیست")
+#            to = one("exit").strip() or exit_address()
+#            if to != exit_address():
+#                return self.redirect(save_node_tunnel(ip, to, one))
+#            mine = installer_tunnel()
+#            if mine and ip == mine["relay"]:
+#                return self.redirect("nodes?m=!تونل این رله مال نصب‌کننده است؛ با --tunnel "
+#                                     "عوضش کنید")
+#            if one("on") != "1":
+#                STORE.run("DELETE FROM settings WHERE key = ?", ("relay_tunnel:" + ip,))
+#                apply_exit_tunnel(ip)
+#                return self.redirect("nodes?m=تونل رلهٔ %s خاموش شد؛ رله تا یک دقیقه دیگر "
+#                                     "مستقیم وصل می‌شود" % ip)
+#            direction, transport = one("direction"), one("transport")
+#            if direction not in TUNNEL_TRANSPORTS:
+#                return self.redirect("nodes?m=!جهت تونل را انتخاب کنید")
+#            if transport not in TUNNEL_TRANSPORTS[direction]:
+#                return self.redirect("nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد")
+#            try:
+#                port = int(one("port").strip())
+#            except ValueError:
+#                return self.redirect("nodes?m=!درگاه را عددی بنویسید")
+#            why = tunnel_port_problem(port, ip, direction)
+#            if why:
+#                return self.redirect("nodes?m=!%s" % why)
+#            spec = {"transport": transport, "direction": direction, "port": port,
+#                    "exit": exit_address()}
+#            STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      ("relay_tunnel:" + ip, json.dumps(spec, sort_keys=True)))
+#            STORE.run("DELETE FROM settings WHERE key = ?", ("relay_tunnel_state:" + ip,))
+#            why = apply_exit_tunnel(ip)
+#            if why:
+#                return self.redirect("nodes?m=!%s" % why)
+#            return self.redirect("nodes?m=تونل رلهٔ %s ذخیره شد؛ رله تا یک دقیقه دیگر سر خودش "
+#                                 "را برپا می‌کند — وضعیتش همین‌جاست" % ip)
+#
+#        if rest in ("relay-add", "relay-del", "single-add"):
+#            ip = one("ip").strip()
+#            ips = relay_list()
+#            if rest in ("relay-add", "single-add"):
+#                try:
+#                    good = ipaddress.ip_address(ip).version == 4 and \
+#                        ipaddress.ip_address(ip).is_global
+#                except ValueError:
+#                    good = False
+#                if not good:
+#                    return self.redirect("nodes?m=!آی‌پی عمومی رله را بنویسید، مثل 5.6.7.8")
+#                if ip in ips:
+#                    return self.redirect("nodes?m=!%s از قبل رلهٔ این سرور است" % ip)
+#                if ip == exit_address():
+#                    return self.redirect("nodes?m=!این آی‌پی خود همین سرور است")
+#                if ip in node_list():
+#                    return self.redirect("nodes?m=!%s یکی از سرورهای خارج است" % ip)
+#                ips.append(ip)
+#            else:
+#                if ip not in ips:
+#                    return self.redirect("nodes?m=!این رله در فهرست نیست")
+#                if len(ips) < 2:
+#                    return self.redirect("nodes?m=!آخرین رله را نمی‌شود برداشت")
+#                ips.remove(ip)
+#            why = set_relays(ips)
+#            if why:
+#                return self.redirect("nodes?m=!%s" % why)
+#            if rest == "single-add":
+#                # Single from the start; what it says of itself once
+#                # installed has the last word.
+#                STORE.run("INSERT INTO settings (key, value) VALUES (?, '1')"
+#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                          ("single:" + ip,))
+#                return self.redirect("nodes?m=تک‌سرور %s اضافه شد؛ حالا دستور نصبش را روی آن "
+#                                     "اجرا کنید" % ip)
+#            if rest == "relay-del":
+#                STORE.run("DELETE FROM settings WHERE key IN (?, ?, ?)",
+#                          ("relay_tunnel:" + ip, "relay_tunnel_state:" + ip, "single:" + ip))
+#                STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
+#                          ("relay_tunnel:%s:%%" % ip, "relay_tunnel_state:%s:%%" % ip))
+#                apply_exit_tunnel(ip)
+#            return self.redirect("nodes?m=%s" % (
+#                "رله %s اضافه شد؛ حالا نصب‌کننده را روی آن اجرا کنید" % ip if rest == "relay-add"
+#                else "رله %s برداشته شد" % ip))
+#
 #        if rest == "doh-name":
 #            raw = (one("name") or "").strip()
 #            if not raw:
@@ -18961,12 +27256,113 @@ exit 0
 #                "DNS بالادستی: %s. رله‌ها ظرف یک دقیقه خودشان امتحان و اعمال می‌کنند"
 #                % " و ".join("%s (%s)" % (ip, resolver_name(ip)) for ip in picks)))
 #
+#        if rest == "discount-save":
+#            code = re.sub(r"\s", "", one("code")).upper()
+#            if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+#                return self.redirect("plans?m=!کد ۳ تا ۳۲ حرف انگلیسی یا عدد است (و - _)")
+#            kind = "amount" if one("kind") == "amount" else "percent"
+#            value = toman(one("value"))
+#            if not value or (kind == "percent" and value > 100):
+#                return self.redirect("plans?m=!مقدار تخفیف درست نیست؛ درصد ۱ تا ۱۰۰، یا "
+#                                     "مبلغ به تومان")
+#            days, most = one("days").strip(), one("max_uses").strip()
+#            if (days and not days.isdigit()) or (most and not most.isdigit()):
+#                return self.redirect("plans?m=!روز و سقف استفاده را با عدد بنویسید")
+#            ids = sorted(int(x) for x in params.get("plan") or [] if x.isdigit())
+#            expires = ((datetime.now(timezone.utc) + timedelta(days=int(days))).isoformat(
+#                timespec="seconds") if days and int(days) > 0 else None)
+#            try:
+#                STORE.run("INSERT INTO discount_codes (code, kind, value, expires_at, max_uses,"
+#                          " once, plans, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+#                          (code, kind, value, expires, int(most) if most and int(most) else None,
+#                           1 if one("once") else 0, json.dumps(ids) if ids else None, now()))
+#            except sqlite3.IntegrityError:
+#                return self.redirect("plans?m=!کدی با این نام هست")
+#            return self.redirect("plans?m=کد تخفیف %s ساخته شد" % code)
+#
+#        if rest == "discount-active":
+#            STORE.run("UPDATE discount_codes SET active = ? WHERE id = ?",
+#                      (1 if one("to") == "1" else 0, int(one("id") or 0)))
+#            return self.redirect("plans?m=ذخیره شد")
+#
+#        if rest == "discount-delete":
+#            STORE.run("DELETE FROM discount_codes WHERE id = ?", (int(one("id") or 0),))
+#            return self.redirect("plans?m=کد تخفیف حذف شد")
+#
+#        if rest == "devices-settings":
+#            price, limit = one("price").strip(), one("limit").strip()
+#            if price and (toman(price) is None):
+#                return self.redirect("plans?m=!قیمت دستگاه را به تومان و با عدد بنویسید")
+#            if limit and not (limit.isdigit() and int(limit) > 0):
+#                return self.redirect("plans?m=!حداکثر آی‌پی تازه عدد مثبت است؛ خالی یعنی "
+#                                     "بی‌نهایت")
+#            put_setting("device_price", toman(price) if price and toman(price) else "")
+#            put_setting("ip_changes_per_day", int(limit) if limit else "")
+#            return self.redirect("plans?m=ذخیره شد")
+#
+#        if rest == "user-devices":
+#            uid = int(one("id") or 0)
+#            n = number(one("devices"))
+#            if n is None or n != int(n) or not 1 <= n <= MAX_DEVICES:
+#                return self.redirect("users?m=!تعداد دستگاه باید از ۱ تا %d باشد" % MAX_DEVICES)
+#            with STORE.lock:
+#                u = STORE.db.execute("SELECT id FROM users WHERE id = ?", (uid,)).fetchone()
+#                if u:
+#                    set_devices(STORE.db, uid, int(n))
+#                STORE.db.commit()
+#            if not u:
+#                return self.redirect("users?m=!این کاربر پیدا نشد")
+#            return self.redirect("users?m=تعداد دستگاه ذخیره شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها")
+#
+#        if rest == "wallet-settings":
+#            put_setting("wallet_on", "1" if one("on") else "0")
+#            return self.redirect("pay?m=%s" % ("شارژ کیف پول باز شد" if one("on")
+#                                               else "شارژ کیف پول بسته شد"))
+#
+#        if rest == "ref-settings":
+#            pct = toman(one("percent"))
+#            if one("on") and (pct is None or not 1 <= pct <= 100):
+#                return self.redirect("pay?m=!درصد باید عددی از ۱ تا ۱۰۰ باشد")
+#            put_setting("ref_on", "1" if one("on") else "0")
+#            if pct is not None and 1 <= pct <= 100:
+#                put_setting("ref_percent", pct)
+#            put_setting("ref_mode", "first" if one("mode") == "first" else "every")
+#            return self.redirect("pay?m=%s" % (
+#                "دعوت از دوستان روشن شد: %d٪ از %s" % (
+#                    pct, "اولین خرید" if one("mode") == "first" else "هر خرید")
+#                if one("on") else "دعوت از دوستان خاموش شد"))
+#
+#        if rest == "wallet-adjust":
+#            uid = int(one("id") or 0)
+#            raw = one("amount").strip()
+#            sign = -1 if raw[:1] in ("-", "−") else 1
+#            amount = toman(raw.lstrip("+-−"))
+#            back = "wallet?u=%d&m=" % uid
+#            if not STORE.one("SELECT 1 FROM users WHERE id = ?", (uid,)):
+#                return self.redirect("users?m=!این کاربر پیدا نشد")
+#            if not amount or amount > TOPUP_MAX:
+#                return self.redirect(back + "!مبلغ درست نیست؛ مثلاً 50000 یا -50000")
+#            note = one("note").strip()[:200]
+#            with STORE.lock:
+#                balance = move_wallet(STORE.db, uid, sign * amount, "admin", note)
+#                STORE.db.commit()
+#            if balance is None:
+#                return self.redirect(back + "!موجودی کیف پول کمتر از این مبلغ است")
+#            emit("wallet.changed", uid, {
+#                "amount": sign * amount, "balance": balance,
+#                "text": "💰 %s تومان %s کیف پول شما %s.%s\nموجودی: %s تومان"
+#                        % (format(amount, ","), "به" if sign > 0 else "از",
+#                           "اضافه شد" if sign > 0 else "کم شد",
+#                           " (%s)" % note if note else "", format(balance, ","))})
+#            return self.redirect(back + "موجودی تازه: %s تومان" % format(balance, ","))
+#
 #        if rest == "pay-save":
 #            text = one("text").replace("\r\n", "\n").strip()
 #            if len(text) > PAY_TEXT_MAX:
 #                return self.redirect("pay?m=!حداکثر %d نویسه" % PAY_TEXT_MAX)
-#            STORE.run("INSERT INTO settings (key, value) VALUES ('pay_text', ?)"
-#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (text,))
+#            STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+#                      (pay_key(), text))
 #            return self.redirect("pay?m=%s" % (
 #                "اطلاعات پرداخت ذخیره شد؛ در پنل مشتری و ربات دیده می‌شود" if text
 #                else "اطلاعات پرداخت پاک شد"))
@@ -19087,13 +27483,174 @@ exit 0
 #    return "".join(out)
 #
 #
+## The panel's ready block lists (smartdns-panel's BLOCKLISTS): which a
+## template's page offers, and what they are called. The panel fetches and builds them.
+#BLOCKLISTS = (("ads", "📢", "تبلیغات و بدافزار",
+#               "تبلیغ‌های داخل سایت‌ها، اپ‌ها و بازی‌های موبایل، و دامنه‌های بدافزار — "
+#               "فهرست StevenBlack"),
+#              ("porn", "🔞", "پورن", "سایت‌های بزرگسالان — فهرست‌های Sinfonietta و "
+#                                     "Clefspeare13 از مجموعهٔ StevenBlack"))
+#
+#
+#def blocklist_state(name):
+#    """(mode or None, template ids, meta) of one ready list."""
+#    def js(key):
+#        row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#        try:
+#            return json.loads(row["value"]) if row and row["value"] else None
+#        except ValueError:
+#            return None
+#    scope = js("blocklist:" + name) or {}
+#    mode = scope.get("mode") if scope.get("mode") in ("all", "some") else None
+#    ids = [int(x) for x in scope.get("templates") or [] if str(x).isdigit()]
+#    return mode, ids, js("blocklist_meta:" + name) or {}
+#
+#
+#def load_blocks():
+#    """(sections, rows) of what a template can close."""
+#    try:
+#        with open(BLOCKS_FILE, encoding="utf-8") as fh:
+#            data = json.load(fh)
+#        return data.get("sections", []), data.get("blocks", [])
+#    except Exception:
+#        return [], []
+#
+#
+#BLOCK_SECTIONS, BLOCKS = [], []
+#
+#
+#def block_pick(tid):
+#    """(rows ticked, domains taken out of them) for a template."""
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", ("blocks:%d" % tid,))
+#    try:
+#        v = json.loads(row["value"]) if row and row["value"] else {}
+#    except ValueError:
+#        v = {}
+#    return set(v.get("on") or []), set(v.get("off") or [])
+#
+#
+#def list_state_text(mode, meta):
+#    """Where a ready list stands, in a few words."""
+#    if not mode:
+#        return ""
+#    if meta.get("sha"):
+#        return ("<span class='pill ok'>%s دامنه</span> <span class='muted'>به‌روز %s</span>"
+#                % (format(meta.get("count") or 0, ","),
+#                   html.escape((meta.get("fetched_at") or "")[:10])))
+#    if meta.get("error"):
+#        return ("<span class='pill bad'>دریافت نشد</span> <span class='muted'>%s — یک ساعت "
+#                "دیگر دوباره</span>" % html.escape(meta["error"][:80]))
+#    return "<span class='pill warn'>در حال دریافت…</span>"
+#
+#
+#def template_lists_card(t, p):
+#    """The foot of a template's page: what it closes for its customers - ad
+#    networks and adult sites row by row, domain by domain, drawn like the
+#    services above, and under each kind its full list."""
+#    on_rows, off = block_pick(t["id"])
+#    lists = {b[0]: b for b in BLOCKLISTS}
+#    out = ["<div class='card blocks'><h2>🚫 مسدودی‌ها</h2>"
+#           "<form method='post' action='/%s/template-blocklists'>"
+#           "<input type='hidden' name='id' value='%d'>"
+#           "<p class='muted'>تیک یعنی بسته: مشتری‌های این قالب نمی‌توانند آن دامنه‌ها را "
+#           "باز کنند (جواب «چنین سایتی وجود ندارد» می‌گیرند)، حتی اگر آن دامنه جزو سرویسی باشد "
+#           "که از رله می‌رود. کشو را باز کنید تا دامنه‌ها را ببینید و یکی‌یکی انتخاب کنید.</p>" % (p, t["id"])]
+#    for sec in BLOCK_SECTIONS:
+#        rows = [b for b in BLOCKS if b.get("section") == sec.get("key")]
+#        if not rows and sec.get("list") not in lists:
+#            continue
+#        out.append("<h3 class='sec'>%s</h3>" % html.escape(sec.get("label") or sec["key"]))
+#        for b in rows:
+#            doms = sorted(b.get("domains") or [])
+#            on = b["key"] in on_rows
+#            kept = [d for d in doms if d not in off]
+#            out.append(
+#                "<details class='svc blk'%s><summary>"
+#                "<label><input type='checkbox' name='bg' value='%s'%s> %s</label>"
+#                "<span class='muted count'>%d از %d دامنه</span>"
+#                "<span class='pick bpick'><button type='button' data-all='1'>همه</button>"
+#                "<button type='button' data-all='0'>هیچ‌کدام</button></span></summary>"
+#                "<div class='doms'>%s</div></details>"
+#                % (" open" if on and len(kept) != len(doms) else "",
+#                   html.escape(b["key"], quote=True), " checked" if on else "",
+#                   html.escape(b.get("label") or b["key"]), len(kept) if on else 0, len(doms),
+#                   "".join("<label><input type='checkbox' name='bd' value='%s'%s>"
+#                           "<span>%s</span></label>"
+#                           % (html.escape(d, quote=True),
+#                              " checked" if on and d not in off else "", html.escape(d))
+#                           for d in doms)))
+#        full = lists.get(sec.get("list"))
+#        if full:
+#            mode, ids, meta = blocklist_state(full[0])
+#            fon = mode == "all" or t["id"] in ids
+#            out.append("<label class='fulllist'><input type='checkbox' name='l' value='%s'%s>"
+#                       " <b>فهرست کامل %s</b> <span class='muted'>— %s؛ هر هفته به‌روز "
+#                       "می‌شود و فقط یک‌جا روشن یا خاموش می‌شود</span> %s</label>"
+#                       % (full[0], " checked" if fon else "", html.escape(full[2]),
+#                          html.escape(full[3]), list_state_text(mode if fon else None, meta)))
+#    out.append("<div style='margin-top:14px'><button>ذخیره</button></div></form>"
+#               "<p class='muted'>پنل فهرست کامل را از سازنده‌اش می‌گیرد، دامنه‌هایی را که خود "
+#               "سرویس لازم دارد یا از رله می‌روند از آن کنار می‌گذارد، و هر رله فقط یک بار "
+#               "دریافتش می‌کند؛ روشن شدنش چند دقیقه طول می‌کشد. توجه: بعضی بازی‌های موبایل "
+#               "برای دیدن تبلیغ جایزه می‌دهند؛ اگر تبلیغ بسته شود، آن جایزه هم دیگر نمی‌آید.</p>")
+#    out.append("""<script>
+#(function () {
+#  var card = document.querySelector('.card.blocks');
+#  if (!card) return;
+#  function count(d) {
+#    var boxes = d.querySelectorAll('.doms input');
+#    var on = d.querySelectorAll('.doms input:checked').length;
+#    var g = d.querySelector('summary input[name=bg]');
+#    d.querySelector('.count').textContent = (g.checked ? on : 0) + ' از ' + boxes.length + ' دامنه';
+#  }
+#  card.addEventListener('click', function (e) {
+#    var b = e.target.closest('.bpick button');
+#    if (b) {
+#      e.preventDefault();
+#      e.stopPropagation();
+#      var d = b.closest('details'), all = b.dataset.all === '1';
+#      d.querySelectorAll('.doms input').forEach(function (i) { i.checked = all; });
+#      d.querySelector('summary input[name=bg]').checked = all;
+#      return count(d);
+#    }
+#    if (e.target.matches('summary input[name=bg]')) {
+#      e.stopPropagation();
+#      var d3 = e.target.closest('details');
+#      var boxes = d3.querySelectorAll('.doms input');
+#      if (e.target.checked) {
+#        if (!d3.querySelectorAll('.doms input:checked').length)
+#          boxes.forEach(function (i) { i.checked = true; });
+#      } else {
+#        boxes.forEach(function (i) { i.checked = false; });
+#      }
+#      return count(d3);
+#    }
+#    if (e.target.matches('.doms input')) {
+#      var d2 = e.target.closest('details');
+#      if (e.target.checked) d2.querySelector('summary input[name=bg]').checked = true;
+#      count(d2);
+#    }
+#  });
+#})();
+#</script></div>""")
+#    return "".join(out)
+#
+#
+#def set_blocklist(name, mode, ids):
+#    if mode in ("all", "some") and (mode == "all" or ids):
+#        put_setting("blocklist:" + name, json.dumps(
+#            {"mode": mode, "templates": sorted(ids) if mode == "some" else []}))
+#    else:
+#        STORE.run("DELETE FROM settings WHERE key = ?", ("blocklist:" + name,))
+#
+#
 #def blocked_card(p):
 #    """The domains page's second card: names closed for every customer."""
 #    try:
 #        rows = STORE.q("SELECT * FROM blocked_domains ORDER BY added_at DESC")
 #    except sqlite3.OperationalError:
 #        return ""          # a panel that has not made the table yet
-#    out = ["<div class='card'><h2>دامنه‌های مسدود (%d)</h2>" % len(rows),
+#    out = ["<div class='card'><h2>مسدودی‌های دستی (%d)</h2>" % len(rows),
 #           "<form method='post' action='/%s/blocked-add' class='row' "
 #           "style='margin-bottom:14px'>"
 #           "<input name='domain' placeholder='example.com' style='min-width:220px'>"
@@ -19258,9 +27815,25 @@ exit 0
 #    CATALOGUE = load_catalogue()
 #    GAMES[:] = load_games()
 #    SECTIONS[:] = load_sections()
+#    BLOCK_SECTIONS[:], BLOCKS[:] = load_blocks()
 #    STORE = Store(DB)
+#    try:
+#        move_owner_name()
+#    except Exception as e:
+#        log(WARN, "owner's username not moved to admin.env: %r" % e)
 #    SEALED_CHECK.append(lambda: count_sealed(STORE.db))
 #    threading.Thread(target=bench_loop, daemon=True).start()
+#    threading.Thread(target=backup_loop, daemon=True).start()
+#    threading.Thread(target=update_check_loop, daemon=True).start()
+#    try:
+#        continue_after_self_upgrade()
+#    except Exception as e:
+#        log(WARN, "after the self-upgrade: %r" % e)
+#    if not one_server():
+#        try:
+#            apply_exit_tunnels()
+#        except Exception as e:
+#            log(WARN, "relay tunnels not checked: %r" % e)
 #    try:
 #        db_key()
 #    except Exception as e:
@@ -19316,6 +27889,7 @@ exit 0
 ## usage: smartdns-access                    show the address it answers on
 ##        smartdns-access port <number>      move it to another port
 ##        smartdns-access path [new]         change the secret path, or roll one
+##        smartdns-access username <name>    change the owner's username
 ##        smartdns-access password [new]     set a new password
 ##        smartdns-access rotate             new path and new password at once
 ##
@@ -19377,8 +27951,8 @@ exit 0
 #}
 #
 #show() {
-#    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n\n' \
-#        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)"
+#    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n        username: %s\n\n' \
+#        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)" "$(get ADMIN_USER)"
 #    printf '    The password is not stored, only a hash of it. If it is lost,\n'
 #    printf '    set a new one:  smartdns-access password\n\n'
 #}
@@ -19440,6 +28014,16 @@ exit 0
 #    fi
 #    set_key ADMIN_PATH "$new"
 #    printf '    the old address stops working now.\n'
+#    restart
+#    show
+#    ;;
+#
+#username)
+#    new="$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z')"
+#    printf '%s' "$new" | grep -Eq '^[a-z0-9._-]{3,32}$' \
+#        || die "usage: smartdns-access username <3 to 32 lower-case letters, digits, . - _>"
+#    set_key ADMIN_USER "$new"
+#    printf '    username is now %s\n' "$new"
 #    restart
 #    show
 #    ;;
@@ -20740,6 +29324,31 @@ exit 0
 #WantedBy=multi-user.target
 #__END_TUNNEL_SERVICE__
 
+#__BEGIN_TUNNEL_INSTANCE__
+#[Unit]
+#Description=doctor dns tunnel to %i (BackPack)
+#After=network-online.target
+#Wants=network-online.target
+#
+#[Service]
+## One per tunnel the admin panel set, named for its other end: on an exit or a
+## node, one per relay; on a relay, one per node. Started and stopped by the
+## admin panel or smartdns-sync. A relay's tunnel to the main exit, and the
+## first relay's when the installer made it, is smartdns-tunnel.service
+## instead. Each has its own directory: BackPack keeps its metrics beside its
+## config.
+## The listening end's firewall rule, when this exit is the one listening - a
+## reverse tunnel has none, and is not to log an error for it every start.
+#ExecStartPre=-/bin/sh -c '[ ! -f /etc/nftables.d/41-smartdns-tunnel-%i.conf ] || /usr/sbin/nft -f /etc/nftables.d/41-smartdns-tunnel-%i.conf'
+#ExecStart=/usr/local/lib/smart-dns/backpack -c /etc/smart-dns/relay-tunnels/%i/tunnel.toml
+#Restart=always
+#RestartSec=5
+#LimitNOFILE=65535
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_TUNNEL_INSTANCE__
+
 #__BEGIN_SMARTDNS_TUNNEL__
 ##!/bin/bash
 ## smartdns-tunnel - the tunnel between the relay and the exit: see it, stop it, start it.
@@ -21034,6 +29643,7 @@ exit 0
 #        'its address - forgot it? start here   (smartdns-access)|run smartdns-access' \
 #        'move it to another port   (smartdns-access port)|ask "new port" && run smartdns-access port "$REPLY"' \
 #        'a new secret path   (smartdns-access path)|sure "the old address stops working - go ahead?" && run smartdns-access path' \
+#        'the owner'"'"'s username   (smartdns-access username)|ask "new username" && run smartdns-access username "$REPLY"' \
 #        'a new password   (smartdns-access password)|run smartdns-access password' \
 #        'new path and new password at once   (smartdns-access rotate)|sure "the old address and password stop working - go ahead?" && run smartdns-access rotate'
 #}
@@ -21147,20 +29757,29 @@ exit 0
 #port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
 #case "$port" in ""|*[!0-9]*) port=8443 ;; esac
 #
+## The relays, and the other exits joined to this panel as nodes.
 #list="127.0.0.1"
-#for ip in $(sed -n 's/^RELAY_IP=//p' "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
-#    if valid_ip "$ip"; then list="$list, $ip"
-#    else echo "ignoring '$ip' in RELAY_IP - not an IPv4 address" >&2; fi
+#for key in RELAY_IP NODE_IP; do
+#    for ip in $(sed -n "s/^$key=//p" "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
+#        if valid_ip "$ip"; then list="$list, $ip"
+#        else echo "ignoring '$ip' in $key - not an IPv4 address" >&2; fi
+#    done
 #done
-#[ "$list" = "127.0.0.1" ] && echo "no relays in RELAY_IP - only this machine will reach 8443" >&2
+## A node has no panel and no API: only the rule on nginx's own connections.
+#api="        tcp dport $port ip saddr { $list } accept
+#        tcp dport $port drop"
+#if [ ! -f "$ETC/panel.env" ]; then
+#    api=""
+#elif [ "$list" = "127.0.0.1" ]; then
+#    echo "no relays in RELAY_IP - only this machine will reach 8443" >&2
+#fi
 #
 #rules="table inet smartdns_api
 #delete table inet smartdns_api
 #table inet smartdns_api {
 #    chain input {
 #        type filter hook input priority -5 ; policy accept ;
-#        tcp dport $port ip saddr { $list } accept
-#        tcp dport $port drop
+#$api
 #    }
 #    chain nginx_out {
 #        type filter hook output priority 0 ; policy accept ;
@@ -21182,7 +29801,8 @@ exit 0
 #    exit 0
 #fi
 #if printf '%s\n' "$rules" | "$NFT" -f -; then
-#    echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
+#    if [ -n "$api" ]; then echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
+#    else echo "nginx may not proxy to this machine or a private address"; fi
 #else
 #    echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 #fi
@@ -21608,6 +30228,8 @@ exit 0
 #        "pay": env.get("PAY_TEXT", "").strip().replace("\\n", "\n"),
 #        "support": env.get("SUPPORT_TEXT", "").strip().replace("\\n", "\n"),
 #        "telegram": env.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/"),
+#        # The language the bot speaks, set in the admin panel's bot page.
+#        "lang": "en" if env.get("BOT_LANG", "").strip() == "en" else "fa",
 #    }
 #    missing = [k for k in ("token", "api", "key") if not cfg[k]]
 #    if missing:
@@ -21624,9 +30246,12 @@ exit 0
 #B_SUPPORT = "🎫 پشتیبانی"
 #B_HELP = "❓ راهنما"
 #B_WEB = "🔑 پنل وب"
-#B_DOH = "🔒 DNS امن"
+#B_DNS = "📡 DNSها"
+#B_WALLET = "💰 کیف پول"
+#B_INVITE = "🎁 دعوت از دوستان"
 #B_CANCEL = "انصراف"
-#MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_DOH], [B_SUPPORT, B_WEB], [B_HELP]],
+#MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_WALLET, B_INVITE], [B_IP, B_DNS],
+#                     [B_SUPPORT, B_WEB], [B_HELP]],
 #        "resize_keyboard": True}
 #CANCEL = {"keyboard": [[B_CANCEL]], "resize_keyboard": True}
 #STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال ✅",
@@ -21643,6 +30268,21 @@ exit 0
 #        n /= 1024
 #
 #
+#def money(n):
+#    return format(n or 0, ",")
+#
+#
+#FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+#
+#
+#def typed_toman(text):
+#    """A sum as somebody typed it - Persian digits, commas - or None."""
+#    raw = re.sub(r"[\s,٬،]", "", (text or "").translate(FA_DIGITS))
+#    for word in ("تومان", "تومن"):
+#        raw = raw.replace(word, "")
+#    return int(raw) if raw.isdigit() and len(raw) < 16 else None
+#
+#
 #def image_type(blob):
 #    if blob[:3] == b"\xff\xd8\xff":
 #        return "image/jpeg"
@@ -21653,6 +30293,78 @@ exit 0
 #    if blob[:5] == b"%PDF-":
 #        return "application/pdf"
 #    return None
+#
+#
+## ---------------------------------------------------------------- English
+## The pages and the bot are written in Persian; English is the same text with
+## every Persian phrase swapped for its English, from one file the installer
+## ships (domains/i18n-en.json). A phrase is a piece of a Persian string in the
+## code, cut where a value goes in and at each tag - tools/i18n-extract.py lists
+## them. What somebody typed - a name, a note - is left as they wrote it.
+#I18N_FILE = os.environ.get("I18N_FILE", "/usr/local/share/smart-dns/i18n-en.json")
+#I18N = {}
+#
+#
+#def english_index():
+#    """The phrases by their first two characters, longest first."""
+#    if "index" not in I18N:
+#        try:
+#            with open(I18N_FILE, encoding="utf-8") as fh:
+#                pairs = json.load(fh)
+#        except (OSError, ValueError):
+#            pairs = {}
+#        index = {}
+#        for k, v in pairs.items():
+#            if len(k) >= 2 and isinstance(v, str):
+#                # Plain text only: the English goes into attributes and
+#                # script strings quoted either way.
+#                v = v.replace("'", "\u2019").replace('"', "\u201d")
+#                index.setdefault(k[:2], []).append((k, v))
+#        for bucket in index.values():
+#            bucket.sort(key=lambda kv: -len(kv[0]))
+#        I18N["index"] = index
+#    return I18N["index"]
+#
+#
+#def fa_letter(c):
+#    """Part of a Persian word: a letter or a mark on one, not the comma,
+#    the semicolon or a digit - "نشد؛" ends a word at the "؛"."""
+#    return "\u0621" <= c <= "\u065f" or "\u066e" <= c <= "\u06d3" or c == "\u200c"
+#
+#
+#def to_english(text):
+#    """`text` with every known Persian phrase in English. A phrase is only
+#    taken whole - never the front of a longer Persian word."""
+#    index = english_index()
+#    if not index or not text or not any("\u0600" <= c <= "\u06ff" for c in text):
+#        return text
+#    out, last, i, n = [], 0, 0, len(text)
+#    while i < n:
+#        bucket = index.get(text[i:i + 2])
+#        if bucket and not (fa_letter(text[i]) and i and fa_letter(text[i - 1])):
+#            for k, v in bucket:
+#                end = i + len(k)
+#                if text.startswith(k, i) and not (
+#                        fa_letter(k[-1]) and end < n and fa_letter(text[end])):
+#                    out.append(text[last:i])
+#                    out.append(v)
+#                    i = last = end
+#                    break
+#            else:
+#                i += 1
+#            continue
+#        i += 1
+#    out.append(text[last:])
+#    # What is left - the quote marks around a name, a digit - in English form.
+#    return "".join(out).translate(ENGLISH_MARKS)
+#
+#
+#ENGLISH_MARKS = str.maketrans({"\u00ab": "\u201c", "\u00bb": "\u201d", "\u060c": ",",
+#                               "\u061b": ";", "\u061f": "?", "\u066a": "%",
+#                               **{chr(0x06f0 + i): str(i) for i in range(10)},
+#                               **{chr(0x0660 + i): str(i) for i in range(10)}})
+#
+#
 #
 #
 #class ApiError(Exception):
@@ -21747,6 +30459,15 @@ exit 0
 #        self.panel = panel or Panel(cfg)
 #        self.tg = telegram or Telegram(cfg)
 #        self.state = {}          # chat id -> (what we wait for, details)
+#        # In English, the keyboard's buttons come back as their English: the
+#        # way back to the Persian the rest of this file compares with.
+#        self.en = cfg.get("lang") == "en"
+#        self.back = {}
+#        if self.en:
+#            for label in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_SUPPORT, B_HELP, B_WEB,
+#                          B_DNS,
+#                          B_CANCEL):
+#                self.back[to_english(label)] = label
 #        self.known = set()       # telegram ids the panel already has an account for
 #        self.seen = []           # recent webhook ids, so a repeat is dropped
 #        self.lock = threading.Lock()
@@ -21755,7 +30476,22 @@ exit 0
 #    def is_admin(self, uid):
 #        return uid in self.cfg["admins"]
 #
+#    def t(self, text):
+#        return to_english(text) if self.en else text
+#
+#    def t_markup(self, markup):
+#        """A keyboard with its buttons' words in the bot's language."""
+#        if not self.en or not markup:
+#            return markup
+#        out = dict(markup)
+#        for key in ("keyboard", "inline_keyboard"):
+#            if key in out:
+#                out[key] = [[dict(b, text=self.t(b["text"])) if isinstance(b, dict)
+#                             else self.t(b) for b in row] for row in out[key]]
+#        return out
+#
 #    def say(self, chat, text, markup=None):
+#        text, markup = self.t(text), self.t_markup(markup)
 #        try:
 #            self.tg.send(chat, text, markup)
 #        except Exception as e:
@@ -21790,6 +30526,7 @@ exit 0
 #    def on_message(self, msg):
 #        chat, sender = msg["chat"]["id"], msg["from"]
 #        text = (msg.get("text") or "").strip()
+#        text = self.back.get(text, text)
 #        if text == B_CANCEL or text == "/cancel":
 #            self.state.pop(chat, None)
 #            return self.say(chat, "لغو شد.", MENU)
@@ -21803,14 +30540,24 @@ exit 0
 #            return self.got_name(chat, sender, text)
 #        if waiting == "onb_user":
 #            return self.got_username(chat, sender, text, extra)
-#        if text == "/doh":
-#            text = B_DOH
-#        if text in (B_ACCOUNT, B_BUY, B_IP, B_DOH, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
+#        if text in ("/doh", "/dns"):
+#            text = B_DNS
+#        if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
+#                and not self.ready(chat, sender):
 #            return
 #        if waiting == "ip":
 #            return self.got_ip(chat, sender, text)
 #        if waiting == "receipt":
 #            return self.got_receipt(chat, sender, msg, extra)
+#        if waiting == "topup_amount":
+#            return self.got_topup_amount(chat, sender, text)
+#        if waiting == "topup_receipt":
+#            return self.got_receipt(chat, sender, msg, None, topup=extra)
+#        if waiting == "code":
+#            self.state.pop(chat, None)
+#            return self.chose_plan(chat, sender, extra, code=text.strip()[:32])
+#        if waiting == "device_receipt":
+#            return self.got_receipt(chat, sender, msg, None, device=True)
 #        if waiting == "ticket_subject" and text:
 #            self.state[chat] = ("ticket_body", text[:80])
 #            return self.say(chat, "متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):",
@@ -21826,12 +30573,16 @@ exit 0
 #            return self.show_account(chat, sender)
 #        if text == B_BUY:
 #            return self.show_plans(chat, sender)
+#        if text == B_WALLET:
+#            return self.show_wallet(chat, sender)
+#        if text == B_INVITE:
+#            return self.show_invite(chat, sender)
 #        if text == B_IP:
 #            return self.ip_help(chat, sender)
 #        if text == B_WEB:
 #            return self.show_web(chat, sender)
-#        if text == B_DOH:
-#            return self.show_doh(chat, sender)
+#        if text == B_DNS:
+#            return self.show_dns(chat, sender)
 #        if text == B_SUPPORT:
 #            return self.show_tickets(chat, sender)
 #        if text == B_HELP:
@@ -21850,6 +30601,16 @@ exit 0
 #                                "کنید، کد بازیابی همین‌جا می‌آید.", MENU)
 #            except ApiError as e:
 #                return self.say(chat, "⚠️ " + str(e), MENU)
+#        if arg.startswith("ref_") and sender["id"] not in self.known:
+#            # Somebody's invitation link. The account is opened now, with it:
+#            # the panel writes down the inviter only for an account it opens.
+#            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#            try:
+#                self.panel.call("POST", "/users", {"telegram_id": sender["id"],
+#                                                   "name": name[:60], "ref": arg[4:20]})
+#                self.known.add(sender["id"])
+#            except ApiError as e:
+#                log("invitation start failed: %s" % e)
 #        return self.say(chat, "سلام! 👋 به ربات خوش آمدید.\n\n" + self.help_text(), MENU)
 #
 #    # -- a web sign-in for everybody who comes through the bot ----------------
@@ -21921,39 +30682,79 @@ exit 0
 #                 {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
 #                                       {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 #
-#    def show_doh(self, chat, sender):
-#        """The customer's personal encrypted-DNS addresses. The panel sends
-#        them only once a relay has DoH on; the iPhone profile is on the web
-#        page, which is what the login button is for."""
+#    def show_dns(self, chat, sender):
+#        """Every way to use the service, in one message: the plain DNS
+#        addresses, and the personal DoH and DoT ones once a relay has them.
+#        The iPhone profile is on the web page, which is what the login button
+#        is for."""
 #        u = self.account(sender)
+#        lines = ["📡 DNSهای شما", ""]
+#        servers = u.get("servers") or []
+#        if servers:
+#            return self.show_servers(chat, u, servers)
+#        if u["dns"]:
+#            lines.append("🌐 DNS معمولی — در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را "
+#                         "روی یکی از این‌ها بگذارید:")
+#            lines.extend(u["dns"])
+#        else:
+#            lines.append("🌐 آدرس DNS معمولی هنوز آماده نیست؛ کمی بعد دوباره بزنید.")
 #        doh = u.get("doh")
-#        if not doh:
-#            return self.say(chat, "🔒 DNS امن هنوز روی این سرویس فعال نیست. از DNS معمولی "
-#                            "(«حساب من») استفاده کنید.", MENU)
-#        lines = ["🔒 DNS امن (رمزگذاری‌شده)",
-#                 "برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند. مثل DNS معمولی "
-#                 "فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید.",
-#                 "",
-#                 "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان:",
-#                 doh["dot_host"],
-#                 "",
-#                 "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما:",
-#                 doh["url"],
-#                 "",
-#                 "پروفایل آماده‌ی آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است.",
-#                 "این آدرس مخصوص حساب شماست؛ آن را به کسی ندهید."]
+#        buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
+#        if doh:
+#            lines += ["",
+#                      "🔒 DNS امن (رمزگذاری‌شده)",
+#                      "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):",
+#                      doh["dot_host"],
+#                      "",
+#                      "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):",
+#                      doh["url"],
+#                      "",
+#                      "پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+#                      "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
+#            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+#        lines.append("")
+#        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
 #        if not u["ips"]:
-#            lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
-#        self.say(chat, "\n".join(lines),
-#                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"},
-#                                       {"text": "🔄 آدرس تازه", "callback_data": "dohnew"}]]})
+#            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
+#
+#    def show_servers(self, chat, u, servers):
+#        """One block per server the customer is given: its plain DNS, and
+#        its DoT and DoH once it has them - so when one is filtered, another
+#        is right there."""
+#        lines = ["📡 DNSهای شما", "",
+#                 "در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی آدرس یکی از این "
+#                 "سرورها بگذارید. اگر یکی کند یا فیلتر شد، سراغ دیگری بروید."]
+#        with_doh = False
+#        for s in servers:
+#            lines += ["", "%s %s %d%s" % ("🌍" if s.get("single") else "🌐",
+#                                          "تک‌سرور" if s.get("single") else "سرور", s["n"],
+#                                          " — %s" % s["note"] if s.get("note") else ""),
+#                      "DNS: %s" % s["ip"]]
+#            if s.get("dot"):
+#                with_doh = True
+#                lines += ["DoT (اندروید ← DNS خصوصی): %s" % s["dot"],
+#                          "DoH (آیفون، ویندوز، مرورگر): %s" % s["doh"]]
+#        lines.append("")
+#        if with_doh:
+#            lines.append("پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+#                         "آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.")
+#        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
+#        if not u["ips"]:
+#            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
+#        buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
+#        if with_doh:
+#            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
 #                "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
+#                "💰 کیف پول: موجودی و شارژ\n"
+#                "🎁 دعوت از دوستان: لینک دعوت و پورسانت\n"
 #                "🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند\n"
 #                "🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی\n"
-#                "🔒 DNS امن: آدرس DoH و DoT، برای وقتی اپراتور DNS را دست‌کاری می‌کند\n"
+#                "📡 DNSها: آدرس DNS معمولی، DoH و DoT\n"
 #                "🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه\n\n"
 #                "حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را "
 #                "همین‌جا بفرستید." + ("\n\n" + self.cfg["support"] if self.cfg["support"] else ""))
@@ -21975,9 +30776,31 @@ exit 0
 #        if u["dns"]:
 #            lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
 #                         "بگذارید." % u["dns"][0])
+#        if (u.get("max_ips") or 1) > 1:
+#            lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
 #        if u["receipt_waiting"]:
 #            lines.append("\n⏳ یک رسید در انتظار بررسی دارید.")
+#        offer = u.get("device_offer")
+#        if offer and offer.get("available"):
+#            return self.say(chat, "\n".join(lines), {"inline_keyboard": [[
+#                {"text": "📱 دستگاه اضافه — %s تومان" % money(offer["price"]),
+#                 "callback_data": "dev"}]]})
 #        self.say(chat, "\n".join(lines), MENU)
+#
+#    def show_device(self, chat, sender):
+#        u = self.account(sender)
+#        offer = u.get("device_offer")
+#        if not offer:
+#            return self.say(chat, "دستگاه اضافه فروخته نمی‌شود.", MENU)
+#        if not offer.get("available"):
+#            return self.say(chat, "⚠️ %s" % offer.get("why"), MENU)
+#        rows = []
+#        if (u.get("wallet") or 0) >= offer["price"]:
+#            rows.append([{"text": "💰 پرداخت از کیف پول", "callback_data": "dwb"}])
+#        rows.append([{"text": "🧾 پرداخت با رسید", "callback_data": "drc"}])
+#        self.say(chat, "📱 دستگاه اضافه\nالان %d دستگاه دارید؛ هر دستگاه اضافه %s تومان، تا "
+#                 "وقتی همین پلن را تمدید کنید." % (offer["devices"], money(offer["price"])),
+#                 {"inline_keyboard": rows})
 #
 #    def show_plans(self, chat, sender):
 #        u = self.account(sender)
@@ -21993,8 +30816,9 @@ exit 0
 #            return self.say(chat, "فعلاً پلنی برای فروش نیست. با پشتیبانی در تماس باشید.", MENU)
 #        for p in plans:
 #            size = size_fa(p["quota_bytes"]) if p["quota_bytes"] else "نامحدود"
-#            rows.append([{"text": "%s · %s · %d روز · %s تومان"
-#                          % (p["name"], size, p["days"], format(p["price"], ",")),
+#            dev = " · %d دستگاه" % p["devices"] if (p.get("devices") or 1) > 1 else ""
+#            rows.append([{"text": "%s · %s · %d روز%s · %s تومان"
+#                          % (p["name"], size, p["days"], dev, format(p["price"], ",")),
 #                          "callback_data": "buy:%d" % p["id"]}])
 #        notes = "\n".join("• %s (%s): %s" % (p["name"], p["template"], p["note"])
 #                          for p in plans if p.get("note"))
@@ -22019,9 +30843,17 @@ exit 0
 #            line += " و %d بازی دیگر" % rest
 #        return "\n\n🎮 شامل: " + line
 #
-#    def chose_plan(self, chat, sender, plan_id):
+#    def chose_plan(self, chat, sender, plan_id, code=""):
 #        sale = self.panel.call("GET", "/plans")
 #        plans = {p["id"]: p for p in sale["plans"]}
+#        if code:
+#            # The plans' prices after the code, as the panel reckons them.
+#            try:
+#                found = self.panel.call("POST", "/users/%d/discount" % sender["id"],
+#                                        {"code": code})
+#                plans = {p["id"]: p for p in found["plans"]}
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ %s" % e, MENU)
 #        # What the admin panel says, first: changing the card there changes it
 #        # here at once. PAY_TEXT is only for a panel that has none set.
 #        pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
@@ -22035,14 +30867,88 @@ exit 0
 #                    "و باقی‌ماندهٔ پلن فعلی از بین می‌رود." % u["plan"]["name"])
 #        elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
 #            warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
-#        self.state[chat] = ("receipt", plan_id)
-#        self.say(chat, "پلن «%s» — %s تومان%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
-#                 "بفرستید." % (plan["name"], format(plan["price"], ","),
+#        self.state[chat] = ("receipt", (plan_id, code) if code else plan_id)
+#        price = ("%s تومان (به‌جای %s، با کد %s)" % (format(plan["price"], ","),
+#                                                  format(plan["list_price"], ","), code)
+#                 if code and plan.get("list_price") else "%s تومان" % format(plan["price"], ","))
+#        self.say(chat, "پلن «%s» — %s%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+#                 "بفرستید." % (plan["name"], price,
 #                               self.plan_games(plan), warn,
 #                               pay or "برای روش پرداخت با پشتیبانی تماس بگیرید."),
 #                 CANCEL)
+#        wallet = u.get("wallet") or 0
+#        rows = []
+#        if wallet >= plan["price"] > 0:
+#            rows.append([{"text": "💰 پرداخت از کیف پول (موجودی %s تومان)" % money(wallet),
+#                          "callback_data": ("wbuy:%d:%s" % (plan_id, code))[:64]
+#                          if code else "wbuy:%d" % plan_id}])
+#        elif wallet > 0:
+#            self.say(chat, "💰 موجودی کیف پولتان %s تومان است؛ برای این پلن %s تومان کم "
+#                     "دارید." % (money(wallet), money(plan["price"] - wallet)))
+#        if not code:
+#            rows.append([{"text": "🏷 کد تخفیف دارم", "callback_data": "code:%d" % plan_id}])
+#        if rows:
+#            self.say(chat, "یا:", {"inline_keyboard": rows})
 #
-#    def got_receipt(self, chat, sender, msg, plan_id):
+#    def show_wallet(self, chat, sender):
+#        self.account(sender)
+#        w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
+#        lines = ["💰 کیف پول", "موجودی: %s تومان" % money(w["balance"])]
+#        if w.get("moves"):
+#            lines.append("")
+#            for m in w["moves"][:8]:
+#                lines.append("%s %s%s تومان — %s%s" % (
+#                    (m.get("at") or "")[:10], "+" if m["amount"] > 0 else "−",
+#                    money(abs(m["amount"])), m.get("what") or "",
+#                    " (%s)" % m["note"] if m.get("note") else ""))
+#        rows = []
+#        if w.get("wallet_on"):
+#            rows.append([{"text": "➕ شارژ کیف پول", "callback_data": "topup"}])
+#        if w["balance"] > 0:
+#            rows.append([{"text": "🛒 خرید پلن", "callback_data": "plans"}])
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else MENU)
+#
+#    def show_invite(self, chat, sender):
+#        """The customer's invitation links, while inviting pays - their own
+#        button, so the wallet is only about money."""
+#        self.account(sender)
+#        ref = self.panel.call("GET", "/users/%d/wallet" % sender["id"]).get("ref")
+#        if not ref or not (ref.get("bot_link") or ref.get("web_link")):
+#            return self.say(chat, "🎁 دعوت از دوستان فعلاً فعال نیست.", MENU)
+#        lines = ["🎁 دعوت از دوستان",
+#                 "هر کس با لینک شما حساب بسازد و پلن بخرد، %d٪ مبلغ %s به کیف پول شما "
+#                 "اضافه می‌شود." % (ref["percent"], "اولین خریدش"
+#                                    if ref.get("mode") == "first" else "هر خریدش")]
+#        if ref.get("bot_link"):
+#            lines += ["", "🤖 لینک ربات:", ref["bot_link"]]
+#        if ref.get("web_link"):
+#            lines += ["", "🌐 لینک ثبت‌نام در سایت:", ref["web_link"]]
+#        lines += ["", "تا حالا %d نفر با لینک شما آمده‌اند و %s تومان پورسانت گرفته‌اید."
+#                  % (ref.get("invited") or 0, money(ref.get("earned")))]
+#        self.say(chat, "\n".join(lines), MENU)
+#
+#    def ask_topup(self, chat, sender):
+#        w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
+#        if not w.get("wallet_on"):
+#            return self.say(chat, "شارژ کیف پول فعلاً بسته است.", MENU)
+#        self.state[chat] = ("topup_amount", None)
+#        self.say(chat, "چقدر می‌خواهید شارژ کنید؟ مبلغ را به تومان بنویسید (حداقل %s):"
+#                 % money(w.get("topup_min")), CANCEL)
+#
+#    def got_topup_amount(self, chat, sender, text):
+#        amount = typed_toman(text)
+#        sale = self.panel.call("GET", "/plans")
+#        least, most = sale.get("topup_min") or 0, sale.get("topup_max") or 10 ** 12
+#        if amount is None or not least <= amount <= most:
+#            return self.say(chat, "⚠️ مبلغ را به تومان و با عدد بنویسید، بین %s و %s."
+#                            % (money(least), money(most)), CANCEL)
+#        pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
+#        self.state[chat] = ("topup_receipt", amount)
+#        self.say(chat, "شارژ کیف پول — %s تومان\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+#                 "بفرستید." % (money(amount), pay or "برای روش پرداخت با پشتیبانی تماس "
+#                                                     "بگیرید."), CANCEL)
+#
+#    def got_receipt(self, chat, sender, msg, plan_id, topup=None, device=False):
 #        file_id = None
 #        if msg.get("photo"):
 #            file_id = msg["photo"][-1]["file_id"]
@@ -22057,10 +30963,17 @@ exit 0
 #        kind = image_type(blob)
 #        if not kind or len(blob) > MAX_FILE:
 #            return self.say(chat, "⚠️ فقط عکس (JPG، PNG، WEBP) یا PDF تا ۴ مگابایت.", CANCEL)
+#        code = ""
+#        if isinstance(plan_id, tuple):
+#            plan_id, code = plan_id
 #        # One key per Telegram message: a retry after a timeout is the same receipt.
-#        res = self.panel.call("POST", "/users/%d/receipts" % sender["id"],
-#                              {"plan_id": plan_id, "content_type": kind,
-#                               "data": base64.b64encode(blob).decode()},
+#        body = {"plan_id": plan_id, "code": code, "content_type": kind,
+#                "data": base64.b64encode(blob).decode()}
+#        if topup:
+#            body = dict(body, plan_id=None, kind="topup", amount=topup)
+#        if device:
+#            body = dict(body, plan_id=None, kind="device")
+#        res = self.panel.call("POST", "/users/%d/receipts" % sender["id"], body,
 #                              idem="receipt-%d-%d" % (sender["id"], msg["message_id"]))
 #        self.state.pop(chat, None)
 #        self.say(chat, "✅ " + res["message"], MENU)
@@ -22073,8 +30986,7 @@ exit 0
 #        except ApiError as e:
 #            return self.say(chat, "⚠️ %s\nدوباره بفرستید یا «انصراف»." % e, CANCEL)
 #        self.state.pop(chat, None)
-#        self.say(chat, "✅ %s\n\nDNS را روی %s بگذارید." % (
-#            res["message"], res["user"]["dns"][0] if res["user"]["dns"] else "آدرس سرویس"), MENU)
+#        self.say(chat, "✅ %s" % res["message"], MENU)
 #
 #    def show_tickets(self, chat, sender):
 #        self.account(sender)
@@ -22134,6 +31046,39 @@ exit 0
 #            return self.chose_plan(chat, sender, int(arg))
 #        if kind == "plans":
 #            return self.show_plans(chat, sender)
+#        if kind == "topup":
+#            return self.ask_topup(chat, sender)
+#        if kind == "dev":
+#            return self.show_device(chat, sender)
+#        if kind == "dwb":
+#            try:
+#                res = self.panel.call("POST", "/users/%d/devices/buy" % sender["id"])
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ %s" % e, MENU)
+#            return self.say(chat, res["message"], MENU)
+#        if kind == "drc":
+#            sale = self.panel.call("GET", "/plans")
+#            pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
+#            self.state[chat] = ("device_receipt", None)
+#            return self.say(chat, "📱 دستگاه اضافه — %s تومان\n\n%s\n\nبعد از واریز، عکس رسید "
+#                            "را همین‌جا بفرستید." % (money(sale.get("device_price")),
+#                                                   pay or "برای روش پرداخت با پشتیبانی تماس "
+#                                                          "بگیرید."), CANCEL)
+#        if kind == "code":
+#            self.state[chat] = ("code", int(arg))
+#            return self.say(chat, "کد تخفیف را بنویسید:", CANCEL)
+#        if kind == "wbuy":
+#            self.state.pop(chat, None)
+#            pid, _, code = arg.partition(":")
+#            try:
+#                res = self.panel.call("POST", "/users/%d/wallet/buy" % sender["id"],
+#                                      {"plan_id": int(pid), "code": code})
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ %s" % e, MENU)
+#            self.say(chat, res["message"], MENU)
+#            if not res["user"]["ips"]:
+#                return self.ip_help(chat, sender)
+#            return None
 #        if kind == "login":
 #            link = self.login_button(sender)
 #            return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
@@ -22143,7 +31088,7 @@ exit 0
 #            self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
 #            self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
 #                     "این را روی دستگاه‌هایتان بگذارید:")
-#            return self.show_doh(chat, sender)
+#            return self.show_dns(chat, sender)
 #        if kind == "newpw":
 #            res = self.panel.call("POST", "/users/%d/password" % sender["id"])
 #            return self.say(chat, "🔄 رمز تازهٔ پنل: %s\nنام کاربری: %s\n\nهر جا با رمز قبلی "
@@ -22176,7 +31121,8 @@ exit 0
 #            return self.say(chat, "رسیدی در انتظار نیست.")
 #        for r in receipts[:10]:
 #            self.post_receipt(chat, r["id"], "رسید از %s%s — %s تومان" % (
-#                r["user"]["label"], " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
+#                r["user"]["label"], " برای شارژ کیف پول" if r.get("kind") == "topup"
+#                else " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
 #                format(r["amount"], ",")))
 #
 #    def post_receipt(self, chat, rid, caption):
@@ -22184,7 +31130,8 @@ exit 0
 #                                        {"text": "❌ رد", "callback_data": "no:%d" % rid}]]}
 #        try:
 #            pic = self.panel.call("GET", "/admin/receipts/%d/image" % rid)
-#            self.tg.photo(chat, base64.b64decode(pic["data"]), caption, buttons)
+#            self.tg.photo(chat, base64.b64decode(pic["data"]), self.t(caption),
+#                          self.t_markup(buttons))
 #        except ApiError:
 #            self.say(chat, caption, buttons)
 #
@@ -22249,6 +31196,9 @@ exit 0
 #        chat = ev.get("telegram_id")
 #        if not chat or not text:
 #            return
+#        if kind == "broadcast":
+#            # One of many: a pace Telegram accepts from one bot.
+#            time.sleep(0.05)
 #        markup = None
 #        if kind == "ticket.answered":
 #            markup = {"inline_keyboard": [[{"text": "✍️ جواب",
@@ -22360,6 +31310,28 @@ exit 0
 #[Install]
 #WantedBy=multi-user.target
 #__END_BOT_SERVICE__
+
+#__BEGIN_BOT_SELLER_SERVICE__
+#[Unit]
+#Description=doctor-dns Telegram bot of reseller %i
+#After=network-online.target
+#Wants=network-online.target
+#
+#[Service]
+#Type=simple
+#EnvironmentFile=/etc/doctor-dns-bot-%i.env
+#ExecStart=/usr/bin/python3 /usr/local/bin/doctor-dns-bot
+#Restart=always
+#RestartSec=10
+#DynamicUser=yes
+#NoNewPrivileges=yes
+#ProtectSystem=strict
+#ProtectHome=yes
+#PrivateTmp=yes
+#
+#[Install]
+#WantedBy=multi-user.target
+#__END_BOT_SELLER_SERVICE__
 
 #__BEGIN_SMARTDNS_BOT_LOGS__
 ##!/bin/bash
@@ -26760,6 +35732,2168 @@ exit 0
 #  ]
 #}
 #__END_GAMES__
+
+#__BEGIN_BLOCKS__
+#{
+#  "sections": [
+#    {"key": "ads", "label": "📢 تبلیغات", "list": "ads"},
+#    {"key": "porn", "label": "🔞 پورن", "list": "porn"}
+#  ],
+#  "blocks": [
+#    {"key": "google-ads", "label": "Google Ads و AdMob", "section": "ads",
+#     "domains": ["2mdn.net", "admob.com", "adservice.google.com", "doubleclick.net",
+#                 "googleadservices.com", "googlesyndication.com", "googletagservices.com"]},
+#    {"key": "meta-ads", "label": "متا (فیسبوک) Audience Network", "section": "ads",
+#     "domains": ["an.facebook.com"]},
+#    {"key": "unity-ads", "label": "Unity Ads", "section": "ads",
+#     "domains": ["unityads.unity.cn", "unityads.unity3d.com"]},
+#    {"key": "applovin", "label": "AppLovin", "section": "ads",
+#     "domains": ["applovin.com", "applvn.com", "safedk.com"]},
+#    {"key": "ironsource", "label": "ironSource", "section": "ads",
+#     "domains": ["ironsource.mobi", "ironsrc.com", "ironsrc.mobi", "supersonicads.com"]},
+#    {"key": "vungle", "label": "Vungle و Liftoff", "section": "ads",
+#     "domains": ["liftoff.io", "vungle.com"]},
+#    {"key": "chartboost", "label": "Chartboost", "section": "ads",
+#     "domains": ["chartboost.com"]},
+#    {"key": "adcolony", "label": "AdColony", "section": "ads",
+#     "domains": ["adcolony.com"]},
+#    {"key": "mintegral", "label": "Mintegral", "section": "ads",
+#     "domains": ["mintegral.com", "mtgglobals.com", "rayjump.com"]},
+#    {"key": "pangle", "label": "Pangle (تبلیغات تیک‌تاک)", "section": "ads",
+#     "domains": ["pangle.io", "pangolin-sdk-toutiao-b.com", "pangolin-sdk-toutiao.com"]},
+#    {"key": "inmobi", "label": "InMobi", "section": "ads",
+#     "domains": ["inmobi.com", "inmobicdn.net"]},
+#    {"key": "yandex-ads", "label": "تبلیغات یاندکس", "section": "ads",
+#     "domains": ["adfox.ru", "an.yandex.ru", "yandexadexchange.net"]},
+#    {"key": "amazon-ads", "label": "تبلیغات آمازون", "section": "ads",
+#     "domains": ["amazon-adsystem.com"]},
+#    {"key": "criteo", "label": "Criteo", "section": "ads",
+#     "domains": ["criteo.com", "criteo.net"]},
+#    {"key": "native", "label": "Taboola و Outbrain", "section": "ads",
+#     "domains": ["outbrain.com", "taboola.com"]},
+#    {"key": "popups", "label": "پاپ‌آپ‌ها (سایت‌های دانلود)", "section": "ads",
+#     "domains": ["adcash.com", "adsterra.com", "popads.net", "propellerads.com"]},
+#    {"key": "adult-ads", "label": "تبلیغات بزرگسالان", "section": "ads",
+#     "domains": ["exoclick.com", "trafficjunky.com", "trafficjunky.net"]},
+#    {"key": "iran-ads", "label": "تبلیغات ایرانی — تپسل، عدیوری، یکتانت، صباویژن، مدیا‌اد", "section": "ads",
+#     "domains": ["adivery.com", "mediaad.org", "sabavision.com", "tapsell.ir", "yektanet.com"]},
+#
+#    {"key": "pornhub", "label": "Pornhub", "section": "porn",
+#     "domains": ["phncdn.com", "pornhub.com", "pornhub.org", "pornhubpremium.com"]},
+#    {"key": "xvideos", "label": "XVideos و XNXX", "section": "porn",
+#     "domains": ["xnxx-cdn.com", "xnxx.com", "xvideos-cdn.com", "xvideos.com"]},
+#    {"key": "xhamster", "label": "xHamster", "section": "porn",
+#     "domains": ["xhamster.com", "xhamsterlive.com", "xhcdn.com"]},
+#    {"key": "redtube", "label": "RedTube، YouPorn و Tube8", "section": "porn",
+#     "domains": ["rdtcdn.com", "redtube.com", "t8cdn.com", "tube8.com", "youporn.com",
+#                 "ypncdn.com"]},
+#    {"key": "spankbang", "label": "SpankBang", "section": "porn",
+#     "domains": ["sb-cd.com", "spankbang.com"]},
+#    {"key": "tubes", "label": "سایت‌های دیگر ویدیو", "section": "porn",
+#     "domains": ["beeg.com", "eporner.com", "porn.com", "tnaflix.com", "youjizz.com"]},
+#    {"key": "studios", "label": "استودیوها", "section": "porn",
+#     "domains": ["brazzers.com"]},
+#    {"key": "onlyfans", "label": "OnlyFans", "section": "porn",
+#     "domains": ["onlyfans.com"]},
+#    {"key": "cams", "label": "وب‌کم زنده", "section": "porn",
+#     "domains": ["bongacams.com", "chaturbate.com", "highwebmedia.com", "livejasmin.com",
+#                 "stripchat.com"]},
+#    {"key": "hentai", "label": "انیمه و هنتای", "section": "porn",
+#     "domains": ["e-hentai.org", "hanime.tv", "nhentai.net", "rule34.xxx"]}
+#  ]
+#}
+#__END_BLOCKS__
+
+#__BEGIN_I18N_EN__
+#{
+#"(با": "(with",
+#"(خالی = همین بماند)": "(empty = keep it)",
+#"(خاموش)": "(off)",
+#"(روشن)": "(on)",
+#"(صفحهٔ API)": "(the API page)",
+#"(فایل رسید عکس نبود؛ در پنل ببینید)": "(The receipt file was not a picture; see it in the panel)",
+#"(فعال": "(active",
+#"(فعلی: ...": "(current: ...",
+#"(پلن فعلی — تمدید)": "(current plan — renewal)",
+#"(پیش‌فرض)": "(default)",
+#"(چیزی نیست)": "(nothing)",
+#"(۱۵ دقیقه بعد دوباره امتحان می‌شود)": "(tried again in 15 minutes)",
+#") اشاره نمی‌کند؛ الان:": "); it points at:",
+#") با رمز بکاپش باز می‌شود.": ") opens with its backup password.",
+#") روی این سرور نیست، ولی": ") is not on this server, but",
+#"). با رمز بکاپ باز می‌شود؛ برای بازگردانی در صفحهٔ «تنظیمات» بفرستیدش.": "). It opens with the backup password; to restore, upload it on the “Settings” page.",
+#". با موجودی کیف پول، پلن را از بخش «خرید یا تمدید» بدون رسید و فوری بخرید.": ". With your wallet balance, buy a plan instantly and with no receipt from “Buy or renew”.",
+#". جدول هر بار که صفحه را باز کنید تازه می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.": ". The table refreshes every time you open the page; a new name takes up to a minute to arrive.",
+#". رله‌ها ظرف یک دقیقه خودشان امتحان و اعمال می‌کنند": ". The relays try it and apply it themselves within a minute",
+#". ستون هر رله می‌گوید آن DNS از خود رله جواب می‌دهد یا نه (هر ده دقیقه). دامنهٔ مسدود بر این مقدم است. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ در صفحهٔ هر قالب می‌شود تیکش را برداشت.": ". Each relay’s column says whether that DNS answers from the relay itself (every ten minutes). A blocked domain wins over this. Every new domain is for all templates; on each template’s page you can untick it.",
+#". هر دو مال همین سرویس‌اند و یکسان جواب می‌دهند؛ اگر یکی در دسترس نبود، دستگاه سراغ دیگری می‌رود. DNS دیگری کنارشان نگذارید — سرویس گاهی کار می‌کند و گاهی نه.": ". Both belong to this service and answer the same; if one is unreachable, the device uses the other. Do not put another DNS next to them — the service would work sometimes and sometimes not.",
+#". پورت ۸۴۴۵ را اگر فایروال سرور یا دیتاسنتر دارد باز کنید.": ". Open port 8445 if the server or data center has a firewall.",
+#". یک بار، با یک کلیک، بدون رسید.": ". Once, with one click, no receipt.",
+#"50000 یا -50000": "50000 or -50000",
+#"API ربات": "Bot API",
+#"API همگام‌سازی و پنل مشتری": "Sync API and customer panel",
+#"BackPack روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید": "BackPack is not installed on this relay; run the installer on the relay once more",
+#"BackPack یا سرویس تونل روی این رله نیست؛ نصب‌کننده را یک بار دیگر اجرا کنید": "BackPack or the tunnel service is not on this relay; run the installer once more",
+#"BackPack یا سرویس تونل روی این سرور نصب نیست؛ نصب‌کنندهٔ نسخهٔ تازه را یک بار دیگر روی همین سرور اجرا کنید": "BackPack or the tunnel service is not installed on this server; run the new version’s installer on this server once more",
+#"Cloudflare — بدون بدافزار": "Cloudflare — no malware",
+#"Cloudflare — خانواده": "Cloudflare — family",
+#"DNS امن (DoH و DoT)": "Secure DNS (DoH and DoT)",
+#"DNS امن (DoH و DoT) — ۷ روز اخیر": "Secure DNS (DoH and DoT) — last 7 days",
+#"DNS امن تا یک دقیقه دیگر به نام خود رله برمی‌گردد": "Secure DNS goes back to the relay’s own name within a minute",
+#"DNS امن — DoH و DoT": "Secure DNS — DoH and DoT",
+#"DNS اول": "DNS 1",
+#"DNS بالادستی": "Upstream DNS",
+#"DNS بالادستی:": "Upstream DNS:",
+#"DNS جداگانه": "Separate DNS",
+#"DNS جداگانه برای دامنه‌ها (": "Separate DNS for domains (",
+#"DNS دوم": "DNS 2",
+#"DNS رمزگذاری‌شده": "Encrypted DNS",
+#"DNS عمومی": "Public DNS",
+#"DNS عمومی خاموش شد؛ تا یک دقیقه دیگر فقط آی‌پی‌های ثبت‌شده سرویس می‌گیرند": "Public DNS is off; within a minute only registered IPs get the service",
+#"DNS عمومی روشن شد؛ تا یک دقیقه دیگر رله‌ها برای همه باز می‌شوند": "Public DNS is on; within a minute the relays open to everyone",
+#"DNS عمومی روشن شود؟ هر کسی آدرس رله را بگذارد، بدون ثبت‌نام و بدون هیچ محدودیتی سرویس می‌گیرد و مصرفش جایی شمرده نمی‌شود.": "Turn public DNS on? Anyone who sets the relay’s address gets the service with no sign-up and no limit, and their usage is not counted anywhere.",
+#"DNS قالب‌ها": "Templates’ DNS",
+#"DNS و همگام‌سازی": "DNS and sync",
+#"DNS پشتیبان": "Backup DNS",
+#"DNSهای این مشتری ذخیره شد": "This customer’s DNS servers saved",
+#"DoH (آیفون، ویندوز، مرورگر):": "DoH (iPhone, Windows, browser):",
+#"DoT (اندروید ← DNS خصوصی)": "DoT (Android → Private DNS)",
+#"DoT (اندروید ← DNS خصوصی):": "DoT (Android → Private DNS):",
+#"EA FC (فیفا)": "EA Sports FC",
+#"EA — سرورهای بازی": "EA — game servers",
+#"English / فارسی": "English / فارسی",
+#"Epic Games — بک‌اند بازی": "Epic Games — game back end",
+#"GB — بی‌سقف": "GB — no cap",
+#"GOG و itch.io": "GOG / itch.io",
+#"Google Ads و AdMob": "Google Ads and AdMob",
+#"Idempotency-Key حداکثر ۱۰۰ نویسه": "Idempotency-Key at most 100 characters",
+#"Pangle (تبلیغات تیک‌تاک)": "Pangle (TikTok’s ads)",
+#"PlayStation — STUN و API": "PlayStation — STUN and API",
+#"PowerShell را با Run as administrator باز کنید و این را بزنید:": "Open PowerShell with Run as administrator and enter this:",
+#"RedTube، YouPorn و Tube8": "RedTube, YouPorn and Tube8",
+#"SYNC_SECRET در panel.env نیست": "SYNC_SECRET is missing from panel.env",
+#"Security ← DNS over HTTPS ← Max Protection ← Custom، و آدرس DoH.": "Security ← DNS over HTTPS ← Max Protection ← Custom, and the DoH address.",
+#"Taboola و Outbrain": "Taboola and Outbrain",
+#"Vungle و Liftoff": "Vungle and Liftoff",
+#"XVideos و XNXX": "XVideos and XNXX",
+#"dnsmasq نپذیرفت؛ همان قبلی ماند": "dnsmasq refused it; the previous one stayed",
+#"nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود": "nginx refused the tunnel path; the relay goes straight to the exit server",
+#"nginx راه مستقیم را نپذیرفت": "nginx refused the direct path",
+#"nginx نپذیرفت": "nginx refused it",
+#"nginx نپذیرفت؛ چیزی عوض نشد:": "nginx refused it; nothing changed:",
+#"nginx — سرور خارج": "nginx — exit server",
+#"nginx.conf خوانده نشد:": "nginx.conf could not be read:",
+#"s Encrypt داده می‌شود و دانلود کنسول‌ها همان مدت مکث می‌کند) و از آن به بعد آدرس DoH و DoT مشتری‌ها با نام تازه نشان داده می‌شود. تا وقتی نام قبلی هنوز به رله اشاره کند، در همان گواهی می‌ماند و دستگاه‌هایی که با آن تنظیم شده‌اند از کار نمی‌افتند.": "s Encrypt, and console downloads pause for that long) and from then on customers are shown DoH and DoT addresses with the new name. While the old name still points at the relay it stays on the same certificate, so devices set up with it keep working.",
+#"status باید active یا suspended باشد": "status must be active or suspended",
+#"status یکی از open، answered، closed یا all است": "status is one of open, answered, closed or all",
+#"status یکی از pending، approved، rejected یا all است": "status is one of pending, approved, rejected or all",
+#"telegram_id باید عدد مثبت باشد": "telegram_id must be a positive number",
+#"«ترافیک این ماه» از شمارندهٔ کارت شبکهٔ خود سرور است، همان چیزی که سرویس‌دهنده حساب می‌کند؛ رویش بزنید تا سقف ماهانه، روز شروع دوره و کاری که با رسیدن به سقف بشود را تعیین کنید. هشدار در ۸۰ و ۹۵ و ۱۰۰ درصد می‌آید.": "“This month’s traffic” comes from the server’s own network card counter, the same thing the provider bills; click it to set the monthly cap, the day the period starts and what happens when the cap is reached. Alerts come at 80, 95 and 100 percent.",
+#"· آخرین نسخه در گیت‌هاب:": "· latest on GitHub:",
+#"· از کیف پول": "· from wallet",
+#"· توکن پوشانده شده است.": "· the token is hidden.",
+#"· دسترسی:": "· access:",
+#"» آی‌پی درستی نیست": "” is not a valid IP",
+#"» آی‌پی درستی نیست؛ مثل 1.1.1.1 یا 10.0.0.2#5353": "” is not a valid IP; like 1.1.1.1 or 10.0.0.2#5353",
+#"» است. پلن تازه از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین می‌رود.": "”. A new plan starts from the moment it is approved, and what is left of the current plan is lost.",
+#"» اعمال شد": "” applied",
+#"» باطل شود؟ رباتی که با آن کار می‌کند فوراً قطع می‌شود.": "” be revoked? A bot using it is cut off at once.",
+#"» برای همیشه حذف شود؟ آی‌پی‌ها و رسیدهایش هم پاک می‌شوند و برنمی‌گردند.": "” be deleted for good? Their IPs and receipts are deleted too and cannot be brought back.",
+#"» تمدید شد تا": "” renewed until",
+#"» جدا شود؟ بعد از آن بازیابی رمز با تلگرام کار نمی‌کند تا دوباره وصل کند.": "” be unlinked? After that, password recovery by Telegram will not work until they link again.",
+#"» جواب داد:": "” answered:",
+#"» حذف شود؟": "” be deleted?",
+#"» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون می‌آید.": "” get a new password? They will be signed out of every device.",
+#"» روی خود رله است، نه یک DNS": "” is on the relay itself, not a DNS server",
+#"» فعال شد تا": "” active until",
+#"، آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را روشن می‌کند.": ", puts the bot’s address behind the customer panel’s “Connect Telegram” button, and turns the bot on.",
+#"، آپلود": ", upload",
+#"، آپلود تا": ", upload up to",
+#"، از هر رله و از همان راهی که ترافیک مشتری می‌رود. اگر از سرور خارج نشود، آن سرویس آن سرور را قبول نمی‌کند و از دست ما کاری برنمی‌آید؛ اگر از سرور خارج بشود و از مسیر مشتری نه، مشکل از راه ایران تا خارج است. فقط ۴۴۳ آزموده می‌شود؛ بازی‌هایی که روی پورت‌های دیگر یا UDP بازی می‌کنند این‌جا نیستند.": ", from each relay and along the same path customer traffic takes. If it fails from the exit server, that service does not accept that server and there is nothing we can do; if it works from the exit server but not along the customer’s path, the problem is on the way from Iran to abroad. Only 443 is tested; games that play on other ports or UDP are not here.",
+#"، با کد": ", with code",
+#"، بعد بقیه یکی‌یکی": ", then the rest one by one",
+#"، در انتظار پلن": ", waiting for a plan",
+#"، درگاه": ", port",
+#"؛ www. هم:": "; www. too:",
+#"؛ این صفحه خودش تازه می‌شود": "; this page refreshes itself",
+#"؛ جزو": "; it was part of",
+#"؛ حساب فعال شد": "; account activated",
+#"؛ سرویس مشتری‌هایش تا ۳۰ ثانیه دیگر قطع می‌شود": "; their customers’ service is cut within 30 seconds",
+#"؛ مشتری‌هایش دوباره سرویس می‌گیرند": "; their customers get service again",
+#"؛ مشتری‌هایش سرویس ندارند": "; their customers have no service",
+#"؛ هر هفته به‌روز می‌شود و فقط یک‌جا روشن یا خاموش می‌شود": "; updated weekly, and turned on or off only as a whole",
+#"آخرین (UTC)": "Last (UTC)",
+#"آخرین استفاده": "Last used",
+#"آخرین بار": "Last seen",
+#"آخرین تست:": "Last test:",
+#"آخرین تغییر": "Last change",
+#"آخرین خریدها": "Latest purchases",
+#"آخرین رله را نمی‌شود برداشت": "The last relay cannot be removed",
+#"آخرین نسخه در گیت‌هاب:": "Latest on GitHub:",
+#"آخرین پیام‌های ربات:": "The bot’s latest messages:",
+#"آخرین گزارش": "Last report",
+#"آدرس API:": "API address:",
+#"آدرس DNS": "DNS address",
+#"آدرس DoH شخصی": "Personal DoH address",
+#"آدرس این پنل": "This panel’s address",
+#"آدرس باید https باشد (یا http روی همین سرور). با ذخیرهٔ آدرس تازه، یک رمز امضا یک بار نشان داده می‌شود تا ربات مطمئن شود خبر از طرف این پنل است. اگر ربات در دسترس نباشد، خبر تا حدود یک روز دوباره فرستاده می‌شود.": "The address must be https (or http on this same server). When you save a new address, a signing secret is shown once so the bot can be sure a message comes from this panel. If the bot cannot be reached, a message is resent for about a day.",
+#"آدرس باید با https:// شروع شود (یا http فقط روی همین سرور)": "The address must start with https:// (or http only on this same server)",
+#"آدرس تازه": "New address",
+#"آدرس تازه را از": "Get the new address from",
+#"آدرس تازه ساخته شد؛ تا یک دقیقه دیگر کار می‌کند و آدرس قبلی دیگر نه": "A new address has been made; it works within a minute and the old one no longer does",
+#"آدرس ربات": "Bot address",
+#"آدرس ربات باید مثل https://t.me/MyBot باشد": "The bot address must look like https://t.me/MyBot",
+#"آدرس ربات برای مشتری‌ها": "Bot address for customers",
+#"آدرس ربات برداشته شد": "Bot address removed",
+#"آدرس ربات ذخیره شد": "Bot address saved",
+#"آدرس سرور خارج معلوم نیست": "The exit server’s address is not known",
+#"آدرس فعلی از کار می‌افتد و باید آدرس تازه را روی دستگاه‌هایتان بگذارید. ادامه می‌دهید؟": "The current address stops working and you must put the new one on your devices. Continue?",
+#"آدرس پنل عوض شد": "Panel address changed",
+#"آدرس پنل مشتری هنوز معلوم نیست؛ چند دقیقه دیگر": "The customer panel address is not known yet; in a few minutes",
+#"آدرس:": "Address:",
+#"آدرسی ندارد": "has no address",
+#"آدرس‌های DNS": "DNS addresses",
+#"آدرس‌های فعلی از کار می‌افتند و باید آدرس تازه را روی دستگاه‌هایتان بگذارید. ادامه می‌دهید؟": "The current addresses stop working and you will need to put the new ones on your devices. Continue?",
+#"آرما": "Arma",
+#"آرنا بریک‌اوت": "Arena Breakout",
+#"آرک‌نایتس": "Arknights",
+#"آزاد شد": "Unblocked",
+#"آزاد کن": "Unblock",
+#"آزمایش از پنل doctor-dns": "Test from the doctor-dns panel",
+#"آزمایش و ذخیره": "Test and save",
+#"آستتو کورسا": "Assetto Corsa",
+#"آلبیون آنلاین": "Albion Online",
+#"آماده: آخرین بکاپ و نصب‌کننده روی": "Ready: the latest backup and installer are on",
+#"آمار سرور": "Server stats",
+#"آمار و کارها": "Stats and actions",
+#"آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر بیرون ماندید، از روی خود سرور:": "there, or it will not be reachable from outside. If you get locked out, from the server itself:",
+#"آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود.": "What matters for customers is the relays column: that is where their questions are asked from.",
+#"آپدیت": "Upgrade",
+#"آپدیت این سرور به": "Upgrading this server to",
+#"آپدیت شد": "upgraded",
+#"آپدیت شدند.": "upgraded.",
+#"آپدیت شروع شد: اول": "Upgrade started: first",
+#"آپدیت شروع نشد:": "The upgrade did not start:",
+#"آپدیت شوند؟": "?",
+#"آپدیت همه به": "Upgrade everything to",
+#"آپدیت همین سرور نشد (کد": "Upgrading this server failed (code",
+#"آپلود": "Upload",
+#"آیدی عددی تلگرام خودتان را از": "Get your numeric Telegram ID from",
+#"آیدی عددی تلگرام خودتان را بنویسید": "Write your own numeric Telegram ID",
+#"آیدی عددی تلگرام شما (چند تا با ویرگول)": "Your numeric Telegram ID (several, separated by commas)",
+#"آیفون و آیپد": "iPhone and iPad",
+#"آیفون: بعد از دانلود پروفایل، تنظیمات ← پروفایل دانلودشده ← نصب. اندروید: تنظیمات ← Private DNS ← نام میزبان، و نام DoT یک سرور. کروم و فایرفاکس: بخش DNS امن تنظیماتشان، و آدرس DoH یک سرور.": "iPhone: after downloading the profile, Settings → Profile Downloaded → Install. Android: Settings → Private DNS → hostname, and one server’s DoT name. Chrome and Firefox: the secure DNS part of their settings, and one server’s DoH address.",
+#"آی‌پی": "IP",
+#"آی‌پی DNS را بنویسید": "Write the DNS server IP",
+#"آی‌پی آن را این بالا اضافه کنید.": "Add its IP up here.",
+#"آی‌پی ایرانی رله": "Relay’s Iranian IP",
+#"آی‌پی ایرانی مشتری": "Customer’s Iranian IP",
+#"آی‌پی اینترنت شما با آنچه ثبت شده فرق دارد. این دکمه آی‌پی فعلی را جایگزین می‌کند.": "Your internet IP is different from the registered one. This button replaces it with your current IP.",
+#"آی‌پی اینترنتی را که می‌خواهید سرویس رویش کار کند بفرستید.": "Send the IP of the internet connection you want the service to work on.",
+#"آی‌پی تک‌سرور تازه": "New single server’s IP",
+#"آی‌پی ثبت نشده": "No IP registered",
+#"آی‌پی ثبت‌شده": "Registered IP",
+#"آی‌پی خانگی معمولاً ثابت نیست. اگر مودم را ریست کردید و سرویس قطع شد، دوباره به همین صفحه بیایید و ثبت کنید.": "A home IP is usually not fixed. If you reset your router and the service stops, come back to this page and register again.",
+#"آی‌پی درستی نیست": "is not a valid IP",
+#"آی‌پی رلهٔ تازه": "New relay’s IP",
+#"آی‌پی رلهٔ تازه را این بالا اضافه کنید.": "Add the new relay’s IP up here.",
+#"آی‌پی سرور تازه را این بالا اضافه کنید.": "Add the new server’s IP up here.",
+#"آی‌پی سرور خارج تازه": "New exit server’s IP",
+#"آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.": "Your IP is registered correctly. If you reset your router and the service stops, open this page and press this button.",
+#"آی‌پی عمومی رله را بنویسید، مثل 5.6.7.8": "Write the relay’s public IP, like 5.6.7.8",
+#"آی‌پی عمومی سرور را بنویسید، مثل 5.6.7.8": "Write the server’s public IP, like 5.6.7.8",
+#"آی‌پی عمومی نیست": "is not a public IP",
+#"آی‌پی نامعتبر": "Invalid IP",
+#"آی‌پی نامعتبر است؛ آی‌پی عمومی اینترنت مشتری لازم است": "Invalid IP; the customer’s public internet IP is needed",
+#"آی‌پی همین سرور": "This server’s IP",
+#"آی‌پی هم‌زمان. هر دستگاه اضافه": "IPs at once. Each extra device is",
+#"آی‌پی-همین-سرور": "this-server-ip",
+#"آی‌پی:": "IP:",
+#"آی‌پی‌های ثبت‌شده": "Registered IPs",
+#"اتصال امن برقرار نشد": "A secure connection could not be made",
+#"اتصال به تلگرام": "Link to Telegram",
+#"اتصال به تلگرام فعلاً راه نیفتاده": "Linking to Telegram is not set up yet",
+#"اتصال حساب به تلگرام": "Link account to Telegram",
+#"اتصال رد شد": "Connection refused",
+#"اتصال قطع شد": "Connection dropped",
+#"اختیاری": "Optional",
+#"ادمین": "Admin",
+#"ادمین تازه": "New admin",
+#"ادمین متوقفش کرد (": "The admin stopped it (",
+#"ادمین مسدودش کرده": "Blocked by the admin",
+#"ادمینی با این نام کاربری هست": "An admin with this username exists",
+#"ادمین‌ها": "Admins",
+#"ادمین‌ها (": "Admins (",
+#"ارسال آزمایشی": "Send test",
+#"ارسال پیام آزمایشی": "Send a test message",
+#"ارک": "ARK: Survival",
+#"از": "from",
+#"از DNS تعیین‌شدهٔ ادمین پرسیده می‌شود": "asked of the DNS server the admin set",
+#"از DNS مخصوص این دامنه پرسیده می‌شود": "asked of the DNS set for this domain",
+#"از امروز چند روز دیگر": "How many days from today",
+#"از این به بعد اینجاست — همین حالا ذخیره‌اش کنید:": "lives here from now on — save it right now:",
+#"از این به بعد خرید و تمدید در پنل وب تلگرام وصل‌شده می‌خواهد": "From now on, buying and renewing in the web panel needs a linked Telegram",
+#"از این رله جواب نداد؛ بدون آن اعمال شد": "did not answer from this relay; applied without it",
+#"از این رله جواب نداد؛ همان قبلی ماند": "did not answer from this relay; the previous one stayed",
+#"از این سرور جواب نداد": "did not answer from this server",
+#"از این سرور جواب نداد؛ چیزی عوض نشد": "did not answer from this server; nothing changed",
+#"از دکمه‌های پایین استفاده کنید.": "Use the buttons below.",
+#"از رله": "through the relay",
+#"از رلهٔ": "from relay",
+#"از سرور خارج": "from the exit server",
+#"از قبل DNS جداگانه دارد؛ اول حذفش کنید": "already has a separate DNS; delete that first",
+#"از قبل اضافه شده": "already added",
+#"از قبل در سرویس": "is already in the service",
+#"از قبل در فهرست است": "is already in the list",
+#"از قبل رلهٔ این سرور است": "is already a relay of this server",
+#"از قبل مسدود است": "is already blocked",
+#"از مسیر مشتری": "along the customer’s path",
+#"از مسیر مشتری —": "along the customer’s path —",
+#"از همان اینترنتی وارد شوید که می‌خواهید سرویس روی آن کار کند — آی‌پی همان اتصال ثبت می‌شود.": "Sign in from the internet connection you want the service to work on — that connection’s IP is registered.",
+#"از کیف پول": "from wallet",
+#"اساسینز کرید": "Assassin's Creed",
+#"است": "is",
+#"است (بکاپ": "is (backup",
+#"است.": ".",
+#"است، نه در دیتابیس — پس نسخهٔ پشتیبان هم رمزگذاری‌شده است. برای بازگردانی روی سرور دیگری این کلید را هم لازم دارید؛ کنار نسخهٔ پشتیبان ولی جدا از آن نگهش دارید. کلید گم شود، عکس‌ها برنمی‌گردند (بقیهٔ اطلاعات چرا).": ", not in the database — so the backup is encrypted too. To restore on another server you need this key as well; keep it next to the backup but apart from it. If the key is lost, the pictures cannot be recovered (the rest of the data can).",
+#"است؛ از این به بعد با آن وارد شوید": "; sign in with it from now on",
+#"است؛ ربات تلگرام بیشتر از ۵۰ مگ نمی‌فرستد": "; the Telegram bot does not send more than 50 MB",
+#"استار سیتیزن": "Star Citizen",
+#"استارکرفت": "StarCraft II",
+#"استامبل گایز": "Stumble Guys",
+#"استریت فایتر": "Street Fighter",
+#"استرینووا": "Strinova",
+#"استفاده": "Used",
+#"استودیوها": "Studios",
+#"استیم": "Steam",
+#"اسم": "Name",
+#"اسم پلن لازم است": "A plan name is required",
+#"اسمتان چیست؟": "What is your name?",
+#"اسکواد": "Squad",
+#"اسکواد باسترز": "Squad Busters",
+#"اسکیپ فرام تارکوف": "Escape from Tarkov",
+#"اصلی": "main",
+#"اضافه شد": "added",
+#"اضافه شد؛ حالا دستور نصبش را روی آن اجرا کنید": "added; now run its install command on it",
+#"اضافه شد؛ حالا نصب‌کننده را روی آن اجرا کنید": "added; now run the installer on it",
+#"اطلاعات پرداخت": "Payment details",
+#"اطلاعات پرداخت ذخیره شد؛ در پنل مشتری و ربات دیده می‌شود": "Payment details saved; they show in the customer panel and the bot",
+#"اطلاعات پرداخت پاک شد": "Payment details cleared",
+#"اعمال": "Apply",
+#"اعمال شد": "Applied",
+#"افزودن": "Add",
+#"افزودن تک‌سرور": "Add single server",
+#"افزودن رله": "Add relay",
+#"افزودن سرور": "Add server",
+#"افزوده": "Added",
+#"الان": "Right now",
+#"الان در سرویس": "in service now",
+#"الان نشد": "Not now",
+#"الان نشد، چند دقیقه دیگر": "Not now, in a few minutes",
+#"الان پلن فعال دارید؛ تست رایگان برای وقتی است که پلنی ندارید": "You have an active plan right now; the free trial is for when you have no plan",
+#"الدر اسکرولز آنلاین": "Elder Scrolls Online",
+#"الدن رینگ": "Elden Ring",
+#"امروز": "Today",
+#"انتخاب رله و سرور خارج برای حساب شما باز نیست": "Picking relays and exit servers is not open to your account",
+#"انتخاب پلن…": "Choose a plan…",
+#"انتقال پنل — سرور پشتیبان": "Move the panel — standby server",
+#"اندازه‌گیری دوباره": "Measure again",
+#"اندازه‌گیری شروع شد؛ تا یک دقیقه دیگر صفحه را تازه کنید": "Measuring started; refresh this page in a minute",
+#"اندازه‌گیری نشد": "Could not be measured",
+#"اندروید": "Android",
+#"انصراف": "Cancel",
+#"انلیستد": "Enlisted",
+#"انیمه و هنتای": "Anime and hentai",
+#"اورواچ ۲": "Overwatch 2",
+#"اول": "First",
+#"اول حسابتان را کامل کنیم 🙂": "Let’s finish setting up your account first 🙂",
+#"اول ربات را در صفحهٔ «ربات» راه بیندازید و آی‌دی تلگرام ادمین را تعیین کنید؛ بکاپ برای ادمین‌های ربات فرستاده می‌شود.": "First set up the bot on the “Bot” page and set the admin’s Telegram ID; the backup is sent to the bot’s admins.",
+#"اول ربات را راه‌اندازی کنید": "Set up the bot first",
+#"اول رمز خودتان را انتخاب کنید": "Choose your own password first",
+#"اول پلن را انتخاب کنید": "Choose a plan first",
+#"اول پلنی را که خریده‌اید انتخاب کنید": "First choose the plan you bought",
+#"اولین خرید": "first purchase",
+#"اولین خریدش": "their first purchase",
+#"اوما موسومه": "Uma Musume",
+#"اِمانگ آس": "Among Us",
+#"اپیک گیمز": "Epic Games Store",
+#"اگر آدرس به دست کس دیگری افتاده. آدرس قبلی تا یک دقیقه بعد دیگر کار نمی‌کند.": "if the address got into someone else’s hands. The old address stops working within a minute.",
+#"اگر آی‌پی سرور ربات ثابت است، آن را بنویسید: کلیدی که لو برود از جای دیگر کار نمی‌کند. برای کلید ادمین این کار را حتماً بکنید.": "If the bot server has a fixed IP, write it: a leaked key will not work from anywhere else. Always do this for an admin key.",
+#"اگر این آی‌پی اینترنت خانه یا موبایل شما": "If this IP is your home or mobile internet",
+#"اگر این حساب به تلگرام وصل باشد، کد شش‌رقمی به تلگرامتان فرستاده شد؛": "If this account is linked to Telegram, a six-digit code was sent to your Telegram;",
+#"اگر جای دیگری وارد حسابتان باشید، با تغییر رمز از آنجا خارج می‌شوید.": "If you are signed in to your account anywhere else, changing the password signs you out there.",
+#"اگر حسابتان به تلگرام وصل باشد، یک کد شش‌رقمی به تلگرامتان می‌فرستیم.": "If your account is linked to Telegram, we send a six-digit code to your Telegram.",
+#"ایج آو امپایرز": "Age of Empires",
+#"این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته": "This Idempotency-Key was already used for another request",
+#"این آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، بگذارید.": "Put this address in your console or router as both DNS 1 and DNS 2.",
+#"این آدرس معتبر نیست": "This address is not valid",
+#"این آی‌پی به حساب دیگری ثبت شده است": "This IP is registered to another account",
+#"این آی‌پی خود همین سرور است": "This IP is this server itself",
+#"این آی‌پی درست نیست — چهار عدد با نقطه، مثل 5.123.45.67": "This IP is not valid — four numbers with dots, like 5.123.45.67",
+#"این آی‌پی روی این حساب نیست": "This IP is not on this account",
+#"این آی‌پی عمومی نیست. آی‌پی اینترنت خود را بنویسید، نه آی‌پی داخل شبکهٔ خانه (مثل 192.168...)": "This IP is not public. Write your internet IP, not an IP inside your home network (like 192.168...)",
+#"این آی‌پی مال سرورهای خود سرویس است": "This IP belongs to the service’s own servers",
+#"این ادمین برای همیشه حذف شود؟": "Delete this admin for good?",
+#"این ادمین غیرفعال است": "This admin is disabled",
+#"این ادمین غیرفعال شود؟ دیگر نمی‌تواند وارد شود.": "Disable this admin? They will not be able to sign in.",
+#"این ادمین پیدا نشد": "Admin not found",
+#"این اسم خودش سایتی ندارد — فقط پسوند زیردامنه‌هاست، یا فقط به سایت دیگری هدایت می‌کند — و آزموده نشد؛ خود سرویس از دامنه‌های دیگرش کار می‌کند": "This name has no site of its own — it is only a suffix for subdomains, or only redirects to another site — and was not tested; the service works through its other domains",
+#"این بخش برای حساب شما باز نیست؛ اگر لازمش دارید، به مالک پنل بگویید.": "This part is not open to your account; if you need it, ask the panel’s owner.",
+#"این بکاپ رمزگذاری شده؛ رمزش را هم بنویسید": "This backup is encrypted; write its password too",
+#"این تلگرام به حساب دیگری وصل است؛ از همان ربات استفاده کنید": "This Telegram is linked to another account; use that bot",
+#"این تلگرام به حساب دیگری وصل است؛ با پشتیبانی تماس بگیرید": "This Telegram is linked to another account; contact support",
+#"این تک‌سرور از پنل جدا می‌شود و مشتری‌هایی که DNS را رویش گذاشته‌اند قطع می‌شوند. ادامه؟": "This single server is detached from the panel and customers who set their DNS to it are cut off. Continue?",
+#"این تیکت مال مشتری‌های شما نیست": "This ticket is not from your customers",
+#"این تیکت پیدا نشد": "Ticket not found",
+#"این حساب به تلگرام وصل نیست": "This account is not linked to Telegram",
+#"این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید": "This account has no password; contact support",
+#"این حساب فقط با تلگرام کار می‌کند و جدا کردنش یعنی دیگر کسی واردش نمی‌شود": "This account only works through Telegram, and unlinking it means nobody can get into it any more",
+#"این حساب فقط با تلگرام کار می‌کند؛ جدا کردنش یعنی دیگر کسی واردش نمی‌شود": "This account only works through Telegram; unlinking it means nobody can get into it any more",
+#"این حساب نام کاربری دارد:": "This account has a username:",
+#"این حساب نام کاربری ندارد و از پنل وارد نمی‌شود": "This account has no username and does not sign in to the panel",
+#"این حساب هنوز نام کاربری ندارد": "This account has no username yet",
+#"این دامنه درست نیست یا برای دو سرور نوشته شده:": "This domain is not valid or is written for two servers:",
+#"این دامنه را نمی‌شود مسیر داد": "This domain cannot be routed",
+#"این دامنه و همهٔ زیردامنه‌هایش برای مشتری‌های قالب‌های انتخاب‌شده از همین DNS پرسیده می‌شوند، نه از DNS بالادستی. اگر جزو دامنه‌هایی باشد که سرویس از رله می‌برد، دیگر از رله نمی‌رود و جواب همین DNS به مشتری داده می‌شود. چند DNS را با فاصله بنویسید؛ پورت غیر ۵۳ با #، مثل": "This domain and all its subdomains are asked of this DNS for customers of the chosen templates, not of the upstream DNS. If it is one of the domains the service routes through the relay, it no longer goes through the relay and the customer gets this DNS’s answer. Write several DNS servers separated by spaces; a port other than 53 with #, like",
+#"این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم به‌عنوان": "Put this in the network settings of your console, phone or router as",
+#"این را نگه دارید؛ رمز را در پنل هر وقت خواستید عوض کنید.": "Keep this; you can change the password in the panel whenever you like.",
+#"این ربات برای حساب دیگری روی همین پنل کار می‌کند؛ یک ربات تازه از @BotFather بگیرید": "This bot already works for another account on this panel; get a new bot from @BotFather",
+#"این رسید روی این سرور باز نمی‌شود": "This receipt cannot be opened on this server",
+#"این رسید قبلاً بررسی شده": "This receipt was already reviewed",
+#"این رسید مال مشتری‌های شما نیست": "This receipt is not from your customers",
+#"این رسید پیدا نشد": "Receipt not found",
+#"این رله در فهرست نیست": "This relay is not in the list",
+#"این رله دیگر به این سرور راه ندارد و مشتری‌هایی که DNS را رویش گذاشته‌اند قطع می‌شوند. ادامه؟": "This relay no longer has a way to this server and customers who set their DNS to it are cut off. Continue?",
+#"این رمز را برای مشتری بفرستید. فقط همین یک بار نشان داده می‌شود.": "Send this password to the customer. It is shown only this once.",
+#"این رمز را در تنظیمات ربات بگذارید.": "Put this secret in the bot’s settings.",
+#"این سرور": "This server",
+#"این سرور از پنل جدا می‌شود و رله‌هایی که از آن می‌روند به این سرور برمی‌گردند. ادامه؟": "This server is detached from the panel and the relays that go through it come back to this server. Continue?",
+#"این سرور تک‌سرور است و رلهٔ جدایی ندارد.": "This is a single server and has no separate relay.",
+#"این سرور خارج در فهرست نیست": "This exit server is not in the list",
+#"این سرور در فهرست نیست": "This server is not in the list",
+#"این سرور و بعد همهٔ رله‌ها، نودها و تک‌سرورها به نسخهٔ": "Upgrade this server, then every relay, node and single server, to",
+#"این سرور پیدا نشد.": "Server not found.",
+#"این سرور — پنل": "This server — panel",
+#"این سرور:": "This server:",
+#"این صفحه را با همان اینترنتی باز کنید که می‌خواهید سرویس رویش کار کند.": "Open this page on the internet connection you want the service to work on.",
+#"این صفحه را رفرش نکنید: رفرش یک رمز تازهٔ دیگر می‌سازد.": "Do not refresh this page: a refresh makes another new password.",
+#"این صفحه را رفرش نکنید: رفرش یک کلید تازهٔ دیگر می‌سازد.": "Do not refresh this page: a refresh makes another new key.",
+#"این عکس روی این سرور باز نمی‌شود": "This picture cannot be opened on this server",
+#"این عکس پیدا نشد": "Picture not found",
+#"این فایل جایگزین دیتابیس فعلی شود؟": "Replace the current database with this file?",
+#"این فایل نسخهٔ پشتیبان سالمی نیست:": "This file is not a sound backup:",
+#"این فروشنده غیرفعال است": "This seller is disabled",
+#"این فروشنده غیرفعال شود؟ دیگر نمی‌تواند وارد شود، سرویس همهٔ": "Disable this seller? They will not be able to sign in, the service of all",
+#"این فروشنده فعلاً غیرفعال است؛ با خودش تماس بگیرید": "This seller is disabled for now; contact them",
+#"این فروشنده و همه‌چیزش برای همیشه پاک شود؟": "Delete this seller and everything of theirs for good?",
+#"این قالب برای شما نیست": "This template is not for you",
+#"این قالب مال شما نیست": "This template is not yours",
+#"این لینک درست نیست": "This link is not valid",
+#"این لینک درست نیست یا قبلاً استفاده شده": "This link is not valid or was already used",
+#"این لینک را با همان اینترنتی باز کنید که می‌خواهید سرویس رویش کار کند (مثلاً وای‌فای خانه، نه اینترنت گوشی)؛ خودکار وارد حسابتان می‌شوید و فقط «ثبت آی‌پی» را بزنید:": "Open this link on the internet connection you want the service to work on (for example your home Wi-Fi, not your phone’s data); you will be signed in automatically, then just press “Register IP”:",
+#"این لینک منقضی شده؛ از ربات یکی تازه بگیرید": "This link has expired; get a new one from the bot",
+#"این مشتری از سرور خارج هر رله می‌رود": "This customer goes through each relay’s exit server",
+#"این مشتری تا یک دقیقه دیگر روی همهٔ رله‌ها از": "Within a minute, on every relay, this customer goes through",
+#"این نام کاربری قبلاً گرفته شده. یکی دیگر بنویسید یا وارد شوید": "This username is already taken. Write another one or sign in",
+#"این نام کاربری مال مالک است": "This username is the owner’s",
+#"این نام کاربری گرفته شده؛ یکی دیگر بنویسید": "This username is taken; write another one",
+#"این پلن با کیف پول خریدنی نیست": "This plan cannot be bought with the wallet",
+#"این پلن به این کاربر داده شود؟ همان پلن تمدید می‌شود و پلن دیگر از همین حالا از نو شروع می‌شود.": "Give this plan to this user? The same plan is renewed, and another plan starts over right now.",
+#"این پلن دیگر فروخته نمی‌شود.": "This plan is no longer sold.",
+#"این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید": "This plan is no longer sold; choose another one",
+#"این پلن مال شما نیست": "This plan is not yours",
+#"این پلن مشتری دارد؛ به جای حذف، خاموشش کنید": "This plan has customers; turn it off instead of deleting it",
+#"این پلن پیدا نشد": "Plan not found",
+#"این پنل هم دارد ری‌استارت می‌شود تا دیتابیس تازه را باز کند. چند ثانیه دیگر خودش برمی‌گردد.": "This panel is restarting too, to open the new database. It will be back by itself in a few seconds.",
+#"این پیام برای همه‌ی کسانی که انتخاب کرده‌اید فرستاده شود؟": "Send this message to everyone you chose?",
+#"این کار با این روش نمی‌شود": "This cannot be done this way",
+#"این کار فقط با مالک پنل است": "Only the panel’s owner can do this",
+#"این کاربر مال شما نیست": "This customer is not yours",
+#"این کاربر پیدا نشد": "User not found",
+#"این کاربر پیدا نشد.": "User not found.",
+#"این کد تخفیف برای این پلن نیست": "This discount code is not for this plan",
+#"این کد تخفیف را قبلاً استفاده کرده‌اید": "You have already used this discount code",
+#"این کد تخفیف معتبر نیست": "This discount code is not valid",
+#"این کد حذف شود؟": "Delete this code?",
+#"این کد را برای ربات ما بفرستید.": "Send this code to our bot.",
+#"این کلید آدرس ربات ندارد": "This key has no bot address",
+#"این کلید از این آدرس پذیرفته نمی‌شود": "This key is not accepted from this address",
+#"این کلید دسترسی ادمین ندارد": "This key does not have admin access",
+#"این کلید را در تنظیمات ربات بگذارید.": "Put this key in the bot’s settings.",
+#"این کلید پیدا نشد": "Key not found",
+#"این کلید پیدا نشد یا قبلاً باطل شده": "Key not found, or already revoked",
+#"این گروه کسی با تلگرام ندارد": "Nobody in this group has Telegram",
+#"اینسرجنسی": "Insurgency",
+#"این‌ها برای مشتری‌های قالب‌های انتخاب‌شده بالا نمی‌آیند: DNS جواب «چنین اسمی نیست» می‌دهد، با همهٔ زیردامنه‌ها. دامنه‌ای که خود سرویس از رله می‌برد هم بسته می‌شود. تا یک دقیقه بعد روی رله‌ها اعمال می‌شود؛ دستگاهی که جواب قبلی را نگه داشته ممکن است چند دقیقه دیرتر ببیند. فقط جلوی DNS ما را می‌گیرد: کسی که DNS دیگری بگذارد یا مستقیم با آی‌پی وصل شود از این رد می‌شود. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ در صفحهٔ هر قالب می‌شود تیکش را برداشت.": "These do not load for customers of the templates picked above: the DNS answers “no such name”, with all subdomains. A domain the service routes through the relay is closed too. It is applied on the relays within a minute; a device holding the old answer may see it a few minutes later. It only stops our DNS: someone who sets another DNS or connects straight by IP gets past it. Every new domain is for all templates; on each template’s page you can untick it.",
+#"این‌ها را در تنظیمات شبکهٔ کنسول، گوشی یا مودم بگذارید: اولی را به‌عنوان": "Put these in the network settings of your console, phone or router: the first as",
+#"این‌ها قالب‌هایی است که می‌توانید به مشتری‌ها و پلن‌هایتان بدهید.": "These are the templates you can give your customers and plans.",
+#"ایپکس لجندز": "Apex Legends",
+#"ایکس‌باکس و گیم‌پس": "Xbox / Game Pass",
+#"ای‌فوتبال": "eFootball",
+#"با": "with",
+#"با اتصال به تلگرام، اگر رمز را فراموش کنید خودتان با یک کد بازیابی‌اش می‌کنید.": "With Telegram linked, if you forget your password you recover it yourself with a code.",
+#"با اجازهٔ خود مشتری؛ هر اسم یک ساعت بعد از آخرین بار پاک می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا اسم در فهرست نیست.": "With the customer’s own permission; each name is deleted an hour after it was last seen. “Direct” means it did not go through the relay; the “Why” column says whether that is because of their template or because the name is not in the list.",
+#"با اولین ورود باید رمز خودش را انتخاب کند؛ بعد از آن این رمز دیگر کار نمی‌کند.": "On first sign-in they must choose their own password; after that this one no longer works.",
+#"با این آدرس، دکمهٔ «اتصال به تلگرام» در پنل مشتری ربات را مستقیم باز می‌کند و کد اتصال را خودش می‌فرستد (": "With this address, the “Link to Telegram” button in the customer panel opens the bot directly and sends the link code itself (",
+#"با بستن": "Blocking",
+#"با تأیید، خودکار فعال می‌شود": "Activated automatically on approval",
+#"با تأیید، پلنی که مشتری انتخاب کرده خودکار روی حسابش می‌نشیند: قالب، حجم، مدت و سرعتش. رسیدِ بدون پلن فقط ثبت می‌شود و سهمیه و زمان را خودتان در صفحهٔ کاربران می‌گذارید. عکس رسید بعد از تصمیم پاک می‌شود.": "On approval, the plan the customer chose is put on their account automatically: its template, quota, length and speed. A receipt without a plan is only recorded, and you set the quota and time yourself on the users page. The receipt picture is deleted after the decision.",
+#"با دعوت:": "Invited by:",
+#"با رمز موقت وارد شده‌اید. برای ادامه یک رمز تازه بگذارید؛ بعد از آن رمز موقت دیگر کار نمی‌کند.": "You signed in with a temporary password. To continue, set a new password; after that the temporary one no longer works.",
+#"با مصرف هفتهٔ اخیر، حجم باقی‌مانده حدود": "At last week’s usage, the quota left is about",
+#"با مصرف هفتهٔ اخیر، حجم تا پایان دوره کافی است.": "At last week’s usage, the quota is enough until the end of the period.",
+#"بار": "times",
+#"بار آی‌پی تازه ثبت کرده‌اید و به سقف رسیده‌اید؛ حدود": "times, which is the limit; in about",
+#"باز کردن دوباره": "Reopen",
+#"باز کردن ربات و اتصال": "Open the bot and link",
+#"بازگردانی": "Restore",
+#"بازگردانی شد": "Restored",
+#"بازگردانی لغو شد": "Restore cancelled",
+#"بازگردانی نشد:": "Restore failed:",
+#"بازگردانی، دیتابیس فعلی را کامل جایگزین می‌کند. از وضعیت فعلی قبلش یک نسخه کنار دیتابیس نگه داشته می‌شود، پس این کار برگشت‌پذیر است — ولی سرویس چند ثانیه‌ای ری‌استارت می‌شود.": "Restoring replaces the current database completely. A copy of the current state is kept next to the database first, so this can be undone — but the service restarts for a few seconds.",
+#"بازی دیگر": "more games",
+#"بازیابی با تلگرام": "Recover with Telegram",
+#"بازیابی رمز": "Password recovery",
+#"بازی‌ها": "Games",
+#"بازی‌های Focus": "Focus Entertainment games",
+#"باشد": "",
+#"باطل شده": "Revoked",
+#"باطل کردن": "Revoke",
+#"باقی‌مانده": "Left",
+#"بایت": "bytes",
+#"بتسدا": "Bethesda",
+#"بتلفیلد": "Battlefield",
+#"بتل‌نت": "Battle.net",
+#"بدنهٔ درخواست JSON درستی نیست": "The request body is not valid JSON",
+#"بدنهٔ درخواست باید یک شیء JSON باشد": "The request body must be a JSON object",
+#"بدهید.": ".",
+#"بدون آدرس": "No address",
+#"بدون دامنه: فقط DNS معمولی": "No domain: plain DNS only",
+#"بدون محدودیت": "No limit",
+#"بدون پلن": "No plan",
+#"براول استارز": "Brawl Stars",
+#"براول‌هالا": "Brawlhalla",
+#"برای": "for",
+#"برای «": "for “",
+#"برای آماده کردن پشتیبان، اول در «تنظیمات» رمز بکاپ بگذارید؛ بکاپی که پشتیبان نگه می‌دارد با همان رمز باز می‌شود.": "To get a standby ready, first set a backup password in “Settings”; the backup the standby keeps opens with that password.",
+#"برای بکاپ یک رمز بگذارید": "Set a password for the backup",
+#"برای تست رایگان، اول حسابتان را به تلگرام وصل کنید": "For the free trial, first link your account to Telegram",
+#"برای خرید یا تمدید، اول حسابتان را به تلگرام وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.": "To buy or renew, first link your account to Telegram. Each Telegram links to only one account.",
+#"برای خرید، اول حسابتان را به تلگرام وصل کنید": "To buy, first link your account to Telegram",
+#"برای دستگاه اضافه": "for an extra device",
+#"برای دیدن حساب و ثبت آی‌پی وارد شوید.": "Sign in to see your account and register your IP.",
+#"برای روزی که نام فعلی در ایران فیلتر شود. اول یک رکورد A برای نام تازه بسازید که به آی‌پی رله اشاره کند؛ بعد اینجا ذخیره کنید. رله برای نام تازه گواهی می‌گیرد (حدود بیست ثانیه پورت ۸۰ به Let": "For the day the current name is filtered in Iran. First make an A record for the new name pointing at the relay’s IP; then save it here. The relay gets a certificate for the new name (for about twenty seconds port 80 is given to Let’",
+#"برای روش پرداخت با پشتیبانی تماس بگیرید.": "Contact support for how to pay.",
+#"برای شارژ کیف پول": "to top up the wallet",
+#"برای فعال شدن سرویس، رسید پرداختتان را از پایین همین صفحه بفرستید — بعد از تأیید، پلن برایتان ثبت می‌شود.": "To activate the service, send your payment receipt from the bottom of this page — after it is approved, your plan is set.",
+#"برای مسیری که TCP وصل می‌شود و بعد می‌میرد": "For a path where TCP connects and then dies",
+#"برای هر سرویسی که از سرور می‌رود، چند دامنه‌اش امتحان می‌شود: یک اتصال امن روی ۴۴۳ با گواهی خود سرویس. دو جا:": "For every service that goes through the server, a few of its domains are tested: a secure connection on 443 with the service’s own certificate. In two places:",
+#"برای همهٔ قالب‌ها مسدود است (": "is blocked for every template (",
+#"برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت (اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت (DOH) یا (DOT) جلویشان.": "To find which domain a service needs: pick the customer, press the button and ask them to open the service that does not work during that time. “via relay” means it went through the server, “direct” means it went directly (if the service does not accept Iran, add those domains on the domains page), “filtered” means Iran’s own filter. DoH and DoT queries show too, marked (DOH) or (DOT).",
+#"برای کار کردن، این‌ها هم باید روشن باشند:": "For it to work, these must be on too:",
+#"برای کدام خریدها": "For which purchases",
+#"برداشتن": "Remove",
+#"برداشته شد": "Removed",
+#"بررسی دوباره": "Check again",
+#"بررسی فایل": "Check file",
+#"برش گردانید.": "brought it back.",
+#"برنامه‌نویسی و ابزار": "Development and tools",
+#"بروید،": "go to",
+#"برگرداندن": "Restore",
+#"برگشت به API": "Back to API",
+#"برگشت به حساب": "Back to account",
+#"برگشت به حساب خودم": "Back to my own account",
+#"برگشت به ربات": "Back to the bot",
+#"برگشت به نام خود رله": "Back to the relay’s own name",
+#"برگشت به ورود": "Back to sign in",
+#"برگشت به کاربران": "Back to users",
+#"بزنید و توکن را بگیرید.": "press it and get the token.",
+#"بستن تیکت": "Close ticket",
+#"بسته": "Closed",
+#"بعد از جدا کردن، می‌توانید تلگرام تازه را وصل کنید.": "After unlinking, you can link a new Telegram.",
+#"بعد از دانلود: تنظیمات ← پروفایل دانلودشده ← نصب.": "After downloading: Settings ← Profile Downloaded ← Install.",
+#"بعد از واریز، عکس رسید را همین‌جا بفرستید.": "After paying, send a photo of the receipt here.",
+#"بعد از ۲۰ دقیقه از آپدیتش خبری نداده؛ بقیهٔ سرورها آپدیت نشدند. لاگ آن سرور را ببینید.": "has not reported on its upgrade after 20 minutes; the other servers were not upgraded. See that server’s log.",
+#"بعد از ۲۰ دقیقه جوابی نداد": "gave no answer after 20 minutes",
+#"بعد تونل‌های «مستقیم» رله‌ها به این سرور را از ستون «تونل» دوباره ذخیره کنید.": "Then save the relays’ “direct” tunnels to this server again from the “Tunnel” column.",
+#"بعدی:": "Next:",
+#"بقیه": "Other",
+#"بلاد استرایک": "Blood Strike",
+#"بله، جایگزین کن": "Yes, replace it",
+#"بلک دزرت": "Black Desert",
+#"به": "to",
+#"به آدرسی داخلی اشاره می‌کند (مثل 127.0.0.1) — اسم خراب است": "points at an internal address (like 127.0.0.1) — the name is broken",
+#"به تفکیک سرویس — ۳۰ روز اخیر": "By service — last 30 days",
+#"به تلگرام نرسیدیم:": "Could not reach Telegram:",
+#"به روی همه باز است": "is open to everyone",
+#"به سقف": "You have reached the limit of",
+#"به سقف ماهانه‌اش رسید": "reached its monthly cap",
+#"به نسخهٔ": "to version",
+#"به کیف پول شما اضافه می‌شود.": "is added to your wallet.",
+#"به‌روز": "updated",
+#"بوم بیچ": "Boom Beach",
+#"بکاپ برای ادمین‌های ربات فرستاده شد (": "Backup sent to the bot’s admins (",
+#"بکاپ خودکار خاموش شد": "Automatic backup turned off",
+#"بکاپ خودکار در تلگرام": "Automatic backup to Telegram",
+#"بکاپ خودکار روشن شد: هر": "Automatic backup turned on: every",
+#"بکاپ نشد:": "Backup failed:",
+#"بکاپ پشتیبان ساخته نشد:": "Standby backup not made:",
+#"بگذارید. DNS دیگری کنارش نگذارید — سرویس گاهی کار می‌کند و گاهی نه.": ". Do not put another DNS beside it — the service would work only some of the time.",
+#"بگذارید. اگر DNS دوم هم می‌خواهد،": ". If it also wants a DNS 2,",
+#"بگیرید.": "get it.",
+#"بیش از": "more than",
+#"بیش از ۳ دقیقه است گزارش نداده.": "has not reported for more than 3 minutes.",
+#"بیش از ۸۰٪ سهمیه‌تان مصرف شده —": "More than 80% of your quota is used —",
+#"بیش از ۹۵٪ سهمیه‌تان مصرف شده —": "More than 95% of your quota is used —",
+#"بیشتر": "more",
+#"بیشتر از": "More than",
+#"بی‌حد": "Unlimited",
+#"بی‌خطا": "No errors",
+#"بی‌مهلت": "No end date",
+#"بی‌نهایت": "Unlimited",
+#"بی‌پایان": "No end",
+#"تأیید": "Approve",
+#"تأیید شد": "Approved",
+#"تأیید شده": "Approved",
+#"تأیید شدهٔ امروز:": "Approved today:",
+#"تا": "until",
+#"تا آی‌پی ثبت نشود سرویس روی اینترنت شما کار نمی‌کند.": "Until an IP is registered, the service does not work on your internet.",
+#"تا حالا": "So far",
+#"تا چند دقیقهٔ دیگر بکاپ و نصب‌کننده را می‌گیرد.": "It picks up the backup and installer within a few minutes.",
+#"تا یک دقیقه دیگر از": "Within a minute from",
+#"تا ۳ روز دیگر تمام می‌شود.": "run out within 3 days.",
+#"تاریخ": "Date",
+#"تازه کردن": "Refresh",
+#"تاور آو فانتزی": "Tower of Fantasy",
+#"تبلیغ و ردیاب را می‌بندد؛ بعضی بازی‌ها و فروشگاه‌ها که به همان دامنه‌ها نیاز دارند ممکن است درست کار نکنند.": "Blocks ads and trackers; some games and stores that need those same domains may not work properly.",
+#"تبلیغات آمازون": "Amazon ads",
+#"تبلیغات ایرانی — تپسل، عدیوری، یکتانت، صباویژن، مدیا‌اد": "Iranian ads — Tapsell, Adivery, Yektanet, Sabavision, MediaAd",
+#"تبلیغات بزرگسالان": "Adult ads",
+#"تبلیغات و بدافزار": "Ads and malware",
+#"تبلیغات یاندکس": "Yandex ads",
+#"تبلیغ‌های داخل سایت‌ها، اپ‌ها و بازی‌های موبایل، و دامنه‌های بدافزار — فهرست StevenBlack": "Ads inside sites, apps and mobile games, and malware domains — StevenBlack’s list",
+#"تخفیف": "Discount",
+#"ترابایت": "TB",
+#"ترافیک این ماه": "This month’s traffic",
+#"تراکنش‌ها": "Transactions",
+#"ترتیب": "Order",
+#"ترراریا": "Terraria",
+#"ترنسپورت:": "Transport:",
+#"تست رایگان امروز:": "Free trials today:",
+#"تست رایگان را قبلاً گرفته‌اید": "You have already had the free trial",
+#"تست رایگان فقط با مالک پنل است": "Free trials are the panel owner’s only",
+#"تست رایگانی تعریف نشده": "No free trial is set up",
+#"تست شروع شد؛ از سرور خارج چند دقیقه، و از رله‌ها بعد از همگام‌سازی بعدی": "Test started; a few minutes from the exit server, and from the relays after their next sync",
+#"تست قبلی هنوز تمام نشده": "The previous test has not finished yet",
+#"تصمیم": "Decision",
+#"تصمیم باید approve یا reject باشد": "The decision must be approve or reject",
+#"تصمیم نامعتبر": "Invalid decision",
+#"تصمیم‌های قبلی": "Earlier decisions",
+#"تعداد ثبت‌نام از این اینترنت زیاد بوده.": "Too many sign-ups from this internet connection.",
+#"تعداد دستگاه": "Number of devices",
+#"تعداد دستگاه باید از ۱ تا": "The number of devices must be from 1 to",
+#"تعداد دستگاه باید از ۱ تا ۵ باشد": "The number of devices must be from 1 to 5",
+#"تعداد دستگاه ذخیره شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها": "Number of devices saved; on the relays within 30 seconds",
+#"تعداد روز درست نیست": "The number of days is not valid",
+#"تعداد روز ریست را با عدد بنویسید؛ خالی یعنی خاموش": "Write the reset days as a number; empty means off",
+#"تعداد روز منفی نمی‌شود": "The number of days cannot be negative",
+#"تغییر به دست مدیر": "Changed by the admin",
+#"تغییر رمز": "Change password",
+#"تغییر رمز عبور": "Change password",
+#"تغییر مسیر": "Redirect",
+#"تغییر نام کاربری": "Change username",
+#"تغییر پورت": "Change port",
+#"تفت": "Teamfight Tactics",
+#"تقریباً همان": "About the same",
+#"تلاش دوباره (": "Retrying (",
+#"تلاش زیاد بوده.": "Too many attempts.",
+#"تلاش زیاد بوده؛": "Too many attempts;",
+#"تلاش‌های ناموفق زیاد. چند دقیقه صبر کنید.": "Too many failed attempts. Wait a few minutes.",
+#"تلگرام": "Telegram",
+#"تلگرام «": "Telegram “",
+#"تلگرام اجباری": "Telegram required",
+#"تلگرام از حساب جدا شد": "Telegram unlinked from the account",
+#"تلگرام از حساب جدا شد؛ مشتری می‌تواند تلگرام تازه را وصل کند": "Telegram unlinked from the account; the customer can link a new Telegram",
+#"تلگرام این توکن را نمی‌شناسد": "Telegram does not know this token",
+#"تلگرام جواب نداد (HTTP": "Telegram did not answer (HTTP",
+#"تلگرامتان عوض شده؟ جدا کردن تلگرام": "Changed your Telegram? Unlink Telegram",
+#"تمام": "Done",
+#"تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید.": "has run out; their customers’ service is cut until you renew it.",
+#"تمام می‌شود.": ".",
+#"تمام می‌شود. برای قطع نشدن، زودتر تمدید کنید.": "ends. To avoid being cut off, renew early.",
+#"تمدید": "Renewal",
+#"تمدید شد.": "renewed.",
+#"تمدید همان پلن": "Renewing the same plan",
+#"تمدید همان پلن، روزها و حجم را روی باقی‌مانده‌تان اضافه می‌کند.": "Renewing the same plan adds its days and quota to what you have left.",
+#"تمدید گواهی HTTPS": "HTTPS certificate renewal",
+#"تمدید گواهی HTTPS — سرور خارج": "HTTPS certificate renewal — exit server",
+#"تنظیم تونل از پنل خوانا نبود": "The tunnel setting from the panel could not be read",
+#"تنظیمات": "Settings",
+#"تنظیمات ذخیره شد ولی ربات روشن نشد؛ پیام‌های پایین صفحه را ببینید": "Settings saved but the bot did not start; see the messages below",
+#"تنظیمات ربات": "Bot settings",
+#"توضیح": "Description",
+#"توضیح برای مشتری": "Description for customers",
+#"توضیح سرورها برای مشتری‌های شما": "Server notes for your customers",
+#"توضیح سرورها ذخیره شد": "Server notes saved",
+#"توضیح مالک پنل": "The panel owner’s note",
+#"توضیح کنار هر آدرس می‌گوید کدام برای شما بهتر است. همان را در تنظیمات شبکهٔ کنسول، گوشی یا مودم، هم به‌عنوان": "The note beside each address says which suits you best. Put that one in your console, phone or modem’s network settings as both",
+#"توقف": "Stop",
+#"تومان": "Toman",
+#"تومان (به‌جای": "Toman (instead of",
+#"تومان از کیف پول برداشته شد؛ موجودی:": "Toman taken from the wallet; balance:",
+#"تومان است —": "Toman —",
+#"تومان است؛ برای این پلن": "Toman; for this plan",
+#"تومان باشد": "Toman",
+#"تومان به کیف پول اضافه شد": "Toman added to the wallet",
+#"تومان به کیف پولتان اضافه شد.": "Toman has been added to your wallet.",
+#"تومان به کیف پولتان اضافه می‌شود": "Toman will be added to your wallet",
+#"تومان دارید و این پلن": "Toman and this plan is",
+#"تومان را واریز کنید و رسیدش را بفرستید؛ بعد از تأیید، یک دستگاه به حسابتان اضافه می‌شود.": "Toman and send the receipt; after it is approved, a device is added to your account.",
+#"تومان پورسانت به کیف پول دعوت‌کننده‌اش اضافه شد": "Toman commission added to their inviter’s wallet",
+#"تومان پورسانت گرفته‌اید.": "Toman in commission.",
+#"تومان کم دارید": "Toman short",
+#"تومان کم دارید.": "Toman short.",
+#"تومان —": "Toman —",
+#"تومان)": "Toman)",
+#"تومان.": "Toman.",
+#"تومان، تا وقتی همین پلن را تمدید کنید.": "Toman, for as long as you renew this same plan.",
+#"تومان؛ تا وقتی همین پلن را تمدید کنید می‌ماند.": "Toman; it stays while you renew this same plan.",
+#"تومانی": "Toman",
+#"تومن": "Tomans",
+#"تونل": "Tunnel",
+#"تونل BackPack": "BackPack tunnel",
+#"تونل این رله مال نصب‌کننده است؛ با --tunnel عوضش کنید": "This relay’s tunnel belongs to the installer; change it with --tunnel",
+#"تونل رلهٔ": "Tunnel of relay",
+#"تونل رله‌ها — سرور خارج": "Relays’ tunnels — exit server",
+#"تونل — سرور خارج": "Tunnel — exit server",
+#"تونل‌ها": "Tunnels",
+#"توکن درست نیست؛ از @BotFather کپی کنید": "The token is not valid; copy it from @BotFather",
+#"توکن را فقط به خودتان بدهید — با آن هر کسی می‌تواند رله‌ای بسازد که به این پنل وصل شود.": "Give the token only to yourself — with it anyone can make a relay that connects to this panel.",
+#"توکن را فقط به خودتان بدهید.": "Give the token only to yourself.",
+#"توکن ربات": "Bot token",
+#"تکرار رمز تازه": "Repeat the new password",
+#"تکرار رمز عبور": "Repeat password",
+#"تکن": "Tekken",
+#"تک‌سرور": "Single server",
+#"تک‌سرور یک سرور در کشوری دیگر است که هم ورودی است و هم خروجی: مشتری DNS را مستقیم روی خودش می‌گذارد و رله لازم ندارد. مشتری‌ها، حجمشان و تنظیمات همین پنل را دارد؛ مصرف روی آن از همان حجم مشترک کم می‌شود.": "A single server is a server in another country that is both the way in and the way out: the customer sets their DNS straight to it, and it needs no relay. It has this panel’s customers, their quotas and settings; usage on it comes off the same shared quota.",
+#"تک‌سرورها (": "Single servers (",
+#"تیک یعنی بسته: مشتری‌های این قالب نمی‌توانند آن دامنه‌ها را باز کنند (جواب «چنین سایتی وجود ندارد» می‌گیرند)، حتی اگر آن دامنه جزو سرویسی باشد که از رله می‌رود. کشو را باز کنید تا دامنه‌ها را ببینید و یکی‌یکی انتخاب کنید.": "A tick means blocked: this template’s customers cannot open those domains (they get “no such site”), even when the domain belongs to a service that goes through the relay. Open the drawer to see the domains and pick them one by one.",
+#"تیکت #": "Ticket #",
+#"تیکت باز": "Open tickets",
+#"تیکت باز دارید؛ در همان‌ها بنویسید یا یکی را ببندید": "open tickets; write in those or close one",
+#"تیکت بسته شد": "Ticket closed",
+#"تیکت تازه": "New ticket",
+#"تیکت تازه از": "New ticket from",
+#"تیکت ثبت شد؛ جواب همین‌جا می‌آید": "Ticket sent; the reply comes here",
+#"تیکت دوباره باز شد": "Ticket reopened",
+#"تیکت منتظر جواب:": "Tickets waiting for a reply:",
+#"تیکتی نیامده. مشتری‌ها از پنل خودشان یا از ربات تیکت می‌فرستند.": "No tickets yet. Customers send tickets from their own panel or from the bot.",
+#"تیکت‌ها": "Tickets",
+#"تیکت‌ها (": "Tickets (",
+#"تیکت‌های شما:": "Your tickets:",
+#"تیکِ مسدودها و DNS جداگانه یعنی برای مشتری‌های این قالب. برداشتن تیکِ ردیفی که «همهٔ قالب‌ها» است آن را فقط برای قالب‌های دیگر نگه می‌دارد. اگر دامنه‌ای در این قالب هم مسدود باشد هم DNS جداگانه داشته باشد، مسدود بودن برنده است.": "A tick on a block or a separate DNS means it is for this template’s customers. Unticking a row that is “All templates” keeps it for the other templates only. If a domain in this template is both blocked and has a separate DNS, the block wins.",
+#"ثانیه —": "seconds —",
+#"ثبت": "Save",
+#"ثبت آی‌پی": "Register IP",
+#"ثبت آی‌پی فعلی (": "Register current IP (",
+#"ثبت آی‌پی — سرویس هنوز باز نشده": "Register IP — the service is not open yet",
+#"ثبت این آی‌پی": "Register this IP",
+#"ثبت دستی آی‌پی": "Register an IP by hand",
+#"ثبت دوباره همین آی‌پی": "Register this same IP again",
+#"ثبت شد": "Saved",
+#"ثبت شده.": "page.",
+#"ثبت نشده": "Not registered",
+#"ثبت نشده ⚠️": "not registered ⚠️",
+#"ثبت‌نام": "Sign up",
+#"ثبت‌نام امروز:": "Sign-ups today:",
+#"ثبت‌نام تازه با وضعیت «در انتظار پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی نمی‌گیرد؛ اولین ذخیرهٔ همین سطر فعالش می‌کند. صفر در سهمیه یا سرعت یعنی بی‌حد. «زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود.": "A new sign-up arrives as “Waiting for a plan” and gets no traffic until you save a plan for it; the first save of its row activates it. Zero in quota or speed means no limit. An empty “Time” means no change; a number you write moves the end date that many days on from today, and the grey number inside it is the days left. Speed only limits downloads and is applied on the relays within 30 seconds.",
+#"ثبت‌نام کنید": "sign up",
+#"ثرون اند لیبرتی": "Throne and Liberty",
+#"جدا کردن تلگرام": "Unlink Telegram",
+#"جدول روزانه": "Daily table",
+#"جستجوی بازی یا دامنه…": "Search a game or domain…",
+#"جهت تونل را انتخاب کنید": "Choose the tunnel direction",
+#"جواب": "Reply",
+#"جواب آمده": "Answered",
+#"جواب تازه": "new reply",
+#"جواب تیکت #": "Reply to ticket #",
+#"جواب داده شد": "Answered",
+#"جواب فرستاده شد": "Reply sent",
+#"جواب نداد": "Did not answer",
+#"جوابی از رله‌ها نیامد. رله‌ها باید روی نسخهٔ تازه باشند.": "No answer from the relays. The relays must be on the new version.",
+#"جوابی نیامد": "No answer",
+#"حالا اگر رمز پنل را فراموش کنید، کد بازیابی همین‌جا می‌آید.": "Now if you forget your panel password, the recovery code will come here.",
+#"حالت مستقیم فقط stealth، wss، tcp و ws را دارد": "Direct mode only has stealth, wss, tcp and ws",
+#"حالت مستقیم فقط stealth، wss، tcp و ws را دارد. در حالت معکوس این درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش کنید. تا وقتی تونل وصل نیست، رله مستقیم به سرور خارج می‌رود.": "Direct mode only has stealth, wss, tcp and ws. In reverse mode this port opens on the relay, and in direct mode on the exit server; if a firewall is in front of it, open it. While the tunnel is not connected, the relay goes straight to the exit server.",
+#"حجم": "Traffic",
+#"حجم (گیگ)": "Quota (GB)",
+#"حجم تمام شده ⛔": "Quota used up ⛔",
+#"حجم را به گیگ بنویسید، یا تیک «نامحدود» را بزنید": "Write the quota in GB, or tick “Unlimited”",
+#"حجم سرویس شما تمام شد و سرویس قطع است. برای ادامه، پلن را تمدید کنید.": "Your service quota is used up and the service is cut off. To continue, renew your plan.",
+#"حجم فایل:": "File size:",
+#"حجم مانده:": "Quota left:",
+#"حجم نامحدود": "Unlimited quota",
+#"حجم یا روزهای شما تمام شده و سرویس همهٔ مشتری‌هایتان قطع است؛ برای تمدید به مالک پنل بگویید.": "Your traffic or days have run out and all your customers’ service is cut; ask the panel’s owner to renew it.",
+#"حداکثر": "At most",
+#"حداکثر آی‌پی تازه در ۲۴ ساعت": "Most new IPs in 24 hours",
+#"حداکثر آی‌پی تازه عدد مثبت است؛ خالی یعنی بی‌نهایت": "The most new IPs is a positive number; empty means unlimited",
+#"حداکثر چهار DNS برای هر دامنه": "At most four DNS servers per domain",
+#"حدود": "About",
+#"حذف": "Delete",
+#"حذف شد": "Deleted",
+#"حذف قالب": "Delete template",
+#"حذف همیشگی": "Delete for good",
+#"حذف همیشگی این کاربر": "Delete this user for good",
+#"حذف کاربر": "Delete user",
+#"حساب": "Account",
+#"حساب این مشتری ←": "This customer’s account →",
+#"حساب خود": "your account",
+#"حساب دارید؟": "Have an account?",
+#"حساب ساخته شد": "Account created",
+#"حساب شما": "Your account",
+#"حساب شما از قبل به تلگرام وصل است": "Your account is already linked to Telegram",
+#"حساب شما به تلگرام وصل شد": "Your account is now linked to Telegram",
+#"حساب شما ساخته شد.": "Your account has been created.",
+#"حساب شما سر جایش است؛ برای وصل شدن دوباره با فروشنده‌تان تماس بگیرید.": "Your account is safe; contact your seller to get connected again.",
+#"حساب شما غیرفعال است.": "Your account is inactive.",
+#"حساب فروشنده": "Seller account",
+#"حساب من": "My account",
+#"حساب من —": "My account —",
+#"حساب ندارید؟": "No account?",
+#"حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را همین‌جا بفرستید.": "Have a web panel account? In the panel press “Link account to Telegram” and send the code here.",
+#"حسابی که دیگر نیست": "An account that no longer exists",
+#"خالی = بی‌حد": "Empty = unlimited",
+#"خالی = بی‌سقف": "Empty = no cap",
+#"خالی = بی‌مهلت": "Empty = no end date",
+#"خالی = بی‌نهایت": "Empty = unlimited",
+#"خالی = بی‌پایان": "Empty = no end",
+#"خالی = خاموش": "Empty = off",
+#"خالی = فروخته نمی‌شود": "Empty = not sold",
+#"خالی است": "is empty",
+#"خاموش": "Off",
+#"خاموش است. اگر مشتری مشکلی دارد، از او بخواهید در پنل خودش «گزارش DNS برای پشتیبانی» را روشن کند و همان سرویس را دوباره باز کند؛ بعد این‌جا دیده می‌شود. زنده دیدن در همان لحظه:": "is off. If a customer has a problem, ask them to turn on “DNS report for support” in their own panel and open that same service again; it then shows here. Watching live, right now:",
+#"خاموش است: فقط آی‌پی‌هایی که مشتری‌ها ثبت کرده‌اند سرویس می‌گیرند.": "Off: only the IPs customers registered get the service.",
+#"خاموش شد؛ تا یک دقیقه دیگر مستقیم وصل می‌شود": "turned off; it connects directly within a minute",
+#"خاموش شد؛ رله تا یک دقیقه دیگر مستقیم وصل می‌شود": "turned off; the relay connects directly within a minute",
+#"خاموش کردن": "Turn off",
+#"خاموش کردن DNS عمومی": "Turn public DNS off",
+#"خاموش کردن و پاک کردن": "Turn off and clear",
+#"خاموش — رله مستقیم به سرور خارج وصل شود": "Off — the relay connects straight to the exit server",
+#"خاموش — مستقیم": "Off — direct",
+#"خانه": "Home",
+#"خبر": "Message",
+#"خبر آزمایشی در صف است؛ چند ثانیه دیگر وضعیتش پایین همین صفحه دیده می‌شود": "A test message is queued; its status shows at the bottom of this page in a few seconds",
+#"خبر دادن به این ربات خاموش شد": "Messages to this bot turned off",
+#"خبر دادن به ربات (webhook)": "Telling the bot (webhook)",
+#"خبرها به": "Messages to",
+#"خروج": "Sign out",
+#"خروج از حساب": "Sign out",
+#"خرید با رسید": "Buy with a receipt",
+#"خرید پلن": "Buy a plan",
+#"خرید یا تمدید": "Buy or renew",
+#"خط resolver در nginx.conf پیدا نشد": "The resolver line was not found in nginx.conf",
+#"خط آخر": "Last line",
+#"خط خطا یا هشدار": "Error or warning line",
+#"خطا": "Error",
+#"خطاهای nginx — اگر مشتری به سایتی وصل نمی‌شود، دلیلش معمولاً این‌جاست": "nginx errors — if a customer cannot reach a site, the reason is usually here",
+#"خطاهای nginx — سرور خارج": "nginx errors — exit server",
+#"خلاصه": "Summary",
+#"خوب": "Good",
+#"خودش قالب بسازد، تا": "Makes their own templates, up to",
+#"خیلی کلی است - دامنهٔ کامل بدهید": "too broad - give a full domain",
+#"د فاینالز": "THE FINALS",
+#"داخل پینگ — برای جایی که فقط پینگ رد می‌شود": "Inside ping — for a place where only ping gets through",
+#"دادن پلن بدون رسید": "Give a plan without a receipt",
+#"دارد؛ ربات با این رمز چکش می‌کند که از طرف پنل آمده باشد. راهنما: docs/bot-api.md": "; the bot checks with this secret that it came from the panel. Guide: docs/bot-api.md",
+#"دامنه": "Domain",
+#"دامنه (DoH و DoT)": "Domain (DoH and DoT)",
+#"دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.": "Domain: first make an A record pointing at that server’s IP and open its ports 80, 443 and 853; then write the domain here and save. Within a minute the server gets a certificate by itself and turns DoH and DoT on for it (it takes a few minutes, and console downloads on that server pause for about twenty seconds); then customers are shown it. If the record is not right yet, it says so here and tries again a quarter of an hour later.",
+#"دامنهٔ دلخواهی که بعداً اضافه کنید، در قالبی که دست‌کم یکی از این‌ها تیک خورده، خودکار از رله می‌رود.": "A custom domain you add later goes through the relay automatically in a template where at least one of these is ticked.",
+#"دامنه‌ای ندارد.": "Has no domains.",
+#"دامنه‌ای که با نصاب می‌آید.": "domains that come with the installer.",
+#"دامنه‌ها": "Domains",
+#"دامنه‌های دلخواه ادمین": "the admin’s custom domains",
+#"دامنه‌های دلخواه شما": "Your custom domains",
+#"دامنه‌های دلخواه — از رله می‌روند": "Custom domains — go through the relay",
+#"دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب": "This template’s custom domains, blocks and separate DNS",
+#"دامنه‌های شما": "Your domains",
+#"دامنه‌های شما (": "Your domains (",
+#"دامنه‌های مسدود": "Blocked domains",
+#"دامنه‌های مشتری": "Customer’s domains",
+#"دامنه‌هایی که مشتری باز می‌کند": "Domains the customer opens",
+#"دانلود": "Download",
+#"دانلود بازی": "Game downloads",
+#"دانلود نسخهٔ پشتیبان": "Download backup",
+#"دانلود و آپدیت": "Downloads and updates",
+#"دانلود و آپلود": "Download and upload",
+#"دانلود کلید": "Download key",
+#"دانلود کنسول و HTTP": "Console downloads and HTTP",
+#"دانلودها": "Downloads",
+#"دد بای دی‌لایت": "Dead by Daylight",
+#"در انتظار": "Waiting",
+#"در انتظار بررسی است. رسید تازه جای آن را می‌گیرد.": "is waiting for review. A new receipt replaces it.",
+#"در انتظار خرید پلن": "Waiting for a plan",
+#"در انتظار فعال‌سازی": "Waiting for activation",
+#"در انتظار همگام‌سازی": "Waiting for sync",
+#"در انتظار پلن": "Waiting for a plan",
+#"در تلگرام به": "in Telegram to",
+#"در تیکت «": "in ticket “",
+#"در حال آپدیت همین سرور به": "Upgrading this server to",
+#"در حال آپدیت…": "Upgrading…",
+#"در حال استفاده": "In use",
+#"در حال اندازه‌گیری…": "Measuring…",
+#"در حال تست…": "Testing…",
+#"در حال دریافت…": "Fetching…",
+#"در حال ضبط؛ این صفحه خودش تازه می‌شود": "Recording; this page refreshes itself",
+#"در حال گرفتن گواهی…": "Getting a certificate…",
+#"در دسترس نیست؛ مشتری‌های این رله از سرور خارج بعدی می‌روند.": "is unreachable; this relay’s customers go through the next exit server.",
+#"در سرویس مسدود شده": "Blocked in the service",
+#"در صف": "Queued",
+#"در فایل": "In file",
+#"در فهرست سرویس‌ها نیست": "Not in the service list",
+#"در قالب شما از رله می‌رود": "Goes through the relay in your template",
+#"در قالب شما از رله نمی‌رود": "Does not go through the relay in your template",
+#"در قالبش از رله می‌رود": "Goes through the relay in their template",
+#"در قالبش از رله نمی‌رود": "Does not go through the relay in their template",
+#"در کروم: تنظیمات ← حریم خصوصی و امنیت ← استفاده از DNS امن ← سفارشی، و آدرس DoH را بگذارید. یا برای کل گوشی: تنظیمات ← Private DNS ← نام میزبان، و نام DoT بالا را بگذارید.": "In Chrome: Settings ← Privacy and security ← Use secure DNS ← Custom, and enter the DoH address. Or for the whole phone: Settings ← Private DNS ← Hostname, and enter the DoT name above.",
+#"در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی آدرس یکی از این سرورها بگذارید. اگر یکی کند یا فیلتر شد، سراغ دیگری بروید.": "On a console, modem or phone, set both the first and the second DNS to one of these servers. If one is slow or filtered, use another.",
+#"در ۲۴ ساعت گذشته": "In the last 24 hours you have registered a new IP",
+#"در ۷ روز اخیر کسی از DNS امن استفاده نکرده.": "Nobody has used secure DNS in the last 7 days.",
+#"درآمد ۷ روز:": "Income, 7 days:",
+#"درخواست برای": "Request for",
+#"درخواست بیش از حد بزرگ است": "The request is too large",
+#"درخواست رفت؛ تا ۳۰ ثانیه دیگر رله‌ها شروع می‌کنند. از مشتری بخواهید سرویس را باز کند": "Request sent; the relays start within 30 seconds. Ask the customer to open the service",
+#"درخواست زیاد بوده؛": "Too many requests;",
+#"درخواست‌ها زیاد است؛ کمی صبر کنید": "Too many requests; wait a little",
+#"درصد": "percent",
+#"درصد از مبلغ خرید": "Percent of the purchase price",
+#"درصد باید عددی از ۱ تا ۱۰۰ باشد": "The percent must be a number from 1 to 100",
+#"درگاه": "Port",
+#"درگاه باید عددی بین ۱ و ۶۵۵۳۵ باشد": "The port must be a number between 1 and 65535",
+#"درگاه را عددی بنویسید": "Write the port as a number",
+#"درگاه:": "Port:",
+#"درگاه‌های ۲۰۰۰۰ تا ۲۰۹۹۹ مال سر تونل نودها روی رله است": "Ports 20000 to 20999 are for the nodes’ tunnel ends on the relay",
+#"درگاه‌های ۵۲۹۹ تا ۵۹۹۹ مال DNS قالب‌ها روی رله است": "Ports 5299 to 5999 are for the templates’ DNS on the relay",
+#"دریافت تست رایگان": "Get the free trial",
+#"دریافت نشد": "Not fetched",
+#"دریافت پروفایل": "Get the profile",
+#"دسترسی": "Access",
+#"دسترسی ادمین": "Admin access",
+#"دسترسی ندارید": "No access",
+#"دسترسی:": "Access:",
+#"دستور ویندوز": "Windows command",
+#"دستور ویندوز ۱۱": "Windows 11 command",
+#"دستگاه": "devices",
+#"دستگاه اضافه": "Extra device",
+#"دستگاه اضافه ·": "Extra device ·",
+#"دستگاه اضافه از کیف پول": "Extra device from wallet",
+#"دستگاه اضافه برای پلن فعال است؛ اول پلن بخرید": "Extra devices are for an active plan; buy a plan first",
+#"دستگاه اضافه فروخته نمی‌شود": "Extra devices are not sold",
+#"دستگاه اضافه فروخته نمی‌شود.": "Extra devices are not sold.",
+#"دستگاه دارید — یعنی": "devices — that is",
+#"دستگاه دارید.": "devices.",
+#"دستگاه دارید؛ هر دستگاه اضافه": "devices; each extra device is",
+#"دستگاه نمی‌شود": "devices is not possible",
+#"دستگاه. تعداد دستگاه هر کاربر را در صفحهٔ کاربران (روی آی‌پی‌اش) دستی هم می‌توانید عوض کنید. سقف آی‌پی تازه فقط برای خود مشتری است؛ آی‌پی‌هایی که شما ثبت می‌کنید شمرده نمی‌شوند.": "devices. You can also change a customer’s devices by hand on the users page (on their IP). The new-IP limit is only for the customer; IPs you register are not counted.",
+#"دستگاه:": "Devices:",
+#"دستگاه‌ها": "Devices",
+#"دست‌کم یک DNS لازم است": "At least one DNS server is needed",
+#"دست‌کم ۸ نویسه": "At least 8 characters",
+#"دعوت از دوستان خاموش شد": "Inviting friends turned off",
+#"دعوت از دوستان روشن شد:": "Inviting friends turned on:",
+#"دعوت‌شده": "Invited",
+#"دعوت‌شده‌ها (": "Invited (",
+#"دقیقه اعتبار دارد و یک بار کار می‌کند)": "minutes and works once)",
+#"دقیقه اعتبار دارد.": "minutes.",
+#"دقیقه اعتبار دارد. اگر خودتان درخواست نکرده‌اید، این پیام را نادیده بگیرید.": "minutes. If you did not ask for this, ignore this message.",
+#"دقیقه دیگر امتحان کنید.": "minutes.",
+#"دقیقه دیگر.": "minutes.",
+#"دقیقه پیش": "minutes ago",
+#"دقیقهٔ دیگر خودش خاموش می‌شود": "minutes it turns itself off",
+#"دلتا فورس": "Delta Force",
+#"دلخواه": "Custom",
+#"دلیل (به مشتری هم گفته می‌شود)": "Reason (the customer is told too)",
+#"ده دقیقه است به‌طور میانگین": "for ten minutes, on average",
+#"دو رمز تازه یکی نیستند": "The two new passwords do not match",
+#"دو رمز یکی نیستند": "The two passwords do not match",
+#"دوباره": "Again",
+#"دوباره بفرستید": "Send it again",
+#"دوباره بفرستید یا «انصراف».": "Send it again, or “Cancel”.",
+#"دوباره جا دارد:": "has room again:",
+#"دوباره در دسترس است.": "is reachable again.",
+#"دوباره زیر": "below again",
+#"دوباره عادی است:": "is back to normal:",
+#"دوباره فروخته شود": "Sell it again",
+#"دوباره وصل است.": "is connected again.",
+#"دور زده‌ها": "Bypassed",
+#"دوره از روز": "Period from day",
+#"دوره تمام شده ⛔": "Period ended ⛔",
+#"دورهٔ": "period",
+#"دورهٔ سرویس شما": "Your service period",
+#"دورهٔ سرویس شما تمام شد. برای ادامه، پلن را تمدید کنید.": "Your service period has ended. To continue, renew your plan.",
+#"دورهٔ شما تمام شد": "Your period has ended",
+#"دورهٔ شما تمام شد.": "Your period has ended.",
+#"دورهٔ شما در": "Your period ends on",
+#"دوره‌شان تا ۳ روز دیگر تمام می‌شود": "Their period ends within 3 days",
+#"دوره‌شان تا ۷ روز دیگر تمام می‌شود": "Their period ends within 7 days",
+#"دوره‌شان تمام شده": "Their period has ended",
+#"دیابلو": "Diablo",
+#"دیتابیس در این بکاپ نیست": "The database is not in this backup",
+#"دیتاگرام خام — در آزمایش ما وصل نشد": "Raw datagram — did not connect in our test",
+#"دیدن به‌جای او": "View as",
+#"دیسک": "Disk",
+#"دیویژن": "The Division",
+#"دیگر تمام می‌شود —": "more it runs out —",
+#"دیگر فروخته نشود؛ دارندگانش تا آخر دوره می‌مانند": "Stop selling; its holders keep it until their period ends",
+#"دیگر کافی است.": "more.",
+#"ذخیره": "Save",
+#"ذخیره شد": "Saved",
+#"ذخیره شد؛ بدون محدودیت زمانی": "Saved; no time limit",
+#"ذخیره شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود": "Saved; applied on the relays within 30 seconds",
+#"ذخیره شد؛ حساب فعال شد": "Saved; account activated",
+#"ذخیره شد؛ رله تا یک دقیقه دیگر سر خودش را برپا می‌کند — وضعیتش همین‌جاست": "Saved; the relay sets up its end within a minute — its status is right here",
+#"ذخیره شد؛ رله تا یکی دو دقیقه دیگر گواهی": "Saved; within a minute or two the relay gets the certificate",
+#"ذخیره شد؛ رله و نود تا یک دقیقه دیگر تونل را از سمت خودشان راه می‌اندازند؛ وضعیتش را همین‌جا ببینید": "Saved; the relay and the node start their ends of the tunnel within a minute; watch its state here",
+#"ذخیره شد؛ چند دقیقه‌ای طول می‌کشد تا روی رله‌ها اعمال شود": "Saved; it takes a few minutes to be applied on the relays",
+#"ذخیره و ری‌استارت ربات": "Save and restart the bot",
+#"ذخیره و ورود": "Save and sign in",
+#"ذخیرهٔ تونل": "Save tunnel",
+#"ذخیرهٔ رمز": "Save password",
+#"ذخیرهٔ فهرست مشتری‌ها": "Save the customers list",
+#"را بزنید؛ وگرنه ربات نمی‌تواند به شما پیام بدهد.": "; otherwise the bot cannot message you.",
+#"را بنویسید:": ":",
+#"را به آی‌پی": "to the IP",
+#"را تونل رلهٔ": "as the tunnel of relay",
+#"را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود سرویس گاهی کار کند و گاهی نه.": "again — another address there makes the service work sometimes and sometimes not.",
+#"را می‌گیرد — وضعیتش همین‌جاست": "— its status is right here",
+#"راست": "Rust",
+#"راه": "Path",
+#"راه نیفتاد:": "did not come up:",
+#"راه گوگل روی IPv6": "Google’s path over IPv6",
+#"راهنمای کامل دستورها:": "Full guide to the commands:",
+#"راه‌اندازی": "Set up",
+#"راه‌اندازی ربات": "Set up the bot",
+#"راکت لیگ": "Rocket League",
+#"راک‌استار": "Rockstar Games",
+#"رایگان، با یک کلیک، هر تلگرام و هر حساب یک بار": "Free, one click, once per Telegram account and per account",
+#"ربات": "Bot",
+#"ربات @": "Bot @",
+#"ربات با این کلید به جای همهٔ مشتری‌ها کار می‌کند، پس مثل رمز پنل از آن نگهداری کنید.": "The bot acts for every customer with this key, so guard it like the panel password.",
+#"ربات با این کلید رسید تأیید یا رد می‌کند، کاربر مسدود می‌کند، پلن می‌دهد و به تیکت جواب می‌دهد، و رسید و تیکت تازه و گزارش روزانه را خبر می‌گیرد. فقط برای ربات خودتان.": "With this key the bot approves or rejects receipts, blocks users, gives plans and replies to tickets, and is told about new receipts, new tickets and the daily report. Only for your own bot.",
+#"ربات تازه را در تلگرام باز کنید و": "Open the new bot in Telegram and",
+#"ربات تلگرام": "Telegram bot",
+#"ربات تلگرام @": "Telegram bot @",
+#"ربات جواب می‌دهد که حساب وصل شد. بعد از آن اگر رمز را فراموش کنید، از صفحهٔ ورود کد بازیابی به همین تلگرام می‌آید.": "The bot answers that the account is linked. After that, if you forget your password, the recovery code comes to this Telegram from the sign-in page.",
+#"ربات خاموش شد": "Bot turned off",
+#"ربات راه‌اندازی نشده": "The bot is not set up",
+#"ربات راه‌اندازی نشده (صفحهٔ «ربات»).": "The bot is not set up (the “Bot” page).",
+#"ربات روشن شد": "Bot turned on",
+#"ربات فروش (مال خودتان یا کس دیگری) از این در به پنل وصل می‌شود: ثبت‌نام مشتری با آیدی تلگرام، دیدن حساب، ثبت آی‌پی، دیدن پلن‌ها و فرستادن رسید. رسیدها مثل همیشه در صفحهٔ رسیدها منتظر تأیید شما می‌مانند.": "A sales bot (your own or someone else’s) connects to the panel through this door: signing customers up by Telegram ID, seeing their account, registering an IP, seeing the plans and sending receipts. Receipts wait for your approval on the receipts page as always.",
+#"ربات و API": "Bot and API",
+#"ربات کلید را در سرآیند": "The bot sends the key in the header",
+#"ربات یا ادمین آن تعیین نشده (صفحهٔ «ربات»)": "The bot or its admin is not set (the “Bot” page)",
+#"رباتی به پنل وصل نیست": "No bot is connected to the panel",
+#"رد": "Reject",
+#"رد دد ردمپشن ۲": "Red Dead Redemption 2",
+#"رد شد": "Rejected",
+#"رد شده": "Rejected",
+#"ردی اور نات": "Ready or Not",
+#"رسانه و ارتباط": "Media and messaging",
+#"رسید": "Receipt",
+#"رسید #": "Receipt #",
+#"رسید از": "Receipt from",
+#"رسید تأیید شد ولی آن پلن دیگر نیست؛ سهمیه و زمان را در صفحهٔ کاربران بگذارید": "Receipt approved, but that plan no longer exists; set the quota and time on the users page",
+#"رسید تأیید شد؛": "Receipt approved;",
+#"رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید": "Receipt approved; now set its quota and time",
+#"رسید تأیید شد؛ سهمیه و زمان را خودتان بگذارید": "Receipt approved; set the quota and time yourself",
+#"رسید تأیید شد؛ یک دستگاه اضافه شد (": "Receipt approved; a device was added (",
+#"رسید تازه از": "New receipt from",
+#"رسید در انتظار": "Receipts waiting",
+#"رسید در انتظار:": "Receipts waiting:",
+#"رسید رد شد": "Receipt rejected",
+#"رسید شما": "Your receipt",
+#"رسید شما تأیید شد؛": "Your receipt was approved;",
+#"رسید شما تأیید شد؛ یک دستگاه اضافه شد و حالا": "Your receipt was approved; a device was added and now you have",
+#"رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود": "Receipt sent. Your account is topped up after it is reviewed",
+#"رسید فرستاده شد. پس از بررسی،": "Receipt sent. After it is reviewed,",
+#"رسید پرداخت شما تأیید شد.": "Your payment receipt was approved.",
+#"رسید پرداخت شما تأیید شد؛ به‌زودی حسابتان شارژ می‌شود.": "Your payment receipt was approved; your account will be topped up soon.",
+#"رسید پرداخت شما تأیید نشد. اگر فکر می‌کنید اشتباهی شده، با پشتیبانی در تماس باشید.": "Your payment receipt was not approved. If you think this is a mistake, please contact support.",
+#"رسیده به ربات": "Reached the bot",
+#"رسیدها": "Receipts",
+#"رسیدها و کیف پول": "Receipts and wallets",
+#"رسیدهای در انتظار (": "Receipts waiting (",
+#"رسیدی برای این پلن در انتظار است؛ اول آن را بررسی کنید": "A receipt for this plan is waiting; review it first",
+#"رسیدی در انتظار نیست.": "No receipts waiting.",
+#"رسیدی نرسیده.": "No receipts have come in.",
+#"رفتن به کاربران": "Go to users",
+#"رله": "Relay",
+#"رله هنوز نگرفته است": "the relay has not got it yet",
+#"رله و سرور خارج مشتری‌هایش را خودش انتخاب کند": "Picks the relays and exit servers of their customers",
+#"رله:": "Relay:",
+#"رلهٔ": "relay",
+#"رله‌ای": "relay",
+#"رله‌ها": "Relays",
+#"رله‌ها (": "Relays (",
+#"رله‌ها از سرورهای خارج دیگر بروند": "The relays go through the other exit servers",
+#"رله‌ها از سرورهای خارج دیگر می‌روند.": "The relays go through the other exit servers.",
+#"رله‌ها و سرورهای دیگر": "Relays and other servers",
+#"رله‌ها و نودها ظرف یک دقیقه خودشان پنل تازه را پیدا می‌کنند و از آن به بعد فقط با آن حرف می‌زنند؛ این سرور اگر برگردد، دیگر کسی سراغش نمی‌آید.": "The relays and nodes find the new panel by themselves within a minute and from then on only talk to it; if this server comes back, nobody goes to it any more.",
+#"رله‌هایی که از آن می‌روند": "Relays that go through it",
+#"رمز": "Password",
+#"رمز امضای webhook": "Webhook signing secret",
+#"رمز امضای webhook «": "Webhook signing secret “",
+#"رمز این پنل": "This panel’s password",
+#"رمز باید حداقل ۸ نویسه باشد": "The password must be at least 8 characters",
+#"رمز باید دست‌کم ۸ نویسه باشد": "The password must be at least 8 characters",
+#"رمز بکاپ تعیین نشده": "No backup password set",
+#"رمز بکاپ دست‌کم ۸ نویسه باشد": "The backup password must be at least 8 characters",
+#"رمز بکاپ را می‌پرسد.": "It asks for the backup password.",
+#"رمز بکاپ:": "Backup password:",
+#"رمز تازه": "New password",
+#"رمز تازه (دست‌کم ۸ نویسه)": "New password (at least 8 characters)",
+#"رمز تازه با رمز فعلی یکی است": "The new password is the same as the current one",
+#"رمز تازه باید دست‌کم ۸ نویسه باشد": "The new password must be at least 8 characters",
+#"رمز تازه دست‌کم ۸ نویسه باشد": "The new password must be at least 8 characters",
+#"رمز تازه ذخیره شد و وارد شدید": "New password saved and you are signed in",
+#"رمز تازه نباید همان رمز موقت باشد": "The new password must not be the temporary one",
+#"رمز خودتان را انتخاب کنید": "Choose your own password",
+#"رمز درست نیست، یا این فایل بکاپ پنل نیست": "The password is wrong, or this file is not a panel backup",
+#"رمز دست‌کم ۸ نویسه باشد": "The password must be at least 8 characters",
+#"رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن همهٔ نشست‌های دیگر بسته می‌شوند.": "The password is not stored, only its hash. Changing it closes every other session.",
+#"رمز را فراموش کرده‌اید؟": "Forgot your password?",
+#"رمز را فراموش کرده‌اید؟ «رمز تازه» را بزنید.": "Forgot your password? Press “New password”.",
+#"رمز شما ذخیره شد": "Your password has been saved",
+#"رمز شما قبلاً انتخاب شده؛ برای عوض کردنش از «تغییر رمز» استفاده کنید": "Your password was already chosen; use “Change password” to change it",
+#"رمز عبور": "Password",
+#"رمز عبور (دست‌کم ۸ نویسه)": "Password (at least 8 characters)",
+#"رمز عوض شد": "Password changed",
+#"رمز عوض شد. اگر جای دیگری وارد بودید، خارج شدید": "Password changed. If you were signed in anywhere else, you were signed out",
+#"رمز عوض شد؛ از بقیهٔ دستگاه‌ها بیرون آمدید": "Password changed; you were signed out of other devices",
+#"رمز فعلی": "Current password",
+#"رمز فعلی حساب": "Current account password",
+#"رمز فعلی درست نیست": "The current password is not correct",
+#"رمز موقت": "Temporary password",
+#"رمز موقت «": "Temporary password “",
+#"رمز گذاشته شده؛ خالی بگذارید تا بماند": "A password is set; leave it empty to keep it",
+#"رمز:": "Password:",
+#"رمز، برای بکاپ تلگرام": "Password, for a Telegram backup",
+#"رمزشده، شبیه بایت‌های تصادفی — پیشنهادی": "Encrypted, looks like random bytes — recommended",
+#"روبلاکس": "Roblox",
+#"روز": "days",
+#"روز ·": "days ·",
+#"روز بعد پاک می‌شوند؛ متن می‌ماند.": "days later; the text stays.",
+#"روز دیگر": "days",
+#"روز دیگر منقضی می‌شود و هنوز تمدید نشده؛ لاگ «تمدید گواهی» را ببینید.": "days and has not been renewed; see the “certificate renewal” log.",
+#"روز قبل از پایان دوره": "days before the period ends",
+#"روز مانده": "Days left",
+#"روز و ساعت به وقت تهران. روی نام هر مشتری بزنید تا نمودار خودش را ببینید.": "Day and hour in Tehran time. Click a customer’s name to see their own chart.",
+#"روز و سقف استفاده را با عدد بنویسید": "Write the days and the use limit as numbers",
+#"روز پیش": "days ago",
+#"روز یک بار": "days",
+#"روز یک بار صفر می‌شود": "days",
+#"روز یک بار، برای ادمین‌های ربات بفرست": "days, send it to the bot’s admins",
+#"روزانه": "Daily",
+#"روزی که این سرور از دست رفت": "The day this server is lost",
+#"روشن": "On",
+#"روشن / تیره": "Light / dark",
+#"روشن است": "is on",
+#"روشن تا": "On until",
+#"روشن در هر دو سر": "On at both ends",
+#"روشن شد؛ یک پیام آزمایشی به تلگرامتان رفت": "turned on; a test message went to your Telegram",
+#"روشن کردن": "Turn on",
+#"روشن کردن DNS عمومی": "Turn public DNS on",
+#"روشن کردن برای یک ساعت": "Turn on for an hour",
+#"روشن کردنش matchmaking فورتنایت را می‌شکند": "turning it on breaks Fortnite matchmaking",
+#"روشن کردنش این اتصال‌ها را قطع می‌کند — SNI در مسیر مخدوش می‌شود": "turning it on cuts these connections — SNI gets garbled on the way",
+#"روشن کردنش بازی‌های EA را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند": "turning it on cuts EA games off from their servers — these are not on 443",
+#"روشن کردنش تشخیص NAT کنسول را خراب می‌کند": "turning it on breaks the console’s NAT detection",
+#"روشن کردنش صدا را قطع می‌کند — این‌ها روی UDP کار می‌کنند و رله فقط ۸۰ و ۴۴۳ را می‌برد. اسم discord.media همان چیزی است که کلاینت با آن فاصلهٔ هر منطقهٔ صوتی را می‌سنجد؛ رد کردنش باعث می‌شود همیشه منطقهٔ اشتباه انتخاب شود": "turning it on cuts voice — these work over UDP and the relay only carries 80 and 443. discord.media is the name the client measures each voice region’s distance with; routing it makes it always pick the wrong region",
+#"روشن کردنش ورود استیم را کند می‌کند — کلاینت روی پورت‌های ۲۷۰۱۸ تا ۲۷۰۲۴ به این اسم وصل می‌شود و رله فقط ۸۰ و ۴۴۳ را می‌برد، پس منتظر می‌ماند و بعد به لیست آی‌پی‌ها برمی‌گردد. فروشگاه و انجمن استیم همچنان از سرور رد می‌شوند": "turning it on slows down Steam sign-in — the client connects to this name on ports 27018 to 27024 and the relay only carries 80 and 443, so it waits and then falls back to the IP list. The Steam store and community still go through the server",
+#"روشن کردنش چت و دوستان لیگ و والورانت را قطع می‌کند — این‌ها روی ۵۲۲۲ و ۵۲۲۳ و ۲۰۹۹ هستند و رله فقط ۸۰ و ۴۴۳ را می‌برد. اگر روزی این پورت‌ها روی رله باز شوند، این گروه می‌تواند روشن شود": "turning it on cuts League and Valorant chat and friends — these are on 5222, 5223 and 2099 and the relay only carries 80 and 443. If those ports are ever opened on the relay, this group can be turned on",
+#"روشن کردنش چیزی را می‌شکند": "turning it on breaks something",
+#"روشن کردنش کالاف و وارزون را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند": "turning it on cuts CoD and Warzone off from their servers — these are not on 443",
+#"روی": "on",
+#"روی UDP — در آزمایش ما وصل نشد": "Over UDP — did not connect in our test",
+#"روی UDP، برای مسیری که بسته گم می‌کند": "Over UDP, for a path that loses packets",
+#"روی آن سرور، با فایل نصب‌کنندهٔ همین نسخه، این را اجرا کنید:": "On that server, with this version’s installer file, run:",
+#"روی رله نصب‌کننده را اجرا کنید و «relay» را انتخاب کنید؛ آدرس این سرور": "Run the installer on the relay and choose “relay”; this server’s address",
+#"روی رله.": "on the relay.",
+#"روی سرور هم:": "On the server too:",
+#"روی نام هر ادمین بزنید تا آمار و کارهایش را ببینید.": "Click an admin’s name to see their stats and actions.",
+#"روی نام هر سرور بزنید تا نمودارها و مشتری‌هایش را ببینید. مصرف مشتری‌های ثبت‌شده: روی رله از شمارندهٔ خود رله (همانی که حجم مشتری از آن کم می‌شود)، و روی سرور خارج از روی اینکه رله‌ها هر اتصال را از کدام سرور فرستاده‌اند. روز به وقت تهران.": "Click a server’s name to see its charts and customers. Registered customers’ usage: on a relay from the relay’s own counter (the one the customer’s quota comes off), and on the exit server from which server the relays sent each connection through. Days in Tehran time.",
+#"روی هر سرور بزنید تا نمودارهای خودش را ببینید. روز به وقت تهران.": "Click a server to see its own charts. Days in Tehran time.",
+#"روی همان اینترنت (مودم یا سیم‌کارت) یک سایت «آی‌پی من چیست» را باز کنید تا پیدایش کنید. مثال: 5.123.45.67": "On that same connection (router or SIM card) open a “what is my IP” website to find it. Example: 5.123.45.67",
+#"رویدادهای اخیر": "Recent events",
+#"رک روم": "Rec Room",
+#"رکورد A دامنه به این سرور (": "The domain’s A record does not point at this server (",
+#"رکورد DNS دامنهٔ پنل ادمین": "DNS record of the admin panel’s domain",
+#"ریست خودکار مصرف این کاربر خاموش شد": "Automatic usage reset turned off for this customer",
+#"ریست خودکار مصرف هر": "Reset usage automatically every",
+#"ریست خودکار مصرف هر چند روز": "Reset usage automatically every … days",
+#"رینبو سیکس": "Rainbow Six Siege",
+#"زبان ربات": "Bot language",
+#"زمان": "Time",
+#"زمان جواب": "Response time",
+#"زمان جواب هنوز اندازه گرفته نشده؛ رله‌ها چند دقیقه بعد از این نسخه اولین اندازه‌گیری را می‌فرستند.": "Response time has not been measured yet; the relays send the first measurement a few minutes after this version.",
+#"زنده، با": "Live, with",
+#"زنلس زون زیرو": "Zenless Zone Zero",
+#"زیر ده‌ها بازی است؛ روی ۴۴۳ کار می‌کند و از سرور رد می‌شود": "underlies dozens of games; it works on 443 and goes through the server",
+#"زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس «دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را برداشت. به‌علاوهٔ": "Subdomains are included automatically. These are gathered in the “Custom domains” service, so they can be unticked in any template. On top of the",
+#"زیرساخت و شبکه": "Infrastructure and network",
+#"زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند و جواب نمی‌دهند.": "passes the asker’s subnet (ECS) on to services. Services that refuse Iran in DNS — Tencent games like PUBG Mobile — see the relay’s Iranian IP and do not answer.",
+#"ساخت حساب": "Create account",
+#"ساختن": "Create",
+#"ساختن آدرس تازه": "Make a new address",
+#"ساختن رمز موقت برای این کاربر": "Make a temporary password for this user",
+#"ساختن قالب برای حساب شما باز نیست": "Making templates is not open to your account",
+#"ساختن کد": "Create code",
+#"ساختن کلید": "Create key",
+#"ساخته شد": "created",
+#"ساخته شد،": "created,",
+#"ساخته شده": "Created",
+#"ساده و مشترک — رمز ندارد": "Plain and shared — no encryption",
+#"ساده — رمز ندارد، نام سایت‌ها پیداست": "Plain — no encryption, site names are visible",
+#"ساعت": "Hour",
+#"ساعت دیگر دوباره امتحان کنید": "hours, try again",
+#"ساعت پیش": "hours ago",
+#"ساعت یک بار گیت‌هاب doctor-dns را چک می‌کند. با زدن دکمه، نصب‌کننده از خود ریلیز دانلود می‌شود و فقط وقتی نصب می‌شود که هشش با هشی که گیت‌هاب منتشر کرده یکی باشد. اول همین سرور آپدیت می‌شود و بعد بقیهٔ سرورها یکی‌یکی. نسخهٔ قدیمی‌تر هیچ‌وقت نصب نمی‌شود.": "hours the panel checks doctor-dns on GitHub. With the button, the installer is downloaded from the release itself and installed only when its hash matches the one GitHub published. This server is upgraded first, then the others one by one. An older version is never installed.",
+#"ساعت‌های پرمصرف": "Busiest hours",
+#"ساعت‌های پرمصرف — ۷ روز اخیر": "Busiest hours — last 7 days",
+#"سایبرپانک ۲۰۷۷": "Cyberpunk 2077",
+#"سایتی ندارد": "has no site",
+#"سایت‌های بزرگسال را هم برای همهٔ مشتری‌ها می‌بندد.": "Also closes adult sites for every customer.",
+#"سایت‌های بزرگسالان — فهرست‌های Sinfonietta و Clefspeare13 از مجموعهٔ StevenBlack": "Adult sites — the Sinfonietta and Clefspeare13 lists from the StevenBlack collection",
+#"سایت‌های دیگر ویدیو": "Other video sites",
+#"سایر": "Other",
+#"سر تونل روی رله": "Tunnel end on the relay",
+#"سرعت": "Speed",
+#"سرعت Mb": "Speed Mb",
+#"سرعت Mb/s": "Speed Mb/s",
+#"سرعت الان": "Speed now",
+#"سرعت باید عدد باشد؛ خالی یعنی بی‌حد": "Speed must be a number; empty means no limit",
+#"سرعت منفی نمی‌شود": "Speed cannot be negative",
+#"سرعت کل ۲۴ ساعت اخیر": "Total speed, last 24 hours",
+#"سرعت ۲۴ ساعت": "Speed, 24 hours",
+#"سرعت ۲۴ ساعت اخیر": "Speed, last 24 hours",
+#"سرور": "Server",
+#"سرور ایران": "Iran server",
+#"سرور خارج": "Exit server",
+#"سرور خارج (نود)": "Exit server (node)",
+#"سرور خارج اصلی": "Main exit server",
+#"سرور خارج این مشتری برای هر رله ذخیره شد": "This customer’s exit server saved for each relay",
+#"سرور خارج — پنل": "Exit server — panel",
+#"سرور دیگر به نسخهٔ": "other servers to",
+#"سرور پشتیبان یکی از نودهاست؛ اول یک نود اضافه کنید.": "The standby server is one of the nodes; add a node first.",
+#"سرور پشتیبان:": "Standby server:",
+#"سرور پشتیبانی تعیین نشده": "No standby server set",
+#"سرورها": "Servers",
+#"سرورها برای مشتری": "Servers for customers",
+#"سرورها برای مشتری ذخیره شد": "Servers for customers saved",
+#"سرورهای ایران": "Iran servers",
+#"سرورهای خارج (": "Exit servers (",
+#"سرورهای دیگر": "The other servers",
+#"سروری": "server",
+#"سرویس": "Service",
+#"سرویس تا تمدید کار نمی‌کند.": "The service does not work until renewed.",
+#"سرویس تا شارژ مجدد قطع است.": "The service is cut off until topped up again.",
+#"سرویس تونل روی این رله نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید": "The tunnel service is not on this relay; run the installer on the relay once more",
+#"سرویس را برای اینترنت دیگری می‌خواهید؟ مثلاً الان با موبایل آمده‌اید ولی سرویس را برای اینترنت خانه لازم دارید. آی‌پی آن اینترنت را اینجا بنویسید؛ از صفحهٔ مودم یا یک سایت «آی‌پی من چیست» روی همان اینترنت پیدایش می‌کنید.": "Want the service for another internet connection? For example you came in on mobile data but need the service for your home internet. Write that connection’s IP here; you find it on the router’s page or a “what is my IP” site on that same connection.",
+#"سرویس روی رله کار نمی‌کند": "The service does not work on the relay",
+#"سرویس روی سرور خارج کار نمی‌کند": "The service does not work on the exit server",
+#"سرویس روی همین آی‌پی باز می‌شود.": "The service opens on this IP.",
+#"سرویس فروشندهٔ شما موقتاً قطع است.": "Your seller’s service is paused for now.",
+#"سرویس‌ها": "Services",
+#"سرویس‌هایی که مشکل دارند بالاترند. «گواهی نامعتبر» یعنی جواب از جایی جز خود سرویس آمد — مثلاً صفحهٔ فیلتر. هر اسمی که خراب شد یک بار دیگر آرام‌تر آزموده می‌شود، و فقط اگر بار دوم هم خراب بود این‌جا می‌آید. گروه‌های «پیش‌فرض خاموش» فقط وقتی آزموده می‌شوند که در قالبی روشن باشند. یک دامنهٔ خراب در سرویسی بزرگ همیشه یعنی خرابی نیست؛ جزئیات هر سرویس را باز کنید.": "Services with problems are at the top. “Invalid certificate” means the answer came from somewhere other than the service itself — a filter page, for example. Every name that failed is tried once more, more slowly, and only shows here if it failed the second time too. “Off by default” groups are only tested when they are on in some template. One broken domain in a big service does not always mean an outage; open each service’s details.",
+#"سقف استفادهٔ کل": "Total use limit",
+#"سقف باید بیشتر از صفر و روز بین ۱ و ۲۸ باشد": "The cap must be more than zero and the day between 1 and 28",
+#"سقف ترافیک این سرور برداشته شد": "This server’s traffic cap removed",
+#"سقف ترافیک ذخیره شد:": "Traffic cap saved:",
+#"سقف تعداد مشتری": "Most customers",
+#"سقف حجم کل مشتری‌ها (گیگ)": "Total traffic cap for their customers (GB)",
+#"سقف ماهانه (گیگ):": "Monthly cap (GB):",
+#"سقف و روز را عددی بنویسید": "Write the cap and the day as numbers",
+#"سلام! 👋 به ربات خوش آمدید.": "Hello! 👋 Welcome to the bot.",
+#"سهم": "Share",
+#"سهم هر کدام": "Each one’s share",
+#"سهم ۳۰ روز": "30-day share",
+#"سهمیه": "Quota",
+#"سهمیه GB": "Quota GB",
+#"سهمیه تمام شده": "Quota used up",
+#"سهمیهٔ شما تمام شد.": "Your quota is used up.",
+#"سی آو ثیوز": "Sea of Thieves",
+#"سیمز": "The Sims",
+#"شارژ کیف پول": "Wallet top-up",
+#"شارژ کیف پول ·": "Wallet top-up ·",
+#"شارژ کیف پول باز شد": "Wallet top-ups opened",
+#"شارژ کیف پول بسته شد": "Wallet top-ups closed",
+#"شارژ کیف پول فعلاً بسته است": "Wallet top-ups are closed for now",
+#"شارژ کیف پول فعلاً بسته است.": "Wallet top-ups are closed for now.",
+#"شارژ کیف پول —": "Wallet top-up —",
+#"شبکه": "Network",
+#"شبیه یک سایت HTTPS معمولی": "Looks like an ordinary HTTPS site",
+#"شدوگان": "Shadowgun",
+#"شروع": "Start",
+#"شروع تست": "Start test",
+#"شروع شد؛ پنل چند ثانیه‌ای قطع می‌شود و بعد خودش بقیهٔ سرورها را آپدیت می‌کند": "started; the panel is down for a few seconds, then upgrades the other servers by itself",
+#"شما": "You",
+#"شما مالک این پنل هستید:": "You are this panel’s owner:",
+#"شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد": "Write the card number on the “Payment” page; the bot reads it from there. The panel makes the bot a key with admin rights",
+#"شماره کارت، اسم صاحب کارت، و اگر لازم است یک خط توضیح (مثلاً «کد پیگیری را هم بفرستید»). تا": "Card number, card holder’s name, and if needed a line of explanation (for example “also send the tracking code”). Up to",
+#"شمرده می‌شود:": "is counted:",
+#"صدای بازی روی Vivox است و مستقیم می‌ماند": "The game’s voice is on Vivox and stays direct",
+#"صفحه پیدا نشد": "Page not found",
+#"صفحهٔ دامنه‌ها": "domains page",
+#"صفر کردن مصرف": "Reset usage",
+#"ضدتقلب‌ها (EAC، BattlEye)": "Anti-cheat (EAC, BattlEye)",
+#"ضعیف؛ اینترنت شما تا سرور کند است": "Weak; your internet to the server is slow",
+#"طول درخواست معلوم نیست": "The request length is unknown",
+#"ظرفیت این کد تخفیف تمام شده": "This discount code has been used up",
+#"ظرفیت ثبت‌نام این فروشنده پر است": "This seller has no room for new sign-ups",
+#"ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس بگیرید": "This seller has no room for new sign-ups; contact them",
+#"عالی": "Excellent",
+#"عدد سرعت درست نیست": "The speed number is not valid",
+#"عدد سهمیه درست نیست": "The quota number is not valid",
+#"عدد مثبت به موجودی اضافه می‌کند و عدد منفی از آن کم می‌کند؛ موجودی کمتر از صفر نمی‌شود. به مشتری هم پیام می‌رود.": "A positive number adds to the balance and a negative one takes from it; the balance never goes below zero. The customer is told too.",
+#"عددها را درست بنویسید": "Write the numbers correctly",
+#"عوض می‌شود": "changes",
+#"عکس": "Picture",
+#"عکس (اختیاری)": "Picture (optional)",
+#"عکس (اختیاری، مثلاً اسکرین‌شات خطا)": "Picture (optional, e.g. a screenshot of the error)",
+#"عکس (رسید و تیکت) در این فایل با کلید سرور دیگری رمزگذاری شده و این‌جا باز نمی‌شود. اگر از سرور دیگری آورده‌اید، فایل": "Pictures (receipts and tickets) in this file are encrypted with another server’s key and cannot be opened here. If you brought it from another server, the file",
+#"عکس این رسید نیست (یا بعد از تصمیم پاک شده)": "This receipt has no picture (or it was deleted after the decision)",
+#"عکس با آن رمزگذاری شده و الان باز نمی‌شود. فایل را از نسخهٔ پشتیبانش برگردانید. تا آن موقع عکس‌های تازه بدون رمز نگه داشته می‌شوند.": "pictures are encrypted with it and cannot be opened now. Put the file back from its backup. Until then new pictures are kept unencrypted.",
+#"عکس بزرگ‌تر از": "The picture is larger than",
+#"عکس بزرگ‌تر از ۴ مگابایت است": "The picture is larger than 4 MB",
+#"عکس خراب بود، دوباره بفرستید": "The picture was broken, send it again",
+#"عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)": "Receipt picture (picture or PDF, at most 4 MB)",
+#"عکس رسید را بفرستید (یا «انصراف»).": "Send a photo of the receipt (or “Cancel”).",
+#"عکس رسید واریز (عکس یا PDF، حداکثر ۴ مگابایت)": "Payment receipt picture (picture or PDF, at most 4 MB)",
+#"عکس رسیدها و تیکت‌ها رمزگذاری شده نگه داشته می‌شوند و کلیدشان در": "Receipt and ticket pictures are kept encrypted and their key is in",
+#"عکس فیش واریزی را بفرستید تا مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ مگابایت. اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.": "Send a photo of the payment slip so the admin can review it and top up your account. A picture or PDF, at most 4 MB. If you send a new receipt, it replaces the previous one.",
+#"عکس پیدا نشد": "Picture not found",
+#"عکس‌ها رمزگذاری نمی‌شوند: کتابخانهٔ OpenSSL روی این سرور پیدا نشد.": "Pictures are not encrypted: the OpenSSL library was not found on this server.",
+#"عیب‌یابی": "Diagnose",
+#"عیب‌یابی سرویس‌ها": "Service diagnosis",
+#"غیرفعال": "Inactive",
+#"غیرفعال شد": "Disabled",
+#"غیرفعال کردن": "Disable",
+#"فا": "فا",
+#"فارسی": "فارسی",
+#"فارکرای": "Far Cry",
+#"فاسموفوبیا": "Phasmophobia",
+#"فال گایز": "Fall Guys",
+#"فایرفاکس": "Firefox",
+#"فایل": "File",
+#"فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا تأیید می‌خواهد. بکاپی که ربات فرستاده (": "The file is only checked and described first; replacing needs its own confirmation. A backup the bot sent (",
+#"فایل باز شد ولی خراب است:": "The file opened but is broken:",
+#"فایل بزرگ‌تر از": "The file is larger than",
+#"فایل بزرگ‌تر از ۴ مگابایت است": "The file is larger than 4 MB",
+#"فایل خالی بود": "The file was empty",
+#"فایل خراب بود، دوباره بفرستید": "The file was broken, send it again",
+#"فایل خیلی بزرگ است": "The file is too large",
+#"فایل ربات روی این سرور نیست. نصب‌کننده را یک بار دیگر روی همین سرور اجرا کنید تا اضافه شود.": "The bot file is not on this server. Run the installer on this server once more to add it.",
+#"فایل ربات روی این سرور نیست؛ نصب‌کننده را دوباره اجرا کنید": "The bot file is not on this server; run the installer again",
+#"فایلی انتخاب نشده بود": "No file was chosen",
+#"فایلی برای بازگردانی منتظر نیست. از": "No file is waiting to be restored. From",
+#"فایلی فرستاده نشد": "No file was sent",
+#"فاینال فانتزی XIV": "Final Fantasy XIV",
+#"فرستادن": "Send",
+#"فرستادن تیکت": "Send ticket",
+#"فرستادن جواب": "Send reply",
+#"فرستادن رسید": "Send receipt",
+#"فرستادن رسید شارژ": "Send top-up receipt",
+#"فرستادن کد": "Send code",
+#"فرستاده شد (": "Sent (",
+#"فرستاده شد.": "sent.",
+#"فرستاده می‌شوند.": "are sent.",
+#"فرستاده‌شده‌ها": "Sent",
+#"فروش این ماه (تومان)": "Sales this month (Toman)",
+#"فروش کل (تومان)": "All sales (Toman)",
+#"فروشنده": "seller",
+#"فروشنده است": "Is a seller",
+#"فروشنده فقط مشتری‌هایی را می‌بیند که خودش آورده (با لینک یا ربات خودش)، همراه با رسیدها، تیکت‌ها و کیف پولشان. پلن‌ها و قیمت‌هایش را هم خودش می‌سازد. اگر مصرف مشتری‌هایش روی هم به سقف حجم برسد یا روزهایش تمام شود، سرویس همهٔ مشتری‌هایش قطع می‌شود تا تمدیدش کنید. هر تغییری در این صفحه، آن ادمین را از همهٔ دستگاه‌ها بیرون می‌برد.": "A seller sees only the customers they brought (through their own link or bot), with their receipts, tickets and wallets. They make their own plans and prices too. When their customers’ total usage reaches the traffic cap or their days run out, all their customers’ service is cut until you renew it. Any change on this page signs that admin out of every device.",
+#"فروشندهٔ شما فعلاً غیرفعال است؛ با خودش تماس بگیرید": "Your seller is disabled for now; contact them",
+#"فروشنده‌ها": "Sellers",
+#"فروشگاه و انجمن": "Store and community",
+#"فروشگاه و لانچر. ورود و چت استیم مستقیم می‌ماند": "Store and launcher. Steam sign-in and chat stay direct",
+#"فروشگاه، اکانت و بازی آنلاین": "Store, account and online play",
+#"فروشگاه، لانچر و اکانت": "Store, launcher and account",
+#"فرگ‌پانک": "FragPunk",
+#"فعال": "Active",
+#"فعال شد": "Enabled",
+#"فعال کردن": "Enable",
+#"فعال ✅": "Active ✅",
+#"فعلاً نه، برو به حساب": "Not now, go to account",
+#"فعلاً پلنی برای فروش نیست. با پشتیبانی در تماس باشید.": "No plans are on sale right now. Please contact support.",
+#"فقط از آدرس": "Only from address",
+#"فقط از این آدرس‌ها (اختیاری، با ویرگول جدا)": "Only from these addresses (optional, separated by commas)",
+#"فقط از قالب‌های تیک‌خورده": "Only the ticked templates",
+#"فقط اولین خرید": "First purchase only",
+#"فقط برای این پلن‌ها (هیچ‌کدام = همه):": "Only for these plans (none = all):",
+#"فقط تعداد؛ اینکه چه اسمی پرسیده شد جایی نگه داشته نمی‌شود. روز به وقت تهران.": "Counts only; which names were asked is not kept anywhere. Days in Tehran time.",
+#"فقط خروجی": "Outgoing only",
+#"فقط خطاها). توکن ربات همه‌جا با": "errors only). The bot token everywhere as",
+#"فقط خودتان این را می‌بینید. چیزی که نگه داشته می‌شود فقط «کدام سرویس، کدام روز، چقدر» است — نه اینکه چه سایتی را کِی باز کرده‌اید — و بعد از ۳۰ روز پاک می‌شود. «دانلود کنسول و HTTP» بیشتر دانلود بازی‌های پلی‌استیشن و ایکس‌باکس است.": "Only you see this. All that is kept is “which service, which day, how much” — not which site you opened when — and it is deleted after 30 days. “Console downloads and HTTP” is mostly PlayStation and Xbox game downloads.",
+#"فقط عکس (JPG، PNG یا WEBP) قبول می‌شود": "Only a picture (JPG, PNG or WEBP) is accepted",
+#"فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود": "Only a picture (JPG, PNG, WEBP) or PDF is accepted",
+#"فقط عکس JPG، PNG یا WEBP": "Only JPG, PNG or WEBP pictures",
+#"فقط مشتری‌های شما این‌ها را می‌بینند. خالی بگذارید تا توضیح مالک پنل (خاکستری) نشان داده شود.": "Only your customers see these. Leave one empty to show the panel owner’s note (in grey).",
+#"فقط هشدار": "Alert only",
+#"فقط همین یک بار": "Only this once",
+#"فهرست کامل": "Full list",
+#"فور آنر": "For Honor",
+#"فورتنایت": "Fortnite",
+#"فورزا": "Forza",
+#"فیس‌ایت": "FACEIT",
+#"قاعدهٔ فایروال تونل بار نشد؛ درگاه": "The tunnel firewall rule did not load; port",
+#"قالب": "Template",
+#"قالب تازه": "New template",
+#"قالب تازه با همهٔ سرویس‌ها ساخته می‌شود؛ بعد تیک‌ها را بردارید.": "A new template is made with every service; then untick what you do not want.",
+#"قالب حذف شد و کاربرانش به پیش‌فرض برگشتند": "Template deleted and its users went back to the default",
+#"قالب دامنه درست نیست": "The domain format is not valid",
+#"قالب رسیده‌اید": "templates",
+#"قالب رسیده‌اید.": "templates.",
+#"قالب ساخته شد با همهٔ سرویس‌ها": "Template created with every service",
+#"قالب عوض شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود": "Template changed; applied on the relays within 30 seconds",
+#"قالب مشتری دارند؛ یعنی حدود": "templates have customers; that is about",
+#"قالب پلن پیدا نشد": "The plan’s template was not found",
+#"قالب پیدا نشد": "Template not found",
+#"قالب پیش‌فرض حذف نمی‌شود": "The default template cannot be deleted",
+#"قالب پیش‌فرض قابل تغییر نیست": "The default template cannot be changed",
+#"قالب پیش‌فرض همیشه همهٔ دامنه‌های دلخواه را از رله می‌برد.": "The default template always routes all custom domains through the relay.",
+#"قالب پیش‌فرض همیشه همهٔ سرویس‌ها را از رله می‌برد، از جمله سرویس‌هایی که بعداً اضافه شوند. برای همین قابل ویرایش نیست — یک قالب تازه بسازید.": "The default template always routes every service through the relay, including services added later. So it cannot be edited — make a new template.",
+#"قالبی با این نام هست": "A template with this name exists",
+#"قالب‌ها": "Templates",
+#"قالب‌ها و دامنه‌ها": "Templates and domains",
+#"قبل": "Before",
+#"قطع": "Down",
+#"قیمت (تومان)": "Price (Toman)",
+#"قیمت باید عدد درست باشد، به تومان": "The price must be a whole number, in Toman",
+#"قیمت دستگاه را به تومان و با عدد بنویسید": "Write the device price in Toman, as a number",
+#"قیمت هر دستگاه اضافه (تومان)": "Price of each extra device (Toman)",
+#"لاست آرک": "Lost Ark",
+#"لاست لایت": "Lost Light",
+#"لاگ": "Logs",
+#"لاگ ربات —": "Bot log —",
+#"لاگ و عیب‌یابی": "Logs and diagnosis",
+#"لاگش در صفحهٔ «نود» است": "its log is on the Nodes page",
+#"لغو شد.": "Cancelled.",
+#"لیست اپراتورها — سرور خارج": "Operators list — exit server",
+#"لینک ثبت‌نام در همین سایت": "Sign-up link on this site",
+#"لینک ثبت‌نام مشتری‌های شما": "Sign-up link for your customers",
+#"لینک دعوت ربات": "Bot invitation link",
+#"لینک دعوت سایت": "Site invitation link",
+#"لینک ربات": "Bot link",
+#"لیگ آو لجندز": "League of Legends",
+#"مارول رایولز": "Marvel Rivals",
+#"مال": "belongs to",
+#"مال همین پنل است": "belongs to this panel",
+#"مالک پنل هنوز آدرس پنل مشتری را نگذاشته.": "The panel’s owner has not set the customer panel address yet.",
+#"مانده.": "left.",
+#"مانستر هانتر": "Monster Hunter",
+#"ماه": "Month",
+#"ماینکرفت": "Minecraft",
+#"مبلغ": "Amount",
+#"مبلغ (تومان)": "Amount (Toman)",
+#"مبلغ درست نیست": "The amount is not valid",
+#"مبلغ درست نیست؛ مثلاً 50000 یا -50000": "The amount is not valid; for example 50000 or -50000",
+#"مبلغ را به کارت 6037-0000-0000-0000 به نام ... واریز کنید": "Pay the amount to card 6037-0000-0000-0000 in the name of ...",
+#"مبلغ شارژ باید بین": "The top-up amount must be between",
+#"مبلغ شارژ درست نیست": "The top-up amount is not valid",
+#"مبلغی که به کیف پول اضافه می‌شود؛ اگر رسید چیز دیگری می‌گوید درستش کنید": "The amount added to the wallet; if the receipt says something else, correct it",
+#"متا (فیسبوک) Audience Network": "Meta (Facebook) Audience Network",
+#"متفرقه": "Other game tools",
+#"متن": "Text",
+#"متن جواب را بنویسید": "Write the reply text",
+#"متن جواب را بنویسید (یا «انصراف»).": "Write your reply (or “Cancel”).",
+#"متن راهنما (اختیاری، زیر «راهنما» در ربات)": "Help text (optional, under “Help” in the bot)",
+#"متن پیام": "Message text",
+#"متن پیام را بنویسید": "Write the message text",
+#"متن پیام را بنویسید (یا «انصراف»).": "Write your message (or “Cancel”).",
+#"متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):": "Write your message (you can also send a photo with a caption):",
+#"مثلاً 203.0.113.7": "e.g. 203.0.113.7",
+#"مثلاً مخصوص ایرانسل": "e.g. for Irancell",
+#"مثلاً گیمینگ ماهانه": "e.g. Gaming monthly",
+#"مجموع مصرف": "Total usage",
+#"مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰": "The length must be a whole number of days, from 1 to 3650",
+#"مستقیم": "Direct",
+#"مستقیم کار می‌کند؛ فقط برای مشتری‌های اپراتوری روشن کنید که بازی رویش باز نمی‌شود — آپدیت‌های بازی هم از سرورها رد می‌شود": "works directly; only turn it on for customers of an operator the game does not open on — game updates go through the servers too",
+#"مستقیم — رله به سرور خارج وصل می‌شود": "Direct — the relay connects to the exit server",
+#"مسدود": "Blocked",
+#"مسدود شد": "blocked",
+#"مسدود کردن": "Block",
+#"مسدود کن": "Block",
+#"مسدود ⛔": "Blocked ⛔",
+#"مسدودی‌های دستی (": "Manual blocks (",
+#"مسیر باید ۸ تا ۶۴ نویسه از حروف، رقم، - و _ باشد": "The path must be 8 to 64 characters of letters, digits, - and _",
+#"مسیر تصادفی": "Random path",
+#"مسیر مخفی": "Secret path",
+#"مسیری نیست": "No path",
+#"مشتری": "Customer",
+#"مشتری از همهٔ دستگاه‌ها بیرون آمد. اینترنتش قطع نشده.": "The customer was signed out of every device. Their internet was not cut.",
+#"مشتری این را می‌بیند": "The customer sees this",
+#"مشتری با رسیدها و تیکت‌هایشان، و پلن‌ها، قالب‌ها و رباتش پاک می‌شوند و قابل برگشت نیست.": "customers with their receipts and tickets, and their plans, templates and bot are deleted, with no undo.",
+#"مشتری بتواند کیف پولش را شارژ کند": "Customers can top up their wallet",
+#"مشتری تازه از ربات:": "New customer from the bot:",
+#"مشتری تازه از پنل وب:": "New customer from the web panel:",
+#"مشتری جواب را در پنل خودش یا در ربات می‌بیند. اگر در تیکت بسته بنویسد، دوباره باز می‌شود. عکس‌های تیکت بسته": "The customer sees the reply in their own panel or in the bot. If they write in a closed ticket, it reopens. Pictures of a closed ticket",
+#"مشتری سرورها را به همین ترتیب می‌بیند، با شماره و توضیح هر کدام (در ربات و پنل خودش، کنار DNS، DoT و DoH آن سرور)؛ اولی را معمولاً برمی‌دارد. «پنهان» سرور را از فهرست همهٔ مشتری‌ها برمی‌دارد، مثلاً وقتی در حال تعمیر است، بدون اینکه تیک مشتری‌ها عوض شود. سرور پنهان هنوز کار می‌کند؛ فقط نشان داده نمی‌شود. فروشنده‌ای که اجازهٔ انتخاب رله دارد، می‌تواند برای مشتری‌های خودش توضیح خودش را بنویسد.": "Customers see the servers in this order, each with its number and note (in the bot and in their panel, beside that server’s DNS, DoT and DoH); they usually take the first. “Hidden” takes a server off every customer’s list, for example while it is being repaired, without changing anyone’s ticks. A hidden server still works; it is only not shown. A seller allowed to pick relays can write their own notes for their own customers.",
+#"مشتری مبلغی را که می‌خواهد می‌نویسد و عکس رسید واریز را می‌فرستد. این رسید در صفحهٔ رسیدها با برچسب «شارژ کیف پول» می‌آید و با تأیید شما، همان مبلغ به کیف پولش اضافه می‌شود (اگر مبلغ رسید فرق داشت، همان‌جا درستش کنید). بعد مشتری با موجودی کیف پول، پلن را بدون رسید و فوری می‌خرد. خرید از کیف پول همیشه باز است، حتی وقتی شارژ بسته باشد؛ چون پورسانت دعوت و پولی که خودتان به کیف پول کسی اضافه کرده‌اید هم قابل خرج است.": "The customer writes the amount they want and sends a photo of the payment slip. The receipt appears on the receipts page marked “Wallet top-up”, and once you approve it that amount is added to their wallet (if the slip says otherwise, correct it there). The customer then buys a plan from the wallet at once, with no receipt. Buying from the wallet is always open, even when top-ups are closed, since referral commission and money you add to someone’s wallet can be spent too.",
+#"مشتری و همهٔ پلن‌ها، قالب‌ها و رباتش": "customers and all their plans, templates and bot",
+#"مشتری کد را موقع خرید (در پنل خودش یا ربات) وارد می‌کند و قیمت تخفیف‌خورده را می‌بیند؛ همان مبلغ را واریز می‌کند یا از کیف پول می‌پردازد. هر استفاده فقط وقتی شمرده می‌شود که خرید تأیید شود. پورسانت دعوت هم از مبلغی حساب می‌شود که واقعاً پرداخت شده.": "The customer enters the code when buying (in their panel or the bot) and sees the discounted price; they pay that or pay from the wallet. A use is counted only when the purchase is approved. Referral commission is also worked out from what was actually paid.",
+#"مشتری‌اش قطع می‌شود، چیزی از او فروخته نمی‌شود و رباتش خاموش می‌شود. با «فعال کردن» همه‌چیز برمی‌گردد.": "of their customers is cut, nothing of theirs is sold and their bot is turned off. “Enable” brings everything back.",
+#"مشتری‌های خودم": "My own customers",
+#"مشتری‌های فعال": "Active customers",
+#"مشتری‌های پلن «": "Customers of plan “",
+#"مشتری‌های پنل وب برای خرید و تمدید باید تلگرامشان را به ربات وصل کنند": "Web panel customers must link their Telegram to the bot to buy and renew",
+#"مشکلم حل شد، تیکت را ببند": "My problem is solved, close the ticket",
+#"مصرف": "Usage",
+#"مصرف امروز": "Today’s usage",
+#"مصرف این دوره": "Usage this period",
+#"مصرف این فروشنده صفر شود؟": "Reset this seller’s usage?",
+#"مصرف این کاربر صفر شود؟": "Reset this user’s usage to zero?",
+#"مصرف این کاربر هر": "This customer’s usage is reset every",
+#"مصرف به تفکیک سرور": "Usage by server",
+#"مصرف تا حالا:": "Usage so far:",
+#"مصرف روزانه": "Daily usage",
+#"مصرف شما": "Your usage",
+#"مصرف صفر شد": "Usage reset",
+#"مصرف مشتری‌ها": "Customers’ usage",
+#"مصرف مشتری‌های": "Usage of the customers of",
+#"مصرف مشتری‌های خودم": "My own customers’ usage",
+#"مصرف مشتری‌های من": "My customers’ usage",
+#"مصرف و آمار هر سرور": "Usage and stats per server",
+#"مصرف کاربر": "User usage",
+#"مصرف کل — مشتری‌های شما و فروشنده‌ها": "Total usage — your customers and the sellers’",
+#"مصرف کل — همهٔ مشتری‌ها": "Total usage — all customers",
+#"مصرف —": "Usage —",
+#"مصرف:": "Used:",
+#"معکوس": "Reverse",
+#"معکوس — سرور خارج به رله وصل می‌شود": "Reverse — the exit server connects to the relay",
+#"مقدار تخفیف درست نیست؛ درصد ۱ تا ۱۰۰، یا مبلغ به تومان": "The discount is not valid; a percent from 1 to 100, or an amount in Toman",
+#"ممکن است همین حالا در حال آپدیت باشد)": "it may be upgrading right now)",
+#"منتظر جواب شما": "Waiting for your reply",
+#"منتظر جواب پشتیبانی": "Waiting for support’s reply",
+#"منتظر نتیجه": "Waiting for the result",
+#"منتظر همگام‌سازی بعدی": "Waiting for the next sync",
+#"منقضی": "Expired",
+#"مهلت این کد تخفیف تمام شده": "This discount code has expired",
+#"موتور Unity": "Unity",
+#"موجودی (تومان)": "Balance (Toman)",
+#"موجودی بعدش": "Balance after",
+#"موجودی تازه:": "New balance:",
+#"موجودی کیف پول کافی نیست:": "Not enough in the wallet:",
+#"موجودی کیف پول کمتر از این مبلغ است": "The wallet balance is less than this amount",
+#"موجودی:": "Balance:",
+#"مورتال کامبت": "Mortal Kombat",
+#"مورد دیگر": "more",
+#"موضوع": "Subject",
+#"موضوع تیکت را بنویسید": "Write the ticket subject",
+#"موضوع تیکت را در یک خط بنویسید:": "Write the ticket subject in one line:",
+#"مولتی‌ورسس": "MultiVersus",
+#"مونوپولی گو": "Monopoly GO",
+#"مگابایت": "MB",
+#"مگابایت رم می‌گیرد. الان": "MB of RAM. Right now",
+#"مگابایت روی هر رله. قالبی که مشتری ندارد رم نمی‌گیرد.": "MB on each relay. A template with no customers takes no RAM.",
+#"مگابیت": "Mbit",
+#"مگابیت بر ثانیه": "Mbit/s",
+#"مگابیت بر ثانیه، میانگین ۵ دقیقهٔ اخیر": "Mbit/s, average of the last 5 minutes",
+#"مگابیت بر ثانیه، ۰=بی‌حد": "Mbit/s, 0 = no limit",
+#"مگابیت بر ثانیه؛ خالی یا ۰ یعنی بی‌حد": "Mbit/s; empty or 0 means no limit",
+#"میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری:": "The median of three real DNS questions, in milliseconds; ✓ the fastest in each column and ● the ones picked now. What matters for customers is the relays column: that is where their questions are asked from. Last measured:",
+#"میانگین هر ۵ دقیقه. رله هر نیم دقیقه گزارش می‌دهد، پس اوج لحظه‌ای کوتاه در این نمودار دیده نمی‌شود.": "Average of every 5 minutes. The relay reports every half minute, so a brief momentary peak does not show in this chart.",
+#"میانگین ۵ دقیقهٔ اخیر": "Average of the last 5 minutes",
+#"میلی‌ثانیه": "ms",
+#"می‌بیند.": "sees it.",
+#"می‌خواهند.": "want it.",
+#"می‌رود": "goes",
+#"می‌فرستد.": "sends.",
+#"نام": "Name",
+#"نام (برای خودتان، مثلاً «ربات فروش»)": "Name (for yourself, e.g. “Sales bot”)",
+#"نام DNS امن (DoH و DoT)": "Secure DNS name (DoH and DoT)",
+#"نام DoT": "DoT name",
+#"نام قالب": "Template name",
+#"نام لازم است": "A name is required",
+#"نام کاربری": "Username",
+#"نام کاربری این پنل": "This panel’s username",
+#"نام کاربری باید ۳ تا ۳۲ نویسه باشد — حروف انگلیسی، عدد، و . _ -": "The username must be 3 to 32 characters — English letters, digits, and . _ -",
+#"نام کاربری شما": "Your username is",
+#"نام کاربری همان چیزی است که با آن وارد می‌شوید — حروف انگلیسی، عدد، و . _ - ؛ بزرگ و کوچک فرقی ندارد. اگر قبلاً کسی گرفته باشدش، پیغام می‌دهد.": "The username is what you sign in with — English letters, digits, and . _ - ; upper and lower case are the same. If someone already has it, you are told.",
+#"نام کاربری یا آی‌پی (خالی = همه)": "Username or IP (empty = all)",
+#"نام کاربری یا آی‌پی درست نیست": "The username or IP is not valid",
+#"نام کاربری یا رمز اشتباه است.": "Wrong username or password.",
+#"نام کاربری یا رمز درست نیست": "The username or password is not correct",
+#"نام کاربری ۳ تا ۳۲ حرف انگلیسی کوچک، عدد، . - _ است": "A username is 3 to 32 lower-case English letters, digits, . - _",
+#"نام کاربری ۳ تا ۳۲ حرف انگلیسی، عدد، نقطه، خط تیره یا زیرخط باشد": "The username must be 3 to 32 English letters, digits, dots, dashes or underscores",
+#"نام کاربری:": "Username:",
+#"نامحدود": "Unlimited",
+#"نامعلوم": "Unknown",
+#"نامی که الان به مشتری‌ها داده می‌شود:": "The name customers are given now:",
+#"نتیجه": "Result",
+#"ندارد": "none",
+#"نرسید": "Did not arrive",
+#"نزدیک پر شدن است:": "is nearly full:",
+#"نسخه": "Version",
+#"نسخهٔ قبلی اینجا نگه داشته شد:": "The previous copy was kept here:",
+#"نسخهٔ پشتیبان": "Backup",
+#"نشان داده می‌شود و بعداً خوانده نمی‌شود؛ اگر گمش کردید، یکی تازه بسازید و این را باطل کنید.": "is shown and cannot be read later; if you lose it, make a new one and revoke this one.",
+#"نشان داده می‌شود؛ اگر گمش کردید، آدرس را دوباره ذخیره کنید تا رمز تازه بسازد.": "is shown; if you lose it, save the address again to make a new secret.",
+#"نشد": "Failed",
+#"نشد:": "Failed:",
+#"نشد، دوباره امتحان کنید": "Failed, try again",
+#"نشد؛ بقیهٔ سرورها آپدیت نشدند. لاگش در صفحهٔ «نود» است.": "failed; the other servers were not upgraded. Its log is on the “Node” page.",
+#"نشد؛ پیام‌های ربات را ببینید": "Failed; see the bot’s messages",
+#"نشست معتبر نیست": "The session is not valid",
+#"نشست منقضی شده": "Session expired",
+#"نصب یک تک‌سرور تازه": "Install a new single server",
+#"نصب یک رلهٔ تازه": "Install a new relay",
+#"نصب یک سرور خارج تازه": "Install a new exit server",
+#"نصب‌کننده گرفته نشد:": "The installer was not taken:",
+#"نصب‌کننده‌ای روی این سرور نگه داشته نشده": "No installer has been kept on this server",
+#"نفر": "people",
+#"نفر با لینک شما آمده‌اند و": "people have come with your link and",
+#"نفر تا ۳ روز دیگر تمام می‌شود": "people end within 3 days",
+#"نفر در صف فرستادن است": "people queued for sending",
+#"نفر دیگر تلگرام ندارند)": "more have no Telegram)",
+#"نمایش لاگ کامل": "Show the full log",
+#"نمودار مصرف": "Usage chart",
+#"نود": "Node",
+#"نود و سرورها": "Nodes and servers",
+#"نویسه": "characters",
+#"نویسه است": "characters",
+#"نویسه، چند خطی.": "characters, several lines.",
+#"نید فور اسپید": "Need for Speed",
+#"نیست": "is not",
+#"نینتندو": "Nintendo",
+#"نیو ورلد": "New World",
+#"هارث‌استون": "Hearthstone",
+#"هانت شوداون": "Hunt: Showdown",
+#"هر": "every",
+#"هر اسمی که رله‌ها مسیریابی نمی‌کنند": "Any name the relays do not route",
+#"هر اسمی که رله‌ها مسیریابی نمی‌کنند از این‌ها پرسیده می‌شود، و nginx همین سرور هم برای پیدا کردن آدرس سرویس‌ها از آن‌ها می‌پرسد. پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از اعمال، خودش از ایران امتحان می‌کند — اگر جواب ندهد همان قبلی را نگه می‌دارد.": "Any name the relays do not route is asked of these, and this server’s nginx asks them too to find services’ addresses. They are tested from this server before saving, and each relay also tries them from Iran before applying — if they do not answer, it keeps the previous ones.",
+#"هر اسمی که سرور مسیریابی نمی‌کند": "Any name the server does not route",
+#"هر تلگرام فقط به یک حساب وصل می‌شود، پس هر کس به سختی بیش از یک حساب می‌سازد. سرویس کسی قطع نمی‌شود؛ فقط خرید تازه و تمدید منتظر وصل شدن می‌ماند. تیکت آزاد است.": "Each Telegram account links to only one account, so it is hard for anyone to make more than one account. Nobody’s service is cut; only new purchases and renewals wait until they link. Tickets stay open.",
+#"هر جا با رمز قبلی وارد بودید، خارج شدید.": "You have been signed out everywhere you used the old password.",
+#"هر خبر سرآیند": "Each message has the header",
+#"هر خرید": "every purchase",
+#"هر خرید و تمدیدش": "every purchase and renewal",
+#"هر خریدش": "every purchase",
+#"هر ردیف یک تیک دارد: زدنش یعنی همهٔ دامنه‌های آن از رله می‌رود، از جمله دامنه‌هایی که بعداً اضافه شوند. کشو را باز کنید تا خود دامنه‌ها را ببینید و یکی‌یکی انتخاب کنید.": "Each row has one tick: ticking it means all its domains go through the relay, including domains added later. Open the drawer to see the domains themselves and pick them one by one.",
+#"هر رله از سرور خارجی که برایش انتخاب شده می‌رود؛ اگر آن سرور در دسترس نباشد، خودکار از بقیه می‌رود. مشتری‌ها و حجمشان بین همه مشترک است.": "Each relay goes through the exit server chosen for it; if that server cannot be reached, it goes through the others automatically. Customers and their quotas are shared by all.",
+#"هر رله هر نیم دقیقه از راه هر سرور خارج یک سایت را امتحان می‌کند؛ اگر دو بار پشت هم جواب نگیرد، آن سرور را برای مشتری‌هایش آخر صف می‌گذارد تا وقتی دوباره جواب بدهد. این‌ها هم این‌جا می‌آیند: سروری که ۳ دقیقه گزارش ندهد، دیسک بالای ۹۰٪، جدول اتصال‌ها بالای ۸۰٪، گواهی HTTPS که کمتر از ۱۴ روز مانده و تمدید نشده، و رم یا پردازندهٔ بالای ۹۰٪ در ۱۰ دقیقه. هر تغییر یک بار به ادمین‌های ربات هم فرستاده می‌شود.": "Every half minute each relay tries a site through each exit server; if it gets no answer twice in a row, it puts that server last for its customers until it answers again. These also show here: a server silent for 3 minutes, a disk over 90%, a connection table over 80%, an HTTPS certificate with less than 14 days left and not renewed, and RAM or CPU over 90% for 10 minutes. Each change is also sent once to the bot’s admins.",
+#"هر رله یک در ورود مشتری‌هاست؛ همهٔ رله‌ها مشتری‌ها و حجم مشترک دارند. مشتری می‌تواند یکی را DNS اول و دیگری را DNS دوم بگذارد.": "Each relay is a way in for customers; all relays share the customers and their quotas. A customer can set one as DNS 1 and another as DNS 2.",
+#"هر سرور نصب‌کننده را از همین پنل می‌گیرد، هشش را چک می‌کند و اجرایش می‌کند. سرور بعدی فقط وقتی شروع می‌شود که قبلی موفق شده باشد. اگر یکی خطا بدهد یا ۲۰ دقیقه جواب ندهد، کار متوقف می‌شود و هشدار می‌آید. نسخهٔ قدیمی‌تر هیچ‌وقت روی نسخهٔ جدیدتر نصب نمی‌شود.": "Each server takes the installer from this panel, checks its hash and runs it. The next server starts only after the previous one succeeded. If one fails or does not answer for 20 minutes, the job stops and you are alerted. An older version is never installed over a newer one.",
+#"هر ماه شروع می‌شود": "starts every month",
+#"هر مشتری": "Per customer",
+#"هر مشتری فقط یک بار": "Each customer only once",
+#"هر مشتری لینک دعوت خودش را بگیرد": "Every customer gets their own invitation link",
+#"هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.": "Press one of the buttons again whenever you like.",
+#"هر پلن تعداد دستگاه خودش را دارد (ستون «دستگاه»)، یعنی چند آی‌پی هم‌زمان می‌توانند وصل باشند. اگر آی‌پی تازه‌ای بیاید و جا نباشد، قدیمی‌ترین آی‌پی حذف می‌شود. مشتری روی پلن فعالش می‌تواند از پنل یا ربات دستگاه اضافه بخرد، با رسید یا از کیف پول. دستگاه اضافه تا وقتی همان پلن را تمدید کند می‌ماند و با خرید پلن دیگر از بین می‌رود. حداکثر": "Each plan has its own number of devices (the “Devices” column): how many IPs can be connected at once. When a new IP comes and there is no room, the oldest one is removed. On an active plan, a customer can buy extra devices from the panel or the bot, by receipt or from the wallet. An extra device lasts while the same plan is renewed and ends when another plan is bought. At most",
+#"هر پلن یعنی یک قالب، برای چند روز، با یک حجم و یک قیمت. مشتری در پنل خودش پلن را انتخاب می‌کند و رسید می‌فرستد؛ با تأیید رسید همه‌چیز خودکار روی حسابش می‌نشیند. خرید دوبارهٔ همان پلن پیش از تمام شدنش تمدید است: روزها و حجم روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ حجم پذیرفته نمی‌شود.": "Each plan is a template, for a number of days, with a quota and a price. The customer picks a plan in their own panel and sends a receipt; on approval everything is put on their account automatically. Buying the same plan again before it ends is a renewal: the days and quota are added to what is left. Buying another plan starts over from that moment and what was left is lost; the customer is told this before buying. “Unlimited” only by its own tick; an empty quota box is not accepted.",
+#"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",
+#"هر کس با این لینک ثبت‌نام کند، مشتری شما می‌شود و پلن‌ها و اطلاعات پرداخت شما را می‌بیند.": "Whoever signs up with this link becomes your customer and sees your plans and payment details.",
+#"هر کس با لینک شما حساب بسازد و پلن بخرد،": "When someone makes an account with your link and buys a plan,",
+#"هرگز": "Never",
+#"هست": "exists",
+#"هشدارها": "Alerts",
+#"هشدارهای هستهٔ لینوکس — سرور خارج": "Linux kernel warnings — exit server",
+#"هشدارهای هستهٔ لینوکس — کم آمدن حافظه، پر شدن جدول اتصال‌ها": "Linux kernel warnings — running out of memory, the connection table filling up",
+#"هفتهٔ": "Week",
+#"هل لت لوز": "Hell Let Loose",
+#"هل‌دایورز ۲": "Helldivers 2",
+#"هم بسته می‌شود که مشتری‌ها برای رسیدن به سرویس لازمش دارند": "is closed too, which customers need to reach the service",
+#"هم بود و دیگر از رله نمی‌رود": "too and no longer goes through the relay",
+#"همان آدرس قبلی است؛ چیزی عوض نشد": "That is the same address as before; nothing changed",
+#"همان سرور را هم این‌جا بگذارید. بقیهٔ اطلاعات بی‌مشکل برمی‌گردد.": "Put that server’s file here too. The rest of the data comes back without trouble.",
+#"همان مسیر قبلی است": "That is the same path as before",
+#"همان پورت قبلی است": "That is the same port as before",
+#"همان، روی چند اتصال مشترک": "The same, over several shared connections",
+#"همه": "All",
+#"همه (": "All (",
+#"همه، از جمله سرویس‌هایی که بعداً اضافه شوند": "All, including services added later",
+#"همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.": "All of these work only on the internet connection whose IP you registered.",
+#"همهٔ تیکت‌ها": "All tickets",
+#"همهٔ خریدها و تمدیدها": "Every purchase and renewal",
+#"همهٔ رله‌ها": "All relays",
+#"همهٔ سرورها آخرین نسخه را دارند.": "Every server has the latest version.",
+#"همهٔ سرورها روی همین نسخه‌اند": "All servers are on this version",
+#"همهٔ سرورها سالم‌اند.": "All servers are healthy.",
+#"همهٔ سرورها همین حالا": "Every server already has",
+#"همهٔ قالب‌ها": "All templates",
+#"همهٔ مشتری‌ها": "All customers",
+#"همگام‌سازی با پنل": "Sync with the panel",
+#"همگام‌سازی و پنل مشتری": "Sync and customer panel",
+#"همین آدرس": "This address",
+#"همین آی‌پی را ثبت کن": "Register this IP",
+#"همین الان": "Just now",
+#"همین حالا بفرست": "Send now",
+#"همین حالا:": "Right now:",
+#"همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله می‌گوید قالب شما کدام است.": "The same service, encrypted. Like plain DNS, it works only on the internet connection whose IP you registered. This address is your account’s own and tells the relay which template is yours.",
+#"همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید. هر سرور آدرس‌های خودش را دارد؛ اگر یکی فیلتر شد، سراغ دیگری بروید. آدرس‌های DoH مخصوص حساب شماست.": "The same service, encrypted. Like plain DNS, it works only on the internet connection whose IP you registered. Each server has its own addresses; if one is filtered, use another. The DoH addresses are your account’s own.",
+#"همین مبلغ را واریز کنید و رسیدش را بفرستید؛ بعد از تأیید، به کیف پولتان اضافه می‌شود. حداقل": "Pay exactly this amount and send its receipt; after it is approved, it is added to your wallet. At least",
+#"هنوز آماده نیست:": "Not ready yet:",
+#"هنوز آماری نرسیده": "No stats yet",
+#"هنوز آماری نرسیده.": "No stats yet.",
+#"هنوز ادمینی نساخته‌اید.": "You have not made any admins yet.",
+#"هنوز تیکتی ندارید.": "You have no tickets yet.",
+#"هنوز تیکتی نفرستاده‌اید.": "You have not sent any tickets yet.",
+#"هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از": "You have not made any custom domains, blocks or separate DNS yet; from the",
+#"هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.": "No bot is connected to the panel yet (API page); until there is one this rule is not enforced, so nobody gets stuck.",
+#"هنوز قالبی نیست": "No templates yet",
+#"هنوز لاگی نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ سرورهای قدیمی‌تر بعد از ارتقا.": "They have not sent logs yet. Each Iran server sends its log every 5 minutes; older servers after they are upgraded.",
+#"هنوز مصرفی از این سرور ثبت نشده.": "No usage recorded from this server yet.",
+#"هنوز مصرفی ثبت نشده. نمودارها از اولین همگام‌سازی رله بعد از این نسخه پر می‌شوند.": "No usage recorded yet. The charts fill from the relays’ first sync after this version.",
+#"هنوز نه": "not yet",
+#"هنوز پلن نخریده‌اند": "Have not bought a plan yet",
+#"هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، مشتری رسید را بدون انتخاب پلن می‌فرستد و سهمیه را خودتان می‌گذارید.": "You have not made any plans yet. Until there is a plan, the customer sends a receipt without choosing one and you set the quota yourself.",
+#"هنوز پلنی نیست": "No plans yet",
+#"هنوز چیزی نرسیده.": "Nothing has arrived yet.",
+#"هنوز چیزی ننوشته‌اید؛ مشتری موقع خرید نمی‌داند کجا واریز کند.": "You have not written anything yet; at purchase the customer does not know where to pay.",
+#"هنوز چیزی نیامده و نرفته.": "Nothing has come in or gone out yet.",
+#"هنوز چیزی نیست": "Nothing yet",
+#"هنوز چیزی نیست. چند دقیقه بعد از اولین استفاده این‌جا پر می‌شود.": "Nothing yet. This fills up a few minutes after first use.",
+#"هنوز کسی ثبت‌نام نکرده.": "Nobody has signed up yet.",
+#"هنوز کلیدی نساخته‌اید.": "You have not made any keys yet.",
+#"هنوز گزارشی نداده": "Has not reported yet",
+#"هوش مصنوعی": "AI",
+#"هونکای استار ریل": "Honkai: Star Rail",
+#"هی دی": "Hay Day",
+#"هیلو": "Halo",
+#"هیچ": "nothing",
+#"هیچ رله‌ای تیک نخورده بود؛ همه به این مشتری نشان داده می‌شوند": "No relay was ticked; all are shown to this customer",
+#"هیچ رله‌ای هنوز DNS امن را روشن نکرده؛ رله برای این کار به دامنه و گواهی نیاز دارد.": "No relay has turned secure DNS on yet; a relay needs a domain and a certificate for it.",
+#"هیچ قالبی": "No template",
+#"هیچ‌کدام": "None",
+#"و دومی را": "and the second as",
+#"و هم": "and",
+#"وار ثاندر": "War Thunder",
+#"وارد شوید": "sign in",
+#"وارفریم": "Warframe",
+#"وارهمر دارک‌تاید": "Warhammer: Darktide",
+#"والورانت": "Valorant",
+#"وانس هیومن": "Once Human",
+#"وایلد ریفت": "Wild Rift",
+#"وب‌سوکت مشترک — رمز ندارد": "Shared WebSocket — no encryption",
+#"وب‌سوکت — رمز ندارد": "WebSocket — no encryption",
+#"وب‌کم زنده": "Live webcams",
+#"ورلد آو تنکس": "World of Tanks",
+#"ورلد آو وارشیپس": "World of Warships",
+#"ورلد آو وارکرفت": "World of Warcraft",
+#"ورمز و Dredge": "Team17 games",
+#"ورود": "Sign in",
+#"ورود به حساب": "Sign in to your account",
+#"ورود و ثبت آی‌پی": "Sign in and register IP",
+#"ورودش از حساب PSN می‌گذرد، پس پلی‌استیشن هم لازم است": "signs in through the PSN account, so PlayStation is needed too",
+#"وصل شد، بی جواب HTTP": "Connected, no HTTP answer",
+#"وصل شد؛ گواهی برای زیردامنه‌ها": "Connected; certificate for subdomains",
+#"وصل شوید و اجرا کنید:": "connect and run:",
+#"وصل کردن تلگرام دیگر اجباری نیست": "Linking Telegram is no longer required",
+#"وصل —": "Connected —",
+#"وضعیت": "Status",
+#"وضعیت نامعتبر": "Invalid status",
+#"وضعیت:": "Status:",
+#"وقتی به سقف رسید:": "When the cap is reached:",
+#"وقتی توکن جفت‌کردن خواست، این را بدهید:": "When it asks for the pairing token, give it this:",
+#"وقتی در این جدول «وصل» شد، از ستون «سرور خارج» جدول رله‌ها رله‌هایی را که باید از آن بروند انتخاب کنید. توکن را فقط به خودتان بدهید.": "When it shows “Connected” in this table, pick in the relays table’s “Exit server” column the relays that should go through it. Give the token only to yourself.",
+#"وقتی رله در جدول «وصل» شد، اگر تونل می‌خواهد، از ستون «تونل» روشنش کنید؛ رله تا یک دقیقه بعد خودش آن را برپا می‌کند.": "When the relay shows “Connected” in the table, if it needs a tunnel, turn it on from the “Tunnel” column; the relay sets it up by itself within a minute.",
+#"وقتی روشن باشد، DNS برای همه باز است: کسی لازم نیست ثبت‌نام کند یا آی‌پی ثبت کند، و سهمیه، تاریخ پایان و مسدود بودن مشتری‌ها هم جلوی کسی را نمی‌گیرد. مصرف کسانی که آی‌پی ثبت نکرده‌اند جایی شمرده نمی‌شود. تا یک دقیقه روی همهٔ رله‌ها و تک‌سرورها اعمال می‌شود؛ با خاموش کردنش همه‌چیز مثل قبل می‌شود. DoH و DoT همچنان فقط برای مشتری‌ها کار می‌کنند.": "When it is on, the DNS is open to everyone: nobody needs to sign up or register an IP, and quotas, end dates and blocked customers stop no one. The usage of those without a registered IP is not counted anywhere. It reaches every relay and single server within a minute; turning it off puts everything back as it was. DoH and DoT still work only for customers.",
+#"وقتی سرویسی باز نمی‌شود، این را روشن کنید و همان سرویس را دوباره باز کنید: این‌جا می‌بینید دستگاه‌هایتان چه اسم‌هایی پرسیدند، هر کدام از رله رفت یا مستقیم، و چرا. پشتیبانی هم همین را می‌بیند. فقط تا یک ساعت نگه داشته می‌شود و خاموشش که کنید همان لحظه پاک می‌شود.": "When a service does not open, turn this on and open that service again: here you see which names your devices asked, whether each went through the relay or directly, and why. Support sees the same. It is kept for up to an hour, and when you turn it off it is deleted at once.",
+#"وقتی مشتری پلن را انتخاب می‌کند، در پنل خودش و در ربات همین را می‌بیند: کجا و به نام چه کسی واریز کند. عوض کردنش فوراً همه‌جا عوض می‌شود.": "When a customer picks a plan, they see exactly this in their own panel and in the bot: where and in whose name to pay. Changing it changes it everywhere at once.",
+#"وقتی کسی با لینک دعوت یک مشتری (لینک ربات یا لینک ثبت‌نام) حساب بسازد و پلن بخرد، این درصد از قیمت پلن به کیف پول همان مشتری اضافه می‌شود؛ فرقی نمی‌کند با رسید خریده باشد یا از کیف پول. شارژ کیف پول پورسانت ندارد، تا یک پول دو بار حساب نشود. دعوت‌کننده فقط موقع ساختن حساب ثبت می‌شود و بعداً عوض نمی‌شود، و هیچ‌کس نمی‌تواند خودش را دعوت کند. هر مشتری لینک دعوتش را در ربات (بخش کیف پول) و در پنل خودش می‌بیند.": "When someone signs up with a customer’s invitation link (the bot link or the sign-up link) and buys a plan, this percent of the plan’s price is added to that customer’s wallet, whether they paid by receipt or from the wallet. Wallet top-ups earn no commission, so the same money is not counted twice. The inviter is recorded only when the account is made and never changes, and nobody can invite themselves. Each customer sees their invitation link in the bot (under Wallet) and in their own panel.",
+#"ووترینگ ویوز": "Wuthering Waves",
+#"ویرایش": "Edit",
+#"ویرایش حساب این کاربر ←": "Edit this user’s account →",
+#"ویندوز ۱۱": "Windows 11",
+#"ویچر": "The Witcher",
+#"وی‌آرچت": "VRChat",
+#"ٔ رله‌ها": "the relays",
+#"ٔ سرور خارج": "the exit server",
+#"٪ از": "% of",
+#"٪ از خرید": "% of the purchase",
+#"٪ حجم سرویس شما مصرف شده؛": "% of your service quota is used;",
+#"٪ حجمش مصرف شد.": "% of their traffic used.",
+#"٪ سقف است:": "% of the cap:",
+#"٪ سقف ماهانه‌اش گذشت": "% of its monthly cap passed",
+#"٪ مبلغ": "% of the price of",
+#"٪ پر است.": "% full.",
+#"٪ کار می‌کند.": "% busy.",
+#"٪. پر که بشود، اتصال‌های تازهٔ مشتری‌ها رد می‌شوند.": "%. When it is full, customers’ new connections are refused.",
+#"٪. پر که بشود، لاگ و دیتابیس دیگر نوشته نمی‌شوند.": "%. When it is full, logs and the database can no longer be written.",
+#"پابجی رایانه": "PUBG: Battlegrounds",
+#"پابجی موبایل": "PUBG Mobile",
+#"پال‌ورلد": "Palworld",
+#"پاپ‌آپ‌ها (سایت‌های دانلود)": "Pop-ups (download sites)",
+#"پایان دوره": "Period ends",
+#"پایان دوره:": "Period ends:",
+#"پث آو اگزایل": "Path of Exile",
+#"پر شده است:": "is full:",
+#"پراکسی": "Proxy",
+#"پرداخت": "Payment",
+#"پرسیده می‌شود": "is asked",
+#"پرش به:": "Jump to:",
+#"پرفکت ورلد": "Perfect World",
+#"پرمصرف‌ترین‌ها — ۷ روز اخیر": "Top users — last 7 days",
+#"پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید.": "A ready iPhone profile is in the web panel, under “Encrypted DNS”. The DoH address is your account’s own; do not give it to anyone.",
+#"پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "A ready iPhone profile is in the web panel, under “Encrypted DNS”. The DoH addresses are your account’s own; do not give them to anyone.",
+#"پروفایل آیفون این سرور": "iPhone profile for this server",
+#"پشتیبان": "Standby",
+#"پشتیبان باید یکی از نودها باشد": "The standby must be one of the nodes",
+#"پشتیبان هر ۶ ساعت آخرین بکاپ پنل (رمزگذاری‌شده با رمز بکاپ) و نصب‌کننده را از همین سرور می‌گیرد و نگه می‌دارد. همهٔ رله‌ها و نودها هم آدرسش را می‌دانند.": "Every 6 hours the standby gets the panel’s latest backup (encrypted with the backup password) and the installer from this server and keeps them. All relays and nodes know its address too.",
+#"پشتیبانی": "Support",
+#"پشتیبانی به تیکت «": "Support replied to ticket “",
+#"پشتیبانی و تیکت‌ها": "Support and tickets",
+#"پشتیبان‌گیری نشد:": "Backup failed:",
+#"پلدینز و اسمایت": "Paladins / SMITE",
+#"پلن": "Plan",
+#"پلن «": "Plan “",
+#"پلن انتخاب‌شده فوراً فعال می‌شود و قیمتش از کیف پول کم می‌شود؛ رسید لازم نیست.": "The chosen plan is activated at once and its price comes off the wallet; no receipt needed.",
+#"پلن تازه": "New plan",
+#"پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش": "Free trial plan created; customers with a linked Telegram get it once",
+#"پلن حذف شد": "Plan deleted",
+#"پلن دوباره فروخته می‌شود": "The plan is sold again",
+#"پلن دیگر فروخته نمی‌شود؛ کسانی که دارندش تا آخر دوره می‌مانند": "The plan is no longer sold; those who have it keep it until their period ends",
+#"پلن دیگری": "another plan",
+#"پلن ذخیره شد؛ برای خریدهای بعدی": "Plan saved; for later purchases",
+#"پلن را انتخاب کنید:": "Choose a plan:",
+#"پلن را انتخاب کنید، مبلغش را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار روی حسابتان فعال می‌شود.": "Choose a plan, pay its price and send a photo of the receipt. After it is approved, the plan is activated on your account automatically.",
+#"پلن ساخته شد و در پنل مشتری دیده می‌شود": "Plan created; it shows in the customer panel",
+#"پلن فعال": "Active plans",
+#"پلن:": "Plan:",
+#"پلنی که انتخاب کرده بود حذف شده؛ بعد از تأیید، سهمیه و زمان را خودتان بگذارید": "The plan they chose was deleted; after approving, set the quota and time yourself",
+#"پلن‌ها": "Plans",
+#"پلن‌ها (": "Plans (",
+#"پلن‌ها و پرداخت": "Plans and payment",
+#"پلن‌هایی این قالب را می‌فروشند؛ اول آن‌ها را حذف کنید یا قالبشان را عوض کنید": "Plans sell this template; delete them or change their template first",
+#"پلی‌استیشن": "PlayStation Network",
+#"پنل ادمین — سرور خارج": "Admin panel — exit server",
+#"پنل به این آدرس ربات خبر می‌دهد: تأیید یا رد رسید، جواب تیکت، ۸۰٪ و ۹۵٪ حجم، تمام شدن حجم، نزدیک شدن و تمام شدن دوره. هر خبر یک متن فارسی آماده دارد که ربات می‌تواند عیناً برای مشتری بفرستد.": "The panel tells the bot at this address about: a receipt approved or rejected, a ticket reply, 80% and 95% of the quota, the quota running out, the period ending soon and ending. Each message has a ready text the bot can send to the customer as it is.",
+#"پنل تا چند ثانیهٔ دیگر روی آدرس تازه بالا می‌آید. اگر باز نشد، به احتمال زیاد فایروال یا security group سرور پورت را نمی‌گذارد رد شود؛ از روی خود سرور با": "The panel comes up on the new address within a few seconds. If it does not open, most likely the server’s firewall or security group is not letting the port through; from the server itself with",
+#"پنل جواب درستی نداد (HTTP": "The panel did not answer properly (HTTP",
+#"پنل را همان‌طور ببینید که او می‌بیند": "See the panel as they see it",
+#"پنل فهرست کامل را از سازنده‌اش می‌گیرد، دامنه‌هایی را که خود سرویس لازم دارد یا از رله می‌روند از آن کنار می‌گذارد، و هر رله فقط یک بار دریافتش می‌کند؛ روشن شدنش چند دقیقه طول می‌کشد. توجه: بعضی بازی‌های موبایل برای دیدن تبلیغ جایزه می‌دهند؛ اگر تبلیغ بسته شود، آن جایزه هم دیگر نمی‌آید.": "The panel takes the full list from its maker, leaves out the domains the service itself needs or that go through the relay, and each relay downloads it once; turning it on takes a few minutes. Note: some mobile games reward watching ads; with ads blocked, that reward stops too.",
+#"پنل مدیریت": "Admin panel",
+#"پنل هر": "Every",
+#"پنل و API — سرور خارج": "Panel and API — exit server",
+#"پنل‌ها": "Panels",
+#"پنهان": "Hidden",
+#"پورت": "Port",
+#"پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد": "The port must be a number from 1 to 65535",
+#"پورت را که عوض کنید، پنل روی پورت تازه بالا می‌آید — ولی اگر سرور فایروال یا security group دارد (روی AWS، Hetzner و مانندش) باید پورت تازه را": "When you change the port, the panel comes up on the new port — but if the server has a firewall or security group (on AWS, Hetzner and the like) you must open the new port",
+#"پورت ۸۵۳. برای Private DNS اندروید، و برنامه‌ها و مودم‌هایی که DoT دارند؛ بعضی‌ها آن را به شکل": "Port 853. For Android’s Private DNS, and apps and routers that have DoT; some want it in the form",
+#"پورسانت دعوت": "Invitation commission",
+#"پورسانت گرفته (تومان)": "Commission earned (Toman)",
+#"پورن": "Porn",
+#"پوشانده می‌شود.": "is hidden.",
+#"پیام": "Message",
+#"پیام آزمایشی در صف است؛ چند ثانیه دیگر در تلگرام": "A test message is queued; in Telegram in a few seconds",
+#"پیام برای": "Message for",
+#"پیام بیشتر از": "The message is more than",
+#"پیام تازه": "New message",
+#"پیام تازه از": "New message from",
+#"پیام تازه — تیکت دوباره باز می‌شود": "New message — the ticket reopens",
+#"پیام فرستاده شد": "Message sent",
+#"پیام فقط به مشتری‌هایی می‌رسد که تلگرامشان به ربات وصل است. ربات پیام‌ها را یکی‌یکی و با فاصله می‌فرستد تا تلگرام محدودش نکند؛ برای همین اگر مشتری زیاد باشد، چند دقیقه طول می‌کشد. عدد کنار هر گزینه، تعداد همین لحظه است.": "The message reaches only customers whose Telegram is linked to the bot. The bot sends them one by one, spaced out, so Telegram does not limit it; with many customers it takes a few minutes. The number beside each choice is the count right now.",
+#"پیامتان را بنویسید:": "Write your message:",
+#"پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید": "You have sent many messages; write again a little later",
+#"پیش از ذخیره از همین سرور آزموده می‌شوند — اگر جواب ندهند، همان قبلی می‌ماند.": "They are tested from this server before saving — if they do not answer, the previous ones stay.",
+#"پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از اعمال، خودش از ایران امتحان می‌کند — اگر جواب ندهد همان قبلی را نگه می‌دارد.": "They are tested from this server before saving, and each relay also tries them from Iran before applying — if they do not answer, it keeps the previous ones.",
+#"پیش‌فرض خاموش —": "Off by default —",
+#"پیش‌فرض خاموش: روی بیشتر اپراتورها مستقیم بهتر کار می‌کند": "off by default: works better direct on most operators",
+#"پیش‌فرض خاموش: روی ۵۲۲۳ است، که رله نمی‌برد": "off by default: it is on 5223, which the relay does not carry",
+#"پیش‌فرض رله": "Relay default",
+#"پینگ شما تا سرور:": "Your ping to the server:",
+#"پی‌دی": "PAYDAY",
+#"چت رایوت": "Riot chat (PVP.net)",
+#"چت و لیست دوستانش روی pvp.net است — پورت ۵۲۲۳، که رله نمی‌برد. خود بازی کار می‌کند": "its chat and friends list are on pvp.net — port 5223, which the relay does not carry. The game itself works",
+#"چرا": "Why",
+#"چقدر می‌خواهید شارژ کنید؟ مبلغ را به تومان بنویسید (حداقل": "How much do you want to top up? Write the amount in Toman (at least",
+#"چند آی‌پی هم‌زمان، ۱ تا ۵": "How many IPs at once, 1 to 5",
+#"چند دقیقه دیگر دوباره.": "Try again in a few minutes.",
+#"چند روز اعتبار": "Valid for how many days",
+#"چند روز دیگر": "How many more days",
+#"چنین آدرسی نیست": "No such address",
+#"چنین اسمی نیست": "No such name",
+#"چنین کاری نیست": "No such action",
+#"چه": "What",
+#"چه بخش‌هایی را ببیند": "Which parts they see",
+#"چیزی برای بازگردانی نیست": "Nothing to restore",
+#"چیزی نیست": "Nothing",
+#"کار آپدیت متوقف شد": "The upgrade job stopped",
+#"کار آپدیت متوقف شد:": "The upgrade job stopped:",
+#"کاربر": "User",
+#"کاربر برگشت": "User restored",
+#"کاربر حذف شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود": "User deleted; cut off within 30 seconds",
+#"کاربر مسدود شد": "User blocked",
+#"کاربر مسدود شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود": "User blocked; cut off within 30 seconds",
+#"کاربر یا پلن پیدا نشد": "User or plan not found",
+#"کاربران": "Users",
+#"کاربران (": "Users (",
+#"کاربران:": "Users:",
+#"کاربری با این آیدی تلگرام نیست": "No user with this Telegram ID",
+#"کارمند است و مشتری مال خودش ندارد؛ همهٔ مشتری‌ها را در بخش‌هایی که برایش تیک خورده می‌بیند. هر کاری که کرده با نام کاربری‌اش در صفحهٔ": "Staff, with no customers of their own; they see every customer in the parts ticked for them. Everything they did is recorded with their username on the",
+#"کارهای دیگر": "More actions",
+#"کال آو دیوتی": "Call of Duty",
+#"کامل": "Full",
+#"کامند اند کانکر": "Command and Conquer",
+#"کجا رفت": "Where it went",
+#"کد": "Code",
+#"کد اتصال درست نیست": "The link code is not correct",
+#"کد اتصال منقضی شده؛ یکی تازه بگیرید": "The link code has expired; get a new one",
+#"کد بازیابی رمز پنل:": "Panel password recovery code:",
+#"کد تازه": "New code",
+#"کد تخفیف": "Discount code",
+#"کد تخفیف «": "Discount code “",
+#"کد تخفیف حذف شد": "Discount code deleted",
+#"کد تخفیف را بنویسید:": "Write the discount code:",
+#"کد درست نیست یا منقضی شده": "The code is not correct or has expired",
+#"کد را وارد کنید": "Enter the code",
+#"کد زیاد گرفته‌اید؛ کمی بعد دوباره": "You have asked for many codes; try again a little later",
+#"کد شش‌رقمی‌ای که در تلگرام گرفتید، و رمز تازه.": "The six-digit code you got in Telegram, and a new password.",
+#"کد نرسید؟": "No code?",
+#"کد ۳ تا ۳۲ حرف انگلیسی یا عدد است (و - _)": "A code is 3 to 32 English letters or digits (and - _)",
+#"کدام رله‌ها به هر مشتری به‌عنوان DNS اول و دوم نشان داده شوند، از ستون «DNS» صفحهٔ کاربران.": "Which relays each customer is shown as DNS 1 and DNS 2 is set in the “DNS” column of the users page.",
+#"کدام سر وصل شود:": "Which end connects:",
+#"کدی با این نام هست": "A code with this name exists",
+#"کلاینت رایوت": "Riot Client",
+#"کلش آو کلنز": "Clash of Clans",
+#"کلش رویال": "Clash Royale",
+#"کلید": "Key",
+#"کلید API": "API key",
+#"کلید API «": "API key “",
+#"کلید API معتبر نیست": "The API key is not valid",
+#"کلید «": "Key “",
+#"کلید باطل شد؛ رباتی که با آن کار می‌کرد قطع شد": "Key revoked; the bot that used it has been cut off",
+#"کلید تازه": "New key",
+#"کلید رمزگذاری عکس‌ها": "Picture encryption key",
+#"کلید رمزگذاری عکس‌ها (": "Picture encryption key (",
+#"کلیدها": "Keys",
+#"کلیدی روی این سرور نیست": "There is no key on this server",
+#"کم آمدن حافظه، پر شدن جدول اتصال‌ها": "Running out of memory, the connection table filling up",
+#"کم شد": "taken away",
+#"کمتر": "less",
+#"کمی صبر کنید": "Wait a little",
+#"که انتخاب کنید از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین می‌رود.": "you choose starts over from the moment it is approved, and what is left of the current plan is lost.",
+#"که فقط مشتری‌ها، پلن‌ها و کارت شما را می‌بیند": "that sees only your customers, plans and card",
+#"کوئری DoH": "DoH query",
+#"کوئری DoT": "DoT query",
+#"کونان اگزایلز و Dune": "Conan Exiles / Dune",
+#"کپی": "Copy",
+#"کپی شد": "Copied",
+#"کیف پول": "Wallet",
+#"کیف پول شما": "Your wallet",
+#"کیف پول و دعوت": "Wallet and invites",
+#"کیف پول کاربر": "User wallet",
+#"کیفیت اتصال": "Connection quality",
+#"کیلوبایت": "KB",
+#"گارنا": "Garena",
+#"گردش کیف پول": "Wallet history",
+#"گرفت).": "got it).",
+#"گرفتن کد اتصال": "Get a link code",
+#"گرفتن گواهی یا روشن کردن DoH نشد": "Getting the certificate or turning DoH on failed",
+#"گرفته است": "has taken it",
+#"گروهِ «پیش‌فرض خاموش» تیک نخورد": "An “off by default” group was not ticked",
+#"گری زون وارفر": "Gray Zone Warfare",
+#"گزارش DNS": "DNS report",
+#"گزارش DNS خاموش و پاک شد": "DNS report turned off and cleared",
+#"گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود": "DNS report turned on; kept for up to an hour",
+#"گزارش DNS —": "DNS report —",
+#"گزارش روزانه": "Daily report",
+#"گنشین ایمپکت": "Genshin Impact",
+#"گواهی": "Certificate",
+#"گواهی خود سایت منقضی یا ناقص است": "The site’s own certificate is expired or incomplete",
+#"گواهی خود سایت منقضی یا ناقص است — مشکل از خود سرویس است، نه از ما": "The site’s own certificate is expired or incomplete — the problem is with the service itself, not with us",
+#"گواهی نامعتبر — جواب از جای دیگری آمد": "Invalid certificate — the answer came from somewhere else",
+#"گیت‌هاب جواب درستی نداد:": "GitHub did not answer properly:",
+#"گیرنده‌ها را انتخاب کنید": "Choose the recipients",
+#"گیلتی گیر": "Guilty Gear",
+#"گیلد وارز ۲": "Guild Wars 2",
+#"گیم‌لوپ تنسنت": "GameLoop",
+#"گیگ": "GB",
+#"گیگ در ماه": "GB a month",
+#"گیگابایت": "GB",
+#"گیگابایت، ۰=نامحدود": "GB, 0 = unlimited",
+#"یا آی‌پی دلخواه": "or a custom IP",
+#"یا آی‌پی را همین‌جا بفرستید.": "Or send the IP here.",
+#"یا تازه‌تر را دارند": "or newer",
+#"یا:": "Or:",
+#"یادداشت": "Note",
+#"یادداشت (اختیاری)": "Note (optional)",
+#"یادداشت نسخه": "release notes",
+#"یوبی‌سافت کانکت": "Ubisoft Connect",
+#"یورو تراک": "Euro Truck Simulator",
+#"یک ادمین این نام کاربری را دارد": "An admin has this username",
+#"یک استثنا: گروه‌هایی که «پیش‌فرض خاموش» علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید.": "One exception: groups marked “off by default” are not routed even in this template. To turn them on, make a new template and tick them there.",
+#"یک بار": "Once",
+#"یک ربات تلگرام برای مشتری‌ها و خودتان: خرید پلن و فرستادن رسید، ثبت آی‌پی، تیکت، و برای شما رسید تازه با دکمهٔ تأیید. همه‌چیز روی همین سرور است.": "A Telegram bot for your customers and yourself: buying a plan and sending a receipt, registering an IP, tickets, and for you new receipts with an approve button. Everything is on this server.",
+#"یک فایل sqlite با همهٔ کاربران، آی‌پی‌ها، قالب‌ها، تراکنش‌ها و تنظیمات. آمار سلامت سرورها داخلش نیست — حجم زیادی است و ارزشی در بازگردانی ندارد.": "An sqlite file with all users, IPs, templates, transactions and settings. The servers’ health stats are not in it — they are large and not worth restoring.",
+#"یک فایل، رمزگذاری‌شده با همین رمز: دیتابیس، کلید عکس‌ها، و آنچه برای بالا آوردن همین پنل روی سرور دیگری لازم است. رمز را جایی جدا نگه دارید؛ بدون آن فایل باز نمی‌شود و این‌جا هم نشان داده نمی‌شود. برای بازگردانی، فایل را با همین رمز در کارت «نسخهٔ پشتیبان» بفرستید؛ یا روی هر سیستمی با openssl:": "One file, encrypted with this password: the database, the picture key, and what is needed to bring this panel up on another server. Keep the password somewhere separate; without it the file does not open, and it is not shown here either. To restore, upload the file with this password in the “Backup” card; or on any system with openssl:",
+#"یک نام برای کلید بنویسید": "Write a name for the key",
+#"یک نام بنویسید، نه آی‌پی": "Write a name, not an IP",
+#"یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید (حروف انگلیسی و عدد، مثلاً ali_gamer):": "Choose an English username for signing in to the web panel (English letters and numbers, e.g. ali_gamer):",
+#"یک نسخهٔ پشتیبان بفرستید.": "Upload a backup.",
+#"یک پلن تست رایگانِ روشن دیگر هست؛ اول آن را خاموش کنید": "Another free trial plan is on; turn it off first",
+#"یکی از رله‌هاست": "is one of the relays",
+#"یکی از سرورهای خارج است": "is one of the exit servers",
+#"۱ دقیقه": "1 minute",
+#"۲ دقیقه": "2 minutes",
+#"۲۰۰ خط آخر": "Last 200 lines",
+#"۳ تا ۳۲ حرف انگلیسی کوچک، عدد، . - _": "3 to 32 lower-case English letters, digits, . - _",
+#"۳ تا ۳۲ حرف انگلیسی کوچک، عدد، نقطه، خط تیره یا زیرخط. از روی سرور هم:": "3 to 32 lower-case English letters, digits, dots, dashes or underscores. From the server too:",
+#"۳۰ روز": "30 days",
+#"۳۰ روز اخیر": "Last 30 days",
+#"۳۰ روز اخیر — دانلود / آپلود": "Last 30 days — download / upload",
+#"۳۰ روز — آپلود": "30 days — upload",
+#"۳۰ روز — دانلود": "30 days — download",
+#"۵ دقیقه": "5 minutes",
+#"۷ روز": "7 days",
+#"۷ روز اخیر": "Last 7 days",
+#"۷ روز اخیر — دانلود / آپلود": "Last 7 days — download / upload",
+#"— آیفون، ویندوز، کروم و فایرفاکس": "— iPhone, Windows, Chrome and Firefox",
+#"— از نصب‌کننده؛ با": "— from the installer; with",
+#"— اندروید ← DNS خصوصی": "— Android → Private DNS",
+#"— این سرور": "— this server",
+#"— با تأیید، یک دستگاه به حسابش اضافه می‌شود": "— on approval, one device is added to their account",
+#"— بررسی:": "— checked:",
+#"— تا چند دقیقهٔ دیگر آماده می‌شود": "— ready within a few minutes",
+#"— خالی بگذارید تا همین بماند)": "— leave empty to keep it)",
+#"— خود سرور به آن سرویس می‌رسد یا نه — و": "— whether the server itself reaches that service — and",
+#"— دانلود": "— download",
+#"— دانلود تا": "— download up to",
+#"— روز و ساعت به وقت تهران. تفکیک سرویس را فقط خود کاربر می‌بیند.": "— day and hour in Tehran time. Only the user sees the per-service breakdown.",
+#"— سرور خارج": "— exit server",
+#"— سرویس را از شما می‌خرد و به مشتری‌های خودش می‌فروشد. فقط مشتری‌هایی را می‌بیند که خودش آورده؛ پلن و قیمت و شماره کارت هم مال خودش. بدون این تیک، مثل کارمند شماست و همهٔ مشتری‌ها را می‌بیند.": "— buys the service from you and sells it to their own customers. Sees only the customers they brought; the plans, prices and card number are theirs too. Without this tick, they are like your staff and see every customer.",
+#"— قیمت پلن": "— plan price",
+#"— مثلاً وی‌پی‌ان روشن است یا از اینترنت دیگری وارد شده‌اید — آن را ببندید، همین صفحه را تازه کنید و بعد ثبت کنید.": "— for example a VPN is on, or you came in from another internet connection — turn it off, refresh this page and then register.",
+#"— موجودی فعلی:": "— current balance:",
+#"— هر ۵ دقیقه تازه می‌شود. روی خود سرور:": "— refreshed every 5 minutes. On the server itself:",
+#"— هیچ —": "— none —",
+#"— یک ساعت دیگر دوباره": "— again in an hour",
+#"… پنل چند ثانیه‌ای قطع می‌شود و بعد خودش بقیهٔ سرورها را آپدیت می‌کند.": "… the panel is down for a few seconds, then upgrades the other servers by itself.",
+#"‹ برگشت به ادمین‌ها": "‹ Back to admins",
+#"‹ برگشت به حساب": "‹ Back to account",
+#"‹ برگشت به فهرست قالب‌ها": "‹ Back to templates",
+#"‹ برگشت به نود": "‹ Back to nodes",
+#"‹ برگشت به کاربران": "‹ Back to users",
+#"↪ مستقیم": "↪ Direct",
+#"⏳ یک رسید در انتظار بررسی دارید.": "⏳ You have a receipt waiting for review.",
+#"⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.": "⚠️ The panel address is not known yet; try again in a few minutes.",
+#"⚠️ آپدیت": "⚠️ Upgrade",
+#"⚠️ ترافیک": "⚠️ Traffic",
+#"⚠️ جدول اتصال‌های": "⚠️ Connection table of",
+#"⚠️ دامنهٔ": "⚠️ The domain",
+#"⚠️ دیسک": "⚠️ Disk",
+#"⚠️ رم": "⚠️ RAM",
+#"⚠️ روزهای فروشنده": "⚠️ The days of seller",
+#"⚠️ سرور خارج": "⚠️ Exit server",
+#"⚠️ فروشنده": "⚠️ Seller",
+#"⚠️ فقط عکس (JPG، PNG، WEBP) یا PDF تا ۴ مگابایت.": "⚠️ Only a picture (JPG, PNG, WEBP) or PDF up to 4 MB.",
+#"⚠️ مبلغ را به تومان و با عدد بنویسید، بین": "⚠️ Write the amount in Toman, as a number, between",
+#"⚠️ هر قالبی که مشتری دارد، روی هر رله و تک‌سرور یک DNS جدا اجرا می‌کند که حدود": "⚠️ Every template that has customers runs its own DNS on each relay and single server, taking about",
+#"⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.": "⚠️ You have not registered an IP yet; tap “Register IP” first.",
+#"⚠️ پردازندهٔ": "⚠️ Processor of",
+#"⚠️ پلن فعلی شما «": "⚠️ Your current plan is “",
+#"⚠️ گواهی HTTPS": "⚠️ HTTPS certificate",
+#"⛔ حجم فروشنده": "⛔ The traffic of seller",
+#"⛔ روزهای فروشنده": "⛔ The days of seller",
+#"⛔ فیلتر داخل ایران": "⛔ Filtered inside Iran",
+#"✅ از رله": "✅ Through the relay",
+#"✅ تأیید": "✅ Approve",
+#"✅ ترافیک": "✅ Traffic",
+#"✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود.": "✅ Renewing the same plan: the days and quota are added to what you have left.",
+#"✅ جدول اتصال‌های": "✅ Connection table of",
+#"✅ جواب تیکت #": "✅ Reply to ticket #",
+#"✅ حساب شما به تلگرام وصل است؛ اگر رمز را فراموش کنید، از صفحهٔ ورود با کد تلگرام بازیابی‌اش می‌کنید.": "✅ Your account is linked to Telegram; if you forget your password, you recover it from the sign-in page with a Telegram code.",
+#"✅ حساب پنل شما ساخته شد": "✅ Your panel account has been created",
+#"✅ دیسک": "✅ Disk",
+#"✅ ربات به پنل وصل است.": "✅ The bot is connected to the panel.",
+#"✅ رم": "✅ RAM",
+#"✅ سرور خارج": "✅ Exit server",
+#"✅ همهٔ سرورها به نسخهٔ": "✅ All servers upgraded to version",
+#"✅ پردازندهٔ": "✅ Processor of",
+#"✅ گواهی HTTPS": "✅ HTTPS certificate",
+#"✅ یک دستگاه اضافه شد؛ حالا": "✅ A device was added; now you have",
+#"✍️ جواب": "✍️ Reply",
+#"✍️ پیام تازه": "✍️ New message",
+#"✓ DoH و DoT روشن": "✓ DoH and DoT on",
+#"✓ روی": "✓ on",
+#"✓ همه (": "✓ All (",
+#"✔️ بستن": "✔️ Close",
+#"✗ هیچ‌کدام (": "✗ None (",
+#"❌ رد": "❌ Reject",
+#"❓ راهنما": "❓ Help",
+#"➕ تیکت تازه": "➕ New ticket",
+#"➕ شارژ کیف پول": "➕ Top up wallet",
+#"🆕 نسخهٔ تازه از گیت‌هاب": "🆕 New version from GitHub",
+#"🌍 DNS عمومی روشن است: هر کسی آدرس رله را بگذارد، بدون ثبت‌نام و ثبت آی‌پی سرویس می‌گیرد.": "🌍 Public DNS is on: anyone who sets the relay’s address gets the service, with no sign-up and no registered IP.",
+#"🌐 DNS معمولی — در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی یکی از این‌ها بگذارید:": "🌐 Plain DNS — on a console, modem or phone, set both the first and the second DNS to one of these:",
+#"🌐 آدرس DNS معمولی هنوز آماده نیست؛ کمی بعد دوباره بزنید.": "🌐 The plain DNS address is not ready yet; tap again in a little while.",
+#"🌐 ثبت آی‌پی": "🌐 Register IP",
+#"🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند": "🌐 Register IP: the service only works on a registered IP",
+#"🌐 لینک ثبت‌نام در سایت:": "🌐 Sign-up link on the website:",
+#"🎁 «تست رایگان»: فروخته نمی‌شود؛ مشتری با یک کلیک می‌گیردش، در پنل خودش یا ربات. شرطش تلگرامِ وصل‌شده است، و هر تلگرام و هر حساب فقط یک بار. کسی که همین حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. یک پلن تست در یک زمان.": "🎁 “Free trial”: not sold; the customer gets it with one click, in their own panel or the bot. It needs a linked Telegram, and each Telegram account and each account only once. Someone who has an active service right now does not get it, so what is left of their plan is not lost. One trial plan at a time.",
+#"🎁 با لینک دعوت یکی از دوستانتان آمده‌اید.": "🎁 You came with a friend’s invitation link.",
+#"🎁 تست رایگان": "🎁 Free trial",
+#"🎁 تست رایگان فعال شد.": "🎁 Free trial activated.",
+#"🎁 تست رایگان گرفت:": "🎁 Took the free trial:",
+#"🎁 تست رایگان:": "🎁 Free trial:",
+#"🎁 دعوت از دوستان": "🎁 Invite friends",
+#"🎁 دعوت از دوستان فعلاً فعال نیست.": "🎁 Inviting friends is not on right now.",
+#"🎁 دعوت از دوستان: لینک دعوت و پورسانت": "🎁 Invite friends: your invitation link and commission",
+#"🎉 یکی از کسانی که با لینک دعوت شما آمده بود خرید کرد؛": "🎉 Someone who came with your invitation link made a purchase;",
+#"🎫 پشتیبانی": "🎫 Support",
+#"🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی": "🎫 Support: tickets and chat with support",
+#"🎮 شامل:": "🎮 Includes:",
+#"🏷 با کد تخفیف": "🏷 With discount code",
+#"🏷 کد تخفیف دارم": "🏷 I have a discount code",
+#"🏷 کدهای تخفیف (": "🏷 Discount codes (",
+#"👁 پنل را همان‌طور می‌بینید که": "👁 You are seeing the panel as",
+#"💰 خرید از کیف پول (موجودی": "💰 Buy from wallet (balance",
+#"💰 خرید از کیف پول:": "💰 Bought from the wallet:",
+#"💰 دستگاه اضافه از کیف پول:": "💰 Extra device from the wallet:",
+#"💰 شارژ کیف پول · مبلغی که مشتری نوشته:": "💰 Wallet top-up · amount the customer wrote:",
+#"💰 موجودی کیف پولتان": "💰 Your wallet balance is",
+#"💰 پرداخت از کیف پول": "💰 Pay from wallet",
+#"💰 پرداخت از کیف پول (موجودی": "💰 Pay from wallet (balance",
+#"💰 کیف پول": "💰 Wallet",
+#"💰 کیف پول: موجودی و شارژ": "💰 Wallet: balance and top-up",
+#"💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):": "💻 iPhone, Windows, Chrome and Firefox — your personal address (DoH):",
+#"📊 حساب من": "📊 My account",
+#"📊 حساب من: وضعیت، حجم مانده و آدرس DNS": "📊 My account: status, quota left and DNS address",
+#"📊 نمودار مصرف و سرعت": "📊 Usage and speed charts",
+#"📡 DNSها": "📡 DNS",
+#"📡 DNSها: آدرس DNS معمولی، DoH و DoT": "📡 DNS: the plain DNS address, DoH and DoT",
+#"📡 DNSهای شما": "📡 Your DNS",
+#"📢 تبلیغات": "📢 Ads",
+#"📣 پیام همگانی": "📣 Broadcast message",
+#"📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):": "📱 Android — Settings → Network → Private DNS → hostname (DoT):",
+#"📱 دستگاه اضافه": "📱 Extra device",
+#"📱 دستگاه اضافه ·": "📱 Extra device ·",
+#"📱 دستگاه اضافه —": "📱 Extra device —",
+#"📱 دستگاه‌ها و تغییر آی‌پی": "📱 Devices and IP changes",
+#"🔄 آدرس DoH تازه": "🔄 New DoH address",
+#"🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ این را روی دستگاه‌هایتان بگذارید:": "🔄 A new address has been made. The old one stops working within a minute; put this one on your devices:",
+#"🔄 رمز تازه": "🔄 New password",
+#"🔄 رمز تازهٔ پنل:": "🔄 New panel password:",
+#"🔎 گزارش DNS برای پشتیبانی": "🔎 DNS report for support",
+#"🔑 پنل وب": "🔑 Web panel",
+#"🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه": "🔑 Web panel: username, one-click sign-in and new password",
+#"🔒 DNS امن": "🔒 Secure DNS",
+#"🔒 DNS امن (رمزگذاری‌شده)": "🔒 Secure DNS (encrypted)",
+#"🔒 DNS رمزگذاری‌شده": "🔒 Encrypted DNS",
+#"🔗 ورود با یک کلیک": "🔗 One-click sign-in",
+#"🔗 ورود به پنل وب": "🔗 Sign in to the web panel",
+#"🔞 پورن": "🔞 Porn",
+#"🗄 بکاپ پنل —": "🗄 Panel backup —",
+#"🚫 مسدودی‌ها": "🚫 Blocks",
+#"🛒 تمدید": "🛒 Renew",
+#"🛒 خرید / تمدید": "🛒 Buy / Renew",
+#"🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید": "🛒 Buy / Renew: choose a plan and send the receipt",
+#"🛒 خرید پلن": "🛒 Buy a plan",
+#"🤖 لینک ربات:": "🤖 Bot link:",
+#"🧾 پرداخت با رسید": "🧾 Pay with a receipt"
+#}
+#__END_I18N_EN__
 
 #__BEGIN_FONT__
 #d09GMgABAAAAAbIwABQAAAADsWQAAbG6ACEAxQAAAAAAAAAAAAAAAAAAAAAAAAAAGotDG4HRKhy4

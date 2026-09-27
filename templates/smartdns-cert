@@ -43,6 +43,19 @@ die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run as root"
 
+# One certbot at a time. The renewal timer can start while this very script
+# is issuing a certificate - the installer restarts that timer on every run,
+# and it fires at once - and a second certbot refuses to run beside the
+# first: "Another instance of Certbot is already running". So each run of
+# this waits for the one before it, then for any other certbot on the
+# machine, before it starts.
+exec 9>/run/smartdns-cert.lock
+flock -w 600 9 || die "another certificate run did not finish in ten minutes"
+for _ in $(seq 1 60); do
+    pgrep -x certbot >/dev/null 2>&1 || break
+    sleep 5
+done
+
 open_port80() {
     nft add table ip $NAT_TABLE 2>/dev/null
     nft add chain ip $NAT_TABLE pre \

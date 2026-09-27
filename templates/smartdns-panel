@@ -22,6 +22,7 @@ no pip step.
 """
 
 import base64
+import gzip
 import hashlib
 import hmac
 import html
@@ -246,6 +247,128 @@ CREATE TABLE IF NOT EXISTS doh_users (
     PRIMARY KEY (day, user_id)
 );
 
+-- What went through each server: kind is "relay" (from the relay's counters,
+-- as the bill is) or "exit" (from the relays' nginx, by which exit carried
+-- the connection). All customers together, in the grains of the usage table
+-- and kept as long, for the admin panel's charts of one server...
+CREATE TABLE IF NOT EXISTS server_usage (
+    grain  TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    server TEXT NOT NULL,
+    up     INTEGER NOT NULL DEFAULT 0,
+    down   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (grain, bucket, kind, server)
+);
+-- ...and each customer's through each, per day, kept ninety days.
+CREATE TABLE IF NOT EXISTS user_server_usage (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day     TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    server  TEXT NOT NULL,
+    up      INTEGER NOT NULL DEFAULT 0,
+    down    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day, kind, server)
+);
+
+-- What went wrong with the servers and came right again, for the admin
+-- panel and the operator's bot: each change of state once. Kept thirty days.
+CREATE TABLE IF NOT EXISTS alerts (
+    id   INTEGER PRIMARY KEY,
+    at   TEXT NOT NULL,
+    key  TEXT NOT NULL,
+    ok   INTEGER NOT NULL,
+    text TEXT NOT NULL
+);
+
+-- Every change to a customer's wallet and what it was for: a top-up receipt
+-- approved, a plan paid for, a share of a purchase by somebody they invited,
+-- or the operator's hand. users.wallet is the balance; this is how it got
+-- there, for the customer and the operator to read.
+-- Every new address a customer registered, for the admin's limit on how
+-- often an address may change. Kept a few days.
+CREATE TABLE IF NOT EXISTS ip_log (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip      TEXT NOT NULL,
+    at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ip_log_user ON ip_log(user_id, at);
+
+-- Discount codes the admin hands out, and who used which: a percent or a
+-- sum off a plan, until a date, for so many uses, once a customer or not,
+-- on some plans or all of them.
+CREATE TABLE IF NOT EXISTS discount_codes (
+    id          INTEGER PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    value       INTEGER NOT NULL,
+    expires_at  TEXT,
+    max_uses    INTEGER,
+    once        INTEGER NOT NULL DEFAULT 1,
+    plans       TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    uses        INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discount_uses (
+    code_id        INTEGER NOT NULL REFERENCES discount_codes(id) ON DELETE CASCADE,
+    user_id        INTEGER NOT NULL,
+    transaction_id INTEGER,
+    at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS discount_uses_code ON discount_uses(code_id, user_id);
+
+-- Messages the admin sent every customer, or some of them, through the bot:
+-- the text, who it was for, and the outbox rows that carried it, so the
+-- page can say how many have reached the bot.
+CREATE TABLE IF NOT EXISTS broadcasts (
+    id          INTEGER PRIMARY KEY,
+    text        TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    recipients  INTEGER NOT NULL,
+    first_row   INTEGER,
+    last_row    INTEGER,
+    created_at  TEXT NOT NULL
+);
+
+-- The admins besides the owner - whose own password stays in admin.env -
+-- with what each may see, and for a reseller the customers they bring, the
+-- traffic their customers may use and until when.
+CREATE TABLE IF NOT EXISTS admins (
+    id             INTEGER PRIMARY KEY,
+    username       TEXT NOT NULL UNIQUE,
+    password_hash  TEXT NOT NULL,
+    password_salt  TEXT NOT NULL,
+    perms          TEXT NOT NULL DEFAULT '[]',
+    own_only       INTEGER NOT NULL DEFAULT 0,
+    can_route      INTEGER NOT NULL DEFAULT 0,
+    max_users      INTEGER,
+    cap_bytes      INTEGER,
+    used_bytes     INTEGER NOT NULL DEFAULT 0,
+    expires_at     TEXT,
+    templates_mode TEXT NOT NULL DEFAULT 'pick',
+    templates      TEXT,
+    templates_max  INTEGER NOT NULL DEFAULT 1,
+    ref_code       TEXT UNIQUE,
+    disabled       INTEGER NOT NULL DEFAULT 0,
+    warned         INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wallet_moves (
+    id             INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    at             TEXT NOT NULL,
+    amount         INTEGER NOT NULL,
+    balance        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    note           TEXT,
+    -- The receipt or purchase it came from; for an invitation, who bought.
+    transaction_id INTEGER,
+    other_user     INTEGER
+);
+CREATE INDEX IF NOT EXISTS wallet_moves_user ON wallet_moves(user_id, id);
+
 CREATE TABLE IF NOT EXISTS usage_service (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     day     TEXT NOT NULL,
@@ -466,7 +589,8 @@ CREATE TABLE IF NOT EXISTS api_idempotency (
 
 METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
                  "swap_total", "disk_used", "disk_total", "rx_bps", "tx_bps",
-                 "uptime")
+                 "uptime", "rx_total", "tx_total", "conntrack", "conntrack_max",
+                 "cert_days")
 
 # How long health samples are kept. A day is enough to answer "was it the
 # server?" about something that happened this morning, and short enough that
@@ -476,6 +600,23 @@ METRICS_KEEP_HOURS = 24
 # Columns added after the first release. sqlite has no ADD COLUMN IF NOT
 # EXISTS, so these are applied only when the column is genuinely missing.
 MIGRATIONS = [
+    # The connection table, the certificate's days left and every byte since
+    # boot - for the alerts, and the month's traffic against a cap.
+    ("metrics", "rx_total", "INTEGER"),
+    ("metrics", "tx_total", "INTEGER"),
+    ("metrics", "conntrack", "INTEGER"),
+    ("metrics", "conntrack_max", "INTEGER"),
+    ("metrics", "cert_days", "INTEGER"),
+    # The exit the admin sent this customer through, on every relay; null for
+    # each relay's own.
+    ("users", "exit", "TEXT"),
+    # The exit a plan puts its customers on; null for all of them.
+    ("plans", "exit", "TEXT"),
+    # And on particular relays, when not the same on all: {relay: exit}.
+    ("users", "relay_exits", "TEXT"),
+    # Which relays this customer is shown as DNS addresses, comma separated;
+    # null for the ones shown to everybody. Every relay still serves them.
+    ("users", "relays", "TEXT"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -505,6 +646,9 @@ MIGRATIONS = [
     # allowance was set by hand.
     ("users", "plan_id", "INTEGER"),
     ("transactions", "plan_id", "INTEGER"),
+    # A discount on it: the code, and the plan's price before it.
+    ("transactions", "code_id", "INTEGER"),
+    ("transactions", "list_price", "INTEGER"),
     # Where a bot wants to be told things, and the secret its messages are
     # signed with. Kept readable, unlike the key: the panel has to sign with it.
     ("api_tokens", "webhook_url", "TEXT"),
@@ -516,6 +660,8 @@ MIGRATIONS = [
     ("relay_logs", "tunnel", "TEXT"),
     # And nginx's error log, which is a file on the relay, not its journal.
     ("relay_logs", "nginx", "TEXT"),
+    # The same logs a part of the machine at a time: [[key, label, text], ...].
+    ("relay_logs", "parts", "TEXT"),
     # A free trial: given with one tap, never bought.
     ("plans", "is_trial", "INTEGER NOT NULL DEFAULT 0"),
     # When this account had its trial; one per account.
@@ -537,6 +683,27 @@ MIGRATIONS = [
     ("users", "doh_seen_at", "TEXT"),
     # Until when the customer wants their DNS kept for support; NULL is off.
     ("users", "qlog_until", "TEXT"),
+    # Inviting: the code in this customer's invitation link, and who invited
+    # this account - written when it is opened, never after.
+    ("users", "ref_code", "TEXT"),
+    ("users", "referred_by", "INTEGER"),
+    # Devices: how many addresses a plan gives, and the ones bought on top
+    # of it, which last until another plan replaces it.
+    ("plans", "devices", "INTEGER NOT NULL DEFAULT 1"),
+    # Whose they are: a reseller's customers, plans, templates and bot key;
+    # null is the owner's.
+    ("users", "owner_admin", "INTEGER"),
+    ("plans", "owner_admin", "INTEGER"),
+    ("templates", "owner_admin", "INTEGER"),
+    ("api_tokens", "admin_id", "INTEGER"),
+    ("broadcasts", "admin_id", "INTEGER"),
+    # Usage back to zero every so many days, whatever the plan: the admin's
+    # choice per customer and per seller, and when it next happens.
+    ("users", "reset_days", "INTEGER"),
+    ("users", "reset_next", "TEXT"),
+    ("admins", "reset_days", "INTEGER"),
+    ("admins", "reset_next", "TEXT"),
+    ("users", "extra_devices", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -550,18 +717,13 @@ INDEXES = [
     # not collide in a unique index, which is what accounts that never had one
     # need.
     "CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_ref_code ON users(ref_code)",
+    "CREATE INDEX IF NOT EXISTS users_referred_by ON users(referred_by)",
 ]
 
 # Where the installer puts the service catalogue - which brands exist, which
 # groups each has, and which domains are in each group.
 SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
-
-# Ceiling on distinct templates actually in use. Each one is a dnsmasq
-# instance on every relay, with its own cache and its own port, so this is a
-# real resource limit rather than a preference. Eight plans is more than any
-# of this is likely to need; the panel refuses to exceed it rather than
-# quietly starting a ninth resolver on every machine.
-MAX_TEMPLATES = 8
 
 MB = 1024 ** 2
 GB = 1024 ** 3
@@ -926,6 +1088,34 @@ def load_games():
         return []
 
 
+BLOCKS_FILE = "/usr/local/share/smart-dns/blocks.json"
+BLOCKS = []
+
+
+def load_blocks():
+    """What a template can close - ad networks, adult sites - each with its
+    domains. The admin ticks them at the foot of a template's page."""
+    try:
+        with io_open(BLOCKS_FILE) as fh:
+            return json.load(fh).get("blocks", [])
+    except Exception as e:
+        log(WARN, "no block catalogue at %s: %s" % (BLOCKS_FILE, e))
+        return []
+
+
+def picked_blocks(store, template_id):
+    """The domains a template closes from that catalogue: every row ticked,
+    less the domains taken out of it - so a domain a later version adds to a
+    ticked row is closed too, as a service's is routed."""
+    try:
+        v = json.loads(store.setting("blocks:%d" % template_id) or "{}")
+    except (ValueError, TypeError):
+        v = {}
+    on, off = set(v.get("on") or []), set(v.get("off") or [])
+    return {d for b in BLOCKS if b.get("key") in on
+            for d in b.get("domains") or [] if d not in off}
+
+
 def load_config():
     cfg = {}
     with open(CONFIG) as fh:
@@ -942,6 +1132,17 @@ def load_config():
 
 
 # --------------------------------------------------------------- database
+def clean_log_parts(parts):
+    """A server's logs by part, as it sent them, within bounds - or None."""
+    if not isinstance(parts, list):
+        return None
+    out = []
+    for p in parts[:20]:
+        if isinstance(p, list) and len(p) == 3 and all(isinstance(x, str) for x in p):
+            out.append([p[0][:30], p[1][:120], p[2][-10000:]])
+    return json.dumps(out, ensure_ascii=False)
+
+
 def relax_telegram_id(db, path):
     """Drop the NOT NULL from users.telegram_id on databases that predate web
     signup.
@@ -998,6 +1199,14 @@ def relax_telegram_id(db, path):
     if broken:
         raise RuntimeError("migration left %d dangling references - the "
                            "database before it is at %s" % (len(broken), backup))
+
+
+# A seller's customers are served while the seller's traffic cap and days
+# last and the owner has not disabled them; otherwise all of them stop.
+SELLER_LIVE = ("(u.owner_admin IS NULL OR u.owner_admin IN (SELECT id FROM admins"
+               " WHERE disabled = 0 AND (cap_bytes IS NULL OR used_bytes < cap_bytes)"
+               " AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%S+00:00',"
+               " 'now'))))")
 
 
 class Store:
@@ -1058,7 +1267,14 @@ class Store:
 
     def run(self, sql, args=()):
         with self.lock:
-            cur = self.db.execute(sql, args)
+            try:
+                cur = self.db.execute(sql, args)
+            except Exception:
+                # A statement that failed - a name that is taken, say - must
+                # not leave its transaction open: until something commits,
+                # the other process could not write to the database at all.
+                self.db.rollback()
+                raise
             self.db.commit()
             return cur
 
@@ -1125,7 +1341,7 @@ class Store:
                  timespec="seconds")))
         return token
 
-    def plans_for_sale(self):
+    def plans_for_sale(self, seller=None):
         """The plans a customer may buy, grouped the way they are shown: by
         template, then cheapest first.
 
@@ -1135,9 +1351,10 @@ class Store:
         """
         rows = [dict(r) for r in self.q(
             "SELECT p.id, p.name, p.days, p.quota_bytes, p.price, p.speed_kbps,"
-            " p.note, p.template_id, t.name AS template FROM plans p"
+            " p.devices, p.note, p.template_id, t.name AS template FROM plans p"
             " JOIN templates t ON t.id = p.template_id"
-            " WHERE p.active = 1 AND p.is_trial = 0 ORDER BY t.id, p.price, p.id")]
+            " WHERE p.active = 1 AND p.is_trial = 0 AND COALESCE(p.owner_admin, 0) = ?"
+            " ORDER BY t.id, p.price, p.id", (seller or 0,))]
         for row in rows:
             row["games"] = games_in_template(self, row.pop("template_id"))
         return rows
@@ -1145,7 +1362,7 @@ class Store:
     def trial_plan(self):
         """The free trial on offer, if the operator made one."""
         row = self.one("SELECT p.id, p.name, p.days, p.quota_bytes, p.speed_kbps, p.note,"
-                       " p.template_id, t.name AS template FROM plans p JOIN templates t"
+                       " p.devices, p.template_id, t.name AS template FROM plans p JOIN templates t"
                        " ON t.id = p.template_id WHERE p.active = 1 AND p.is_trial = 1"
                        " ORDER BY p.id LIMIT 1")
         if not row:
@@ -1160,7 +1377,7 @@ class Store:
     def allowed(self):
         return self.q(
             "SELECT i.ip AS ip, u.id AS uid FROM ips i JOIN users u ON u.id = i.user_id"
-            " WHERE u.status = 'active'"
+            " WHERE u.status = 'active' AND " + SELLER_LIVE
         )
 
     # ----------------------------------------------------------- templates
@@ -1284,7 +1501,7 @@ class Store:
             " COALESCE(u.template_id, ?) AS tid,"
             " COALESCE(u.username, '') AS uname"
             " FROM ips i JOIN users u ON u.id = i.user_id"
-            " WHERE u.status = 'active'", (default_id,))
+            " WHERE u.status = 'active' AND " + SELLER_LIVE, (default_id,))
         by_ip = {}
         used = set()
         for r in rows:
@@ -1349,10 +1566,11 @@ class Store:
         """The blocks and forwards one template has: those for every template
         and those ticked for it. A forward under one of its blocks is left out
         - the block wins - so the relay is never handed the two to settle."""
-        blocked = [r["domain"] for r in self.q(
+        blocked = sorted({r["domain"] for r in self.q(
             "SELECT domain FROM blocked_domains b WHERE all_templates = 1 OR EXISTS"
             " (SELECT 1 FROM blocked_templates t WHERE t.domain = b.domain"
-            " AND t.template_id = ?) ORDER BY domain", (template_id,))]
+            " AND t.template_id = ?)", (template_id,))}
+            | picked_blocks(self, template_id))
         closed = set(blocked)
         forwards = {}
         for r in self.q("SELECT domain, servers FROM dns_forwards f WHERE all_templates = 1"
@@ -1361,7 +1579,8 @@ class Store:
             parts = r["domain"].split(".")
             if not any(".".join(parts[i:]) in closed for i in range(len(parts))):
                 forwards[r["domain"]] = r["servers"].split()
-        return {"blocked": blocked, "forwards": forwards}
+        return {"blocked": blocked, "forwards": forwards,
+                "lists": blocklists_for(self, template_id)}
 
     def template_names(self):
         """Every template's name by id, and which is the default - so the
@@ -1458,6 +1677,10 @@ class Store:
             % (", ".join(cols), ", ".join("?" * len(cols))),
             [host, now()] + [sample[c] for c in cols],
         )
+        try:
+            count_month(self, host, sample)
+        except Exception as e:
+            log(WARN, "month's traffic not counted for %s: %r" % (host, e))
 
     def prune_metrics(self):
         self.run(
@@ -1505,6 +1728,9 @@ class Store:
                         "UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?",
                         (delta, row["user_id"]),
                     )
+                    self.db.execute(
+                        "UPDATE admins SET used_bytes = used_bytes + ? WHERE id ="
+                        " (SELECT owner_admin FROM users WHERE id = ?)", (delta, row["user_id"]))
                     touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
                 # Upload and download apart, for the charts. The relay sends
                 # both beside the total; one that does not is an older relay,
@@ -1524,6 +1750,8 @@ class Store:
                     d_up, d_down = 0, max(delta, 0)
                 if d_up or d_down:
                     record_usage(self.db, row["user_id"], d_up, d_down)
+                if d_up or d_down:
+                    record_server(self.db, row["user_id"], "relay", relay, d_up, d_down)
                 self.db.execute(
                     "INSERT INTO ip_counters (ip, relay, last_counter, last_up, last_down)"
                     " VALUES (?, ?, ?, ?, ?) ON CONFLICT(ip, relay)"
@@ -1535,6 +1763,29 @@ class Store:
 
 
 # ----------------------------------------------------------------- health
+def conntrack_counts():
+    """(connections tracked, the table's size), or (None, None) where the
+    kernel keeps no table - when full, new connections are dropped."""
+    try:
+        with open("/proc/sys/net/netfilter/nf_conntrack_count") as fh:
+            count = int(fh.read().strip())
+        with open("/proc/sys/net/netfilter/nf_conntrack_max") as fh:
+            return count, int(fh.read().strip())
+    except (OSError, ValueError):
+        return None, None
+
+
+def cert_days(path):
+    """Whole days until this certificate expires, or None without one."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        ends = ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(path)["notAfter"])
+    except Exception:
+        return None
+    return int((ends - time.time()) // 86400)
+
+
 class Health:
     """This machine's own metrics, read straight out of /proc.
 
@@ -1587,9 +1838,22 @@ class Health:
             return None, None
         return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
 
+    @staticmethod
+    def cert_path():
+        """The admin panel's certificate, as admin.env names it."""
+        try:
+            with open("/etc/smart-dns/admin.env") as fh:
+                for line in fh:
+                    if line.startswith("ADMIN_CERT="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return None
+
     def sample(self):
         m = self._meminfo()
         rx, tx = self._net_rates()
+        track = conntrack_counts()
         st = os.statvfs("/")
         with open("/proc/uptime") as fh:
             uptime = int(float(fh.readline().split()[0]))
@@ -1608,6 +1872,12 @@ class Health:
             "rx_bps": rx,
             "tx_bps": tx,
             "uptime": uptime,
+            # Every byte since boot, for the month's traffic against a cap.
+            "rx_total": self.net[0] if self.net else None,
+            "tx_total": self.net[1] if self.net else None,
+            "conntrack": track[0],
+            "conntrack_max": track[1],
+            "cert_days": cert_days(self.cert_path()),
         }
 
 
@@ -1630,7 +1900,7 @@ def trial_offer(store, user):
     (the plan or None, why not): 'none' - there is no trial; 'telegram' - link
     Telegram first; 'used' - this account or this Telegram account had one;
     'running' - a plan is running, and a trial would end it."""
-    plan = store.trial_plan()
+    plan = store.trial_plan() if not seller_of(user) else None
     if not plan:
         return None, "none"
     if user["trial_at"]:
@@ -1682,6 +1952,490 @@ def take_trial(store, user):
     return {"ok": True, "message": "🎁 تست رایگان فعال شد. %s" % done}
 
 
+# ------------------------------------------------------- wallet and invites
+# Toman. Below the least a top-up is a slip of the finger more often than a
+# payment; above the most, a zero too many.
+TOPUP_MIN = 10_000
+TOPUP_MAX = 100_000_000
+REF_CODE_RE = re.compile(r"[a-z0-9]{6,16}")
+REF_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+MONEY_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def toman(text):
+    """A sum as somebody typed it - Persian digits, thousands commas - or None."""
+    raw = str(text if text is not None else "").translate(MONEY_DIGITS)
+    raw = re.sub(r"[\s,٬،]", "", raw)
+    return int(raw) if raw.isdigit() and len(raw) < 16 else None
+
+
+def wallet_on(store):
+    """Whether customers may top their wallet up with a receipt. Spending what
+    is in it works either way: an invitation or the operator can put money
+    there with this off."""
+    return store.setting("wallet_on") == "1"
+
+
+def referral_terms(store):
+    """(percent, "every" or "first") while inviting pays, else None."""
+    if store.setting("ref_on") != "1":
+        return None
+    try:
+        pct = int(store.setting("ref_percent") or 0)
+    except ValueError:
+        return None
+    if not 0 < pct <= 100:
+        return None
+    return pct, ("first" if store.setting("ref_mode") == "first" else "every")
+
+
+def move_wallet(db, uid, amount, kind, note="", tid=None, other=None):
+    """Change a balance and write down why; the new balance. On a connection
+    already under the store's lock, inside the caller's transaction.
+
+    Never below zero: a spend larger than the balance changes nothing and
+    gives None - decided by the database in one statement, so two purchases
+    at once cannot both spend the same money."""
+    cur = db.execute("UPDATE users SET wallet = wallet + ? WHERE id = ? AND wallet + ? >= 0",
+                     (amount, uid, amount))
+    if not cur.rowcount:
+        return None
+    balance = db.execute("SELECT wallet FROM users WHERE id = ?", (uid,)).fetchone()[0]
+    db.execute("INSERT INTO wallet_moves (user_id, at, amount, balance, kind, note,"
+               " transaction_id, other_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+               (uid, now(), amount, balance, kind, (note or "")[:200], tid, other))
+    return balance
+
+
+WALLET_KINDS = {"topup": "شارژ کیف پول", "purchase": "خرید پلن",
+                "referral": "پورسانت دعوت", "admin": "تغییر به دست مدیر"}
+
+
+def wallet_moves(store, uid, most=10):
+    return [{"at": r["at"], "amount": r["amount"], "balance": r["balance"],
+             "kind": r["kind"], "what": WALLET_KINDS.get(r["kind"], r["kind"]),
+             "note": r["note"] or ""}
+            for r in store.q("SELECT * FROM wallet_moves WHERE user_id = ?"
+                             " ORDER BY id DESC LIMIT ?", (uid, most))]
+
+
+def ref_code(store, user):
+    """This customer's invitation code, made the first time it is asked for."""
+    if user["ref_code"]:
+        return user["ref_code"]
+    for _ in range(5):
+        code = "".join(secrets.choice(REF_ALPHABET) for _ in range(8))
+        try:
+            store.run("UPDATE users SET ref_code = ? WHERE id = ? AND ref_code IS NULL",
+                      (code, user["id"]))
+        except sqlite3.IntegrityError:
+            continue        # somebody else's already; draw again
+        row = store.one("SELECT ref_code FROM users WHERE id = ?", (user["id"],))
+        return row["ref_code"] if row else None
+    return None
+
+
+def set_referrer(store, uid, code):
+    """Who invited a new account, from the code in the link it came by: the
+    inviter's id, or None. Only while inviting pays, never oneself, and once -
+    an account's inviter is not something a later link can change."""
+    code = str(code or "").strip().lower()
+    if not referral_terms(store) or not REF_CODE_RE.fullmatch(code):
+        return None
+    who = store.one("SELECT id FROM users WHERE ref_code = ?", (code,))
+    if not who or who["id"] == uid:
+        return None
+    cur = store.run("UPDATE users SET referred_by = ? WHERE id = ? AND referred_by IS NULL",
+                    (who["id"], uid))
+    if not cur.rowcount:
+        return None
+    log(INFO, "user #%d came by the invitation of #%d" % (uid, who["id"]))
+    return who["id"]
+
+
+def seller_of(user):
+    """The reseller a customer belongs to, or None for the owner's."""
+    try:
+        return user["owner_admin"] or None
+    except (KeyError, IndexError):
+        return None
+
+
+def seller_by_code(store, code):
+    """The reseller whose sign-up link this is, or None."""
+    code = str(code or "").strip().lower()
+    if not REF_CODE_RE.fullmatch(code):
+        return None
+    return store.one("SELECT * FROM admins WHERE ref_code = ? AND own_only = 1", (code,))
+
+
+def seller_from_link(store, code):
+    """The reseller a sign-up link brings a customer to: their own link, or
+    the invitation of one of their customers - whether or not inviting pays."""
+    s = seller_by_code(store, code)
+    if s:
+        return s
+    code = str(code or "").strip().lower()
+    if not REF_CODE_RE.fullmatch(code):
+        return None
+    return store.one("SELECT a.* FROM users u JOIN admins a ON a.id = u.owner_admin"
+                     " WHERE u.ref_code = ? AND a.own_only = 1", (code,))
+
+
+def seller_full(store, seller):
+    return bool(seller["max_users"]) and store.one(
+        "SELECT count(*) c FROM users WHERE owner_admin = ?", (seller["id"],))["c"] \
+        >= seller["max_users"]
+
+
+def seller_stopped(store, seller_id):
+    """Why a reseller's customers are not served now, or None."""
+    if not seller_id:
+        return None
+    s = store.one("SELECT * FROM admins WHERE id = ?", (seller_id,))
+    if not s:
+        return None
+    if s["disabled"]:
+        return "disabled"
+    if s["cap_bytes"] and s["used_bytes"] >= s["cap_bytes"]:
+        return "cap"
+    if s["expires_at"] and s["expires_at"] <= now():
+        return "expired"
+    return None
+
+
+def seller_off(store, user):
+    """A refusal when this customer's seller is disabled: nothing of theirs
+    is sold while it is."""
+    seller = seller_of(user)
+    if seller and store.one("SELECT 1 FROM admins WHERE id = ? AND disabled = 1", (seller,)):
+        return refused("seller_disabled", "فروشندهٔ شما فعلاً غیرفعال است؛ با خودش تماس بگیرید")
+    return None
+
+
+def seller_pay_text(store, user):
+    seller = seller_of(user)
+    return store.setting("pay_text:%d" % seller) if seller else store.setting("pay_text")
+
+
+def pay_referral(store, buyer_id, amount, tid, kind="plan"):
+    """The inviter's share of a plan bought - by receipt or from the wallet -
+    into their wallet, and a word to them: the share, or None. An extra
+    device counts only when every purchase does."""
+    terms = referral_terms(store)
+    if not terms or amount <= 0:
+        return None
+    pct, mode = terms
+    if kind == "device" and mode == "first":
+        return None
+    buyer = store.one("SELECT referred_by FROM users WHERE id = ?", (buyer_id,))
+    if not buyer or not buyer["referred_by"]:
+        return None
+    if mode == "first" and store.one(
+            "SELECT 1 FROM transactions WHERE user_id = ? AND id != ? AND status = 'approved'"
+            " AND plan_id IS NOT NULL AND kind != 'topup'", (buyer_id, tid)):
+        return None
+    share = amount * pct // 100
+    if share <= 0:
+        return None
+    with store.lock:
+        balance = move_wallet(store.db, buyer["referred_by"], share, "referral",
+                              "%d٪ از خرید %s تومانی" % (pct, format(amount, ",")),
+                              tid=tid, other=buyer_id)
+        store.db.commit()
+    if balance is None:
+        return None         # the inviter's account is gone
+    log(INFO, "invitation: user #%d earned %d for #%d's purchase"
+        % (buyer["referred_by"], share, buyer_id))
+    inviter = store.one("SELECT * FROM users WHERE id = ?", (buyer["referred_by"],))
+    emit(store, inviter, "wallet.referral", {
+        "amount": share, "balance": balance,
+        "text": "🎉 یکی از کسانی که با لینک دعوت شما آمده بود خرید کرد؛ %s تومان به "
+                "کیف پولتان اضافه شد.\nموجودی: %s تومان"
+                % (format(share, ","), format(balance, ","))})
+    return share
+
+
+def ref_view(store, user):
+    """The customer's invitation, while inviting pays: the links, the terms,
+    and what it has brought them so far."""
+    terms = referral_terms(store)
+    if not terms:
+        return None
+    code = ref_code(store, user)
+    if not code:
+        return None
+    bot = bot_link_for(store, user) or ""
+    web = store.setting("customer_panel_url") or ""
+    row = store.one("SELECT (SELECT count(*) FROM users WHERE referred_by = ?) AS n,"
+                    " (SELECT COALESCE(sum(amount), 0) FROM wallet_moves"
+                    "  WHERE user_id = ? AND kind = 'referral') AS earned",
+                    (user["id"], user["id"]))
+    return {"percent": terms[0], "mode": terms[1], "code": code,
+            "bot_link": "%s?start=ref_%s" % (bot, code)
+            if bot.startswith("https://t.me/") else None,
+            "web_link": "%ssignup?ref=%s" % (web, code) if web else None,
+            "invited": row["n"], "earned": row["earned"]}
+
+
+MAX_DEVICES = 10
+
+
+def plan_devices(plan):
+    try:
+        return max(1, min(5, int(plan["devices"] or 1)))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 1
+
+
+def set_devices(db, uid, total, extra=None):
+    """An account's number of devices - its addresses at once - and, when
+    it went down, its oldest addresses let go to fit."""
+    total = max(1, min(MAX_DEVICES, int(total)))
+    if extra is None:
+        db.execute("UPDATE users SET max_ips = ? WHERE id = ?", (total, uid))
+    else:
+        db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
+                   (total, max(0, int(extra)), uid))
+    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
+                     (uid,)).fetchall()
+    for row in ips[total:]:
+        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
+    return total
+
+
+def ip_change_limit(store):
+    """New addresses a customer may register a day, or None for no limit."""
+    raw = (store.setting("ip_changes_per_day") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def device_price(store):
+    raw = (store.setting("device_price") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 0
+
+
+def device_offer(store, user):
+    """An extra device for this customer, while the operator sells them:
+    {"price", "devices", "available", "why"}, or None when not sold."""
+    price = device_price(store)
+    if not price:
+        return None
+    why = None
+    if not user["plan_id"] or user["status"] not in ("active", "over_quota"):
+        why = "دستگاه اضافه برای پلن فعال است؛ اول پلن بخرید"
+    elif (user["max_ips"] or 1) >= MAX_DEVICES:
+        why = "بیشتر از %d دستگاه نمی‌شود" % MAX_DEVICES
+    return {"price": price, "devices": user["max_ips"] or 1,
+            "extra": user["extra_devices"] or 0, "available": why is None, "why": why}
+
+
+def add_device(db, uid):
+    user = db.execute("SELECT max_ips, extra_devices FROM users WHERE id = ?", (uid,)).fetchone()
+    return set_devices(db, uid, (user[0] or 1) + 1, (user[1] or 0) + 1)
+
+
+def buy_device_with_wallet(store, user):
+    """An extra device paid from the wallet, at once: the money and the
+    device in one transaction."""
+    off = seller_off(store, user)
+    if off:
+        return off
+    offer = device_offer(store, user)
+    if not offer:
+        return refused("devices_not_sold", "دستگاه اضافه فروخته نمی‌شود")
+    if not offer["available"]:
+        return refused("device_unavailable", offer["why"])
+    price = offer["price"]
+    with store.lock:
+        cur = store.db.execute(
+            "INSERT INTO transactions (user_id, amount, kind, note, status, created_at,"
+            " decided_at) VALUES (?, ?, 'device', 'دستگاه اضافه از کیف پول', 'approved', ?, ?)",
+            (user["id"], price, now(), now()))
+        tid = cur.lastrowid
+        balance = move_wallet(store.db, user["id"], -price, "purchase", "دستگاه اضافه",
+                              tid=tid)
+        if balance is None:
+            store.db.rollback()
+            have = store.db.execute("SELECT wallet FROM users WHERE id = ?",
+                                    (user["id"],)).fetchone()[0]
+            return refused("wallet_short", "موجودی کیف پول کافی نیست: %s تومان کم دارید"
+                           % format(price - have, ","))
+        total = add_device(store.db, user["id"])
+        store.db.commit()
+    emit_admin(store, "wallet.bought", {
+        "user_id": user["id"], "amount": price, "plan": None,
+        "text": "💰 دستگاه اضافه از کیف پول: %s — %s تومان"
+                % (who_label(user), format(price, ","))})
+    pay_referral(store, user["id"], price, tid, kind="device")
+    return {"ok": True, "balance": balance, "devices": total,
+            "message": "✅ یک دستگاه اضافه شد؛ حالا %d دستگاه دارید. %s تومان از کیف پول "
+                       "برداشته شد؛ موجودی: %s تومان"
+                       % (total, format(price, ","), format(balance, ","))}
+
+
+def put_plan(db, uid, plan_id, stamp=None):
+    """apply_plan's work, inside a transaction somebody else commits - so a
+    plan paid from the wallet is the money and the plan together, or neither."""
+    stamp = stamp or datetime.now(timezone.utc)
+    user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+    if not user or not plan:
+        return None
+    ends = parse_ts(user["expires_at"])
+    renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
+                and user["status"] in ("active", "over_quota"))
+    if renewing:
+        until = ends + timedelta(days=plan["days"])
+        quota = (user["quota_bytes"] + plan["quota_bytes"]
+                 if plan["quota_bytes"] and user["quota_bytes"] else 0)
+        used = user["used_bytes"]
+    else:
+        until = stamp + timedelta(days=plan["days"])
+        quota = plan["quota_bytes"]
+        used = 0
+    db.execute(
+        "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
+        " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
+        " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
+        " status = CASE WHEN status = 'suspended' THEN 'suspended'"
+        " ELSE 'active' END WHERE id = ?",
+        (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
+         until.isoformat(timespec="seconds"), uid))
+    # The plan's devices, and those bought on top - which a renewal keeps
+    # and another plan ends.
+    extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
+    set_devices(db, uid, plan_devices(plan) + extra, extra)
+    # A plan sold with an exit of its own puts the customer on it, on
+    # every relay; one sold with all of them leaves their exit alone.
+    if "exit" in plan.keys() and plan["exit"]:
+        db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
+                   (plan["exit"], uid))
+    return ("پلن «%s» تمدید شد تا %s" if renewing
+            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+
+
+CODE_RE = re.compile(r"[A-Z0-9_-]{3,32}")
+
+
+def clean_code(raw):
+    code = str(raw or "").strip().upper().translate(MONEY_DIGITS)
+    return code if CODE_RE.fullmatch(code) else ""
+
+
+def discount_for(store, user, plan, raw):
+    """(price after the code, the code's row, why not): the code as this
+    customer may use it on this plan. No code is the plan's price."""
+    price = plan["price"]
+    if not str(raw or "").strip():
+        return price, None, None
+    code = clean_code(raw)
+    row = store.one("SELECT * FROM discount_codes WHERE code = ?", (code,)) if code else None
+    if not row or not row["active"]:
+        return price, None, "این کد تخفیف معتبر نیست"
+    if row["expires_at"] and row["expires_at"] < now():
+        return price, None, "مهلت این کد تخفیف تمام شده"
+    if row["max_uses"] and row["uses"] >= row["max_uses"]:
+        return price, None, "ظرفیت این کد تخفیف تمام شده"
+    try:
+        plans = json.loads(row["plans"]) if row["plans"] else None
+    except ValueError:
+        plans = None
+    if plans and plan["id"] not in plans:
+        return price, None, "این کد تخفیف برای این پلن نیست"
+    if row["once"] and store.one("SELECT 1 FROM discount_uses WHERE code_id = ? AND user_id = ?",
+                                 (row["id"], user["id"])):
+        return price, None, "این کد تخفیف را قبلاً استفاده کرده‌اید"
+    if "owner_admin" in plan.keys() and plan["owner_admin"]:
+        return price, None, "این کد تخفیف برای این پلن نیست"
+    off = price * row["value"] // 100 if row["kind"] == "percent" else row["value"]
+    return max(0, price - off), row, None
+
+
+def use_discount(db, code_id, user_id, tid):
+    """A code counted as used, inside the purchase's transaction."""
+    if not code_id:
+        return
+    db.execute("INSERT INTO discount_uses (code_id, user_id, transaction_id, at)"
+               " VALUES (?, ?, ?, ?)", (code_id, user_id, tid, now()))
+    db.execute("UPDATE discount_codes SET uses = uses + 1 WHERE id = ?", (code_id,))
+
+
+def discount_view(store, user, raw):
+    """The plans on sale with a code's prices, for the page and the bot to
+    show before paying: (plans, message, ok)."""
+    plans = store.plans_for_sale(seller_of(user))
+    if not str(raw or "").strip():
+        return plans, None, True
+    ok, why = False, None
+    for p in plans:
+        price, row, err = discount_for(store, user, p, raw)
+        if row:
+            p["list_price"], p["price"], ok = p["price"], price, True
+        why = why or err
+    if ok:
+        return plans, "کد تخفیف «%s» اعمال شد" % clean_code(raw), True
+    return plans, why or "این کد تخفیف معتبر نیست", False
+
+
+def buy_with_wallet(store, user, plan_id, code=None):
+    """Pay for a plan from the wallet: no receipt, nobody to wait for. The
+    money leaves and the plan arrives in one transaction."""
+    off = seller_off(store, user)
+    if off:
+        return off
+    if telegram_required(store, user):
+        return refused("telegram_required", "برای خرید، اول حسابتان را به تلگرام وصل کنید")
+    try:
+        pid = int(plan_id or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        return refused("plan_required", "اول پلن را انتخاب کنید")
+    plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1 AND is_trial = 0"
+                     " AND COALESCE(owner_admin, 0) = ?", (pid, seller_of(user) or 0))
+    if not plan:
+        return refused("plan_not_on_sale", "این پلن دیگر فروخته نمی‌شود، یکی دیگر را "
+                                           "انتخاب کنید")
+    if plan["price"] <= 0:
+        return refused("not_for_wallet", "این پلن با کیف پول خریدنی نیست")
+    price, row, why = discount_for(store, user, plan, code)
+    if why:
+        return refused("bad_code", why)
+    with store.lock:
+        cur = store.db.execute(
+            "INSERT INTO transactions (user_id, amount, kind, note, status, created_at,"
+            " decided_at, plan_id, code_id, list_price)"
+            " VALUES (?, ?, 'wallet', 'از کیف پول', 'approved', ?, ?, ?, ?, ?)",
+            (user["id"], price, now(), now(), plan["id"], row["id"] if row else None,
+             plan["price"] if row else None))
+        tid = cur.lastrowid
+        use_discount(store.db, row["id"] if row else None, user["id"], tid)
+        balance = move_wallet(store.db, user["id"], -price, "purchase",
+                              "پلن «%s»" % plan["name"], tid=tid)
+        if balance is None:
+            store.db.rollback()
+            have = store.db.execute("SELECT wallet FROM users WHERE id = ?",
+                                    (user["id"],)).fetchone()[0]
+            return refused("wallet_short",
+                           "موجودی کیف پول کافی نیست: %s تومان دارید و این پلن %s تومان است"
+                           " — %s تومان کم دارید" % (format(have, ","), format(price, ","),
+                                                     format(price - have, ",")))
+        done = put_plan(store.db, user["id"], plan["id"])
+        store.db.commit()
+    log(INFO, "user #%d bought plan #%d from the wallet: %d, %d left"
+        % (user["id"], plan["id"], price, balance))
+    emit_admin(store, "wallet.bought", {
+        "user_id": user["id"], "amount": price,
+        "plan": {"id": plan["id"], "name": plan["name"]},
+        "text": "💰 خرید از کیف پول: %s — «%s»، %s تومان"
+                % (who_label(user), plan["name"], format(price, ","))})
+    pay_referral(store, user["id"], price, tid)
+    return {"ok": True, "balance": balance,
+            "message": "✅ %s. %s تومان از کیف پول برداشته شد؛ موجودی: %s تومان"
+                       % (done, format(price, ","), format(balance, ","))}
+
+
 def create_receipt(store, user, body):
     """Record a photograph of a payment slip against a customer.
 
@@ -1690,6 +2444,9 @@ def create_receipt(store, user, body):
     and not the other. Nothing about the account changes here: this records a
     claim, and the operator decides what it is worth.
     """
+    off = seller_off(store, user)
+    if off:
+        return off
     # One account per person, as far as one Telegram account per person goes:
     # the operator can ask that buying wait until Telegram is linked.
     if telegram_required(store, user):
@@ -1707,10 +2464,13 @@ def create_receipt(store, user, body):
     if len(blob) > MAX_RECEIPT:
         return refused("too_big", "فایل بزرگ‌تر از %s است" % human(MAX_RECEIPT))
 
+    code_row = None
     # What the receipt pays for. Once there is anything on sale a receipt has
     # to name one of those plans, or the operator is back to guessing what a
     # sum of money was meant to buy. The price comes from the plan, never from
-    # the form.
+    # the form - except for a top-up, where the sum is the whole point.
+    topup = body.get("kind") == "topup"
+    device = body.get("kind") == "device"
     try:
         amount = max(0, int(body.get("amount") or 0))
     except (TypeError, ValueError):
@@ -1720,14 +2480,32 @@ def create_receipt(store, user, body):
         wanted = int(body.get("plan_id") or 0)
     except (TypeError, ValueError):
         wanted = 0
-    if wanted:
+    if device:
+        offer = device_offer(store, user)
+        if not offer:
+            return refused("devices_not_sold", "دستگاه اضافه فروخته نمی‌شود")
+        if not offer["available"]:
+            return refused("device_unavailable", offer["why"])
+        amount = offer["price"]
+    elif topup:
+        if not wallet_on(store):
+            return refused("wallet_off", "شارژ کیف پول فعلاً بسته است")
+        amount = toman(body.get("amount"))
+        if amount is None or not TOPUP_MIN <= amount <= TOPUP_MAX:
+            return refused("bad_amount", "مبلغ شارژ باید بین %s و %s تومان باشد"
+                           % (format(TOPUP_MIN, ","), format(TOPUP_MAX, ",")))
+    elif wanted:
         plan = store.one("SELECT * FROM plans WHERE id = ? AND active = 1"
-                         " AND is_trial = 0", (wanted,))
+                         " AND is_trial = 0 AND COALESCE(owner_admin, 0) = ?",
+                         (wanted, seller_of(user) or 0))
         if not plan:
             return refused("plan_not_on_sale",
                            "این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید")
-        amount = plan["price"]
-    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"):
+        amount, code_row, why = discount_for(store, user, plan, body.get("code"))
+        if why:
+            return refused("bad_code", why)
+    elif store.one("SELECT 1 FROM plans WHERE active = 1 AND is_trial = 0"
+                   " AND COALESCE(owner_admin, 0) = ?", (seller_of(user) or 0,)):
         return refused("plan_required", "اول پلنی را که خریده‌اید انتخاب کنید")
 
     # One pending receipt per customer. A second one replaces the first rather
@@ -1739,33 +2517,57 @@ def create_receipt(store, user, body):
         cur = store.db.execute(
             "INSERT INTO transactions"
             " (user_id, amount, kind, receipt_blob, receipt_type, note,"
-            "  status, created_at, plan_id)"
-            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, ?)",
-            (user["id"], amount, seal(blob), kind,
+            "  status, created_at, plan_id, code_id, list_price)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (user["id"], amount, "topup" if topup else "device" if device else "card",
+             seal(blob), kind,
              (body.get("note") or "").strip()[:200], now(),
-             plan["id"] if plan else None))
+             plan["id"] if plan else None, code_row["id"] if code_row else None,
+             plan["price"] if code_row else None))
         store.db.commit()
     print("receipt from user %d: %s, %s%s"
           % (user["id"], kind, human(len(blob)),
              ", plan %d" % plan["id"] if plan else ""), flush=True)
     emit_admin(store, "receipt.submitted", {
         "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
+        "kind": "topup" if topup else "device" if device else "card",
         "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
         "text": "رسید تازه از %s%s — %s تومان"
-                % (who_label(user), " برای «%s»" % plan["name"] if plan else "",
+                % (who_label(user), " برای شارژ کیف پول" if topup
+                   else " برای دستگاه اضافه" if device
+                   else " برای «%s»" % plan["name"] if plan else "",
                    format(amount, ","))})
     return {"ok": True, "receipt_id": cur.lastrowid,
-            "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+            "message": "رسید فرستاده شد. پس از بررسی، %s تومان به کیف پولتان اضافه "
+                       "می‌شود" % format(amount, ",") if topup
+            else "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
 
 
-def register_ip(store, user_id, ip):
+def register_ip(store, user_id, ip, limited=False):
     """Put an address on an account - the web panel's button and the API's
-    call both land here."""
+    call both land here. `limited`: the customer themselves, held to the
+    admin's number of new addresses a day; the admin is not."""
     owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
     if owner and owner["user_id"] != user_id:
         return refused("ip_taken", "این آی‌پی به حساب دیگری ثبت شده است")
     user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
     existing = store.user_ips(user_id)
+    new = not any(r["ip"] == ip for r in existing)
+    limit = ip_change_limit(store) if limited and new else None
+    if limit:
+        since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+        rows = store.q("SELECT at FROM ip_log WHERE user_id = ? AND at > ? ORDER BY at",
+                       (user_id, since))
+        if len(rows) >= limit:
+            free = parse_ts(rows[len(rows) - limit]["at"]) + timedelta(days=1)
+            hours = max(1, int((free - datetime.now(timezone.utc)).total_seconds() // 3600) + 1)
+            return refused("ip_changes", "در ۲۴ ساعت گذشته %d بار آی‌پی تازه ثبت کرده‌اید و "
+                           "به سقف رسیده‌اید؛ حدود %d ساعت دیگر دوباره امتحان کنید"
+                           % (limit, hours))
+    if new:
+        store.run("INSERT INTO ip_log (user_id, ip, at) VALUES (?, ?, ?)", (user_id, ip, now()))
+        store.run("DELETE FROM ip_log WHERE at < ?", ((datetime.now(timezone.utc)
+                  - timedelta(days=7)).isoformat(timespec="seconds"),))
     # One active address per account, with as many changes as they like.
     # Replacing rather than adding is what makes that true.
     if existing and len(existing) >= user["max_ips"]:
@@ -2007,6 +2809,43 @@ def record_usage(db, user_id, up, down, when=None):
                    (user_id, grain, bucket, up, down))
 
 
+def record_server(db, user_id, kind, server, up, down, when=None):
+    """Add a stretch of this customer's traffic through this server: to the
+    server's own charts, and to the customer's day on it."""
+    buckets = usage_buckets(when)
+    for grain, bucket in buckets.items():
+        db.execute("INSERT INTO server_usage (grain, bucket, kind, server, up, down)"
+                   " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(grain, bucket, kind, server)"
+                   " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+                   (grain, bucket, kind, server, up, down))
+    db.execute("INSERT INTO user_server_usage (user_id, day, kind, server, up, down)"
+               " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, day, kind, server)"
+               " DO UPDATE SET up = up + excluded.up, down = down + excluded.down",
+               (user_id, buckets["1d"], kind, server, up, down))
+
+
+def record_exit_usage(store, rows):
+    """A relay's customers' bytes by the exit that carried them, since the
+    last sync: {ip: {exit: [up, down]}}."""
+    if not isinstance(rows, dict):
+        return
+    for ip, per in list(rows.items())[:5000]:
+        if not isinstance(per, dict):
+            continue
+        owner = store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+        if not owner:
+            continue
+        with store.lock:
+            for to, n in list(per.items())[:16]:
+                try:
+                    up, down = (int(n[0]), int(n[1])) if isinstance(n, list) else (0, int(n))
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if up >= 0 and down >= 0 and up + down > 0 and valid_ip(str(to)):
+                    record_server(store.db, owner["user_id"], "exit", str(to), up, down)
+            store.db.commit()
+
+
 def service_index(catalogue):
     """Every catalogue name, mapped to its service, for turning the names a
     relay's connections asked for into the service they belong to."""
@@ -2166,12 +3005,16 @@ def qlog_reasoner(store, user, catalogue):
     rules = store.template_rules(tid)
     blocked = set(rules["blocked"])
     forwards = rules["forwards"]
+    lists = [blocklist_names(n) for n in rules.get("lists") or {}]
 
     def reason(name):
         parts = name.lower().rstrip(".").split(".")
         tails = [".".join(parts[i:]) for i in range(len(parts) - 1)]
         if any(t in blocked for t in tails):
             return "blocked:"
+        for names in lists:
+            if any(t in names for t in tails):
+                return "blocked:"
         for t in tails:
             if t in forwards:
                 return "forward:" + " ".join(forwards[t])
@@ -2262,10 +3105,14 @@ def prune_usage(store):
     for grain, days in USAGE_KEEP.items():
         cutoff = usage_buckets(now_t - timedelta(days=days))[grain]
         store.run("DELETE FROM usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
+        store.run("DELETE FROM server_usage WHERE grain = ? AND bucket < ?", (grain, cutoff))
     cutoff = usage_buckets(now_t - timedelta(days=SERVICE_KEEP_DAYS))["1d"]
     store.run("DELETE FROM usage_service WHERE day < ?", (cutoff,))
     cutoff = usage_buckets(now_t - timedelta(days=90))["1d"]
     store.run("DELETE FROM doh_daily WHERE day < ?", (cutoff,))
+    store.run("DELETE FROM user_server_usage WHERE day < ?", (cutoff,))
+    store.run("DELETE FROM alerts WHERE at < ?", ((now_t - timedelta(days=30)).isoformat(
+        timespec="seconds"),))
     prune_qlog(store)
     store.run("DELETE FROM doh_users WHERE day < ?", (cutoff,))
 
@@ -2357,12 +3204,34 @@ def doh_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def doh_view(store, user):
+def doh_view(store, user, relays=()):
+    """The first of this customer's servers that has DoH on - for a bot
+    that knows only one; `servers` below has them all."""
+    for s in customer_servers(store, user, relays):
+        if s["dot"]:
+            return {"url": s["doh"], "dot_host": s["dot"]}
     host = store.setting("doh_host")
     if not host:
         return None
     return {"url": "https://%s/dns-query/%s" % (host, doh_token(store, user)),
             "dot_host": host}
+
+
+def customer_servers(store, user, relays):
+    """Every server this customer is shown, with all three ways to use it:
+    its address for plain DNS, and - once it has a name and a certificate -
+    its DoT name and the customer's own DoH address on it. The same ticks
+    that pick a customer's DNS pick these."""
+    out, token = [], None
+    for n, ip in enumerate(shown_relays(store, user, relays), 1):
+        host = store.setting("doh_host:" + ip) or ""
+        if host and token is None:
+            token = doh_token(store, user)
+        out.append({"ip": ip, "n": n, "note": server_note(store, user, ip),
+                    "single": store.setting("single:" + ip) == "1",
+                    "dot": host or None,
+                    "doh": "https://%s/dns-query/%s" % (host, token) if host else None})
+    return out
 
 
 def doh_tokens(store, profiles, default_id):
@@ -2634,7 +3503,7 @@ def link_code(store, user, password):
     code = "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
     new_code(store, user["id"], "link", code, LINK_MINUTES)
     return {"ok": True, "code": code, "minutes": LINK_MINUTES,
-            "bot_link": store.setting("bot_link")}
+            "bot_link": bot_link_for(store, user)}
 
 
 def unlink_telegram(store, user, password):
@@ -2752,8 +3621,9 @@ def use_login_link(store, token):
     return refused("bad_link", "این لینک درست نیست یا قبلاً استفاده شده")
 
 
-def link_telegram(store, tg, code):
-    """The bot says: this Telegram account sent this code."""
+def link_telegram(store, tg, code, seller=None):
+    """The bot says: this Telegram account sent this code. A reseller's bot
+    links only the reseller's own customers."""
     code = (code or "").strip().lower()
     if not re.match(r"^[a-z0-9]{8}$", code):
         return refused("bad_code", "کد اتصال درست نیست")
@@ -2764,6 +3634,9 @@ def link_telegram(store, tg, code):
         ends = parse_ts(row["expires_at"])
         if not ends or datetime.now(timezone.utc) >= ends:
             return refused("code_expired", "کد اتصال منقضی شده؛ یکی تازه بگیرید")
+        if seller and not store.one("SELECT 1 FROM users WHERE id = ? AND owner_admin = ?",
+                                    (row["user_id"], seller)):
+            return refused("bad_code", "کد اتصال درست نیست")
         other = store.user_by_telegram(tg)
         if other and other["id"] != row["user_id"] and empty_bot_account(store, other):
             # Somebody who opened the bot before linking gets a bot account
@@ -2863,16 +3736,33 @@ WEBHOOK_MAX_TRIES = 30
 WEBHOOK_KEEP_DAYS = 7
 
 
+def bot_keys(store, seller_id=None, admin=False):
+    """The keys a message goes to: a reseller's own bot for their customers,
+    when they have one; the owner's bots for everybody else."""
+    base = ("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
+            " AND COALESCE(webhook_url, '') != ''" + (" AND scope = 'admin'" if admin else ""))
+    if seller_id:
+        rows = store.q(base + " AND admin_id = ?", (seller_id,))
+        if rows:
+            return rows
+    return store.q(base + " AND admin_id IS NULL")
+
+
+def bot_link_for(store, user=None):
+    """The bot a customer talks to: their reseller's, or the owner's."""
+    seller = seller_of(user) if user is not None else None
+    return (seller and store.setting("bot_link:%d" % seller)) or store.setting("bot_link")
+
+
 def emit(store, user, event, data):
-    """Queue something for every bot that asked to be told.
+    """Queue something for the bot this customer talks to.
 
     Only for an account a bot can reach - one with a Telegram id. Nothing is
     sent here; the worker does that.
     """
     if not user["telegram_id"]:
         return
-    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
-                   " AND COALESCE(webhook_url, '') != ''")
+    keys = bot_keys(store, seller_of(user))
     if not keys:
         return
     stamp = now()
@@ -2988,35 +3878,10 @@ def apply_plan(store, uid, plan_id, stamp=None):
     """The admin panel's Store.apply_plan, word for word in effect: the same
     plan while it runs is a renewal, anything else starts fresh, and a
     suspended account stays suspended."""
-    stamp = stamp or datetime.now(timezone.utc)
     with store.lock:
-        user = store.db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-        plan = store.db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
-        if not user or not plan:
-            return None
-        ends = parse_ts(user["expires_at"])
-        renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
-                    and user["status"] in ("active", "over_quota"))
-        if renewing:
-            until = ends + timedelta(days=plan["days"])
-            quota = (user["quota_bytes"] + plan["quota_bytes"]
-                     if plan["quota_bytes"] and user["quota_bytes"] else 0)
-            used = user["used_bytes"]
-        else:
-            until = stamp + timedelta(days=plan["days"])
-            quota = plan["quota_bytes"]
-            used = 0
-        store.db.execute(
-            "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
-            " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
-            " quota_mode = 'oneoff', quota_reset_at = NULL, warned = 0,"
-            " status = CASE WHEN status = 'suspended' THEN 'suspended'"
-            " ELSE 'active' END WHERE id = ?",
-            (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
-             until.isoformat(timespec="seconds"), uid))
+        done = put_plan(store.db, uid, plan_id, stamp)
         store.db.commit()
-    return ("پلن «%s» تمدید شد تا %s" if renewing
-            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+    return done
 
 
 def plan_event(store, uid):
@@ -3029,22 +3894,65 @@ def plan_event(store, uid):
             "expires_at": row["expires_at"], "quota_bytes": row["quota_bytes"]}
 
 
-def decide_receipt(store, tid, to):
+def decide_receipt(store, tid, to, amount=None):
     """Approve or reject a pending receipt, once - the admin panel's
-    receipt-decide."""
+    receipt-decide. `amount` corrects a top-up to what the slip really says."""
     if to not in ("approved", "rejected"):
         return refused("bad_decision", "تصمیم باید approve یا reject باشد")
-    row = store.one("SELECT user_id, plan_id, status FROM transactions WHERE id = ?", (tid,))
+    row = store.one("SELECT user_id, plan_id, status, kind, amount, code_id FROM transactions"
+                    " WHERE id = ?", (tid,))
     if not row:
         return refused("receipt_not_found", "این رسید پیدا نشد")
     if row["status"] != "pending":
         return refused("already_decided", "این رسید قبلاً بررسی شده")
+    topup = row["kind"] == "topup"
+    credit = row["amount"]
+    if row["kind"] == "device" and to == "approved":
+        with store.lock:
+            cur = store.db.execute(
+                "UPDATE transactions SET status = ?, decided_at = ?, receipt_blob = NULL"
+                " WHERE id = ? AND status = 'pending'", (to, now(), tid))
+            total = add_device(store.db, row["user_id"]) if cur.rowcount else None
+            store.db.commit()
+        if not cur.rowcount:
+            return refused("already_decided", "این رسید قبلاً بررسی شده")
+        user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+        emit(store, user, "receipt.approved", {
+            "receipt_id": tid, "devices": total,
+            "text": "رسید شما تأیید شد؛ یک دستگاه اضافه شد و حالا %d دستگاه دارید." % total})
+        pay_referral(store, row["user_id"], row["amount"], tid, kind="device")
+        return {"ok": True, "message": "رسید تأیید شد؛ یک دستگاه اضافه شد (%d)" % total}
+    if topup and to == "approved" and amount not in (None, ""):
+        credit = toman(amount)
+        if credit is None or not 0 < credit <= TOPUP_MAX:
+            return refused("bad_amount", "مبلغ درست نیست")
+    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
+    if topup and to == "approved":
+        # The decision and the money together: a receipt approved twice at
+        # once - the panel and the bot - must not pay twice.
+        with store.lock:
+            cur = store.db.execute(
+                "UPDATE transactions SET status = ?, decided_at = ?, amount = ?,"
+                " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
+                (to, now(), credit, tid))
+            balance = move_wallet(store.db, row["user_id"], credit, "topup",
+                                  "رسید #%d" % tid, tid=tid) if cur.rowcount else None
+            store.db.commit()
+        if not cur.rowcount:
+            return refused("already_decided", "این رسید قبلاً بررسی شده")
+        log(INFO, "receipt #%d approved by bot: user #%d, wallet +%d"
+            % (tid, row["user_id"], credit))
+        emit(store, user, "receipt.approved", {
+            "receipt_id": tid, "amount": credit, "balance": balance,
+            "text": "رسید شما تأیید شد؛ %s تومان به کیف پولتان اضافه شد.\nموجودی: %s تومان"
+                    % (format(credit, ","), format(balance or 0, ","))})
+        return {"ok": True, "message": "رسید تأیید شد؛ %s تومان به کیف پول اضافه شد"
+                % format(credit, ",")}
     cur = store.run("UPDATE transactions SET status = ?, decided_at = ?,"
                     " receipt_blob = NULL WHERE id = ? AND status = 'pending'",
                     (to, now(), tid))
     if not cur.rowcount:
         return refused("already_decided", "این رسید قبلاً بررسی شده")
-    user = store.one("SELECT * FROM users WHERE id = ?", (row["user_id"],))
     if to == "rejected":
         emit(store, user, "receipt.rejected", {
             "receipt_id": tid,
@@ -3052,12 +3960,17 @@ def decide_receipt(store, tid, to):
                     "با پشتیبانی در تماس باشید."})
         return {"ok": True, "message": "رسید رد شد"}
     done = apply_plan(store, row["user_id"], row["plan_id"]) if row["plan_id"] else None
+    if row["code_id"]:
+        with store.lock:
+            use_discount(store.db, row["code_id"], row["user_id"], tid)
+            store.db.commit()
     if done:
         log(INFO, "receipt #%d approved by bot: user #%d, plan #%d"
             % (tid, row["user_id"], row["plan_id"]))
         emit(store, user, "receipt.approved",
              dict(plan_event(store, row["user_id"]), receipt_id=tid,
                   text="رسید پرداخت شما تأیید شد. %s" % done))
+        pay_referral(store, row["user_id"], row["amount"], tid)
         return {"ok": True, "message": "رسید تأیید شد؛ %s" % done}
     emit(store, user, "receipt.approved", {
         "receipt_id": tid,
@@ -3097,11 +4010,474 @@ def who_label(user):
                 else "#%d" % user["id"]))
 
 
+# How long a relay or node may go without a report before the operator is told.
+ALERT_SILENT = 180
+
+
+def alert(store, key, ok, text):
+    """A server's state for `key`, and the operator told when it changes -
+    once per change, never for the first time something is seen well."""
+    before = store.setting("alert_state:" + key)
+    after = "ok" if ok else "down"
+    if before == after or (not before and ok):
+        if not before:
+            store.set_setting("alert_state:" + key, after)
+        return False
+    store.set_setting("alert_state:" + key, after)
+    store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, ?, ?, ?)",
+              (now(), key, 1 if ok else 0, text))
+    log(WARN if not ok else INFO, "alert: %s" % text)
+    emit_admin(store, "server.%s" % ("up" if ok else "down"), {"text": text, "key": key})
+    return True
+
+
+def record_exit_health(store, relay, health):
+    """What a relay found of its exits: {exit: {"ok": bool, "ms": int}}."""
+    if not isinstance(health, dict):
+        return
+    for to, st in list(health.items())[:16]:
+        if not valid_ip(str(to)) or not isinstance(st, dict):
+            continue
+        if st.get("ok"):
+            text = "✅ سرور خارج %s از رلهٔ %s دوباره در دسترس است." % (to, relay)
+        else:
+            text = ("⚠️ سرور خارج %s از رلهٔ %s در دسترس نیست؛ مشتری‌های این رله از "
+                    "سرور خارج بعدی می‌روند." % (to, relay))
+        alert(store, "exit:%s:%s" % (relay, to), bool(st.get("ok")), text)
+
+
+def check_servers(store, relays, nodes):
+    """A relay or node that has stopped reporting, or started again."""
+    for kind, ips in (("رله", relays), ("نود", nodes)):
+        for ip in ips:
+            if kind == "رله" and store.setting("single:" + ip) == "1":
+                kind_here = "تک‌سرور"
+            else:
+                kind_here = kind
+            row = store.one("SELECT MAX(at) at FROM metrics WHERE host = ?", (ip,))
+            seen = parse_ts(row["at"]) if row and row["at"] else None
+            if not seen:
+                continue            # never reported: not installed yet
+            quiet = (datetime.now(timezone.utc) - seen).total_seconds() > ALERT_SILENT
+            alert(store, "silent:" + ip, not quiet,
+                  "⚠️ %s %s بیش از ۳ دقیقه است گزارش نداده." % (kind_here, ip) if quiet
+                  else "✅ %s %s دوباره وصل است." % (kind_here, ip))
+
+
+def cap_config(store, host):
+    """What the admin set as a server's monthly traffic cap: {"gb", "day",
+    "count" - "both" or "out" - and "action" - "alert" or "move"}, or {}."""
+    try:
+        cap = json.loads(store.setting("cap:" + host) or "{}")
+    except ValueError:
+        return {}
+    return cap if isinstance(cap, dict) else {}
+
+
+def period_start(day, today=None):
+    """The first day of the provider's current month: the last `day` of a
+    month on or before today."""
+    today = today or datetime.now(timezone.utc).date()
+    day = max(1, min(int(day or 1), 28))
+    if today.day >= day:
+        return today.replace(day=day)
+    first = today.replace(day=1) - timedelta(days=1)
+    return first.replace(day=day)
+
+
+def count_month(store, host, sample):
+    """Add this sample's growth in the network card's counters to the
+    server's traffic this month - its own counters, since boot, so a reboot
+    starts them over and the growth is then all of what they say."""
+    rx, tx = sample.get("rx_total"), sample.get("tx_total")
+    if rx is None or tx is None:
+        return
+    period = period_start(cap_config(store, host).get("day")).isoformat()
+    try:
+        state = json.loads(store.setting("net_month:" + host) or "{}")
+    except ValueError:
+        state = {}
+    last = state.get("last") or [rx, tx]
+    d_in, d_out = rx - last[0], tx - last[1]
+    if d_in < 0 or d_out < 0:
+        d_in, d_out = rx, tx
+    if state.get("period") != period:
+        state = {"period": period, "in": 0, "out": 0}
+    state.update({"in": state.get("in", 0) + d_in, "out": state.get("out", 0) + d_out,
+                  "last": [rx, tx]})
+    store.set_setting("net_month:" + host, json.dumps(state, sort_keys=True))
+
+
+def month_used(store, host):
+    """(bytes this period as the cap counts them, the cap in bytes or 0)."""
+    cap = cap_config(store, host)
+    try:
+        state = json.loads(store.setting("net_month:" + host) or "{}")
+    except ValueError:
+        state = {}
+    if state.get("period") != period_start(cap.get("day")).isoformat():
+        state = {}
+    used = state.get("out", 0) + (0 if cap.get("count") == "out" else state.get("in", 0))
+    return used, int(float(cap.get("gb") or 0) * 1e9)
+
+
+def next_reset(days, due, stamp=None):
+    """The next reset after one that is due now, or None when none is due:
+    counted on from the date it was due, so it stays on its own day even
+    when the server was off at the time."""
+    if not days or not due:
+        return None
+    stamp = stamp or datetime.now(timezone.utc)
+    when = parse_ts(due)
+    if not when or when > stamp:
+        return None
+    while when <= stamp:
+        when += timedelta(days=days)
+    return when.isoformat(timespec="seconds")
+
+
+def check_sellers(store):
+    """Tell the owner - and the reseller's own bot - as a reseller's traffic
+    passes 80 and 95 percent of their cap, reaches it, or their days end:
+    each once, until the owner renews them."""
+    for s in store.q("SELECT * FROM admins WHERE own_only = 1"):
+        nxt = next_reset(s["reset_days"], s["reset_next"])
+        if nxt:
+            # Their usage back to zero, as the owner set: served again, and
+            # the warnings about the cap due again.
+            store.run("UPDATE admins SET used_bytes = 0, warned = warned & ~7,"
+                      " reset_next = ? WHERE id = ?", (nxt, s["id"]))
+            log(INFO, "usage of seller %s reset, as every %d days"
+                % (s["username"], s["reset_days"]))
+            continue
+        if s["disabled"]:
+            continue
+        warned = s["warned"] or 0
+        steps = []
+        if s["cap_bytes"]:
+            pct = 100 * s["used_bytes"] // s["cap_bytes"]
+            for bit, at in ((1, 80), (2, 95), (4, 100)):
+                if pct >= at and not warned & bit:
+                    steps.append((bit, at))
+        ended = s["expires_at"] and s["expires_at"] <= now()
+        soon = s["expires_at"] and not ended and s["expires_at"] <= (
+            datetime.now(timezone.utc) + timedelta(days=3)).isoformat(timespec="seconds")
+        text = None
+        if steps:
+            bit, at = steps[-1]
+            warned |= sum(b for b, _ in steps)
+            text = ("⛔ حجم فروشنده %s تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید."
+                    % s["username"] if at == 100 else
+                    "⚠️ فروشنده %s: %d٪ حجمش مصرف شد." % (s["username"], at))
+        elif ended and not warned & 8:
+            warned |= 8
+            text = "⛔ روزهای فروشنده %s تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید." \
+                % s["username"]
+        elif soon and not warned & 16:
+            warned |= 16
+            text = "⚠️ روزهای فروشنده %s تا ۳ روز دیگر تمام می‌شود." % s["username"]
+        if text:
+            store.run("UPDATE admins SET warned = ? WHERE id = ?", (warned, s["id"]))
+            emit_admin(store, "seller.limit", {"admin_id": s["id"], "text": text})
+
+
+def check_caps(store, relays, nodes):
+    """Each server's month against the cap the admin set for it."""
+    main = exit_self()
+    hosts = [("exit", "سرور خارج اصلی %s" % main)]
+    hosts += [(ip, "%s %s" % ("تک‌سرور" if store.setting("single:" + ip) == "1" else "رله", ip))
+              for ip in relays]
+    hosts += [(ip, "نود %s" % ip) for ip in nodes]
+    for host, name in hosts:
+        used, cap = month_used(store, host)
+        keys = {lv: "cap%d:%s" % (lv, host) for lv in (80, 95, 100)}
+        state = {lv: store.setting("alert_state:" + k) for lv, k in keys.items()}
+        if not cap:
+            # No cap, or one taken away: nothing of it is still wrong.
+            for k in keys.values():
+                store.run("DELETE FROM settings WHERE key = ?", ("alert_state:" + k,))
+            continue
+        name, pct = name.strip(), int(100 * used / cap)
+        # Crossing several levels at once - a cap set below what is already
+        # used, a month's traffic in an hour - is one message, the highest;
+        # and a new month back under all of them is one message too.
+        went = [lv for lv in keys if pct >= lv and state[lv] != "down"]
+        back = [lv for lv in keys if pct <= lv - 10 and state[lv] == "down"]
+        if went:
+            top = max(went)
+            for lv in went:
+                if lv != top:
+                    store.set_setting("alert_state:" + keys[lv], "down")
+            said = "به سقف ماهانه‌اش رسید" if top == 100 else "از %d٪ سقف ماهانه‌اش گذشت" % top
+            alert(store, keys[top], False,
+                  "⚠️ ترافیک %s %s: %s از %s." % (name, said, human_gb(used), human_gb(cap))
+                  + (" رله‌ها از سرورهای خارج دیگر می‌روند." if top == 100
+                     and cap_config(store, host).get("action") == "move" else ""))
+        if back:
+            low = min(back)
+            for lv in back:
+                if lv != low:
+                    store.set_setting("alert_state:" + keys[lv], "ok")
+            alert(store, keys[low], True,
+                  "✅ ترافیک %s دوباره زیر %d٪ سقف است: %s از %s."
+                  % (name, low, human_gb(used), human_gb(cap)))
+
+def capped_exits(store, nodes):
+    """The exits that reached their cap with "move" as the admin's choice:
+    the relays put them last, still a fallback."""
+    out = []
+    for host, ip in [("exit", exit_self())] + [(n, n) for n in nodes]:
+        used, cap = month_used(store, host)
+        if cap and used >= cap and cap_config(store, host).get("action") == "move" and ip:
+            out.append(ip)
+    return out
+
+
+def human_gb(n):
+    if n < 1e9:
+        return "%d MB" % (n // 1e6)
+    return "%.1f GB" % (n / 1e9) if n < 1e12 else "%.2f TB" % (n / 1e12)
+
+
+# ------------------------------------------------------------------ upgrades
+# The installer the exit last ran, kept by it, for the other servers: the
+# admin panel starts a job, and one server at a time fetches it from here,
+# runs it and says how it went. The first that fails, or does not answer in
+# twenty minutes, stops the job - the rest keep the version they have.
+INSTALLER_COPY = "/var/lib/smart-dns/installer/doctor-dns.sh"
+UPGRADE_WAIT = 20 * 60
+_INSTALLER = {"mtime": None, "blob": b"", "version": "", "sha": ""}
+
+
+def installer_on_hand():
+    """(its version, its sha256, its bytes) - or ("", "", b"") without one."""
+    try:
+        mtime = os.path.getmtime(INSTALLER_COPY)
+    except OSError:
+        return "", "", b""
+    if _INSTALLER["mtime"] != mtime:
+        with open(INSTALLER_COPY, "rb") as fh:
+            blob = fh.read()
+        m = re.search(rb'^VERSION="([0-9.]+)"', blob, re.M)
+        _INSTALLER.update(mtime=mtime, blob=blob, version=m.group(1).decode() if m else "",
+                          sha=hashlib.sha256(blob).hexdigest())
+    return _INSTALLER["version"], _INSTALLER["sha"], _INSTALLER["blob"]
+
+
+def version_key(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return ()
+
+
+STANDBY_BUNDLE = "/var/lib/smart-dns/standby-bundle.enc"
+
+
+def standby_info(store, who):
+    """For the standby node: the bundle and the installer to keep, by hash."""
+    if not who or store.setting("standby") != who:
+        return None
+    try:
+        with open(STANDBY_BUNDLE, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+    return {"bundle": sha, "installer": installer_on_hand()[1]}
+
+
+def panel_where(store):
+    """Where the panel is, and its standby - so a server whose panel moved
+    to the standby keeps to it."""
+    return {"host": exit_self(), "standby": store.setting("standby") or ""}
+
+
+def upgrade_job(store):
+    try:
+        job = json.loads(store.setting("upgrade_job") or "{}")
+    except ValueError:
+        return {}
+    return job if isinstance(job, dict) else {}
+
+
+def save_upgrade_job(store, job):
+    store.set_setting("upgrade_job", json.dumps(job, ensure_ascii=False, sort_keys=True))
+
+
+def upgrade_next(store, job):
+    """On to the next server still behind, or the job is done."""
+    while job.get("queue"):
+        host = job["queue"].pop(0)
+        if version_key(store.setting("version:" + host)) < version_key(job["version"]):
+            job.update(current=host, asked_at=now())
+            return
+        job.setdefault("done", []).append(host)
+    job.update(current=None, finished_at=now())
+    alert_done = "✅ همهٔ سرورها به نسخهٔ %s آپدیت شدند." % job["version"]
+    store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 1, ?)",
+              (now(), alert_done))
+    emit_admin(store, "server.up", {"text": alert_done, "key": "upgrade"})
+
+
+def upgrade_order(store, who):
+    """What this server is to install, when it is its turn."""
+    job = upgrade_job(store)
+    if job.get("current") != who or job.get("stopped"):
+        return None
+    return {"version": job["version"], "sha": job["sha"]}
+
+
+def domain_order(store, who):
+    """The domain the admin gave this relay or single server, and the
+    installer that turns DoH and DoT on for it - until it has it."""
+    want = store.setting("domain_want:" + who) or ""
+    if not want or store.setting("doh_host:" + who) == want:
+        return None
+    try:
+        done = json.loads(store.setting("domain_state:" + who) or "{}")
+    except ValueError:
+        done = {}
+    if done.get("ok") and done.get("name") == want:
+        return None       # it has it; the name it reports may be a shared one
+    version, sha, _ = installer_on_hand()
+    if not sha:
+        return None
+    return {"name": want, "sha": sha}
+
+
+def domain_report(store, who, result):
+    """How giving a server its domain went: kept for the nodes page, and
+    the admin told when it did not."""
+    if not isinstance(result, dict):
+        return
+    name = str(result.get("name") or "")[:253]
+    ok = bool(result.get("ok"))
+    state = {"name": name, "ok": ok, "at": now(),
+             "error": str(result.get("error") or "")[:300],
+             "log": str(result.get("log") or "")[-3000:]}
+    store.set_setting("domain_state:" + who, json.dumps(state, ensure_ascii=False))
+    if not ok:
+        emit_admin(store, "server.down", {
+            "key": "domain", "text": "⚠️ دامنهٔ %s روی %s راه نیفتاد: %s"
+            % (name, who, state["error"] or "لاگش در صفحهٔ «نود» است")})
+
+
+def upgrade_report(store, who, result):
+    """A server's word on its upgrade: on to the next, or the job stops."""
+    if not isinstance(result, dict):
+        return
+    version = str(result.get("version") or "")[:20]
+    store.set_setting("version:" + who, version)
+    job = upgrade_job(store)
+    if job.get("current") != who or job.get("stopped"):
+        return
+    log_tail = str(result.get("log") or "")[-3000:]
+    job.setdefault("logs", {})[who] = log_tail
+    if result.get("ok") and version == job["version"]:
+        job.setdefault("done", []).append(who)
+        upgrade_next(store, job)
+    else:
+        job.update(stopped="آپدیت %s نشد" % who, current=None)
+        text = ("⚠️ آپدیت %s به نسخهٔ %s نشد؛ بقیهٔ سرورها آپدیت نشدند. لاگش در صفحهٔ «نود» "
+                "است." % (who, job["version"]))
+        store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 0, ?)",
+                  (now(), text))
+        emit_admin(store, "server.down", {"text": text, "key": "upgrade"})
+    save_upgrade_job(store, job)
+
+
+def upgrade_timeout(store):
+    """A server that took its turn and has not answered in twenty minutes."""
+    job = upgrade_job(store)
+    asked = parse_ts(job.get("asked_at")) if job.get("current") and not job.get("stopped") else None
+    if asked and (datetime.now(timezone.utc) - asked).total_seconds() > UPGRADE_WAIT:
+        who = job["current"]
+        job.update(stopped="%s بعد از ۲۰ دقیقه جوابی نداد" % who, current=None)
+        save_upgrade_job(store, job)
+        text = ("⚠️ %s بعد از ۲۰ دقیقه از آپدیتش خبری نداده؛ بقیهٔ سرورها آپدیت نشدند. "
+                "لاگ آن سرور را ببینید." % who)
+        store.run("INSERT INTO alerts (at, key, ok, text) VALUES (?, 'upgrade', 0, ?)",
+                  (now(), text))
+        emit_admin(store, "server.down", {"text": text, "key": "upgrade"})
+
+
+def watch_level(store, key, value, bad, good, down_text, up_text, rising=True):
+    """An alert for a figure that crosses `bad`, cleared only once it is back
+    past `good` - so one hovering at the line is not news every half minute."""
+    if value is None:
+        return
+    worse = value >= bad if rising else value < bad
+    better = value <= good if rising else value >= good
+    if worse:
+        alert(store, key, False, down_text)
+    elif better:
+        alert(store, key, True, up_text)
+
+
+def check_health(store, relays, nodes):
+    """What each server's own figures say: its disk, its connection table,
+    its certificate, and its memory and processor over ten minutes."""
+    fresh = (datetime.now(timezone.utc) - timedelta(seconds=ALERT_SILENT)).isoformat(
+        timespec="seconds")
+    since = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    hosts = [("exit", "سرور خارج اصلی %s" % (exit_self() or ""))]
+    hosts += [(ip, "%s %s" % ("تک‌سرور" if store.setting("single:" + ip) == "1" else "رله", ip))
+              for ip in relays]
+    hosts += [(ip, "نود %s" % ip) for ip in nodes]
+    for host, name in hosts:
+        name = name.strip()
+        m = store.one("SELECT * FROM metrics WHERE host = ? AND at >= ? ORDER BY at DESC LIMIT 1",
+                      (host, fresh))
+        if not m:
+            continue            # a server not reporting is its own alert
+        if m["disk_total"]:
+            pct = int(100 * (m["disk_used"] or 0) / m["disk_total"])
+            watch_level(store, "disk:" + host, pct, 90, 85,
+                        "⚠️ دیسک %s پر شده است: %d٪. پر که بشود، لاگ و دیتابیس دیگر "
+                        "نوشته نمی‌شوند." % (name, pct),
+                        "✅ دیسک %s دوباره جا دارد: %d٪." % (name, pct))
+        keys = m.keys()
+        if "conntrack_max" in keys and m["conntrack_max"]:
+            pct = int(100 * (m["conntrack"] or 0) / m["conntrack_max"])
+            watch_level(store, "conntrack:" + host, pct, 80, 70,
+                        "⚠️ جدول اتصال‌های %s نزدیک پر شدن است: %d٪. پر که بشود، اتصال‌های "
+                        "تازهٔ مشتری‌ها رد می‌شوند." % (name, pct),
+                        "✅ جدول اتصال‌های %s دوباره جا دارد: %d٪." % (name, pct))
+        if "cert_days" in keys and m["cert_days"] is not None:
+            watch_level(store, "cert:" + host, m["cert_days"], 14, 20,
+                        "⚠️ گواهی HTTPS %s تا %d روز دیگر منقضی می‌شود و هنوز تمدید نشده؛ "
+                        "لاگ «تمدید گواهی» را ببینید." % (name, m["cert_days"]),
+                        "✅ گواهی HTTPS %s تمدید شد." % name, rising=False)
+        rows = store.q("SELECT cpu, mem_used, mem_total FROM metrics WHERE host = ? AND at >= ?",
+                       (host, since))
+        mems = [100.0 * r["mem_used"] / r["mem_total"] for r in rows if r["mem_total"]]
+        cpus = [r["cpu"] for r in rows if r["cpu"] is not None]
+        if len(mems) >= 8:
+            avg = int(sum(mems) / len(mems))
+            watch_level(store, "mem:" + host, avg, 90, 85,
+                        "⚠️ رم %s ده دقیقه است به‌طور میانگین %d٪ پر است." % (name, avg),
+                        "✅ رم %s دوباره عادی است: %d٪." % (name, avg))
+        if len(cpus) >= 8:
+            avg = int(sum(cpus) / len(cpus))
+            watch_level(store, "cpu:" + host, avg, 90, 80,
+                        "⚠️ پردازندهٔ %s ده دقیقه است به‌طور میانگین %d٪ کار می‌کند." % (name, avg),
+                        "✅ پردازندهٔ %s دوباره عادی است: %d٪." % (name, avg))
+
+
 def emit_admin(store, event, data):
     """Tell the operator's bots - keys with admin rights - that something
-    waits for them. No customer is addressed: telegram_id is empty."""
-    keys = store.q("SELECT id FROM api_tokens WHERE revoked_at IS NULL"
-                   " AND scope = 'admin' AND COALESCE(webhook_url, '') != ''")
+    waits for them. No customer is addressed: telegram_id is empty. About a
+    reseller's customer, the reseller's bot is told; about the reseller
+    themselves, the owner's and theirs."""
+    seller = data.get("admin_id")
+    if seller is None and data.get("user_id"):
+        row = store.one("SELECT owner_admin FROM users WHERE id = ?", (data["user_id"],))
+        seller = row["owner_admin"] if row else None
+    keys = bot_keys(store, seller, admin=True)
+    if data.get("admin_id"):
+        seen = {k["id"] for k in keys}
+        keys = list(keys) + [k for k in bot_keys(store, None, admin=True)
+                             if k["id"] not in seen]
     if not keys:
         return
     stamp = now()
@@ -3113,32 +4489,42 @@ def emit_admin(store, event, data):
                   " next_at) VALUES (?, ?, ?, ?, ?)", (k["id"], event, payload, stamp, stamp))
 
 
-def admin_stats(store):
-    """The numbers an operator looks at in the morning."""
+def admin_stats(store, seller=None):
+    """The numbers an operator looks at in the morning - a reseller's, of
+    their own customers."""
     stamp = datetime.now(timezone.utc)
     today = stamp.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(
         timespec="seconds")
     week = (stamp - timedelta(days=7)).isoformat(timespec="seconds")
     soon = (stamp + timedelta(days=EXPIRING_DAYS)).isoformat(timespec="seconds")
-    one = lambda sql, args=(): store.one(sql, args)[0] or 0
+    # Every query below reads its customers through u, so a reseller's are
+    # theirs by one condition.
+    mine = " AND u.owner_admin = ?" if seller else ""
+    extra = (seller,) if seller else ()
+    one = lambda sql, args=(): store.one(sql + mine, args + extra)[0] or 0
     by_status = {r["status"]: r["c"] for r in store.q(
-        "SELECT status, count(*) c FROM users GROUP BY status")}
+        "SELECT status, count(*) c FROM users u WHERE 1 = 1" + mine + " GROUP BY status",
+        extra)}
+    tx = "SELECT %s FROM transactions t JOIN users u ON u.id = t.user_id WHERE "
     return {
         "users": sum(by_status.values()),
         "by_status": by_status,
-        "new_today": one("SELECT count(*) FROM users WHERE created_at >= ?", (today,)),
-        "receipts_pending": one("SELECT count(*) FROM transactions WHERE status = 'pending'"),
-        "approved_today": one("SELECT count(*) FROM transactions WHERE status = 'approved'"
-                              " AND decided_at >= ?", (today,)),
-        "income_today": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
-                            " AND decided_at >= ?", (today,)),
-        "income_7d": one("SELECT sum(amount) FROM transactions WHERE status = 'approved'"
-                         " AND decided_at >= ?", (week,)),
-        "tickets_open": one("SELECT count(*) FROM tickets WHERE status = 'open'"),
-        "trials_today": one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
-        "expiring_soon": one("SELECT count(*) FROM users WHERE status = 'active'"
+        "new_today": one("SELECT count(*) FROM users u WHERE created_at >= ?", (today,)),
+        "receipts_pending": one(tx % "count(*)" + "t.status = 'pending'"),
+        "approved_today": one(tx % "count(*)" + "t.status = 'approved'"
+                              " AND t.decided_at >= ?", (today,)),
+        "income_today": one(tx % "sum(t.amount)" + "t.status = 'approved'"
+                            " AND t.decided_at >= ?", (today,)),
+        "income_7d": one(tx % "sum(t.amount)" + "t.status = 'approved'"
+                         " AND t.decided_at >= ?", (week,)),
+        "tickets_open": one("SELECT count(*) FROM tickets t JOIN users u ON u.id = t.user_id"
+                            " WHERE t.status = 'open'"),
+        "trials_today": one("SELECT count(*) FROM trial_log g JOIN users u"
+                            " ON u.id = g.user_id WHERE g.created_at >= ?", (today,))
+        if seller else one("SELECT count(*) FROM trial_log WHERE created_at >= ?", (today,)),
+        "expiring_soon": one("SELECT count(*) FROM users u WHERE status = 'active'"
                              " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
-        "used_bytes": one("SELECT sum(used_bytes) FROM users"),
+        "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
     }
 
 
@@ -3180,6 +4566,92 @@ WATCH_FRESH = 600
 
 # How long a service check is handed to the relays after it is asked for.
 PROBE_FRESH = 1200
+
+
+INSTALL_STATE = "/var/lib/smart-dns/install-state"
+
+
+def exit_self():
+    """This exit's own public address, as the installer recorded it."""
+    try:
+        with open(INSTALL_STATE, encoding="utf-8") as fh:
+            found = [l.split()[1] for l in fh if l.startswith("exit-ip ") and len(l.split()) > 1]
+        return found[-1] if found else ""
+    except OSError:
+        return ""
+
+
+def relay_exits(store, relay, relays, nodes, main):
+    """Where this relay's traffic goes, best first: the exit the admin picked
+    for it - this one unless another - and then the rest, which nginx on the
+    relay turns to only while the ones before them are down. None when this
+    exit does not know its own address, and then the relay keeps what it has."""
+    if relay not in relays or not main or store.setting("single:" + relay) == "1":
+        return None
+    every = [main] + [n for n in nodes if n != main]
+    picked = store.setting("relay_exit:" + relay)
+    first = picked if picked in every else main
+    return {"main": main, "order": [first] + [ip for ip in every if ip != first],
+            # Exits past their monthly cap, to be kept for when nothing else answers.
+            "capped": capped_exits(store, nodes)}
+
+
+def user_relay_exits(raw):
+    """A customer's exits on particular relays, {relay: exit}; {} for none."""
+    try:
+        picked = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in picked.items()} if isinstance(picked, dict) else {}
+
+
+def customer_exits(store, exits, relay=None):
+    """The registered addresses whose customer the admin sent through a
+    particular exit on this relay - their own for it, or else the one for
+    every relay - and that exit; only exits the panel still has."""
+    rows = store.q("SELECT i.ip AS ip, u.exit AS exit, u.relay_exits AS relay_exits"
+                   " FROM ips i JOIN users u ON u.id = i.user_id WHERE u.status = 'active'"
+                   " AND " + SELLER_LIVE +
+                   " AND (COALESCE(u.exit, '') != '' OR COALESCE(u.relay_exits, '') != '')")
+    out = {}
+    for r in rows:
+        picked = user_relay_exits(r["relay_exits"]).get(relay) or r["exit"]
+        if picked in exits:
+            out[r["ip"]] = picked
+    return out
+
+
+def node_tunnel_specs(store, relay=None, node=None):
+    """The tunnels the admin set between relays and nodes, {(relay, node): spec}
+    - one relay's, or one node's."""
+    out = {}
+    for r in store.q("SELECT key, value FROM settings WHERE key LIKE 'relay_tunnel:%:%'"):
+        _, r_ip, n_ip = r["key"].split(":", 2)
+        if (relay and r_ip != relay) or (node and n_ip != node):
+            continue
+        try:
+            spec = json.loads(r["value"] or "{}")
+        except ValueError:
+            continue
+        if isinstance(spec, dict) and spec.get("transport") and spec.get("slot"):
+            out[(r_ip, n_ip)] = spec
+    return out
+
+
+def relay_tunnel(store, relay, relays, installer_tunnel):
+    """What the admin panel set for this relay's tunnel, for its sync: None
+    for the first relay while the exit's installer tunnels to it - that one
+    stays the installer's - and for a machine that is not one of our relays."""
+    if relay not in relays or (installer_tunnel == "backpack" and relay == relays[0]) \
+            or store.setting("single:" + relay) == "1":
+        return None
+    try:
+        spec = json.loads(store.setting("relay_tunnel:" + relay) or "{}")
+    except ValueError:
+        spec = {}
+    if not isinstance(spec, dict) or not spec.get("transport"):
+        return {"on": False}
+    return dict(spec, on=True)
 
 
 def probe_job(store):
@@ -3227,6 +4699,16 @@ def enforce_quotas(store):
     stamp = datetime.now(timezone.utc)
     for u in store.q("SELECT * FROM users"):
         quota, used = u["quota_bytes"], u["used_bytes"]
+
+        # Every so many days, as the admin set for this customer: the usage
+        # back to zero, and the warnings about it due again.
+        nxt = next_reset(u["reset_days"], u["reset_next"], stamp)
+        if nxt:
+            store.run("UPDATE users SET used_bytes = 0, warned = warned & ?,"
+                      " status = CASE WHEN status = 'over_quota' THEN 'active' ELSE status END,"
+                      " reset_next = ? WHERE id = ?", (WARNED_EXPIRING, nxt, u["id"]))
+            log(INFO, "usage of user #%d reset, as every %d days" % (u["id"], u["reset_days"]))
+            continue
 
         # A trial ends on its date whether or not the allowance ran out, so
         # this comes before anything to do with bytes. Checked for every
@@ -3402,6 +4884,10 @@ class API(http.server.BaseHTTPRequestHandler):
     store = None
     secret = None
     relays = ()
+    # The other exits joined to this panel - nodes: no panel of their own,
+    # each syncing here for the relays to let in and reporting its health.
+    nodes = ()
+    tunnel = "off"
     tg = None
 
     def log_message(self, fmt, *args):
@@ -3444,6 +4930,7 @@ class API(http.server.BaseHTTPRequestHandler):
         # through the tunnel arrives here from this machine's own address.
         # Nothing is waved through - the secret below is still required.
         if self.client_address[0] not in self.relays \
+                and self.client_address[0] not in self.nodes \
                 and self.client_address[0] not in ("127.0.0.1", "::1"):
             return False
         given = self.headers.get("Authorization", "")
@@ -3473,6 +4960,58 @@ class API(http.server.BaseHTTPRequestHandler):
         except Exception:
             return self.reply(400, {"error": "bad json"})
 
+        if self.path == "/node":
+            return self.reply(*self.do_node(body))
+
+        if self.path == "/standby-bundle":
+            # Only for the standby, which keeps it against the day it is needed.
+            if self.store.setting("standby") != self.client_address[0]:
+                return self.reply(403, {"error": "not the standby"})
+            try:
+                with open(STANDBY_BUNDLE, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                return self.reply(404, {"error": "no bundle yet"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            return None
+
+        if self.path.startswith("/blocklist/"):
+            # A ready block list, gzipped; the hash is of what is inside.
+            name = self.path.rsplit("/", 1)[1]
+            sha = blocklist_meta(self.store, name).get("sha") if name in BLOCKLISTS else None
+            try:
+                with open(os.path.join(BLOCKLIST_DIR, name + ".conf.gz"), "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                blob = None
+            if not sha or not blob:
+                return self.reply(404, {"error": "no such list here"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-Sha256", sha)
+            self.end_headers()
+            self.wfile.write(blob)
+            return None
+
+        if self.path == "/installer":
+            # The installer the admin panel is upgrading the servers with.
+            version, sha, blob = installer_on_hand()
+            if not blob:
+                return self.reply(404, {"error": "no installer here"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("X-Sha256", sha)
+            self.send_header("X-Version", version)
+            self.end_headers()
+            self.wfile.write(blob)
+            return None
+
         if self.path == "/sync":
             counters = body.get("counters") or {}
             clean = {
@@ -3483,6 +5022,7 @@ class API(http.server.BaseHTTPRequestHandler):
             self.store.fold_counters(who, clean, split)
             try:
                 record_services(self.store, body.get("services"), CATALOGUE)
+                record_exit_usage(self.store, body.get("exit_usage"))
             except Exception as e:
                 log_exception("per-service usage not recorded: %r" % e)
             try:
@@ -3498,10 +5038,11 @@ class API(http.server.BaseHTTPRequestHandler):
             if isinstance(body.get("logs"), str):
                 tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
                 self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel,"
-                               " nginx) VALUES (?, ?, ?, ?, ?)",
+                               " nginx, parts) VALUES (?, ?, ?, ?, ?, ?)",
                                (who, now(), body["logs"][-40000:],
                                 tunnel[-20000:] if isinstance(tunnel, str) else None,
-                                errors[-20000:] if isinstance(errors, str) else None))
+                                errors[-20000:] if isinstance(errors, str) else None,
+                                clean_log_parts(body.get("log_parts"))))
             # What the service check found from here, the customer's way.
             probed = body.get("probe_result")
             if isinstance(probed, dict) and isinstance(probed.get("results"), dict):
@@ -3529,12 +5070,45 @@ class API(http.server.BaseHTTPRequestHandler):
             # ever set, never cleared, so a second relay without DoH does not
             # flip it back and forth every half minute.
             doh_host = str(body.get("doh_host") or "")
-            if doh_host and re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host) and \
-                    self.store.setting("doh_host") != doh_host:
+            if doh_host and not re.fullmatch(r"[a-z0-9.-]{3,253}", doh_host):
+                doh_host = ""
+            if self.store.setting("doh_host:" + who) != doh_host:
+                self.store.set_setting("doh_host:" + who, doh_host)
+            if doh_host and not self.store.setting("doh_host"):
                 self.store.set_setting("doh_host", doh_host)
             # Which resolvers the relay asks and how the admin's last pick
             # went there, for the settings page. Written only when it changes.
             # How the admin panel's name for DoH is going on this relay.
+            # Its version, and how an upgrade the admin panel asked for went.
+            if isinstance(body.get("version"), str) and \
+                    self.store.setting("version:" + who) != body["version"][:20]:
+                self.store.set_setting("version:" + who, body["version"][:20])
+            upgrade_report(self.store, who, body.get("upgrade_result"))
+            domain_report(self.store, who, body.get("domain_result"))
+            # A single machine joined here: relay and exit both.
+            single = "1" if body.get("single") else ""
+            if self.store.setting("single:" + who) != single:
+                self.store.set_setting("single:" + who, single)
+            # And its tunnels to the nodes.
+            states = body.get("node_tunnel_state")
+            if isinstance(states, dict):
+                for n_ip, st in list(states.items())[:16]:
+                    if not valid_ip(str(n_ip)) or not isinstance(st, dict):
+                        continue
+                    text = json.dumps({"on": True, "running": bool(st.get("running")),
+                                       "error": str(st.get("error") or "")[:400]},
+                                      sort_keys=True)
+                    key = "relay_tunnel_state:%s:%s" % (who, n_ip)
+                    if self.store.setting(key) != text:
+                        self.store.set_setting(key, text)
+            # How the tunnel the admin panel set for this relay is going.
+            state = body.get("tunnel_state")
+            if isinstance(state, dict):
+                text = json.dumps({"on": bool(state.get("on")),
+                                   "running": bool(state.get("running")),
+                                   "error": str(state.get("error") or "")[:400]}, sort_keys=True)
+                if self.store.setting("relay_tunnel_state:" + who) != text:
+                    self.store.set_setting("relay_tunnel_state:" + who, text)
             state = body.get("doh_name")
             if isinstance(state, dict):
                 text = json.dumps({k: str(state.get(k) or "")[:400]
@@ -3567,6 +5141,10 @@ class API(http.server.BaseHTTPRequestHandler):
             # The relay names itself by the address it connected from, so a
             # second relay appears on its own without any configuration.
             self.store.record_metrics(who, body.get("host") or {})
+            try:
+                record_exit_health(self.store, who, body.get("exit_health"))
+            except Exception as e:
+                log_exception("exit health not recorded: %r" % e)
             # Quotas are evaluated here, on fresh numbers, so a user who runs
             # out is off the list this relay is about to be handed.
             try:
@@ -3619,12 +5197,39 @@ class API(http.server.BaseHTTPRequestHandler):
                                     "qlog": qlog_wanted(self.store),
                                     # The name the admin panel gave DoH, if any.
                                     "doh_name": self.store.setting("doh_name") or "",
+                                    # Public DNS: open to everyone, no allowlist.
+                                    "public": self.store.setting("public_dns") == "1",
                                     # The resolvers to time, and when last asked.
                                     "bench": bench_wanted(self.store),
                                     "templates": self.store.template_names(),
                                     "watch": watch_job(self.store),
                                     # The admin panel's service check, if asked.
                                     "probe": probe_job(self.store),
+                                    # This relay's tunnel, when the admin
+                                    # panel is the one to say.
+                                    "tunnel": relay_tunnel(self.store, who, self.relays,
+                                                           self.tunnel),
+                                    # Which exit this relay uses, and the
+                                    # others after it for when it is down.
+                                    "exits": relay_exits(self.store, who, self.relays,
+                                                         self.nodes, exit_self()),
+                                    # An upgrade, when it is this one's turn,
+                                    # and word that its last result arrived.
+                                    "upgrade": upgrade_order(self.store, who),
+                                    "upgrade_ack": bool(body.get("upgrade_result")),
+                                    # A domain the admin gave it, until it has it.
+                                    "domain": domain_order(self.store, who),
+                                    "domain_ack": bool(body.get("domain_result")),
+                                    "panel": panel_where(self.store),
+                                    # Its tunnels to the nodes, by node.
+                                    "node_tunnels": {
+                                        n: dict(spec, on=True)
+                                        for (r, n), spec in node_tunnel_specs(
+                                            self.store, relay=who).items()
+                                        if n in self.nodes} if who in self.relays else None,
+                                    # Customers sent through another exit.
+                                    "customer_exits": customer_exits(
+                                        self.store, [exit_self()] + list(self.nodes), who),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----
@@ -3672,6 +5277,22 @@ class API(http.server.BaseHTTPRequestHandler):
             new_doh_token(self.store, user)
             return self.reply(200, {"ok": True, "message": "آدرس تازه ساخته شد؛ تا یک دقیقه "
                                     "دیگر کار می‌کند و آدرس قبلی دیگر نه"})
+        if self.path == "/user-device-wallet":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            res = buy_device_with_wallet(self.store, user)
+            res.pop("error", None)
+            return self.reply(200, res)
+        if self.path == "/user-wallet-buy":
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            if self._must_choose(user):
+                return self.reply(200, self._must_choose(user))
+            res = buy_with_wallet(self.store, user, body.get("plan_id"), body.get("code"))
+            res.pop("error", None)
+            return self.reply(200, res)
         if self.path == "/user-trial":
             user = self._session_user(body.get("session"))
             if not user:
@@ -3720,6 +5341,55 @@ class API(http.server.BaseHTTPRequestHandler):
         if path == "/user-ticket-image":
             return ticket_picture(self.store, user, body.get("message_id"))
         return {"ok": False, "message": "چنین کاری نیست"}
+
+    def do_node(self, body):
+        """A node's sync: its health and logs in; the relays it is to let
+        in, and the resolvers its nginx asks, out."""
+        claimed = str(body.get("node") or "").strip()
+        who = claimed if claimed in self.nodes else self.client_address[0]
+        if who not in self.nodes:
+            return 403, {"error": "not a node of this panel"}
+        self._who = "node " + who
+        self.store.record_metrics(who, body.get("host") or {})
+        if isinstance(body.get("logs"), str):
+            tunnel, errors = body.get("tunnel_logs"), body.get("nginx_logs")
+            self.store.run("INSERT OR REPLACE INTO relay_logs (relay, at, text, tunnel, nginx,"
+                           " parts) VALUES (?, ?, ?, ?, ?, ?)",
+                           (who, now(), body["logs"][-40000:],
+                            tunnel[-20000:] if isinstance(tunnel, str) else None,
+                            errors[-20000:] if isinstance(errors, str) else None,
+                            clean_log_parts(body.get("log_parts"))))
+        state = body.get("resolvers")
+        if isinstance(state, dict):
+            text = json.dumps({"using": str(state.get("using") or "")[:100],
+                               "error": str(state.get("error") or "")[:300]}, sort_keys=True)
+            if self.store.setting("node_resolvers:" + who) != text:
+                self.store.set_setting("node_resolvers:" + who, text)
+        if isinstance(body.get("version"), str) and \
+                self.store.setting("version:" + who) != body["version"][:20]:
+            self.store.set_setting("version:" + who, body["version"][:20])
+        upgrade_report(self.store, who, body.get("upgrade_result"))
+        kept = body.get("standby_kept")
+        if isinstance(kept, dict) and self.store.setting("standby") == who:
+            self.store.set_setting("standby_kept", json.dumps(
+                {"bundle": str(kept.get("bundle") or "")[:64],
+                 "installer": str(kept.get("installer") or "")[:64], "at": now()}))
+        running = body.get("tunnel_state")
+        if isinstance(running, dict):
+            for r_ip, up in list(running.items())[:64]:
+                if valid_ip(str(r_ip)):
+                    key = "node_tunnel_state:%s:%s" % (who, r_ip)
+                    if self.store.setting(key) != ("1" if up else "0"):
+                        self.store.set_setting(key, "1" if up else "0")
+        return 200, {"relays": list(self.relays),
+                     "upstream": (self.store.setting("dns_upstream") or DEFAULT_UPSTREAM).split(),
+                     "upgrade": upgrade_order(self.store, who),
+                     "upgrade_ack": bool(body.get("upgrade_result")),
+                     "panel": panel_where(self.store),
+                     "standby": standby_info(self.store, who),
+                     # Its ends of the relays' tunnels, by relay.
+                     "tunnels": {r: spec for (r, n), spec in node_tunnel_specs(
+                         self.store, node=who).items() if r in self.relays}}
 
     def relay_name(self, body):
         """Which relay this sync is from.
@@ -3773,6 +5443,13 @@ class API(http.server.BaseHTTPRequestHandler):
             return {"ok": False,
                     "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
                                " بنویسید یا وارد شوید"}
+        seller = seller_from_link(self.store, body.get("ref"))
+        if seller and seller["disabled"]:
+            return {"ok": False, "message": "این فروشنده فعلاً غیرفعال است؛ با خودش تماس "
+                                            "بگیرید"}
+        if seller and seller_full(self.store, seller):
+            return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
+                                            "بگیرید"}
         try:
             user = self.store.create_web_user(username, name, password)
         except sqlite3.IntegrityError:
@@ -3783,6 +5460,10 @@ class API(http.server.BaseHTTPRequestHandler):
                     "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
                                " بنویسید یا وارد شوید"}
         THROTTLE.hit("signup:%s" % ip)
+        if seller:
+            self.store.run("UPDATE users SET owner_admin = ? WHERE id = ?",
+                           (seller["id"], user["id"]))
+        set_referrer(self.store, user["id"], body.get("ref"))
         print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
         emit_admin(self.store, "user.created", {
             "user_id": user["id"], "via": "web",
@@ -3923,7 +5604,7 @@ class API(http.server.BaseHTTPRequestHandler):
         return self.do_claim_register(user["id"], ip)
 
     def do_claim_register(self, user_id, ip):
-        res = register_ip(self.store, user_id, ip)
+        res = register_ip(self.store, user_id, ip, limited=True)
         res.pop("error", None)
         return res
 
@@ -3942,6 +5623,7 @@ class API(http.server.BaseHTTPRequestHandler):
             "SELECT t.created_at, p.name FROM transactions t"
             " LEFT JOIN plans p ON p.id = t.plan_id"
             " WHERE t.user_id = ? AND t.status = 'pending'", (user["id"],))
+        plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
         return {
             "ok": True,
             "name": user["first_name"] or user["username"] or "",
@@ -3959,12 +5641,28 @@ class API(http.server.BaseHTTPRequestHandler):
             # page turns this into the banner the bot used to send.
             "warned": user["warned"] or 0,
             "seen_ip": body.get("ip", ""),
+            # The relays to type in as DNS 1 and DNS 2 - the same the bot gives.
+            "dns": shown_relays(self.store, user, self.relays),
             "must_change": bool(user["must_change_password"]),
             # What can be bought, and what this account already holds - the
             # page warns before a different plan replaces it.
-            "plans": self.store.plans_for_sale(),
+            "plans": plans,
+            "code": clean_code(body.get("code")) if code_ok else "",
+            "code_message": code_message,
+            "code_ok": code_ok,
             "trial": trial_view(self.store, user),
-            "pay_text": self.store.setting("pay_text"),
+            "pay_text": seller_pay_text(self.store, user),
+            "seller_stopped": seller_stopped(self.store, seller_of(user)),
+            # Devices: how many addresses at once, and an extra one to buy.
+            "ips": [r["ip"] for r in ips],
+            "devices": user["max_ips"] or 1,
+            "device_offer": device_offer(self.store, user),
+            # The wallet: whether it can be topped up, and its last moves.
+            "wallet_on": wallet_on(self.store),
+            "wallet_moves": wallet_moves(self.store, user["id"]),
+            "topup_min": TOPUP_MIN,
+            # The invitation link and what it has brought, while it pays.
+            "ref": ref_view(self.store, user),
             "plan_id": user["plan_id"],
             "plan_name": mine["name"] if mine else "",
             # Tickets with a reply the customer has not answered, for the
@@ -3981,6 +5679,7 @@ class API(http.server.BaseHTTPRequestHandler):
             # The personal DoH address. The relay builds the full address from
             # its own name - it knows which relay the customer is looking at.
             "doh_token": doh_token(self.store, user),
+            "servers": customer_servers(self.store, user, self.relays),
             # Whether that address's DNS reaches us, and whether this account
             # uses the encrypted kind: the page's "your DNS arrives" line.
             "dns_seen_at": ips[0]["dns_seen_at"] if ips else None,
@@ -4011,6 +5710,9 @@ def serve_api(cfg, store):
     API.secret = cfg["SYNC_SECRET"]
     # Comma separated, so one exit can serve several relays.
     API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+    # The installer's tunnel, which is to the first relay only.
+    API.tunnel = cfg.get("TUNNEL") or "off"
+    API.nodes = tuple(x.strip() for x in (cfg.get("NODE_IP") or "").split(",") if x.strip())
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
     make_api_server(ctx, address=api_address(cfg)).serve_forever()
@@ -4065,6 +5767,49 @@ def public_ipv4(s):
     return addr.version == 4 and addr.is_global
 
 
+def server_order(store, relays):
+    """The servers in the order the admin put them, the ones not yet placed
+    after, in the order they were added - and which are hidden from everyone."""
+    try:
+        order = [str(x) for x in json.loads(store.setting("server_order") or "[]")]
+    except (ValueError, TypeError):
+        order = []
+    try:
+        hidden = {str(x) for x in json.loads(store.setting("server_hidden") or "[]")}
+    except (ValueError, TypeError):
+        hidden = set()
+    rank = {ip: n for n, ip in enumerate(order)}
+    ordered = sorted(relays, key=lambda ip: (rank.get(ip, len(order)), list(relays).index(ip)))
+    return ordered, hidden
+
+
+def shown_relays(store, user, relays):
+    """The relays a customer is given as DNS addresses, in the admin's order:
+    the ones picked for them, or else all, less those hidden from everyone.
+    Never none - an address to type in is the one thing a customer cannot do
+    without - and only relays that still exist. What is shown, not what may
+    be used: every relay serves every customer."""
+    keys = user.keys() if hasattr(user, "keys") else user
+    picked = (user["relays"] if "relays" in keys else None) or ""
+    want = {ip.strip() for ip in picked.split(",") if ip.strip()}
+    ordered, hidden = server_order(store, relays)
+    visible = [ip for ip in ordered if ip not in hidden]
+    return [ip for ip in visible if ip in want] or visible or ordered
+
+
+def server_note(store, user, ip):
+    """What the customer is told about a server: their seller's words when
+    the seller may pick servers and wrote some, else the owner's."""
+    seller = seller_of(user)
+    if seller:
+        s = store.one("SELECT can_route FROM admins WHERE id = ?", (seller,))
+        if s and s["can_route"]:
+            own = store.setting("server_note:%d:%s" % (seller, ip))
+            if own:
+                return own
+    return store.setting("server_note:" + ip) or ""
+
+
 def user_view(store, user, relays):
     """An account as the bot sees it.
 
@@ -4099,15 +5844,23 @@ def user_view(store, user, relays):
         "expires_at": user["expires_at"],
         "ips": [r["ip"] for r in store.user_ips(user["id"])],
         "max_ips": user["max_ips"],
+        "extra_devices": user["extra_devices"] or 0,
+        "device_offer": device_offer(store, user),
         "wallet": user["wallet"],
-        # What to put in the console or router: the relays, which is where a
-        # customer's DNS has to point.
-        "dns": list(relays),
+        # What to put in the console or router: the relays the admin shows
+        # this customer, first to last - DNS 1, DNS 2. Every relay serves
+        # every customer; this is what they are told, not what they may use.
+        "dns": shown_relays(store, user, relays),
         "trial": trial_view(store, user),
+        # The customer's invitation link and what it has brought them - null
+        # while the operator does not pay for invitations.
+        "ref": ref_view(store, user),
         # The personal encrypted-DNS addresses, for a bot to hand out: null
         # until a relay has DoH on. Like plain DNS they answer only on the
         # registered address; the token says whose template to answer from.
-        "doh": doh_view(store, user),
+        "doh": doh_view(store, user, relays),
+        # Every server of theirs: plain DNS, DoT and DoH side by side.
+        "servers": customer_servers(store, user, relays),
         "tickets_answered": store.one("SELECT count(*) c FROM tickets WHERE user_id = ?"
                                       " AND status = 'answered'", (user["id"],))["c"],
         "receipt_waiting": ({"id": waiting["id"], "created_at": waiting["created_at"],
@@ -4121,11 +5874,12 @@ def admin_user_view(store, user, relays):
     are."""
     return dict(user_view(store, user, relays), username=user["username"],
                 phone=user["phone"], created_at=user["created_at"],
-                label=who_label(user))
+                label=who_label(user), referred_by=user["referred_by"])
 
 
 def admin_receipt(store, row):
     return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+            "kind": row["kind"],
             "created_at": row["created_at"], "decided_at": row["decided_at"],
             "has_image": bool(row["has_image"]),
             "plan": {"id": row["plan_id"], "name": row["plan_name"]}
@@ -4134,7 +5888,8 @@ def admin_receipt(store, row):
                      "telegram_id": row["telegram_id"]}}
 
 
-RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.created_at, t.decided_at, t.plan_id,"
+RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
+                " t.plan_id,"
                 " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
                 " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
                 " FROM transactions t JOIN users u ON u.id = t.user_id"
@@ -4148,26 +5903,41 @@ class AdminAPI:
     def admin_log(self, what):
         log(INFO, "bot-api admin (key %r): %s" % (self._key["name"], what))
 
+    def mine(self, alias="u"):
+        """A reseller's key reaches only the reseller's customers."""
+        seller = getattr(self, "_seller", None)
+        if not seller:
+            return "", ()
+        return " AND %s.owner_admin = ?" % alias, (seller,)
+
+    def owns(self, sql, *args):
+        extra, more = self.mine()
+        return bool(self.store.one(sql + extra, args + more))
+
     def api_admin_stats(self, body):
-        s = admin_stats(self.store)
+        s = admin_stats(self.store, getattr(self, "_seller", None))
         return 200, dict({"ok": True, "text": daily_report_text(s)}, **s)
 
     def api_admin_receipts(self, body):
         which = (self.query.get("status") or ["pending"])[0]
+        extra, more = self.mine()
         if which == "all":
-            rows = self.store.q(RECEIPT_ROWS + " ORDER BY t.id DESC LIMIT 50")
+            rows = self.store.q(RECEIPT_ROWS + " WHERE 1 = 1" + extra
+                                + " ORDER BY t.id DESC LIMIT 50", more)
         elif which in ("pending", "approved", "rejected"):
-            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ? ORDER BY t.id"
+            rows = self.store.q(RECEIPT_ROWS + " WHERE t.status = ?" + extra + " ORDER BY t.id"
                                 + (" DESC" if which != "pending" else "") + " LIMIT 50",
-                                (which,))
+                                (which,) + more)
         else:
             return 400, refused("bad_status", "status یکی از pending، approved، "
                                               "rejected یا all است")
         return 200, {"ok": True, "receipts": [admin_receipt(self.store, r) for r in rows]}
 
     def api_admin_receipt_image(self, body, rid):
-        row = self.store.one("SELECT receipt_blob, receipt_type FROM transactions"
-                             " WHERE id = ?", (int(rid),))
+        extra, more = self.mine()
+        row = self.store.one("SELECT t.receipt_blob, t.receipt_type FROM transactions t"
+                             " JOIN users u ON u.id = t.user_id WHERE t.id = ?" + extra,
+                             (int(rid),) + more)
         if not row or row["receipt_blob"] is None:
             return 404, refused("image_not_found", "عکس این رسید نیست (یا بعد از "
                                                    "تصمیم پاک شده)")
@@ -4178,8 +5948,12 @@ class AdminAPI:
                      "data": base64.b64encode(image).decode("ascii")}
 
     def api_admin_decide(self, body, rid, verb):
+        if not self.owns("SELECT 1 FROM transactions t JOIN users u ON u.id = t.user_id"
+                         " WHERE t.id = ?", int(rid)):
+            return 404, refused("receipt_not_found", "این رسید پیدا نشد")
         res = decide_receipt(self.store, int(rid),
-                             "approved" if verb == "approve" else "rejected")
+                             "approved" if verb == "approve" else "rejected",
+                             amount=body.get("amount"))
         if not res["ok"]:
             return {"receipt_not_found": 404, "already_decided": 409}.get(
                 res["error"], 400), res
@@ -4189,20 +5963,24 @@ class AdminAPI:
 
     def api_admin_users(self, body):
         q = (self.query.get("q") or [""])[0].strip()[:64]
+        extra, more = self.mine()
         if not q:
-            rows = self.store.q("SELECT * FROM users ORDER BY id DESC LIMIT 20")
+            rows = self.store.q("SELECT * FROM users u WHERE 1 = 1" + extra
+                                + " ORDER BY id DESC LIMIT 20", more)
         else:
             like = "%" + q.replace("%", "").replace("_", "") + "%"
             rows = self.store.q(
                 "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-                " WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
                 " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
-                " OR i.ip = ? ORDER BY u.id DESC LIMIT 20", (like, like, like, q, q, q))
+                " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
+                (like, like, like, q, q, q) + more)
         return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
                                            for r in rows]}
 
     def admin_target(self, uid):
-        user = self.store.one("SELECT * FROM users WHERE id = ?", (int(uid),))
+        extra, more = self.mine()
+        user = self.store.one("SELECT * FROM users u WHERE id = ?" + extra, (int(uid),) + more)
         if not user:
             return None, (404, refused("user_not_found", "این کاربر پیدا نشد"))
         return user, None
@@ -4237,6 +6015,9 @@ class AdminAPI:
             pid = int(body.get("plan_id") or 0)
         except (TypeError, ValueError):
             pid = 0
+        if not self.store.one("SELECT 1 FROM plans WHERE id = ? AND COALESCE(owner_admin, 0)"
+                              " = ?", (pid, getattr(self, "_seller", None) or 0)):
+            return 404, refused("plan_not_found", "این پلن پیدا نشد")
         done = apply_plan(self.store, user["id"], pid)
         if not done:
             return 404, refused("plan_not_found", "این پلن پیدا نشد")
@@ -4245,6 +6026,33 @@ class AdminAPI:
                                                       text=done))
         user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
         return 200, {"ok": True, "message": done,
+                     "user": admin_user_view(self.store, user, self.relays)}
+
+    def api_admin_wallet(self, body, uid):
+        """Put money into a wallet or take it out - by hand, with a reason."""
+        user, err = self.admin_target(uid)
+        if err:
+            return err
+        raw = str(body.get("amount") if body.get("amount") is not None else "").strip()
+        sign = -1 if raw[:1] in ("-", "−") else 1
+        amount = toman(raw.lstrip("+-−"))
+        if not amount or amount > TOPUP_MAX:
+            return 400, refused("bad_amount", "مبلغ درست نیست")
+        note = str(body.get("note") or "").strip()[:200]
+        with self.store.lock:
+            balance = move_wallet(self.store.db, user["id"], sign * amount, "admin", note)
+            self.store.db.commit()
+        if balance is None:
+            return 409, refused("wallet_short", "موجودی کیف پول کمتر از این مبلغ است")
+        self.admin_log("wallet of user #%d %+d" % (user["id"], sign * amount))
+        emit(self.store, user, "wallet.changed", {
+            "amount": sign * amount, "balance": balance,
+            "text": "💰 %s تومان %s کیف پول شما %s.%s\nموجودی: %s تومان"
+                    % (format(amount, ","), "به" if sign > 0 else "از",
+                       "اضافه شد" if sign > 0 else "کم شد",
+                       " (%s)" % note if note else "", format(balance, ","))})
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, {"ok": True, "balance": balance,
                      "user": admin_user_view(self.store, user, self.relays)}
 
     def api_admin_tickets(self, body):
@@ -4256,8 +6064,9 @@ class AdminAPI:
             "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
             " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
             " FROM tickets t JOIN users u ON u.id = t.user_id"
-            + ("" if which == "all" else " WHERE t.status = ?")
-            + " ORDER BY t.updated_at DESC LIMIT 50", () if which == "all" else (which,))
+            + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
+            + " ORDER BY t.updated_at DESC LIMIT 50",
+            (() if which == "all" else (which,)) + self.mine()[1])
         return 200, {"ok": True, "tickets": [
             {"id": r["id"], "subject": r["subject"], "status": r["status"],
              "created_at": r["created_at"], "updated_at": r["updated_at"],
@@ -4266,7 +6075,9 @@ class AdminAPI:
                       "telegram_id": r["telegram_id"]}} for r in rows]}
 
     def api_admin_ticket(self, body, tid):
-        t = self.store.one("SELECT * FROM tickets WHERE id = ?", (int(tid),))
+        extra, more = self.mine()
+        t = self.store.one("SELECT t.* FROM tickets t JOIN users u ON u.id = t.user_id"
+                           " WHERE t.id = ?" + extra, (int(tid),) + more)
         if not t:
             return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
         owner = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
@@ -4276,6 +6087,9 @@ class AdminAPI:
         return 200, res
 
     def api_admin_reply(self, body, tid):
+        if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
+                         " WHERE t.id = ?", int(tid)):
+            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
         res = admin_ticket_reply(self.store, int(tid), body)
         if not res["ok"]:
             return {"ticket_not_found": 404, "too_big": 413}.get(res["error"], 400), res
@@ -4283,6 +6097,9 @@ class AdminAPI:
         return self.api_admin_ticket(body, tid)
 
     def api_admin_close(self, body, tid):
+        if not self.owns("SELECT 1 FROM tickets t JOIN users u ON u.id = t.user_id"
+                         " WHERE t.id = ?", int(tid)):
+            return 404, refused("ticket_not_found", "این تیکت پیدا نشد")
         cur = self.store.run("UPDATE tickets SET status = 'closed', updated_at = ?"
                              " WHERE id = ?", (now(), int(tid)))
         if not cur.rowcount:
@@ -4299,6 +6116,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     store = None
     relays = ()
+    _seller = None
 
     ROUTES = [
         ("GET", re.compile(r"/api/v1/?$"), "ping"),
@@ -4312,6 +6130,10 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "add_receipt"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/receipts$"), "list_receipts"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/trial$"), "trial"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wallet$"), "wallet"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wallet/buy$"), "wallet_buy"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/devices/buy$"), "device_buy"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/discount$"), "discount"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
@@ -4337,6 +6159,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("GET", re.compile(r"/api/v1/admin/users/(\d{1,12})$"), "admin_user"),
         ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/status$"), "admin_status"),
         ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/plan$"), "admin_plan"),
+        ("POST", re.compile(r"/api/v1/admin/users/(\d{1,12})/wallet$"), "admin_wallet"),
         ("GET", re.compile(r"/api/v1/admin/tickets$"), "admin_tickets"),
         ("GET", re.compile(r"/api/v1/admin/tickets/(\d{1,12})$"), "admin_ticket"),
         ("POST", re.compile(r"/api/v1/admin/tickets/(\d{1,12})/reply$"), "admin_reply"),
@@ -4409,6 +6232,11 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
             return self.reply(403, refused("admin_only",
                                            "این کلید دسترسی ادمین ندارد"))
         self._key = key
+        # A reseller's bot: their customers, their plans, their card number.
+        self._seller = key["admin_id"] if "admin_id" in key.keys() else None
+        if self._seller and self.store.one("SELECT 1 FROM admins WHERE id = ? AND disabled = 1",
+                                           (self._seller,)):
+            return self.reply(403, refused("seller_disabled", "این فروشنده غیرفعال است"))
         self.query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         ok, wait = BOT_THROTTLE.check("key:%d" % key["id"], *BOT_RATE)
         if not ok:
@@ -4500,6 +6328,8 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
     # -- what it does ----------------------------------------------------
     def customer(self, tg):
         user = self.store.user_by_telegram(int(tg))
+        if user and self._seller and user["owner_admin"] != self._seller:
+            user = None
         if not user:
             return None, (404, refused("user_not_found",
                                        "کاربری با این آیدی تلگرام نیست"))
@@ -4515,8 +6345,12 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
 
     def api_list_plans(self, body):
         # Where to pay travels with what there is to buy.
-        return 200, {"ok": True, "plans": self.store.plans_for_sale(),
-                     "pay_text": self.store.setting("pay_text")}
+        seller = self._seller
+        return 200, {"ok": True, "plans": self.store.plans_for_sale(seller),
+                     "pay_text": self.store.setting("pay_text:%d" % seller if seller
+                                                    else "pay_text"),
+                     "wallet_on": wallet_on(self.store), "topup_min": TOPUP_MIN,
+                     "topup_max": TOPUP_MAX, "device_price": device_price(self.store)}
 
     def api_create_user(self, body):
         try:
@@ -4526,6 +6360,14 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         if not 0 < tg < 10 ** 20:
             return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
         user = self.store.user_by_telegram(tg)
+        seller = None
+        if self._seller:
+            if user and user["owner_admin"] != self._seller:
+                return 409, refused("other_seller", "این تلگرام به حساب دیگری وصل است؛ "
+                                                    "از همان ربات استفاده کنید")
+            seller = self.store.one("SELECT * FROM admins WHERE id = ?", (self._seller,))
+            if not user and seller and seller_full(self.store, seller):
+                return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
         created = not user
         if created:
             name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
@@ -4534,6 +6376,16 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
             user = self.store.create_user(tg, None, name or None)
             print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
                   flush=True)
+            # A reseller's link makes them the reseller's; somebody else's
+            # invitation link, when that is how they came.
+            seller = seller or seller_from_link(self.store, body.get("ref"))
+            if seller and seller["disabled"]:
+                seller = None
+            if seller and (self._seller or not seller_full(self.store, seller)):
+                self.store.run("UPDATE users SET owner_admin = ? WHERE id = ?",
+                               (seller["id"], user["id"]))
+            set_referrer(self.store, user["id"], body.get("ref"))
+            user = self.store.user_by_telegram(tg)
             emit_admin(self.store, "user.created", {
                 "user_id": user["id"], "via": "bot",
                 "text": "مشتری تازه از ربات: %s" % who_label(user)})
@@ -4548,7 +6400,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
             tg = 0
         if not 0 < tg < 10 ** 20:
             return 400, refused("bad_telegram_id", "telegram_id باید عدد مثبت باشد")
-        res = link_telegram(self.store, tg, body.get("code"))
+        res = link_telegram(self.store, tg, body.get("code"), self._seller)
         if not res["ok"]:
             return {"telegram_in_use": 409}.get(res["error"], 400), res
         user = self.store.one("SELECT * FROM users WHERE id = ?", (res["user_id"],))
@@ -4569,7 +6421,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         if not public_ipv4(ip):
             return 400, refused("bad_ip", "آی‌پی نامعتبر است؛ آی‌پی عمومی اینترنت "
                                           "مشتری لازم است")
-        res = register_ip(self.store, user["id"], ip)
+        res = register_ip(self.store, user["id"], ip, limited=True)
         if not res["ok"]:
             return 409, res
         return 200, {"ok": True, "message": res["message"],
@@ -4655,12 +6507,54 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
         return 200, dict(res, user=user_view(self.store, user, self.relays))
 
+    def api_wallet(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return 200, {"ok": True, "balance": user["wallet"], "wallet_on": wallet_on(self.store),
+                     "topup_min": TOPUP_MIN, "topup_max": TOPUP_MAX,
+                     "moves": wallet_moves(self.store, user["id"], 20),
+                     "ref": ref_view(self.store, user)}
+
+    def api_discount(self, body, tg):
+        """What a code makes of the plans' prices, before the customer pays."""
+        user, err = self.customer(tg)
+        if err:
+            return err
+        plans, message, ok = discount_view(self.store, user, body.get("code"))
+        return (200 if ok else 409), {"ok": ok, "message": message, "plans": plans,
+                                      "code": clean_code(body.get("code")) if ok else "",
+                                      "error": None if ok else "bad_code"}
+
+    def api_device_buy(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = buy_device_with_wallet(self.store, user)
+        if not res["ok"]:
+            return {"wallet_short": 402, "devices_not_sold": 404,
+                    "device_unavailable": 409}.get(res["error"], 400), res
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, dict(res, user=user_view(self.store, user, self.relays))
+
+    def api_wallet_buy(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = buy_with_wallet(self.store, user, body.get("plan_id"), body.get("code"))
+        if not res["ok"]:
+            return {"wallet_short": 402, "plan_not_on_sale": 409,
+                    "telegram_required": 403}.get(res["error"], 400), res
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        return 200, dict(res, user=user_view(self.store, user, self.relays))
+
     def receipt(self, rid):
         r = self.store.one(
-            "SELECT t.id, t.amount, t.status, t.created_at, t.decided_at,"
+            "SELECT t.id, t.amount, t.kind, t.status, t.created_at, t.decided_at,"
             " t.plan_id, p.name FROM transactions t"
             " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (rid,))
         return {"id": r["id"], "amount": r["amount"], "status": r["status"],
+                "kind": r["kind"],
                 "plan": ({"id": r["plan_id"], "name": r["name"]}
                          if r["plan_id"] else None),
                 "created_at": r["created_at"], "decided_at": r["decided_at"]}
@@ -4817,6 +6711,11 @@ def watch_self(store):
         try:
             store.record_metrics("exit", health.sample())
             store.prune_metrics()
+            check_servers(store, API.relays, API.nodes)
+            check_health(store, API.relays, API.nodes)
+            check_caps(store, API.relays, API.nodes)
+            check_sellers(store)
+            upgrade_timeout(store)
         except Exception as e:
             log(WARN, "self health failed: %r" % e)
         # Housekeeping that needs no hurry rides along, once an hour.
@@ -4856,6 +6755,221 @@ def make_key():
     return 1
 
 
+# ------------------------------------------------------------- block lists
+# Ready lists the admin can close for a template - ads, porn - rather than
+# typing names one by one. Far too long to travel in every sync, so this
+# machine fetches them from their authors, cleans them and keeps them, and a
+# relay fetches each once by its hash, as it does the installer. Relays are in
+# Iran, where the authors' pages are not reliably reachable; this is abroad.
+BLOCKLIST_DIR = "/var/lib/smart-dns/blocklists"
+STEVENBLACK = "https://raw.githubusercontent.com/StevenBlack/hosts/master/"
+BLOCKLISTS = {
+    "ads": {"label": "تبلیغات و بدافزار", "icon": "📢",
+            "urls": [STEVENBLACK + "hosts"]},
+    "porn": {"label": "پورن", "icon": "🔞",
+             "urls": [STEVENBLACK + "extensions/porn/sinfonietta/hosts",
+                      STEVENBLACK + "extensions/porn/clefspeare13/hosts"]},
+}
+# Fetched again after this long; a failed fetch is tried again after an hour.
+BLOCKLIST_DAYS = 7
+BLOCKLIST_RETRY = 3600
+BLOCKLIST_MAX_BYTES = 40 * MB
+# Names a hosts file lists that are not somebody's server.
+HOSTS_JUNK = {"localhost", "localhost.localdomain", "local", "broadcasthost",
+              "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
+              "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0"}
+BLOCK_NAME = re.compile(r"(?=.{4,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z]{2,63}")
+
+
+def blocklist_scope(store, name):
+    """("all", []), ("some", [template ids]) or None while it is off."""
+    try:
+        v = json.loads(store.setting("blocklist:" + name) or "null")
+    except ValueError:
+        return None
+    if not isinstance(v, dict) or v.get("mode") not in ("all", "some"):
+        return None
+    ids = [int(x) for x in v.get("templates") or [] if str(x).isdigit()]
+    if v["mode"] == "some" and not ids:
+        return None
+    return v["mode"], ids
+
+
+def blocklist_meta(store, name):
+    try:
+        return json.loads(store.setting("blocklist_meta:" + name) or "{}")
+    except ValueError:
+        return {}
+
+
+def blocklists_for(store, template_id):
+    """{name: hash} of the ready lists closed for this template - only those
+    this machine has built, so a relay is never sent a hash it cannot get."""
+    out = {}
+    for name in BLOCKLISTS:
+        scope = blocklist_scope(store, name)
+        sha = blocklist_meta(store, name).get("sha")
+        if scope and sha and (scope[0] == "all" or template_id in scope[1]) and \
+                os.path.exists(os.path.join(BLOCKLIST_DIR, name + ".conf.gz")):
+            out[name] = sha
+    return out
+
+
+def parse_hosts(text):
+    """The names in a hosts file (or a plain list of names), lower-cased."""
+    out = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip().lower()
+        if not line:
+            continue
+        parts = line.split()
+        name = parts[-1] if len(parts) > 1 else parts[0]
+        name = name.strip(".")
+        if name in HOSTS_JUNK or not BLOCK_NAME.fullmatch(name):
+            continue
+        if re.fullmatch(r"[0-9.]+", name):
+            continue
+        out.add(name)
+    return out
+
+
+def clean_blocklist(names, keep):
+    """The names to close, sorted: without those under another in the list -
+    one address= rule closes a name and everything under it - and without any
+    `keep` names, or their parents: the service's own names, what it routes,
+    the admin's own domains and forwards. dnsmasq prefers the longer rule, so a
+    closed parent leaves a routed child working; only an exact tie, or a parent
+    of this service's own addresses, would do harm."""
+    keep = {k.lower().strip(".") for k in keep if k}
+    guarded = set()
+    for k in keep:
+        parts = k.split(".")
+        guarded.update(".".join(parts[i:]) for i in range(len(parts)))
+    out = []
+    for n in names:
+        if n in guarded:
+            continue
+        parts = n.split(".")
+        if any(".".join(parts[i:]) in names for i in range(1, len(parts) - 1)):
+            continue
+        out.append(n)
+    return sorted(out)
+
+
+def blocklist_keep(store):
+    """Every name a list must not close."""
+    keep = set(store.custom_domains()) | set(store.dns_forwards())
+    for svc in CATALOGUE:
+        for g in svc.get("groups") or []:
+            keep.update(g.get("domains") or [])
+    for key in ("doh_host", "doh_name", "customer_panel_url"):
+        v = (store.setting(key) or "").strip().lower()
+        v = v.split("://", 1)[-1].split("/")[0].split(":")[0].strip(".")
+        if v:
+            keep.add(v)
+    return keep
+
+
+def download_blocklist(name, opener=None):
+    """The list's names as its authors publish them today."""
+    opener = opener or urllib.request.urlopen
+    names = set()
+    for url in BLOCKLISTS[name]["urls"]:
+        req = urllib.request.Request(url, headers={"User-Agent": "doctor-dns"})
+        with opener(req, timeout=120) as r:
+            blob = r.read(BLOCKLIST_MAX_BYTES + 1)
+        if len(blob) > BLOCKLIST_MAX_BYTES:
+            raise RuntimeError("%s is larger than %s" % (url, human(BLOCKLIST_MAX_BYTES)))
+        names |= parse_hosts(blob.decode("utf-8", "replace"))
+    if len(names) < 100:
+        raise RuntimeError("only %d names - not the list it should be" % len(names))
+    return names
+
+
+def build_blocklist(store, name, raw_names):
+    """Write the cleaned list as dnsmasq rules, gzipped for the relays, and
+    note its hash and size for them and the admin panel."""
+    keep = blocklist_keep(store)
+    names = clean_blocklist(raw_names, keep)
+    text = "".join("address=/%s/\n" % n for n in names).encode()
+    sha = hashlib.sha256(text).hexdigest()
+    os.makedirs(BLOCKLIST_DIR, exist_ok=True)
+    tmp = os.path.join(BLOCKLIST_DIR, name + ".conf.gz.tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(gzip.compress(text, 6))
+    os.replace(tmp, os.path.join(BLOCKLIST_DIR, name + ".conf.gz"))
+    meta = blocklist_meta(store, name)
+    meta.update(sha=sha, count=len(names), built_at=now(),
+                keep=hashlib.sha256("\n".join(sorted(keep)).encode()).hexdigest())
+    store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+    return meta
+
+
+def refresh_blocklists(store, opener=None, stamp=None):
+    """Fetch a list that is on and missing or a week old, and rebuild one
+    whose names to keep have changed - a domain the admin routed since, say.
+    Lists nobody uses are not fetched at all."""
+    stamp = stamp or time.time()
+    for name in BLOCKLISTS:
+        if not blocklist_scope(store, name):
+            continue
+        meta = blocklist_meta(store, name)
+        raw = os.path.join(BLOCKLIST_DIR, name + ".raw.gz")
+        fresh = os.path.exists(raw) and stamp - os.path.getmtime(raw) < BLOCKLIST_DAYS * 86400
+        if not fresh and stamp >= (meta.get("retry_at") or 0):
+            try:
+                names = download_blocklist(name, opener)
+                os.makedirs(BLOCKLIST_DIR, exist_ok=True)
+                with open(raw + ".tmp", "wb") as fh:
+                    fh.write(gzip.compress("\n".join(sorted(names)).encode(), 6))
+                os.replace(raw + ".tmp", raw)
+                meta.update(fetched_at=now(), error="", retry_at=0)
+                store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+                build_blocklist(store, name, names)
+                log(INFO, "block list %s: %d names fetched, %d kept"
+                    % (name, len(names), blocklist_meta(store, name)["count"]))
+                continue
+            except Exception as e:
+                meta.update(error=str(e)[:200], retry_at=stamp + BLOCKLIST_RETRY)
+                store.set_setting("blocklist_meta:" + name, json.dumps(meta))
+                log(WARN, "block list %s not fetched: %s" % (name, e))
+        if not os.path.exists(raw):
+            continue
+        keep = hashlib.sha256("\n".join(sorted(blocklist_keep(store))).encode()).hexdigest()
+        if keep != meta.get("keep") or not os.path.exists(
+                os.path.join(BLOCKLIST_DIR, name + ".conf.gz")):
+            with open(raw, "rb") as fh:
+                names = set(gzip.decompress(fh.read()).decode().split())
+            build_blocklist(store, name, names)
+
+
+BLOCKLIST_CACHE = {}
+
+
+def blocklist_names(name):
+    """A built list's names, for saying why a name did not answer; read once
+    per build."""
+    path = os.path.join(BLOCKLIST_DIR, name + ".conf.gz")
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return set()
+    if BLOCKLIST_CACHE.get(name, (None,))[0] != stamp:
+        with open(path, "rb") as fh:
+            text = gzip.decompress(fh.read()).decode()
+        BLOCKLIST_CACHE[name] = (stamp, {l[9:-1] for l in text.split() if l})
+    return BLOCKLIST_CACHE[name][1]
+
+
+def blocklist_loop(store):
+    while True:
+        try:
+            refresh_blocklists(store)
+        except Exception as e:
+            log(WARN, "block lists: %r" % e)
+        time.sleep(60)
+
+
 def main():
     global CATALOGUE
     if sys.argv[1:] == ["--make-key"]:
@@ -4877,12 +6991,14 @@ def main():
         print("<3>sealing failed: %r" % e, flush=True)
     CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
     GAMES[:] = load_games()
+    BLOCKS[:] = load_blocks()
     follow_catalogue_split(store, CATALOGUE)
     DEFAULT_TEMPLATE[0] = store.ensure_default_template(CATALOGUE)["id"]
     print("catalogue: %d services, default template #%d"
           % (len(CATALOGUE), DEFAULT_TEMPLATE[0]), flush=True)
 
     threading.Thread(target=watch_self, args=(store,), daemon=True).start()
+    threading.Thread(target=blocklist_loop, args=(store,), daemon=True).start()
 
     def bye(*_):
         sys.exit(0)

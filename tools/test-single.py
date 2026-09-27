@@ -87,12 +87,12 @@ if BASH:
     check("an exit's nginx has none of the single machine's parts",
           "single begin" not in exit_conf and "/run/smartdns-usage" not in exit_conf
           and "8453" not in exit_conf and "listen 853" not in exit_conf)
-    check("and lets only its relay and the tunnel in, as before",
-          exit_conf.count("allow 198.51.100.1;") == 4 and exit_conf.count("deny all;") == 4)
+    check("and lets only its relays and the tunnel in, from the file the admin panel keeps",
+          exit_conf.count("include /etc/nginx/smartdns-relays.conf;") == 4 and exit_conf.count("deny all;") == 4)
     check("and passes 443 on to $upstream", "proxy_pass $upstream;" in exit_conf)
     solo = render(SINGLE="1", RELAY_IP="203.0.113.2")
     check("a single machine's nginx lets in anybody the gate lets through",
-          not re.search(r"^\s*(allow|deny) ", solo, re.M))
+          not re.search(r"^\s*(allow|deny) ", solo, re.M) and "smartdns-relays" not in solo)
     check("keeps the usage log a relay keeps", "access_log /run/smartdns-usage usage" in solo)
     check("and without a certificate, no DoH", "8453" not in solo and "listen 853" not in solo
           and "proxy_pass $upstream;" in solo)
@@ -116,16 +116,16 @@ else:
 print("the installer")
 check("a single machine is a relay and an exit at once",
       'is_relay() { [ "$ROLE" = relay ] || [ "$ROLE" = single ]; }' in LOGIC
-      and 'is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }' in LOGIC)
+      and 'is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ] || [ "$ROLE" = node ]; }' in LOGIC)
 check("offered as the third choice", "3) single - both on one server abroad" in LOGIC
       and "3|single) ROLE=single; break ;;" in LOGIC)
 check("with the trade said plainly", "customers reach it directly from Iran" in LOGIC)
 check("one address, both ends", 'RELAY_IP="$SELF_IP"; EXIT_IP="$SELF_IP"; PEER_IP="$SELF_IP"' in LOGIC
       and '[ -z "$PEER_IP" ] && [ "$ROLE" != single ]' in LOGIC)
-check("no tunnel", '[ "$ROLE" = single ] && TUNNEL=off' in LOGIC)
+check("no tunnel", '{ [ "$ROLE" = single ] || [ "$ROLE" = node ]; } && TUNNEL=off' in LOGIC)
 check("both halves run: the relay's DNS and gate, and the exit's panel",
       "# ---------------------------------------------------------------- relay only\nif is_relay; then" in LOGIC
-      and 'if is_exit; then\n    step "Panel: database and sync API"' in LOGIC
+      and 'if is_exit && [ "$ROLE" != node ] && [ -z "$JOINED" ]; then\n    step "Panel: database and sync API"' in LOGIC
       and 'if is_relay && [ -n "${SYNC_TOKEN:-}" ]; then' in LOGIC)
 check("it pairs with itself, and prints no token for anybody",
       'SYNC_TOKEN="$SYNC_TOKEN_OUT"; SYNC_TOKEN_OUT=""; PANEL_IP=127.0.0.1' in LOGIC)

@@ -139,6 +139,7 @@ SALT = "a1" * 16          # hex, as the installer generates it
 admin.CFG = {"ADMIN_PATH": SECRET, "ADMIN_SALT": SALT, "ADMIN_PORT": "0",
              "ADMIN_HASH": admin.hash_password("right-pw", SALT)}
 admin.STORE = admin.Store(db)
+admin.STORE.run("INSERT OR REPLACE INTO settings (key, value) VALUES ('owner_username', 'mehdi')")
 admin.CATALOGUE = []
 aport = serve(admin.make_admin_server(None, 0))
 
@@ -158,7 +159,7 @@ check("and never the password tried", "wrong-pw" not in out, out)
 
 at = mark()
 status, hdrs, _ = request(aport, "POST", "/%s/" % SECRET,
-                          urllib.parse.urlencode({"password": "right-pw"}), FORM)
+                          urllib.parse.urlencode({"username": "mehdi", "password": "right-pw"}), FORM)
 out = since(at)
 token = hdrs.get("Set-Cookie", "").split("sdns=", 1)[-1].split(";")[0]
 check("a login is noted", "admin login from 127.0.0.1" in out and status == 303, out)

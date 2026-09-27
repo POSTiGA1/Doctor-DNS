@@ -141,7 +141,8 @@ class Front:
     path = "/p/bot"
 
 
-admin.STORE = type("S", (), {"one": staticmethod(lambda *a: None)})()
+admin.STORE = type("S", (), {"one": staticmethod(lambda *a: None),
+                              "q": staticmethod(lambda *a: [])})()
 front = admin.Admin.bot_page(Front())
 check("the bot page has the button", "bot?log=1" in front and "نمایش لاگ کامل" in front)
 check("and its three lines are masked too", TOKEN not in front)

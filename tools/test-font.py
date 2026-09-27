@@ -102,7 +102,8 @@ logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
 check("the installer unpacks it", "payload FONT | base64 -d" in logic)
 start = logic.index('step "Admin web panel"')
 exit_block = logic[start:logic.index("SYNC_TOKEN_OUT=", start)]
-relay_at = logic.index("payload SYNC > /usr/local/bin/smartdns-sync")
+relay_at = logic.index("payload SYNC > /usr/local/bin/smartdns-sync",
+                       logic.index('step "Panel: sync agent and claim page"'))
 check("on the exit, with the admin panel", "install_font" in exit_block)
 check("and on the relay, with the users panel",
       "install_font" in logic[relay_at:relay_at + 200])

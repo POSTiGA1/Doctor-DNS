@@ -73,6 +73,8 @@ PNG64 = base64.b64encode(PNG).decode()
 
 
 class Api:
+    relays = ("198.51.100.1",)
+
     def __init__(self, store):
         self.store = store
 

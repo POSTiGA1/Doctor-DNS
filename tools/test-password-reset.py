@@ -148,6 +148,8 @@ check("nor one that is not there", "m=%21" in r.sent.get("Location", ""))
 
 
 class Api:
+    relays = ("198.51.100.1",)
+
     def __init__(self, store):
         self.store = store
 

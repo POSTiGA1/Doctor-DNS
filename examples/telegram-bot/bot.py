@@ -59,6 +59,8 @@ def settings(env=os.environ):
         "pay": env.get("PAY_TEXT", "").strip().replace("\\n", "\n"),
         "support": env.get("SUPPORT_TEXT", "").strip().replace("\\n", "\n"),
         "telegram": env.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/"),
+        # The language the bot speaks, set in the admin panel's bot page.
+        "lang": "en" if env.get("BOT_LANG", "").strip() == "en" else "fa",
     }
     missing = [k for k in ("token", "api", "key") if not cfg[k]]
     if missing:
@@ -75,9 +77,12 @@ B_IP = "🌐 ثبت آی‌پی"
 B_SUPPORT = "🎫 پشتیبانی"
 B_HELP = "❓ راهنما"
 B_WEB = "🔑 پنل وب"
-B_DOH = "🔒 DNS امن"
+B_DNS = "📡 DNSها"
+B_WALLET = "💰 کیف پول"
+B_INVITE = "🎁 دعوت از دوستان"
 B_CANCEL = "انصراف"
-MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_IP, B_DOH], [B_SUPPORT, B_WEB], [B_HELP]],
+MENU = {"keyboard": [[B_ACCOUNT, B_BUY], [B_WALLET, B_INVITE], [B_IP, B_DNS],
+                     [B_SUPPORT, B_WEB], [B_HELP]],
         "resize_keyboard": True}
 CANCEL = {"keyboard": [[B_CANCEL]], "resize_keyboard": True}
 STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال ✅",
@@ -94,6 +99,21 @@ def size_fa(n):
         n /= 1024
 
 
+def money(n):
+    return format(n or 0, ",")
+
+
+FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def typed_toman(text):
+    """A sum as somebody typed it - Persian digits, commas - or None."""
+    raw = re.sub(r"[\s,٬،]", "", (text or "").translate(FA_DIGITS))
+    for word in ("تومان", "تومن"):
+        raw = raw.replace(word, "")
+    return int(raw) if raw.isdigit() and len(raw) < 16 else None
+
+
 def image_type(blob):
     if blob[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
@@ -104,6 +124,78 @@ def image_type(blob):
     if blob[:5] == b"%PDF-":
         return "application/pdf"
     return None
+
+
+# ---------------------------------------------------------------- English
+# The pages and the bot are written in Persian; English is the same text with
+# every Persian phrase swapped for its English, from one file the installer
+# ships (domains/i18n-en.json). A phrase is a piece of a Persian string in the
+# code, cut where a value goes in and at each tag - tools/i18n-extract.py lists
+# them. What somebody typed - a name, a note - is left as they wrote it.
+I18N_FILE = os.environ.get("I18N_FILE", "/usr/local/share/smart-dns/i18n-en.json")
+I18N = {}
+
+
+def english_index():
+    """The phrases by their first two characters, longest first."""
+    if "index" not in I18N:
+        try:
+            with open(I18N_FILE, encoding="utf-8") as fh:
+                pairs = json.load(fh)
+        except (OSError, ValueError):
+            pairs = {}
+        index = {}
+        for k, v in pairs.items():
+            if len(k) >= 2 and isinstance(v, str):
+                # Plain text only: the English goes into attributes and
+                # script strings quoted either way.
+                v = v.replace("'", "\u2019").replace('"', "\u201d")
+                index.setdefault(k[:2], []).append((k, v))
+        for bucket in index.values():
+            bucket.sort(key=lambda kv: -len(kv[0]))
+        I18N["index"] = index
+    return I18N["index"]
+
+
+def fa_letter(c):
+    """Part of a Persian word: a letter or a mark on one, not the comma,
+    the semicolon or a digit - "نشد؛" ends a word at the "؛"."""
+    return "\u0621" <= c <= "\u065f" or "\u066e" <= c <= "\u06d3" or c == "\u200c"
+
+
+def to_english(text):
+    """`text` with every known Persian phrase in English. A phrase is only
+    taken whole - never the front of a longer Persian word."""
+    index = english_index()
+    if not index or not text or not any("\u0600" <= c <= "\u06ff" for c in text):
+        return text
+    out, last, i, n = [], 0, 0, len(text)
+    while i < n:
+        bucket = index.get(text[i:i + 2])
+        if bucket and not (fa_letter(text[i]) and i and fa_letter(text[i - 1])):
+            for k, v in bucket:
+                end = i + len(k)
+                if text.startswith(k, i) and not (
+                        fa_letter(k[-1]) and end < n and fa_letter(text[end])):
+                    out.append(text[last:i])
+                    out.append(v)
+                    i = last = end
+                    break
+            else:
+                i += 1
+            continue
+        i += 1
+    out.append(text[last:])
+    # What is left - the quote marks around a name, a digit - in English form.
+    return "".join(out).translate(ENGLISH_MARKS)
+
+
+ENGLISH_MARKS = str.maketrans({"\u00ab": "\u201c", "\u00bb": "\u201d", "\u060c": ",",
+                               "\u061b": ";", "\u061f": "?", "\u066a": "%",
+                               **{chr(0x06f0 + i): str(i) for i in range(10)},
+                               **{chr(0x0660 + i): str(i) for i in range(10)}})
+
+
 
 
 class ApiError(Exception):
@@ -198,6 +290,15 @@ class Bot:
         self.panel = panel or Panel(cfg)
         self.tg = telegram or Telegram(cfg)
         self.state = {}          # chat id -> (what we wait for, details)
+        # In English, the keyboard's buttons come back as their English: the
+        # way back to the Persian the rest of this file compares with.
+        self.en = cfg.get("lang") == "en"
+        self.back = {}
+        if self.en:
+            for label in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_SUPPORT, B_HELP, B_WEB,
+                          B_DNS,
+                          B_CANCEL):
+                self.back[to_english(label)] = label
         self.known = set()       # telegram ids the panel already has an account for
         self.seen = []           # recent webhook ids, so a repeat is dropped
         self.lock = threading.Lock()
@@ -206,7 +307,22 @@ class Bot:
     def is_admin(self, uid):
         return uid in self.cfg["admins"]
 
+    def t(self, text):
+        return to_english(text) if self.en else text
+
+    def t_markup(self, markup):
+        """A keyboard with its buttons' words in the bot's language."""
+        if not self.en or not markup:
+            return markup
+        out = dict(markup)
+        for key in ("keyboard", "inline_keyboard"):
+            if key in out:
+                out[key] = [[dict(b, text=self.t(b["text"])) if isinstance(b, dict)
+                             else self.t(b) for b in row] for row in out[key]]
+        return out
+
     def say(self, chat, text, markup=None):
+        text, markup = self.t(text), self.t_markup(markup)
         try:
             self.tg.send(chat, text, markup)
         except Exception as e:
@@ -241,6 +357,7 @@ class Bot:
     def on_message(self, msg):
         chat, sender = msg["chat"]["id"], msg["from"]
         text = (msg.get("text") or "").strip()
+        text = self.back.get(text, text)
         if text == B_CANCEL or text == "/cancel":
             self.state.pop(chat, None)
             return self.say(chat, "لغو شد.", MENU)
@@ -254,14 +371,24 @@ class Bot:
             return self.got_name(chat, sender, text)
         if waiting == "onb_user":
             return self.got_username(chat, sender, text, extra)
-        if text == "/doh":
-            text = B_DOH
-        if text in (B_ACCOUNT, B_BUY, B_IP, B_DOH, B_SUPPORT, B_WEB) and not self.ready(chat, sender):
+        if text in ("/doh", "/dns"):
+            text = B_DNS
+        if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
+                and not self.ready(chat, sender):
             return
         if waiting == "ip":
             return self.got_ip(chat, sender, text)
         if waiting == "receipt":
             return self.got_receipt(chat, sender, msg, extra)
+        if waiting == "topup_amount":
+            return self.got_topup_amount(chat, sender, text)
+        if waiting == "topup_receipt":
+            return self.got_receipt(chat, sender, msg, None, topup=extra)
+        if waiting == "code":
+            self.state.pop(chat, None)
+            return self.chose_plan(chat, sender, extra, code=text.strip()[:32])
+        if waiting == "device_receipt":
+            return self.got_receipt(chat, sender, msg, None, device=True)
         if waiting == "ticket_subject" and text:
             self.state[chat] = ("ticket_body", text[:80])
             return self.say(chat, "متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):",
@@ -277,12 +404,16 @@ class Bot:
             return self.show_account(chat, sender)
         if text == B_BUY:
             return self.show_plans(chat, sender)
+        if text == B_WALLET:
+            return self.show_wallet(chat, sender)
+        if text == B_INVITE:
+            return self.show_invite(chat, sender)
         if text == B_IP:
             return self.ip_help(chat, sender)
         if text == B_WEB:
             return self.show_web(chat, sender)
-        if text == B_DOH:
-            return self.show_doh(chat, sender)
+        if text == B_DNS:
+            return self.show_dns(chat, sender)
         if text == B_SUPPORT:
             return self.show_tickets(chat, sender)
         if text == B_HELP:
@@ -301,6 +432,16 @@ class Bot:
                                 "کنید، کد بازیابی همین‌جا می‌آید.", MENU)
             except ApiError as e:
                 return self.say(chat, "⚠️ " + str(e), MENU)
+        if arg.startswith("ref_") and sender["id"] not in self.known:
+            # Somebody's invitation link. The account is opened now, with it:
+            # the panel writes down the inviter only for an account it opens.
+            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+            try:
+                self.panel.call("POST", "/users", {"telegram_id": sender["id"],
+                                                   "name": name[:60], "ref": arg[4:20]})
+                self.known.add(sender["id"])
+            except ApiError as e:
+                log("invitation start failed: %s" % e)
         return self.say(chat, "سلام! 👋 به ربات خوش آمدید.\n\n" + self.help_text(), MENU)
 
     # -- a web sign-in for everybody who comes through the bot ----------------
@@ -372,39 +513,79 @@ class Bot:
                  {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
                                        {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 
-    def show_doh(self, chat, sender):
-        """The customer's personal encrypted-DNS addresses. The panel sends
-        them only once a relay has DoH on; the iPhone profile is on the web
-        page, which is what the login button is for."""
+    def show_dns(self, chat, sender):
+        """Every way to use the service, in one message: the plain DNS
+        addresses, and the personal DoH and DoT ones once a relay has them.
+        The iPhone profile is on the web page, which is what the login button
+        is for."""
         u = self.account(sender)
+        lines = ["📡 DNSهای شما", ""]
+        servers = u.get("servers") or []
+        if servers:
+            return self.show_servers(chat, u, servers)
+        if u["dns"]:
+            lines.append("🌐 DNS معمولی — در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را "
+                         "روی یکی از این‌ها بگذارید:")
+            lines.extend(u["dns"])
+        else:
+            lines.append("🌐 آدرس DNS معمولی هنوز آماده نیست؛ کمی بعد دوباره بزنید.")
         doh = u.get("doh")
-        if not doh:
-            return self.say(chat, "🔒 DNS امن هنوز روی این سرویس فعال نیست. از DNS معمولی "
-                            "(«حساب من») استفاده کنید.", MENU)
-        lines = ["🔒 DNS امن (رمزگذاری‌شده)",
-                 "برای وقتی که اپراتور DNS را می‌رباید یا دست‌کاری می‌کند. مثل DNS معمولی "
-                 "فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید.",
-                 "",
-                 "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان:",
-                 doh["dot_host"],
-                 "",
-                 "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما:",
-                 doh["url"],
-                 "",
-                 "پروفایل آماده‌ی آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است.",
-                 "این آدرس مخصوص حساب شماست؛ آن را به کسی ندهید."]
+        buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
+        if doh:
+            lines += ["",
+                      "🔒 DNS امن (رمزگذاری‌شده)",
+                      "📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):",
+                      doh["dot_host"],
+                      "",
+                      "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):",
+                      doh["url"],
+                      "",
+                      "پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+                      "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
+            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+        lines.append("")
+        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
         if not u["ips"]:
-            lines.append("\n⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ بدون آن کار نمی‌کند.")
-        self.say(chat, "\n".join(lines),
-                 {"inline_keyboard": [[{"text": "🔗 ورود به پنل وب", "callback_data": "login"},
-                                       {"text": "🔄 آدرس تازه", "callback_data": "dohnew"}]]})
+            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
+        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
+
+    def show_servers(self, chat, u, servers):
+        """One block per server the customer is given: its plain DNS, and
+        its DoT and DoH once it has them - so when one is filtered, another
+        is right there."""
+        lines = ["📡 DNSهای شما", "",
+                 "در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی آدرس یکی از این "
+                 "سرورها بگذارید. اگر یکی کند یا فیلتر شد، سراغ دیگری بروید."]
+        with_doh = False
+        for s in servers:
+            lines += ["", "%s %s %d%s" % ("🌍" if s.get("single") else "🌐",
+                                          "تک‌سرور" if s.get("single") else "سرور", s["n"],
+                                          " — %s" % s["note"] if s.get("note") else ""),
+                      "DNS: %s" % s["ip"]]
+            if s.get("dot"):
+                with_doh = True
+                lines += ["DoT (اندروید ← DNS خصوصی): %s" % s["dot"],
+                          "DoH (آیفون، ویندوز، مرورگر): %s" % s["doh"]]
+        lines.append("")
+        if with_doh:
+            lines.append("پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+                         "آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.")
+        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
+        if not u["ips"]:
+            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
+        buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
+        if with_doh:
+            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
                 "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
+                "💰 کیف پول: موجودی و شارژ\n"
+                "🎁 دعوت از دوستان: لینک دعوت و پورسانت\n"
                 "🌐 ثبت آی‌پی: سرویس فقط روی آی‌پی ثبت‌شده کار می‌کند\n"
                 "🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی\n"
-                "🔒 DNS امن: آدرس DoH و DoT، برای وقتی اپراتور DNS را دست‌کاری می‌کند\n"
+                "📡 DNSها: آدرس DNS معمولی، DoH و DoT\n"
                 "🔑 پنل وب: نام کاربری، ورود با یک کلیک و رمز تازه\n\n"
                 "حساب پنل وب دارید؟ در پنل «اتصال حساب به تلگرام» را بزنید و کد را "
                 "همین‌جا بفرستید." + ("\n\n" + self.cfg["support"] if self.cfg["support"] else ""))
@@ -426,9 +607,31 @@ class Bot:
         if u["dns"]:
             lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
                          "بگذارید." % u["dns"][0])
+        if (u.get("max_ips") or 1) > 1:
+            lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
         if u["receipt_waiting"]:
             lines.append("\n⏳ یک رسید در انتظار بررسی دارید.")
+        offer = u.get("device_offer")
+        if offer and offer.get("available"):
+            return self.say(chat, "\n".join(lines), {"inline_keyboard": [[
+                {"text": "📱 دستگاه اضافه — %s تومان" % money(offer["price"]),
+                 "callback_data": "dev"}]]})
         self.say(chat, "\n".join(lines), MENU)
+
+    def show_device(self, chat, sender):
+        u = self.account(sender)
+        offer = u.get("device_offer")
+        if not offer:
+            return self.say(chat, "دستگاه اضافه فروخته نمی‌شود.", MENU)
+        if not offer.get("available"):
+            return self.say(chat, "⚠️ %s" % offer.get("why"), MENU)
+        rows = []
+        if (u.get("wallet") or 0) >= offer["price"]:
+            rows.append([{"text": "💰 پرداخت از کیف پول", "callback_data": "dwb"}])
+        rows.append([{"text": "🧾 پرداخت با رسید", "callback_data": "drc"}])
+        self.say(chat, "📱 دستگاه اضافه\nالان %d دستگاه دارید؛ هر دستگاه اضافه %s تومان، تا "
+                 "وقتی همین پلن را تمدید کنید." % (offer["devices"], money(offer["price"])),
+                 {"inline_keyboard": rows})
 
     def show_plans(self, chat, sender):
         u = self.account(sender)
@@ -444,8 +647,9 @@ class Bot:
             return self.say(chat, "فعلاً پلنی برای فروش نیست. با پشتیبانی در تماس باشید.", MENU)
         for p in plans:
             size = size_fa(p["quota_bytes"]) if p["quota_bytes"] else "نامحدود"
-            rows.append([{"text": "%s · %s · %d روز · %s تومان"
-                          % (p["name"], size, p["days"], format(p["price"], ",")),
+            dev = " · %d دستگاه" % p["devices"] if (p.get("devices") or 1) > 1 else ""
+            rows.append([{"text": "%s · %s · %d روز%s · %s تومان"
+                          % (p["name"], size, p["days"], dev, format(p["price"], ",")),
                           "callback_data": "buy:%d" % p["id"]}])
         notes = "\n".join("• %s (%s): %s" % (p["name"], p["template"], p["note"])
                           for p in plans if p.get("note"))
@@ -470,9 +674,17 @@ class Bot:
             line += " و %d بازی دیگر" % rest
         return "\n\n🎮 شامل: " + line
 
-    def chose_plan(self, chat, sender, plan_id):
+    def chose_plan(self, chat, sender, plan_id, code=""):
         sale = self.panel.call("GET", "/plans")
         plans = {p["id"]: p for p in sale["plans"]}
+        if code:
+            # The plans' prices after the code, as the panel reckons them.
+            try:
+                found = self.panel.call("POST", "/users/%d/discount" % sender["id"],
+                                        {"code": code})
+                plans = {p["id"]: p for p in found["plans"]}
+            except ApiError as e:
+                return self.say(chat, "⚠️ %s" % e, MENU)
         # What the admin panel says, first: changing the card there changes it
         # here at once. PAY_TEXT is only for a panel that has none set.
         pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
@@ -486,14 +698,88 @@ class Bot:
                     "و باقی‌ماندهٔ پلن فعلی از بین می‌رود." % u["plan"]["name"])
         elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
             warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
-        self.state[chat] = ("receipt", plan_id)
-        self.say(chat, "پلن «%s» — %s تومان%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
-                 "بفرستید." % (plan["name"], format(plan["price"], ","),
+        self.state[chat] = ("receipt", (plan_id, code) if code else plan_id)
+        price = ("%s تومان (به‌جای %s، با کد %s)" % (format(plan["price"], ","),
+                                                  format(plan["list_price"], ","), code)
+                 if code and plan.get("list_price") else "%s تومان" % format(plan["price"], ","))
+        self.say(chat, "پلن «%s» — %s%s%s\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+                 "بفرستید." % (plan["name"], price,
                                self.plan_games(plan), warn,
                                pay or "برای روش پرداخت با پشتیبانی تماس بگیرید."),
                  CANCEL)
+        wallet = u.get("wallet") or 0
+        rows = []
+        if wallet >= plan["price"] > 0:
+            rows.append([{"text": "💰 پرداخت از کیف پول (موجودی %s تومان)" % money(wallet),
+                          "callback_data": ("wbuy:%d:%s" % (plan_id, code))[:64]
+                          if code else "wbuy:%d" % plan_id}])
+        elif wallet > 0:
+            self.say(chat, "💰 موجودی کیف پولتان %s تومان است؛ برای این پلن %s تومان کم "
+                     "دارید." % (money(wallet), money(plan["price"] - wallet)))
+        if not code:
+            rows.append([{"text": "🏷 کد تخفیف دارم", "callback_data": "code:%d" % plan_id}])
+        if rows:
+            self.say(chat, "یا:", {"inline_keyboard": rows})
 
-    def got_receipt(self, chat, sender, msg, plan_id):
+    def show_wallet(self, chat, sender):
+        self.account(sender)
+        w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
+        lines = ["💰 کیف پول", "موجودی: %s تومان" % money(w["balance"])]
+        if w.get("moves"):
+            lines.append("")
+            for m in w["moves"][:8]:
+                lines.append("%s %s%s تومان — %s%s" % (
+                    (m.get("at") or "")[:10], "+" if m["amount"] > 0 else "−",
+                    money(abs(m["amount"])), m.get("what") or "",
+                    " (%s)" % m["note"] if m.get("note") else ""))
+        rows = []
+        if w.get("wallet_on"):
+            rows.append([{"text": "➕ شارژ کیف پول", "callback_data": "topup"}])
+        if w["balance"] > 0:
+            rows.append([{"text": "🛒 خرید پلن", "callback_data": "plans"}])
+        self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else MENU)
+
+    def show_invite(self, chat, sender):
+        """The customer's invitation links, while inviting pays - their own
+        button, so the wallet is only about money."""
+        self.account(sender)
+        ref = self.panel.call("GET", "/users/%d/wallet" % sender["id"]).get("ref")
+        if not ref or not (ref.get("bot_link") or ref.get("web_link")):
+            return self.say(chat, "🎁 دعوت از دوستان فعلاً فعال نیست.", MENU)
+        lines = ["🎁 دعوت از دوستان",
+                 "هر کس با لینک شما حساب بسازد و پلن بخرد، %d٪ مبلغ %s به کیف پول شما "
+                 "اضافه می‌شود." % (ref["percent"], "اولین خریدش"
+                                    if ref.get("mode") == "first" else "هر خریدش")]
+        if ref.get("bot_link"):
+            lines += ["", "🤖 لینک ربات:", ref["bot_link"]]
+        if ref.get("web_link"):
+            lines += ["", "🌐 لینک ثبت‌نام در سایت:", ref["web_link"]]
+        lines += ["", "تا حالا %d نفر با لینک شما آمده‌اند و %s تومان پورسانت گرفته‌اید."
+                  % (ref.get("invited") or 0, money(ref.get("earned")))]
+        self.say(chat, "\n".join(lines), MENU)
+
+    def ask_topup(self, chat, sender):
+        w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
+        if not w.get("wallet_on"):
+            return self.say(chat, "شارژ کیف پول فعلاً بسته است.", MENU)
+        self.state[chat] = ("topup_amount", None)
+        self.say(chat, "چقدر می‌خواهید شارژ کنید؟ مبلغ را به تومان بنویسید (حداقل %s):"
+                 % money(w.get("topup_min")), CANCEL)
+
+    def got_topup_amount(self, chat, sender, text):
+        amount = typed_toman(text)
+        sale = self.panel.call("GET", "/plans")
+        least, most = sale.get("topup_min") or 0, sale.get("topup_max") or 10 ** 12
+        if amount is None or not least <= amount <= most:
+            return self.say(chat, "⚠️ مبلغ را به تومان و با عدد بنویسید، بین %s و %s."
+                            % (money(least), money(most)), CANCEL)
+        pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
+        self.state[chat] = ("topup_receipt", amount)
+        self.say(chat, "شارژ کیف پول — %s تومان\n\n%s\n\nبعد از واریز، عکس رسید را همین‌جا "
+                 "بفرستید." % (money(amount), pay or "برای روش پرداخت با پشتیبانی تماس "
+                                                     "بگیرید."), CANCEL)
+
+    def got_receipt(self, chat, sender, msg, plan_id, topup=None, device=False):
         file_id = None
         if msg.get("photo"):
             file_id = msg["photo"][-1]["file_id"]
@@ -508,10 +794,17 @@ class Bot:
         kind = image_type(blob)
         if not kind or len(blob) > MAX_FILE:
             return self.say(chat, "⚠️ فقط عکس (JPG، PNG، WEBP) یا PDF تا ۴ مگابایت.", CANCEL)
+        code = ""
+        if isinstance(plan_id, tuple):
+            plan_id, code = plan_id
         # One key per Telegram message: a retry after a timeout is the same receipt.
-        res = self.panel.call("POST", "/users/%d/receipts" % sender["id"],
-                              {"plan_id": plan_id, "content_type": kind,
-                               "data": base64.b64encode(blob).decode()},
+        body = {"plan_id": plan_id, "code": code, "content_type": kind,
+                "data": base64.b64encode(blob).decode()}
+        if topup:
+            body = dict(body, plan_id=None, kind="topup", amount=topup)
+        if device:
+            body = dict(body, plan_id=None, kind="device")
+        res = self.panel.call("POST", "/users/%d/receipts" % sender["id"], body,
                               idem="receipt-%d-%d" % (sender["id"], msg["message_id"]))
         self.state.pop(chat, None)
         self.say(chat, "✅ " + res["message"], MENU)
@@ -524,8 +817,7 @@ class Bot:
         except ApiError as e:
             return self.say(chat, "⚠️ %s\nدوباره بفرستید یا «انصراف»." % e, CANCEL)
         self.state.pop(chat, None)
-        self.say(chat, "✅ %s\n\nDNS را روی %s بگذارید." % (
-            res["message"], res["user"]["dns"][0] if res["user"]["dns"] else "آدرس سرویس"), MENU)
+        self.say(chat, "✅ %s" % res["message"], MENU)
 
     def show_tickets(self, chat, sender):
         self.account(sender)
@@ -585,6 +877,39 @@ class Bot:
             return self.chose_plan(chat, sender, int(arg))
         if kind == "plans":
             return self.show_plans(chat, sender)
+        if kind == "topup":
+            return self.ask_topup(chat, sender)
+        if kind == "dev":
+            return self.show_device(chat, sender)
+        if kind == "dwb":
+            try:
+                res = self.panel.call("POST", "/users/%d/devices/buy" % sender["id"])
+            except ApiError as e:
+                return self.say(chat, "⚠️ %s" % e, MENU)
+            return self.say(chat, res["message"], MENU)
+        if kind == "drc":
+            sale = self.panel.call("GET", "/plans")
+            pay = (sale.get("pay_text") or "").strip() or self.cfg["pay"]
+            self.state[chat] = ("device_receipt", None)
+            return self.say(chat, "📱 دستگاه اضافه — %s تومان\n\n%s\n\nبعد از واریز، عکس رسید "
+                            "را همین‌جا بفرستید." % (money(sale.get("device_price")),
+                                                   pay or "برای روش پرداخت با پشتیبانی تماس "
+                                                          "بگیرید."), CANCEL)
+        if kind == "code":
+            self.state[chat] = ("code", int(arg))
+            return self.say(chat, "کد تخفیف را بنویسید:", CANCEL)
+        if kind == "wbuy":
+            self.state.pop(chat, None)
+            pid, _, code = arg.partition(":")
+            try:
+                res = self.panel.call("POST", "/users/%d/wallet/buy" % sender["id"],
+                                      {"plan_id": int(pid), "code": code})
+            except ApiError as e:
+                return self.say(chat, "⚠️ %s" % e, MENU)
+            self.say(chat, res["message"], MENU)
+            if not res["user"]["ips"]:
+                return self.ip_help(chat, sender)
+            return None
         if kind == "login":
             link = self.login_button(sender)
             return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
@@ -594,7 +919,7 @@ class Bot:
             self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
             self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
                      "این را روی دستگاه‌هایتان بگذارید:")
-            return self.show_doh(chat, sender)
+            return self.show_dns(chat, sender)
         if kind == "newpw":
             res = self.panel.call("POST", "/users/%d/password" % sender["id"])
             return self.say(chat, "🔄 رمز تازهٔ پنل: %s\nنام کاربری: %s\n\nهر جا با رمز قبلی "
@@ -627,7 +952,8 @@ class Bot:
             return self.say(chat, "رسیدی در انتظار نیست.")
         for r in receipts[:10]:
             self.post_receipt(chat, r["id"], "رسید از %s%s — %s تومان" % (
-                r["user"]["label"], " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
+                r["user"]["label"], " برای شارژ کیف پول" if r.get("kind") == "topup"
+                else " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
                 format(r["amount"], ",")))
 
     def post_receipt(self, chat, rid, caption):
@@ -635,7 +961,8 @@ class Bot:
                                         {"text": "❌ رد", "callback_data": "no:%d" % rid}]]}
         try:
             pic = self.panel.call("GET", "/admin/receipts/%d/image" % rid)
-            self.tg.photo(chat, base64.b64decode(pic["data"]), caption, buttons)
+            self.tg.photo(chat, base64.b64decode(pic["data"]), self.t(caption),
+                          self.t_markup(buttons))
         except ApiError:
             self.say(chat, caption, buttons)
 
@@ -700,6 +1027,9 @@ class Bot:
         chat = ev.get("telegram_id")
         if not chat or not text:
             return
+        if kind == "broadcast":
+            # One of many: a pace Telegram accepts from one bot.
+            time.sleep(0.05)
         markup = None
         if kind == "ticket.answered":
             markup = {"inline_keyboard": [[{"text": "✍️ جواب",

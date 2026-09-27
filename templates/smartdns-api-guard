@@ -47,20 +47,29 @@ valid_ip() {
 port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
 case "$port" in ""|*[!0-9]*) port=8443 ;; esac
 
+# The relays, and the other exits joined to this panel as nodes.
 list="127.0.0.1"
-for ip in $(sed -n 's/^RELAY_IP=//p' "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
-    if valid_ip "$ip"; then list="$list, $ip"
-    else echo "ignoring '$ip' in RELAY_IP - not an IPv4 address" >&2; fi
+for key in RELAY_IP NODE_IP; do
+    for ip in $(sed -n "s/^$key=//p" "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
+        if valid_ip "$ip"; then list="$list, $ip"
+        else echo "ignoring '$ip' in $key - not an IPv4 address" >&2; fi
+    done
 done
-[ "$list" = "127.0.0.1" ] && echo "no relays in RELAY_IP - only this machine will reach 8443" >&2
+# A node has no panel and no API: only the rule on nginx's own connections.
+api="        tcp dport $port ip saddr { $list } accept
+        tcp dport $port drop"
+if [ ! -f "$ETC/panel.env" ]; then
+    api=""
+elif [ "$list" = "127.0.0.1" ]; then
+    echo "no relays in RELAY_IP - only this machine will reach 8443" >&2
+fi
 
 rules="table inet smartdns_api
 delete table inet smartdns_api
 table inet smartdns_api {
     chain input {
         type filter hook input priority -5 ; policy accept ;
-        tcp dport $port ip saddr { $list } accept
-        tcp dport $port drop
+$api
     }
     chain nginx_out {
         type filter hook output priority 0 ; policy accept ;
@@ -82,7 +91,8 @@ if [ -z "$NFT" ]; then
     exit 0
 fi
 if printf '%s\n' "$rules" | "$NFT" -f -; then
-    echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
+    if [ -n "$api" ]; then echo "port $port answers: $list; nginx may not proxy to this machine or a private address"
+    else echo "nginx may not proxy to this machine or a private address"; fi
 else
     echo "nft refused the rule - the sync API stays open, and the panel refuses strangers itself" >&2
 fi

@@ -209,13 +209,22 @@ print("the relay's nginx, both ways")
 nginx = read("templates", "relay-nginx.conf")
 
 
+import importlib.machinery as _mach
+import importlib.util as _util
+_spec = _util.spec_from_loader("sync", _mach.SourceFileLoader(
+    "sync", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates",
+                         "smartdns-sync")))
+SYNC = _util.module_from_spec(_spec)
+_spec.loader.exec_module(SYNC)
+
+
 def render(tunnel, doh=False):
-    """The relay's nginx the way install_payload fills it: the tunnel blocks
-    kept or cut, and either the DoH blocks or the plain 443 block."""
+    """The relay's nginx the way install_payload fills it, with the way to the
+    exit the installer and smartdns-sync write in place of its include, and
+    either the DoH blocks or the plain 443 block."""
     out = []
     skip = False
-    cut = [] if tunnel else [("# tunnel begin", "# tunnel end")]
-    cut.append(("# nodoh begin", "# nodoh end") if doh else ("# doh begin", "# doh end"))
+    cut = [("# nodoh begin", "# nodoh end") if doh else ("# doh begin", "# doh end")]
     for line in nginx.splitlines():
         if any(a in line and not ("nodoh" in line and "nodoh" not in a)
                for a, _ in cut):
@@ -225,12 +234,8 @@ def render(tunnel, doh=False):
         if any(b in line and not ("nodoh" in line and "nodoh" not in b)
                for _, b in cut):
             skip = False
-    text = "\n".join(out).replace("__EXIT_IP__", "203.0.113.2")
-    https, http, spot, blz = (
-        ("to_exit_https", "to_exit_http", "to_exit_spotify", "to_exit_blizzard") if tunnel
-        else ("203.0.113.2:443", "203.0.113.2:80", "203.0.113.2:4070", "203.0.113.2:1119"))
-    text = (text.replace("__EXIT_HTTPS__", https).replace("__EXIT_HTTP__", http)
-                .replace("__EXIT_SPOTIFY__", spot).replace("__EXIT_BLIZZARD__", blz))
+    text = "\n".join(out).replace("include /etc/nginx/smartdns-exit.conf;",
+                                   SYNC.exit_conf_text("203.0.113.2", tunnel))
     if doh:
         text = (text.replace("__DOH_HOST__", "users.example.com")
                     .replace("__DOH_CERT__", "/etc/letsencrypt/live/users.example.com/fullchain.pem")
@@ -240,15 +245,16 @@ def render(tunnel, doh=False):
 
 on, off = render(True), render(False)
 check("with a tunnel, every port goes through it",
-      "proxy_pass to_exit_https;" in on and "proxy_pass to_exit_http;" in on
-      and "proxy_pass to_exit_spotify;" in on and "proxy_pass to_exit_blizzard;" in on, on[-600:])
+      "proxy_pass ${to_exit}_https;" in on and "proxy_pass ${to_exit}_http;" in on
+      and "proxy_pass ${to_exit}_spotify;" in on and "proxy_pass ${to_exit}_blizzard;" in on, on[-600:])
 check("  with the exit itself as the fallback",
       "server 203.0.113.2:443 backup;" in on and "server 203.0.113.2:80 backup;" in on)
 check("  and the tunnel's end first", on.index("127.0.0.1:18443") < on.index("203.0.113.2:443 backup"))
 check("without one, straight to the exit as before",
-      "proxy_pass 203.0.113.2:443;" in off and "proxy_pass 203.0.113.2:80;" in off
-      and "proxy_pass 203.0.113.2:4070;" in off and "proxy_pass 203.0.113.2:1119;" in off)
-check("  and no trace of the tunnel", "to_exit" not in off and "18443" not in off)
+      "server 203.0.113.2:443;" in off and "server 203.0.113.2:80;" in off
+      and "server 203.0.113.2:4070;" in off and "server 203.0.113.2:1119;" in off
+      and "proxy_pass ${to_exit}_https;" in off)
+check("  and no trace of the tunnel", "backup;" not in off and "18443" not in off)
 print("the relay's nginx with DNS over HTTPS")
 don, doff = render(True, doh=True), render(False, doh=True)
 check("443 reads the name and nothing more",
@@ -256,9 +262,10 @@ check("443 reads the name and nothing more",
 check("  the DoH names go to the DoH server - the file the installer and smartdns-sync keep",
       "include /etc/nginx/smartdns-doh-names.map;" in don)
 check("  every other name goes where it always went, through the tunnel",
-      "default       to_exit_https;" in don)
+      "default       ${to_exit}_https;" in don)
 check("  or straight to the exit without one",
-      "default       203.0.113.2:443;" in doff)
+      "default       ${to_exit}_https;" in doff and "server 203.0.113.2:443;" in doff
+      and "backup;" not in doff)
 check("  and the plain 443 block is gone, so 443 is not listened on twice",
       don.count("listen 443;") == 1 and doff.count("listen 443;") == 1)
 check("853 ends TLS and says who connected",
@@ -280,16 +287,14 @@ check("the filler cuts one DoH shape or the other",
 for name, text in (("with", on), ("without", off)):
     check("%s: no placeholder left, braces balanced" % name,
           "__" not in text.replace("__MODULE_PATH__", "") and text.count("{") == text.count("}"))
-check("install_payload fills and trims the same way",
-      "__EXIT_SPOTIFY__#${EXIT_SPOTIFY:-__EXIT_SPOTIFY__}" in LOGIC
-      and "__EXIT_BLIZZARD__#${EXIT_BLIZZARD:-__EXIT_BLIZZARD__}" in LOGIC
-      and "__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}" in LOGIC
-      and "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" in LOGIC)
+check("the way to the exit is the file the installer and smartdns-sync keep",
+      nginx.count("include /etc/nginx/smartdns-exit.conf;") == 1 and "__EXIT_" not in nginx
+      and "exit_upstreams() {" in LOGIC)
 
 print("the exit lets the tunnel's own end in")
 exitng = read("templates", "exit-nginx.conf")
-check("the relay is allowed into every block that listens outward",
-      exitng.count("allow 127.0.0.1;") == 4 and exitng.count("allow __RELAY_IP__;") == 4)
+check("the relays are allowed into every block that listens outward",
+      exitng.count("allow 127.0.0.1;") == 4 and exitng.count("include /etc/nginx/smartdns-relays.conf;") == 4)
 check("and Spotify's access point is where 4070 goes",
       "listen 4070;" in exitng and "proxy_pass ap.spotify.com:4070;" in exitng)
 check("and Battle.net's 1119: the sign-in by its TLS name, Blizzard's names only",
@@ -300,7 +305,7 @@ check("  the version check, which is plain HTTP, by its Host on a loopback serve
       '""       127.0.0.1:18119;' in exitng and "listen 127.0.0.1:18119;" in exitng
       and "proxy_pass http://$host:1119$request_uri;" in exitng
       and "listen 127.0.0.1:18119 default_server;" in exitng)
-for m in re.finditer(r"allow __RELAY_IP__;(.*?)deny all;", exitng, re.S):
+for m in re.finditer(r"include /etc/nginx/smartdns-relays\.conf;(.*?)deny all;", exitng, re.S):
     check("  loopback sits between the relay and the deny", "allow 127.0.0.1;" in m.group(1))
 
 print("the installer")

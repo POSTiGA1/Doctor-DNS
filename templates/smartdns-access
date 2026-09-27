@@ -4,6 +4,7 @@
 # usage: smartdns-access                    show the address it answers on
 #        smartdns-access port <number>      move it to another port
 #        smartdns-access path [new]         change the secret path, or roll one
+#        smartdns-access username <name>    change the owner's username
 #        smartdns-access password [new]     set a new password
 #        smartdns-access rotate             new path and new password at once
 #
@@ -65,8 +66,8 @@ domain() {
 }
 
 show() {
-    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n\n' \
-        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)"
+    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n        username: %s\n\n' \
+        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)" "$(get ADMIN_USER)"
     printf '    The password is not stored, only a hash of it. If it is lost,\n'
     printf '    set a new one:  smartdns-access password\n\n'
 }
@@ -128,6 +129,16 @@ path)
     fi
     set_key ADMIN_PATH "$new"
     printf '    the old address stops working now.\n'
+    restart
+    show
+    ;;
+
+username)
+    new="$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z')"
+    printf '%s' "$new" | grep -Eq '^[a-z0-9._-]{3,32}$' \
+        || die "usage: smartdns-access username <3 to 32 lower-case letters, digits, . - _>"
+    set_key ADMIN_USER "$new"
+    printf '    username is now %s\n' "$new"
     restart
     show
     ;;

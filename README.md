@@ -58,40 +58,72 @@ certificate naming no console host at all.
 | **Quotas** | monthly or one-off, with warnings at 80% and 95% and automatic cutoff |
 | **Speed limits** | a per-customer download cap, shaped with htb + fq_codel rather than by dropping packets |
 | **Service templates** | which brands a customer's plan routes, down to individual domains; a few groups ship visible but unticked, because routing them breaks the thing they belong to |
-| **Selling** | a plan is a template for some days with an allowance and a price; the customer picks one and sends the slip, and approving it puts the plan on; renewals, and a free trial once per Telegram account |
-| **Customer panel** | sign up, register an address, see usage, buy a plan and send the slip, tickets, link Telegram and reset a forgotten password with a Telegram code |
-| **Encrypted DNS** | DNS over HTTPS on the relay's 443 and DNS over TLS on 853, a personal address for each customer, an iPhone profile and a Windows 11 command; like plain DNS it answers only a registered address |
+| **Selling** | a plan is a template for some days with an allowance, a price and a number of devices; the customer picks one and sends the slip, and approving it puts the plan on; renewals, a free trial once per Telegram account, discount codes, extra devices bought on top of a plan, and a daily limit on new addresses |
+| **Wallet and invitations** | customers top up a wallet by receipt and buy from it at once, with no slip; each has an invitation link, and a share of what the people they bring pay goes into their wallet - the percent, and whether every purchase or only the first, the operator's to set |
+| **Sellers** | an admin who buys the service from you and sells it on: only the customers who came by their own link or bot, their own plans, prices and card number, their own Telegram bot, the templates you allow; a cap on customers, traffic and days - past it, all their customers stop; disabled or deleted with everything of theirs in one button; a page of their own stats |
+| **Admins** | the owner signs in with a username chosen at install; other admins see only the parts ticked for them, and the owner can see the panel as any of them sees it |
+| **Customer panel** | sign up, register an address, see usage, buy a plan and send the slip, the wallet and the invitation link, each server's DNS, DoT and DoH with the operator's note, tickets, link Telegram and reset a forgotten password with a Telegram code |
+| **Encrypted DNS** | each relay and single server has its own DNS over HTTPS on 443 and DNS over TLS on 853 - its domain given at install, or later from the admin panel, which gets the certificate by itself - a personal address for each customer on each server, an iPhone profile and a Windows 11 command for each; like plain DNS it answers only a registered address |
+| **Servers for customers** | the order customers see the servers in, a note beside each ("for Irancell"), and hiding one from everybody while it is repaired; which servers each customer is shown, ticked per customer |
 | **Usage dashboard** | the customer's speed now, 7 and 30 days against the period before, when the allowance runs out, daily download and upload, 24 hours of speed, busy hours, a connection check, and usage by service — kept as service, day and bytes for 30 days, never as a list of sites; the operator sees the same charts without the services |
 | **Upstream DNS** | the operator picks the public resolvers — Cloudflare, Quad9, Google, OpenDNS, AdGuard or any address — and each relay tests the pick from Iran before it takes it |
-| **Operator panel** | customers, plans, receipts, tickets, templates, domains, host monitoring, backup and restore |
-| **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report), set up from the admin panel |
+| **Operator panel** | customers, plans, receipts, tickets, templates, domains, host monitoring, backup and restore; everybody's usage with each seller's share, and the owner's own customers' apart |
+| **More servers** | more exits (nodes) that relays go out through, single servers in other countries on the same panel, customers and allowance shared by all; a standby node that keeps the latest backup and takes the panel over the day its machine is gone |
+| **Block lists** | ad networks (Iranian ones among them) and adult sites, closed per template row by row, or StevenBlack's full lists updated weekly |
+| **Public DNS** | one button that opens every relay to everyone, with no sign-up, and closes it again |
+| **Upgrades** | from GitHub with one button: the installer is checked against the hash GitHub published, this server is upgraded first, then every relay, node and single server one by one |
+| **Monitoring and backups** | alerts for a server gone quiet, a full disk or connection table, a certificate not renewed, high memory or processor; a monthly traffic cap per server; an encrypted backup of the whole panel sent by the bot |
+| **Usage resets** | a customer's or a seller's usage back to zero every so many days, whatever the plan |
+| **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, the wallet, the invitation link, every server's DNS, DoT and DoH, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report, a message to many customers at once), set up from the admin panel; a seller sets up their own |
+| **English** | the admin panel, the customer's page and the bot, in Persian or English |
 | **API** | to plug in a sales bot of your own: [docs/bot-api.md](docs/bot-api.md) (in Persian) |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
 
 ## What it looks like
 
 The operator's panel, on the exit. Customers, what each has used, their
-quota, their speed cap and how long they have left — all editable in the row:
+wallet, quota, speed, days, template, plan, DNS servers and exit — all
+editable in the row:
 
 ![The operator's user list](docs/screenshots/admin-users.png)
 
+The home page: the sellers and how far into their traffic and days they are,
+and every customer's usage together:
+
+![The home page](docs/screenshots/admin-home.png)
+
+Servers for customers: the order they are shown in, a domain given from the
+panel for each one's DoH and DoT, a note the customer sees beside it, and a
+way to hide one from everybody for a while:
+
+![Servers for customers](docs/screenshots/admin-servers.png)
+
+A seller: their own customers, plans and card number, with a cap on how many
+customers, how much traffic and how many days:
+
+![A seller](docs/screenshots/admin-seller.png)
+
+And a seller's own page, opened from their name: their customers, traffic,
+days and sales, and their customers' usage:
+
+![A seller's stats](docs/screenshots/admin-stats.png)
+
 A template decides which brands a customer's plan carries. Open a service and
-the domains inside it can be picked one at a time; the amber note is a group
-that ships switched off because routing it breaks the thing it belongs to:
+the domains inside it can be picked one at a time:
 
 ![The template editor](docs/screenshots/admin-template.png)
 
-And the machines themselves, reporting in every thirty seconds:
+And at its foot, ad networks and adult sites, closed row by row:
 
-![Host monitoring](docs/screenshots/admin-home.png)
+![Block lists](docs/screenshots/admin-blocks.png)
 
-The customer's own page, served by the relay. It shows what is left, the DNS
-address to type into a console, and the button that re-registers their
-address after the ISP has changed it:
+The customer's own page, served by the relay. What is left, and each of their
+servers' DNS address with the operator's note beside it:
 
 <img src="docs/screenshots/user-panel.png" alt="The customer's page" width="360">
 
-*(Made-up customers. Nobody in these pictures is real.)*
+*(Made-up customers, documentation addresses and example.com names. Nothing
+in these pictures is real.)*
 
 ## Install
 
@@ -140,6 +172,38 @@ on loopback only: its only relay is itself. Do not open it. On a cloud machine
 behind NAT - the public address not on any interface, as on AWS - the installer
 notices and listens on the private address it is mapped to; nothing to set.
 
+### More servers: nodes, single servers, a standby
+
+All of it from the admin panel's **Nodes** page. Each card there has its
+own add form and, under it, the command to run on the new machine with the
+file of this same version:
+
+- **A node** - another exit. Add its address, run the command on it, and
+  once it says "connected" pick the relays that go out through it. A relay
+  goes through the exit picked for it and falls back to the others by itself
+  when that one does not answer; each relay can have its own tunnel to each
+  node.
+- **A single server in another country** - relay and exit at once, joined
+  to this panel: `ROLE=single PANEL_IP=<main exit> SYNC_TOKEN=<token>`, the
+  token from the same card. Its customers, their allowance and every setting
+  are this panel's; what is used on it comes off the same allowance.
+- **A new relay** - its address on the relays card, then the installer on
+  it with the pairing token shown there.
+- **A standby** - pick a node. Every six hours it takes the panel's latest
+  backup (encrypted with the backup password set in *Settings*) and the
+  installer, and every relay and node knows where it is. The day this
+  machine is gone: point the admin panel's domain at the standby and run
+  `sudo bash /var/lib/smart-dns/standby/doctor-dns.sh --take-over` there. The
+  relays and nodes find the new panel within a minute.
+
+**Servers for customers**, on the same page: the order customers see the
+servers in, a note beside each, hiding one from everybody, and a **domain**
+for each relay or single server. Make an A record pointing at that server,
+open its ports 80, 443 and 853, write the domain there and save: within a
+minute the server gets a certificate by itself and turns DoH and DoT on for
+it, and customers are shown them beside that server's DNS. If the record is
+not right yet it says so there, and tries again a quarter of an hour later.
+
 ### Upgrading
 
 Download the new file and run it. Before it touches anything it compares its
@@ -170,6 +234,19 @@ write-ahead log beside the database and copying the file alone can miss its
 newest rows. `--version` prints what a file is without installing anything,
 and `ASSUME_YES=1` takes the default — yes for an upgrade, no for a
 downgrade — for anyone scripting it.
+
+**From 0.9.0 the admin panel asks for a username** as well as the password.
+A new install asks for it beside the password. On an upgrade from an earlier
+version the installer asks for it once - or, with `ASSUME_YES=1`, sets
+`admin` - and shows it at the end. Change it on the settings page or with
+`smartdns-access username <name>`.
+
+After that, upgrading is one button: **Settings -> New version from GitHub**
+checks GitHub every twelve hours. The button downloads the installer from the
+release itself, installs it only when its hash is the one GitHub published,
+upgrades this server first and then every relay, node and single server one
+by one, and stops - and says so - if one fails or does not answer in twenty
+minutes. An older version is never installed.
 
 Customers' receipts and ticket pictures are kept sealed, with a key in
 `/etc/smart-dns/db.key` on the exit — not in the database, so neither is a
@@ -252,6 +329,11 @@ The admin panel is the one port you choose. It defaults to **9443** and can be
 anything free; the installer stops you at 22, 53, 80, 443, 1119, 4070, 8443, 8445,
 8446, 18119 and the tunnel's port, and `smartdns-access port` applies the same rule later, plus a
 check that nothing else is already listening.
+
+On a relay, ports 5299 to 5999 are the templates' own resolvers and 20000 to
+20999 the tunnels to nodes; both are the machine's own business - keep them
+free, and nothing needs opening. A single server with a domain needs 853 open
+like a relay, for DNS over TLS.
 
 Inbound, the relay is the machine customers reach, so its DNS, proxy, STUN and
 panel ports have to be open to the internet. The exit only ever hears from the
@@ -348,6 +430,34 @@ you can no longer reach.
 - **The API** for a sales bot of your own, on port 8445:
   [docs/bot-api.md](docs/bot-api.md).
 
+### Wallet, discounts, devices and sellers
+
+- **Wallet** (Payment page): customers top up by receipt - you approve it,
+  or correct the sum - and buy a plan from the wallet at once. Money can be
+  added to or taken from any customer's wallet by hand, on their wallet page.
+- **Invitations** (Payment page): each customer's link, in the bot and on
+  their page; the percent they get of what the people they bring pay, for
+  every purchase or only the first. Top-ups earn nothing, so the same money
+  is not counted twice.
+- **Discount codes** (Plans page): a percent or a sum, for some plans or all,
+  with an end date, a total number of uses, and once per customer.
+- **Devices** (Plans page): how many addresses each plan allows at once, the
+  price of an extra one, and how many new addresses a customer may register
+  in 24 hours.
+- **Admins** (Admins page): each with a username, a password and the parts of
+  the panel ticked for them. Tick **is a seller** for one who sells the
+  service on: they see only their own customers, make their own plans, write
+  their own card number, set up their own bot, and give the templates you
+  tick for them - or their own, up to a number. Set how many customers, how
+  much traffic and how many days; the usage can be reset by a button, or
+  every so many days. Click a name for their page of stats; disable, reset
+  and delete are beside each name.
+- **A message to many customers** (Bot page): to all of them, the active
+  ones, those whose term ends soon, or those on one plan.
+- **Public DNS** (Settings): one button opens every relay to everyone - no
+  sign-up, no registered address, no allowance - and the same button closes
+  it again.
+
 ### On the exit
 
 **`smartdns-access`** — where the admin panel is, and how to change it. Run it
@@ -355,7 +465,8 @@ with no arguments and it prints the full address, read from the config the
 panel actually serves.
 
 ```sh
-smartdns-access                  # the URL it answers on - forgot it? start here
+smartdns-access                  # the URL it answers on, and the username
+smartdns-access username ali     # change the owner's username
 smartdns-access port 9443        # move it, if a firewall is in the way
 smartdns-access path [new]       # change the secret path, or roll a fresh one
 smartdns-access password [new]   # set a new one; the old is not recoverable
@@ -626,10 +737,9 @@ reach the service from.
   a password, and nothing here asks for a password over plain HTTP — so it is
   not served at all rather than served unsafely. Nobody can sign up or
   register an address on such a relay until it is given a domain.
-- **Selling is not built, and there is no trial.** Signing up gets an account,
-  a password, and somewhere to send a receipt — no traffic. The account waits
-  until an operator opens its row and gives it a plan, which is the moment it
-  becomes able to connect at all.
+- **Signing up alone gets no traffic.** It gets an account, a password, and
+  somewhere to send a receipt. The account can connect once it has a plan -
+  bought and approved, taken as the free trial, or given by an operator.
 - **Xbox downloads stall** regardless of whether they are routed. Measured,
   not solved.
 - **Traffic costs double.** One customer gigabyte is about two on the relay

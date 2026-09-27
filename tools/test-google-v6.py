@@ -68,9 +68,9 @@ check("the public server still resolves over IPv4 only",
       stream.index("resolver __RESOLVERS__ ipv6=off;") < stream.index("listen 443;"))
 # The relay, and loopback - where the tunnel's end on this machine hands its
 # connections in. Nobody else.
-check("only the relay, and the tunnel's end on this machine, may use the public server",
-      re.search(r"allow __RELAY_IP__;\n(?:\s*#[^\n]*\n)*\s*allow 127\.0\.0\.1;\n\s*deny all;",
-                stream) is not None)
+check("only the relays, and the tunnel's end on this machine, may use the public server",
+      re.search(r"include /etc/nginx/smartdns-relays\.conf;\n(?:\s*#[^\n]*\n)*\s*"
+                r"allow 127\.0\.0\.1;\n\s*deny all;", stream) is not None)
 check("the block opens and closes in pairs",
       stream.count("# google-v6 begin") == 2 and stream.count("# google-v6 end") == 2)
 
@@ -109,9 +109,9 @@ check("install_payload drops the block when told to",
 start = logic.index("NO_GOOGLE_V6=1")
 det = logic[start:logic.index("install_payload EXIT_NGINX", start)]
 check("the default is to leave it out", det.startswith("NO_GOOGLE_V6=1"))
-check("only an exit considers it - or a single machine, which is one too",
+check("only an exit considers it - or a single machine or a node, which are exits too",
       "if is_exit; then" in det
-      and 'is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ]; }' in logic)
+      and 'is_exit()  { [ "$ROLE" = exit ] || [ "$ROLE" = single ] || [ "$ROLE" = node ]; }' in logic)
 check("it needs a real IPv6 connection to Google",
       "curl -6 -s -o /dev/null -m 10 https://www.google.com/" in det)
 check("and an nginx with ipv4=off, 1.23.1 or later", "1.23.1" in det and "sort -V" in det)

@@ -84,6 +84,7 @@ for name in ("save_template_names", "save_user_names", "apply_custom_domains",
              "apply_speeds", "close_relay_when_ready", "dns_seen"):
     setattr(sync, name, lambda *a, **k: False)
 sync.apply_profiles = lambda *a, **k: None
+sync.apply_gate_dns = lambda: False
 sync.current_state = lambda: []
 sync.HEALTH = type("H", (), {"sample": staticmethod(lambda: {})})()
 sync.LOG_SENT[0] = 0.0
@@ -215,7 +216,7 @@ check("the certificate renewals, and nginx, of this machine",
 check("and this machine's nginx errors, without the gate's noise",
       "upstream timed out while connecting" in page and "access forbidden" not in page)
 check("each relay's nginx errors", page.count("upstream timed out") >= 2
-      and "خطاهای nginx — سرور ایران" in page)
+      and "خطاهای nginx — اگر مشتری" in page)
 check("this machine's two services", "smartdns-panel" in page and "smartdns-admin" in page)
 check("the bot's, with its token masked", "doctor-dns-bot" in page and TOKEN not in page)
 check("and each relay's, with when it came", "newer lines" in page and "127.0.0.1" in page
