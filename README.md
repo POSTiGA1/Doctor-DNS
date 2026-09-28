@@ -204,6 +204,11 @@ minute the server gets a certificate by itself and turns DoH and DoT on for
 it, and customers are shown them beside that server's DNS. If the record is
 not right yet it says so there, and tries again a quarter of an hour later.
 
+A server with a domain also shows the customer panel on it. To keep the
+panel off some relays, untick that server's **Customer panel**: whoever opens
+it is sent to another server's panel, and its DoH and DoT work as before. At
+least one server keeps its panel.
+
 ### Upgrading
 
 Download the new file and run it. Before it touches anything it compares its

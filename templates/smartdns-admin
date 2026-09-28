@@ -2375,29 +2375,46 @@ def customer_servers_card(p):
             "%s<td><input form='srvlist' name='note_%s' value='%s' maxlength='%d' "
             "style='width:100%%' placeholder='مثلاً مخصوص ایرانسل'></td>"
             "<td><label style='display:inline'><input form='srvlist' type='checkbox' "
-            "name='hide_%s' value='1'%s> پنهان</label></td></tr>"
+            "name='hide_%s' value='1'%s> پنهان</label></td>%s</tr>"
             % (" class='off'" if ip in hidden else "", ip, n, ip,
                "تک‌سرور" if setting("single:" + ip) == "1" else "رله",
                domain_cell(ip) if domains else "",
                ip, html.escape(setting("server_note:" + ip) or "", quote=True),
-               SERVER_NOTE_MAX, ip, " checked" if ip in hidden else ""))
+               SERVER_NOTE_MAX, ip, " checked" if ip in hidden else "",
+               panel_cell(ip) if domains else ""))
     return ("<div class='card'><h2>سرورها برای مشتری</h2>"
             "<form id='srvlist' method='post' action='/%s/server-list-save'></form>"
             "<table><tr><th>ترتیب</th><th>سرور</th><th></th>%s<th>توضیح برای مشتری</th>"
-            "<th></th></tr>%s</table><button form='srvlist'>ذخیره</button>"
+            "<th></th>%s</tr>%s</table><button form='srvlist'>ذخیره</button>"
             "<p class='muted'>مشتری سرورها را به همین ترتیب می‌بیند، با شماره و توضیح هر کدام "
             "(در ربات و پنل خودش، کنار DNS، DoT و DoH آن سرور)؛ اولی را معمولاً برمی‌دارد. "
             "«پنهان» سرور را از فهرست همهٔ مشتری‌ها برمی‌دارد، مثلاً وقتی در حال تعمیر است، "
             "بدون اینکه تیک مشتری‌ها عوض شود. سرور پنهان هنوز کار می‌کند؛ فقط نشان داده "
             "نمی‌شود. فروشنده‌ای که اجازهٔ انتخاب رله دارد، می‌تواند برای مشتری‌های خودش "
             "توضیح خودش را بنویسد.</p>%s</div>"
-            % (p, "<th>دامنه (DoH و DoT)</th>" if domains else "", "".join(rows),
+            % (p, "<th>دامنه (DoH و DoT)</th>" if domains else "",
+               "<th>پنل مشتری</th>" if domains else "", "".join(rows),
                "<p class='muted'>دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و "
                "پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. "
                "سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند "
                "دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث "
                "می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا "
-               "گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.</p>" if domains else ""))
+               "گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.</p>"
+               "<p class='muted'>پنل مشتری: هر سروری که دامنه دارد، پنل مشتری را هم روی همان "
+               "دامنه نشان می‌دهد. تیکش را بردارید تا هر کس آن را باز کند به پنل یکی از "
+               "سرورهای دیگر فرستاده شود؛ DoH و DoT همان سرور مثل قبل کار می‌کنند. دست‌کم یک "
+               "سرور باید پنل داشته باشد. سروری که دامنه ندارد پنلی هم ندارد.</p>"
+               if domains else ""))
+
+
+def panel_cell(ip):
+    """Whether this server shows the customer panel on its domain: a tick
+    for one that has a panel to show."""
+    if not setting("panel_url:" + ip):
+        return "<td class='muted'>—</td>"
+    return ("<td><label style='display:inline'><input form='srvlist' type='checkbox' "
+            "name='panel_%s' value='1'%s> روشن</label></td>"
+            % (ip, "" if setting("panel_off:" + ip) == "1" else " checked"))
 
 
 def domain_cell(ip):
@@ -9250,6 +9267,25 @@ class Admin(http.server.BaseHTTPRequestHandler):
 
         if rest == "server-list-save":
             servers, _ = ordered_servers()
+            # Which keep their customer panel: asked before anything is saved,
+            # so a refusal leaves the whole form as it was.
+            with_panel = [] if one_server() else [
+                ip for ip in servers if setting("panel_url:" + ip)]
+            panel_off = [ip for ip in with_panel if not one("panel_" + ip)]
+            if with_panel and len(panel_off) == len(with_panel):
+                return self.redirect("nodes?m=!دست‌کم یک سرور باید پنل مشتری داشته باشد؛ "
+                                     "مشتری‌ها از آن ثبت‌نام می‌کنند و آی‌پی ثبت می‌کنند")
+            for ip in with_panel:
+                want = "1" if ip in panel_off else ""
+                if (setting("panel_off:" + ip) or "") != want:
+                    put_setting("panel_off:" + ip, want)
+                    log(INFO, "customer panel on %s %s" % (ip, "off" if want else "on"))
+            # The address the bot and the links send customers to, off a
+            # server that no longer shows it - now, not at its next sync.
+            if (setting("customer_panel_url") or "") in {setting("panel_url:" + ip)
+                                                         for ip in panel_off}:
+                put_setting("customer_panel_url", setting(
+                    "panel_url:" + [ip for ip in with_panel if ip not in panel_off][0]))
             ranked = []
             for n, ip in enumerate(servers):
                 raw = one("order_" + ip).strip()

@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.3"
+VERSION="0.9.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -8574,6 +8574,47 @@ exit 0
 #    return {"host": exit_self(), "standby": store.setting("standby") or ""}
 #
 #
+#def panel_off(store, ip):
+#    """Whether the admin took the customer panel off this server."""
+#    return store.setting("panel_off:" + ip) == "1"
+#
+#
+#def note_panel_url(store, who, url):
+#    """Where a server says its customer panel is: kept per server, for the
+#    admin panel's tick, and made the address people are sent to only by a
+#    server that keeps its panel."""
+#    url = str(url or "")
+#    if not re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url):
+#        url = ""
+#    if (store.setting("panel_url:" + who) or "") != url:
+#        store.set_setting("panel_url:" + who, url)
+#    if url and not panel_off(store, who) and store.setting("customer_panel_url") != url:
+#        store.set_setting("customer_panel_url", url)
+#
+#
+#def panel_elsewhere(store, ip):
+#    """For a server whose customer panel is off, the address of one that is
+#    on, to send people to; "" for a server that keeps its own. Never its
+#    own address, which may still be the one kept from before."""
+#    if not panel_off(store, ip):
+#        return ""
+#    return panel_on_url(store) or ""
+#
+#
+#def panel_on_url(store):
+#    """The customer panel to send people to: the one kept, while its server
+#    still shows it, or else the first server that does; None if none."""
+#    on, off = [], set()
+#    for row in store.q("SELECT key, value FROM settings WHERE key LIKE 'panel_url:%'"
+#                       " AND value != '' ORDER BY key"):
+#        (off.add if panel_off(store, row["key"][len("panel_url:"):]) else on.append)(
+#            row["value"])
+#    url = store.setting("customer_panel_url") or ""
+#    if url and url not in off:
+#        return url
+#    return on[0] if on else None
+#
+#
 #def upgrade_job(store):
 #    try:
 #        job = json.loads(store.setting("upgrade_job") or "{}")
@@ -9344,10 +9385,7 @@ exit 0
 #            # Where customers sign in, so a bot can send them there. Only a
 #            # plain https address; the relay knows its own domain, nobody
 #            # has to type it twice.
-#            url = str(body.get("panel_url") or "")
-#            if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
-#                    self.store.setting("customer_panel_url") != url:
-#                self.store.set_setting("customer_panel_url", url)
+#            note_panel_url(self.store, who, body.get("panel_url"))
 #            # The same for DNS over HTTPS: which name has the certificate. Only
 #            # ever set, never cleared, so a second relay without DoH does not
 #            # flip it back and forth every half minute.
@@ -9503,6 +9541,9 @@ exit 0
 #                                    "domain": domain_order(self.store, who),
 #                                    "domain_ack": bool(body.get("domain_result")),
 #                                    "panel": panel_where(self.store),
+#                                    # Where its customer panel sends people,
+#                                    # when the admin took the panel off it.
+#                                    "panel_to": panel_elsewhere(self.store, who),
 #                                    # Its tunnels to the nodes, by node.
 #                                    "node_tunnels": {
 #                                        n: dict(spec, on=True)
@@ -14047,6 +14088,21 @@ exit 0
 #    return CFG.get("SELF_IP") in found, sorted(found)
 #
 #
+## Where this server's customer panel sends people when the admin panel has
+## taken it off here: another server's, at the same path. "" keeps it here.
+#PANEL_TO = {"url": ""}
+#
+#
+#def panel_to(raw):
+#    url = str(raw or "")
+#    if not re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url):
+#        return ""
+#    own = ((CFG or {}).get("PANEL_DOMAIN") or "").lower()
+#    if own and urllib.parse.urlparse(url).hostname == own:
+#        return ""          # never to itself
+#    return url
+#
+#
 #def start_domain(order):
 #    """Give this server the domain the panel names: its certificate, and
 #    DoH and DoT on it - by running the installer again with that name,
@@ -14228,6 +14284,10 @@ exit 0
 #        start_domain(answer.get("domain"))
 #    except Exception as e:
 #        log(WARN, "domain not started: %s" % e)
+#    to = panel_to(answer.get("panel_to"))
+#    if to != PANEL_TO["url"]:
+#        log(INFO, "customer panel here %s" % ("sends people to " + to if to else "is on"))
+#        PANEL_TO["url"] = to
 #    if services:
 #        USAGE_PENDING.clear()
 #    if "exit_usage" in payload:
@@ -16267,8 +16327,36 @@ exit 0
 #        self.end_headers()
 #        self.wfile.write(blob)
 #
+#    def sent_elsewhere(self, path):
+#        """With the customer panel taken off this server, everybody goes to
+#        another server's, at the same address - all but DoH's setup page,
+#        which belongs to this server's own name, and the font it uses."""
+#        to = PANEL_TO["url"]
+#        if not to or path == "/vazirmatn.woff2" or path.startswith("/doh-setup/"):
+#            return False
+#        # A form's body is read off the wire first: a connection closed with
+#        # it still unread is reset, and the browser loses this answer too.
+#        try:
+#            left = int(self.headers.get("Content-Length") or 0)
+#        except ValueError:
+#            left = -1
+#        headers = {"Location": to.rstrip("/") + self.path, "Cache-Control": "no-store"}
+#        if 0 <= left <= 16 * 1024 * 1024:
+#            while left > 0:
+#                chunk = self.rfile.read(min(left, 65536))
+#                if not chunk:
+#                    break
+#                left -= len(chunk)
+#        else:
+#            self.close_connection = True
+#            headers["Connection"] = "close"
+#        self.send("", 303 if self.command == "POST" else 302, headers)
+#        return True
+#
 #    def do_GET(self):
 #        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+#        if self.sent_elsewhere(path):
+#            return
 #
 #        if path == "/vazirmatn.woff2":
 #            return self.send_font()
@@ -16353,6 +16441,8 @@ exit 0
 #
 #    def do_POST(self):
 #        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+#        if self.sent_elsewhere(path):
+#            return
 #
 #        if path in ("/signup", "/login"):
 #            form = self.form()
@@ -20379,29 +20469,46 @@ exit 0
 #            "%s<td><input form='srvlist' name='note_%s' value='%s' maxlength='%d' "
 #            "style='width:100%%' placeholder='مثلاً مخصوص ایرانسل'></td>"
 #            "<td><label style='display:inline'><input form='srvlist' type='checkbox' "
-#            "name='hide_%s' value='1'%s> پنهان</label></td></tr>"
+#            "name='hide_%s' value='1'%s> پنهان</label></td>%s</tr>"
 #            % (" class='off'" if ip in hidden else "", ip, n, ip,
 #               "تک‌سرور" if setting("single:" + ip) == "1" else "رله",
 #               domain_cell(ip) if domains else "",
 #               ip, html.escape(setting("server_note:" + ip) or "", quote=True),
-#               SERVER_NOTE_MAX, ip, " checked" if ip in hidden else ""))
+#               SERVER_NOTE_MAX, ip, " checked" if ip in hidden else "",
+#               panel_cell(ip) if domains else ""))
 #    return ("<div class='card'><h2>سرورها برای مشتری</h2>"
 #            "<form id='srvlist' method='post' action='/%s/server-list-save'></form>"
 #            "<table><tr><th>ترتیب</th><th>سرور</th><th></th>%s<th>توضیح برای مشتری</th>"
-#            "<th></th></tr>%s</table><button form='srvlist'>ذخیره</button>"
+#            "<th></th>%s</tr>%s</table><button form='srvlist'>ذخیره</button>"
 #            "<p class='muted'>مشتری سرورها را به همین ترتیب می‌بیند، با شماره و توضیح هر کدام "
 #            "(در ربات و پنل خودش، کنار DNS، DoT و DoH آن سرور)؛ اولی را معمولاً برمی‌دارد. "
 #            "«پنهان» سرور را از فهرست همهٔ مشتری‌ها برمی‌دارد، مثلاً وقتی در حال تعمیر است، "
 #            "بدون اینکه تیک مشتری‌ها عوض شود. سرور پنهان هنوز کار می‌کند؛ فقط نشان داده "
 #            "نمی‌شود. فروشنده‌ای که اجازهٔ انتخاب رله دارد، می‌تواند برای مشتری‌های خودش "
 #            "توضیح خودش را بنویسد.</p>%s</div>"
-#            % (p, "<th>دامنه (DoH و DoT)</th>" if domains else "", "".join(rows),
+#            % (p, "<th>دامنه (DoH و DoT)</th>" if domains else "",
+#               "<th>پنل مشتری</th>" if domains else "", "".join(rows),
 #               "<p class='muted'>دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و "
 #               "پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. "
 #               "سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند "
 #               "دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث "
 #               "می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا "
-#               "گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.</p>" if domains else ""))
+#               "گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.</p>"
+#               "<p class='muted'>پنل مشتری: هر سروری که دامنه دارد، پنل مشتری را هم روی همان "
+#               "دامنه نشان می‌دهد. تیکش را بردارید تا هر کس آن را باز کند به پنل یکی از "
+#               "سرورهای دیگر فرستاده شود؛ DoH و DoT همان سرور مثل قبل کار می‌کنند. دست‌کم یک "
+#               "سرور باید پنل داشته باشد. سروری که دامنه ندارد پنلی هم ندارد.</p>"
+#               if domains else ""))
+#
+#
+#def panel_cell(ip):
+#    """Whether this server shows the customer panel on its domain: a tick
+#    for one that has a panel to show."""
+#    if not setting("panel_url:" + ip):
+#        return "<td class='muted'>—</td>"
+#    return ("<td><label style='display:inline'><input form='srvlist' type='checkbox' "
+#            "name='panel_%s' value='1'%s> روشن</label></td>"
+#            % (ip, "" if setting("panel_off:" + ip) == "1" else " checked"))
 #
 #
 #def domain_cell(ip):
@@ -27254,6 +27361,25 @@ exit 0
 #
 #        if rest == "server-list-save":
 #            servers, _ = ordered_servers()
+#            # Which keep their customer panel: asked before anything is saved,
+#            # so a refusal leaves the whole form as it was.
+#            with_panel = [] if one_server() else [
+#                ip for ip in servers if setting("panel_url:" + ip)]
+#            panel_off = [ip for ip in with_panel if not one("panel_" + ip)]
+#            if with_panel and len(panel_off) == len(with_panel):
+#                return self.redirect("nodes?m=!دست‌کم یک سرور باید پنل مشتری داشته باشد؛ "
+#                                     "مشتری‌ها از آن ثبت‌نام می‌کنند و آی‌پی ثبت می‌کنند")
+#            for ip in with_panel:
+#                want = "1" if ip in panel_off else ""
+#                if (setting("panel_off:" + ip) or "") != want:
+#                    put_setting("panel_off:" + ip, want)
+#                    log(INFO, "customer panel on %s %s" % (ip, "off" if want else "on"))
+#            # The address the bot and the links send customers to, off a
+#            # server that no longer shows it - now, not at its next sync.
+#            if (setting("customer_panel_url") or "") in {setting("panel_url:" + ip)
+#                                                         for ip in panel_off}:
+#                put_setting("customer_panel_url", setting(
+#                    "panel_url:" + [ip for ip in with_panel if ip not in panel_off][0]))
 #            ranked = []
 #            for n, ip in enumerate(servers):
 #                raw = one("order_" + ip).strip()
@@ -37123,6 +37249,7 @@ exit 0
 #"دستگاه:": "Devices:",
 #"دستگاه‌ها": "Devices",
 #"دست‌کم یک DNS لازم است": "At least one DNS server is needed",
+#"دست‌کم یک سرور باید پنل مشتری داشته باشد؛ مشتری‌ها از آن ثبت‌نام می‌کنند و آی‌پی ثبت می‌کنند": "At least one server must keep the customer panel; customers sign up and register their address there",
 #"دست‌کم ۸ نویسه": "At least 8 characters",
 #"دعوت از دوستان خاموش شد": "Inviting friends turned off",
 #"دعوت از دوستان روشن شد:": "Inviting friends turned on:",
@@ -38015,6 +38142,8 @@ exit 0
 #"پنل را همان‌طور ببینید که او می‌بیند": "See the panel as they see it",
 #"پنل فهرست کامل را از سازنده‌اش می‌گیرد، دامنه‌هایی را که خود سرویس لازم دارد یا از رله می‌روند از آن کنار می‌گذارد، و هر رله فقط یک بار دریافتش می‌کند؛ روشن شدنش چند دقیقه طول می‌کشد. توجه: بعضی بازی‌های موبایل برای دیدن تبلیغ جایزه می‌دهند؛ اگر تبلیغ بسته شود، آن جایزه هم دیگر نمی‌آید.": "The panel takes the full list from its maker, leaves out the domains the service itself needs or that go through the relay, and each relay downloads it once; turning it on takes a few minutes. Note: some mobile games reward watching ads; with ads blocked, that reward stops too.",
 #"پنل مدیریت": "Admin panel",
+#"پنل مشتری": "Customer panel",
+#"پنل مشتری: هر سروری که دامنه دارد، پنل مشتری را هم روی همان دامنه نشان می‌دهد. تیکش را بردارید تا هر کس آن را باز کند به پنل یکی از سرورهای دیگر فرستاده شود؛ DoH و DoT همان سرور مثل قبل کار می‌کنند. دست‌کم یک سرور باید پنل داشته باشد. سروری که دامنه ندارد پنلی هم ندارد.": "Customer panel: every server with a domain also shows the customer panel on it. Untick it and whoever opens it is sent to another server's panel; that server's DoH and DoT keep working as before. At least one server must keep its panel. A server with no domain has no panel.",
 #"پنل هر": "Every",
 #"پنل و API — سرور خارج": "Panel and API — exit server",
 #"پنل‌ها": "Panels",

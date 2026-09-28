@@ -4302,6 +4302,47 @@ def panel_where(store):
     return {"host": exit_self(), "standby": store.setting("standby") or ""}
 
 
+def panel_off(store, ip):
+    """Whether the admin took the customer panel off this server."""
+    return store.setting("panel_off:" + ip) == "1"
+
+
+def note_panel_url(store, who, url):
+    """Where a server says its customer panel is: kept per server, for the
+    admin panel's tick, and made the address people are sent to only by a
+    server that keeps its panel."""
+    url = str(url or "")
+    if not re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url):
+        url = ""
+    if (store.setting("panel_url:" + who) or "") != url:
+        store.set_setting("panel_url:" + who, url)
+    if url and not panel_off(store, who) and store.setting("customer_panel_url") != url:
+        store.set_setting("customer_panel_url", url)
+
+
+def panel_elsewhere(store, ip):
+    """For a server whose customer panel is off, the address of one that is
+    on, to send people to; "" for a server that keeps its own. Never its
+    own address, which may still be the one kept from before."""
+    if not panel_off(store, ip):
+        return ""
+    return panel_on_url(store) or ""
+
+
+def panel_on_url(store):
+    """The customer panel to send people to: the one kept, while its server
+    still shows it, or else the first server that does; None if none."""
+    on, off = [], set()
+    for row in store.q("SELECT key, value FROM settings WHERE key LIKE 'panel_url:%'"
+                       " AND value != '' ORDER BY key"):
+        (off.add if panel_off(store, row["key"][len("panel_url:"):]) else on.append)(
+            row["value"])
+    url = store.setting("customer_panel_url") or ""
+    if url and url not in off:
+        return url
+    return on[0] if on else None
+
+
 def upgrade_job(store):
     try:
         job = json.loads(store.setting("upgrade_job") or "{}")
@@ -5072,10 +5113,7 @@ class API(http.server.BaseHTTPRequestHandler):
             # Where customers sign in, so a bot can send them there. Only a
             # plain https address; the relay knows its own domain, nobody
             # has to type it twice.
-            url = str(body.get("panel_url") or "")
-            if re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url) and \
-                    self.store.setting("customer_panel_url") != url:
-                self.store.set_setting("customer_panel_url", url)
+            note_panel_url(self.store, who, body.get("panel_url"))
             # The same for DNS over HTTPS: which name has the certificate. Only
             # ever set, never cleared, so a second relay without DoH does not
             # flip it back and forth every half minute.
@@ -5231,6 +5269,9 @@ class API(http.server.BaseHTTPRequestHandler):
                                     "domain": domain_order(self.store, who),
                                     "domain_ack": bool(body.get("domain_result")),
                                     "panel": panel_where(self.store),
+                                    # Where its customer panel sends people,
+                                    # when the admin took the panel off it.
+                                    "panel_to": panel_elsewhere(self.store, who),
                                     # Its tunnels to the nodes, by node.
                                     "node_tunnels": {
                                         n: dict(spec, on=True)

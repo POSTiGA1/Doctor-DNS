@@ -2693,6 +2693,21 @@ def name_points_here(name):
     return CFG.get("SELF_IP") in found, sorted(found)
 
 
+# Where this server's customer panel sends people when the admin panel has
+# taken it off here: another server's, at the same path. "" keeps it here.
+PANEL_TO = {"url": ""}
+
+
+def panel_to(raw):
+    url = str(raw or "")
+    if not re.fullmatch(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/", url):
+        return ""
+    own = ((CFG or {}).get("PANEL_DOMAIN") or "").lower()
+    if own and urllib.parse.urlparse(url).hostname == own:
+        return ""          # never to itself
+    return url
+
+
 def start_domain(order):
     """Give this server the domain the panel names: its certificate, and
     DoH and DoT on it - by running the installer again with that name,
@@ -2874,6 +2889,10 @@ def sync_once():
         start_domain(answer.get("domain"))
     except Exception as e:
         log(WARN, "domain not started: %s" % e)
+    to = panel_to(answer.get("panel_to"))
+    if to != PANEL_TO["url"]:
+        log(INFO, "customer panel here %s" % ("sends people to " + to if to else "is on"))
+        PANEL_TO["url"] = to
     if services:
         USAGE_PENDING.clear()
     if "exit_usage" in payload:
@@ -4913,8 +4932,36 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(blob)
 
+    def sent_elsewhere(self, path):
+        """With the customer panel taken off this server, everybody goes to
+        another server's, at the same address - all but DoH's setup page,
+        which belongs to this server's own name, and the font it uses."""
+        to = PANEL_TO["url"]
+        if not to or path == "/vazirmatn.woff2" or path.startswith("/doh-setup/"):
+            return False
+        # A form's body is read off the wire first: a connection closed with
+        # it still unread is reset, and the browser loses this answer too.
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            left = -1
+        headers = {"Location": to.rstrip("/") + self.path, "Cache-Control": "no-store"}
+        if 0 <= left <= 16 * 1024 * 1024:
+            while left > 0:
+                chunk = self.rfile.read(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        else:
+            self.close_connection = True
+            headers["Connection"] = "close"
+        self.send("", 303 if self.command == "POST" else 302, headers)
+        return True
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if self.sent_elsewhere(path):
+            return
 
         if path == "/vazirmatn.woff2":
             return self.send_font()
@@ -4999,6 +5046,8 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if self.sent_elsewhere(path):
+            return
 
         if path in ("/signup", "/login"):
             form = self.form()
