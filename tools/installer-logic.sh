@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.4"
+VERSION="0.9.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -401,6 +401,8 @@ tunnel_port_problem() {
         4070) echo "Spotify's access point" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
+        5298) echo "the relay's page that sends addresses not let in to the customer panel" ;;
+        5297|8853|8454) echo "the relay's DoH and DoT for addresses not let in" ;;
         "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API"|"$TUNNEL_LOCAL_SPOTIFY"|"$TUNNEL_LOCAL_BLIZZARD") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5299 ] && [ "$p" -le 5999 ]; } && echo "the templates' resolvers on the relay"

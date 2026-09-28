@@ -107,8 +107,19 @@ check("with the operator's own pick added when it is not on it",
       w["ips"][-1] == "203.0.113.53" and w["ips"].count("1.1.1.1") == 1 and w["now"] == "")
 psrc = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8").read()
 check("each relay's figures are kept, and the list goes out with every sync",
-      'self.store.set_setting("resolver_bench:" + who, text)' in psrc
-      and '"bench": bench_wanted(self.store),' in psrc)
+      'note_bench(self.store, who, body.get("resolver_bench"))' in psrc
+      and psrc.count('"bench": bench_wanted(self.store),') == 2)
+panel.note_bench(store, "198.51.100.9", {"at": 5, "ms": {"1.1.1.1": 7, "x": "junk"}})
+check("  a node's the same way, junk dropped",
+      json.loads(store.setting("resolver_bench:198.51.100.9"))
+      == {"at": 5, "ms": {"1.1.1.1": 7, "x": None}})
+panel.note_bench(store, "198.51.100.9", {"ms": "nonsense"})
+check("  and nonsense leaves what was there",
+      json.loads(store.setting("resolver_bench:198.51.100.9"))["at"] == 5)
+store.run("DELETE FROM settings WHERE key = 'resolver_bench:198.51.100.9'")
+check("a node times them and sends its figures, as a relay does",
+      src.count('payload["resolver_bench"] = {"at": int(BENCH_STATE["at"]), "ms": '
+                'BENCH_STATE["ms"]}') == 2 and src.count('maybe_bench(answer.get("bench"))') == 2)
 
 print("the admin panel")
 admin.DB = os.path.join(tmp, "panel.db")
@@ -129,6 +140,25 @@ check("one that did not answer said so", "جواب نداد" in card)
 check("the operator's own pick has a row of its own", "203.0.113.53" in card and "90 ms" in card)
 check("the relays' times beside the choices", "9.9.9.9 — 21 ms" in card and "1.1.1.1 — 38 ms" in card)
 check("and a way to time them again", "action='/p/dns-bench'" in card)
+admin.PANEL_ENV = os.path.join(tmp, "panel.env")
+with open(admin.PANEL_ENV, "w") as fh:
+    fh.write("RELAY_IP=198.51.100.7\nNODE_IP=198.51.100.2\n")
+store.set_setting("resolver_bench:198.51.100.2", json.dumps(
+    {"at": now - 60, "ms": {"1.1.1.1": 4, "9.9.9.9": 9}}))
+store.set_setting("upstream_state:198.51.100.7", json.dumps(
+    {"applied": ["1.1.1.1", "203.0.113.53"], "tested": {"1.1.1.1": 38}}))
+store.set_setting("node_resolvers:198.51.100.2", json.dumps(
+    {"using": "1.1.1.1", "error": "203.0.113.53 از این سرور جواب نداد"}))
+card = admin.upstream_card()
+check("a column for each node too, after the relays",
+      "نود 198.51.100.2" in card
+      and card.index("رله 198.51.100.7") < card.index("نود 198.51.100.2") < card.index("این سرور"))
+check("  the choices still labelled with the relays' times", "1.1.1.1 — 38 ms" in card)
+check("each node in the table of what each server uses, with what went wrong",
+      "نود <code>198.51.100.2</code>" in card and "رله <code>198.51.100.7</code>" in card
+      and "203.0.113.53 از این سرور جواب نداد" in card)
+store.set_setting("node_resolvers:198.51.100.5", json.dumps({"using": "1.1.1.1", "error": ""}))
+check("  but not one no longer joined", "198.51.100.5" not in admin.upstream_card())
 
 
 class Rec:

@@ -64,8 +64,13 @@ for conf in ("templates/relay-nginx.conf", "templates/exit-nginx.conf"):
     text = read(conf)
     check("%s takes DoH's names and certificate from the two files" % conf.split("/")[1],
           "include /etc/nginx/smartdns-doh-names.map;" in text
-          and text.count("include /etc/nginx/smartdns-doh-cert.conf;") == 2
+          and text.count("include /etc/nginx/smartdns-doh-cert.conf;") == 3
           and "__DOH_CERT__" not in text)
+    check("  the gate's DoH door lets through only those names, and shuts the rest",
+          text.count("include /etc/nginx/smartdns-doh-names.map;") == 2
+          and '""      127.0.0.1:9;' in text and "listen 5297;" in text
+          and "listen 8853 ssl;" in text and "proxy_set_header X-Gate 1;" in text
+          and 'proxy_set_header X-Gate "";' in text)
 logic = read("tools/installer-logic.sh")
 body = logic[logic.index("doh_includes() {"):logic.index("\n}\n", logic.index("doh_includes() {"))]
 check("the installer writes them with the relay's own name and certificate",

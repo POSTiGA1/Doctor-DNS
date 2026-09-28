@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.4"
+VERSION="0.9.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -401,6 +401,8 @@ tunnel_port_problem() {
         4070) echo "Spotify's access point" ;;
         8402) echo "where certificates are proved" ;;
         3478) echo "STUN on the relay" ;;
+        5298) echo "the relay's page that sends addresses not let in to the customer panel" ;;
+        5297|8853|8454) echo "the relay's DoH and DoT for addresses not let in" ;;
         "$TUNNEL_LOCAL_HTTPS"|"$TUNNEL_LOCAL_HTTP"|"$TUNNEL_LOCAL_API"|"$TUNNEL_LOCAL_SPOTIFY"|"$TUNNEL_LOCAL_BLIZZARD") echo "the tunnel's own end on the relay" ;;
     esac
     { [ "$p" -ge 5299 ] && [ "$p" -le 5999 ]; } && echo "the templates' resolvers on the relay"
@@ -2885,6 +2887,30 @@ exit 0
 #            proxy_http_version 1.1;
 #            proxy_set_header Connection "";
 #            proxy_set_header X-Real-IP $remote_addr;
+#            # Only the gate's own server below may say this.
+#            proxy_set_header X-Gate "";
+#            proxy_connect_timeout 3s;
+#            proxy_read_timeout 10s;
+#        }
+#        location / {
+#            return 302 https://__DOH_HOST__:8443/;
+#        }
+#    }
+#    # The gate's DoH, for an address not let in, as on a relay.
+#    server {
+#        listen 127.0.0.1:8454 ssl http2 proxy_protocol;
+#        server_name __DOH_HOST__;
+#        include /etc/nginx/smartdns-doh-cert.conf;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        client_max_body_size 8k;
+#
+#        location /dns-query {
+#            proxy_pass http://127.0.0.1:8055;
+#            proxy_http_version 1.1;
+#            proxy_set_header Connection "";
+#            proxy_set_header X-Real-IP $remote_addr;
+#            proxy_set_header X-Gate 1;
+#            proxy_set_header X-Client-IP $proxy_protocol_addr;
 #            proxy_connect_timeout 3s;
 #            proxy_read_timeout 10s;
 #        }
@@ -3033,15 +3059,35 @@ exit 0
 #        default       $upstream;
 #    }
 #    # DNS over TLS, as on a relay: TLS ends here and the stream goes to
-#    # smartdns-doh with a PROXY line saying who connected.
+#    # smartdns-doh with a PROXY line saying who connected. 8853 is the same
+#    # door for an address not let in, as on a relay.
 #    server {
 #        listen 853 ssl;
+#        listen 8853 ssl;
 #        include /etc/nginx/smartdns-doh-cert.conf;
 #        ssl_protocols TLSv1.2 TLSv1.3;
 #        proxy_protocol on;
 #        proxy_connect_timeout 5s;
 #        proxy_timeout 2m;
 #        proxy_pass 127.0.0.1:8054;
+#    }
+#    # 443 for an address not let in, as on a relay: this machine's own DoH
+#    # names only, to the gate's DoH; everything else shut at once.
+#    map $ssl_preread_server_name $gate_doh_name {
+#        include /etc/nginx/smartdns-doh-names.map;
+#        default "";
+#    }
+#    map $gate_doh_name $gate_target {
+#        ""      127.0.0.1:9;
+#        default 127.0.0.1:8454;
+#    }
+#    server {
+#        listen 5297;
+#        ssl_preread on;
+#        proxy_protocol on;
+#        proxy_connect_timeout 3s;
+#        proxy_timeout 1m;
+#        proxy_pass $gate_target;
 #    }
 #    # doh end
 #    # single end
@@ -3200,14 +3246,41 @@ exit 0
 #    # same certificate as the customer panel and hands the plain stream to
 #    # smartdns-doh with a PROXY line in front - which is how it knows whose
 #    # resolver to ask, since the connection itself now comes from loopback.
+#    # 8853 is the same door for an address not let in: the gate sends its
+#    # 853 here, past the firewall that shuts 853 to it, and smartdns-doh
+#    # answers it from the gate's resolver - the customer panel's names, and
+#    # this relay for everything else - so a phone on Private DNS offers to
+#    # open the panel as one on plain DNS does.
 #    server {
 #        listen 853 ssl;
+#        listen 8853 ssl;
 #        include /etc/nginx/smartdns-doh-cert.conf;
 #        ssl_protocols TLSv1.2 TLSv1.3;
 #        proxy_protocol on;
 #        proxy_connect_timeout 5s;
 #        proxy_timeout 2m;
 #        proxy_pass 127.0.0.1:8054;
+#    }
+#
+#    # 443 for an address not let in, sent here by the gate. Only this relay's
+#    # own DoH names are let through, to a DoH server of their own that
+#    # answers from the gate's resolver; every other name is shut at once, so
+#    # this door carries nobody anywhere.
+#    map $ssl_preread_server_name $gate_doh_name {
+#        include /etc/nginx/smartdns-doh-names.map;
+#        default "";
+#    }
+#    map $gate_doh_name $gate_target {
+#        ""      127.0.0.1:9;
+#        default 127.0.0.1:8454;
+#    }
+#    server {
+#        listen 5297;
+#        ssl_preread on;
+#        proxy_protocol on;
+#        proxy_connect_timeout 3s;
+#        proxy_timeout 1m;
+#        proxy_pass $gate_target;
 #    }
 #    # doh end
 #    # nodoh begin
@@ -3284,11 +3357,40 @@ exit 0
 #            # Always 127.0.0.1 - the stream. smartdns-doh refuses anything
 #            # else, as something that found its way round the gate.
 #            proxy_set_header X-Real-IP $remote_addr;
+#            # Only the gate's own server below may say this.
+#            proxy_set_header X-Gate "";
 #            proxy_connect_timeout 3s;
 #            proxy_read_timeout 10s;
 #        }
 #
 #        # Somebody who types the relay's name into a browser wants the panel.
+#        location / {
+#            return 302 https://__DOH_HOST__:8443/;
+#        }
+#    }
+#
+#    # The gate's DoH, for an address not let in (port 5297 above). The same
+#    # names and certificate; smartdns-doh answers anything marked X-Gate from
+#    # the gate's resolver, whatever address is in the path, and holds each
+#    # address - which only the PROXY line knows - to a rate of its own.
+#    server {
+#        listen 127.0.0.1:8454 ssl http2 proxy_protocol;
+#        server_name __DOH_HOST__;
+#        include /etc/nginx/smartdns-doh-cert.conf;
+#        ssl_protocols TLSv1.2 TLSv1.3;
+#        client_max_body_size 8k;
+#
+#        location /dns-query {
+#            proxy_pass http://127.0.0.1:8055;
+#            proxy_http_version 1.1;
+#            proxy_set_header Connection "";
+#            proxy_set_header X-Real-IP $remote_addr;
+#            proxy_set_header X-Gate 1;
+#            proxy_set_header X-Client-IP $proxy_protocol_addr;
+#            proxy_connect_timeout 3s;
+#            proxy_read_timeout 10s;
+#        }
+#
 #        location / {
 #            return 302 https://__DOH_HOST__:8443/;
 #        }
@@ -4892,6 +4994,10 @@ exit 0
 #    # Which relays this customer is shown as DNS addresses, comma separated;
 #    # null for the ones shown to everybody. Every relay still serves them.
 #    ("users", "relays", "TEXT"),
+#    # The relays a plan is sold on, comma separated; null for every relay.
+#    # Unlike the customer's own ticks above, these are kept: a customer on
+#    # such a plan is on no other relay's allowlist.
+#    ("plans", "relays", "TEXT"),
 #    # Blocks and forwards per template; the ones made before that are for all.
 #    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -5038,6 +5144,22 @@ exit 0
 #        if ip not in ips:
 #            ips.append(ip)
 #    return {"ips": ips, "now": store.setting("bench_now") or ""}
+#
+#
+#def note_bench(store, who, timed):
+#    """How fast each resolver answered a relay or node, as it measured."""
+#    if not isinstance(timed, dict) or not isinstance(timed.get("ms"), dict):
+#        return
+#    try:
+#        at = int(timed.get("at") or 0)
+#    except (TypeError, ValueError):
+#        return
+#    text = json.dumps({"at": at,
+#                       "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
+#                              for k, v in list(timed["ms"].items())[:32]}},
+#                      sort_keys=True)
+#    if store.setting("resolver_bench:" + who) != text:
+#        store.set_setting("resolver_bench:" + who, text)
 #
 ## Fractions of the quota at which the user is warned, and the bit each one
 ## sets in users.warned.
@@ -9445,14 +9567,7 @@ exit 0
 #                    if isinstance(servers, dict)}}, sort_keys=True)
 #                if self.store.setting("forward_check:" + who) != text:
 #                    self.store.set_setting("forward_check:" + who, text)
-#            timed = body.get("resolver_bench")
-#            if isinstance(timed, dict) and isinstance(timed.get("ms"), dict):
-#                text = json.dumps({"at": int(timed.get("at") or 0),
-#                                   "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
-#                                          for k, v in list(timed["ms"].items())[:32]}},
-#                                  sort_keys=True)
-#                if self.store.setting("resolver_bench:" + who) != text:
-#                    self.store.set_setting("resolver_bench:" + who, text)
+#            note_bench(self.store, who, body.get("resolver_bench"))
 #            report = body.get("upstream")
 #            if isinstance(report, dict):
 #                text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -9490,14 +9605,18 @@ exit 0
 #            # uid travels as well as the label built from it: the relay uses
 #            # it as the shaping mark, and parsing it back out of "u12" would
 #            # be a second place that has to agree about the format.
+#            # Customers whose plan is sold on other relays are not this one's.
+#            off = kept_off(self.store, who, self.relays)
 #            allowed = [{"ip": ip, "name": "u%d" % v["uid"], "uid": v["uid"],
 #                        "kbps": v["kbps"], "user": v.get("user", ""),
 #                        "profile": str(v["tid"]) if str(v["tid"]) in profiles else ""}
-#                       for ip, v in sorted(by_ip.items())]
+#                       for ip, v in sorted(by_ip.items()) if v["uid"] not in off]
 #            extra = [r["domain"] for r in self.store.q(
 #                "SELECT domain FROM custom_domains ORDER BY domain")]
 #            try:
-#                doh = doh_tokens(self.store, profiles, DEFAULT_TEMPLATE[0])
+#                doh = {h: t for h, t in doh_tokens(self.store, profiles,
+#                                                   DEFAULT_TEMPLATE[0]).items()
+#                       if t["uid"] not in off}
 #            except Exception as e:
 #                doh = {}
 #                log_exception("DoH tokens not built: %r" % e)
@@ -9544,6 +9663,9 @@ exit 0
 #                                    # Where its customer panel sends people,
 #                                    # when the admin took the panel off it.
 #                                    "panel_to": panel_elsewhere(self.store, who),
+#                                    # Where a relay with no panel of its own
+#                                    # sends the addresses it does not let in.
+#                                    "portal": panel_on_url(self.store) or "",
 #                                    # Its tunnels to the nodes, by node.
 #                                    "node_tunnels": {
 #                                        n: dict(spec, on=True)
@@ -9688,6 +9810,7 @@ exit 0
 #                               "error": str(state.get("error") or "")[:300]}, sort_keys=True)
 #            if self.store.setting("node_resolvers:" + who) != text:
 #                self.store.set_setting("node_resolvers:" + who, text)
+#        note_bench(self.store, who, body.get("resolver_bench"))
 #        if isinstance(body.get("version"), str) and \
 #                self.store.setting("version:" + who) != body["version"][:20]:
 #            self.store.set_setting("version:" + who, body["version"][:20])
@@ -9706,6 +9829,8 @@ exit 0
 #                        self.store.set_setting(key, "1" if up else "0")
 #        return 200, {"relays": list(self.relays),
 #                     "upstream": (self.store.setting("dns_upstream") or DEFAULT_UPSTREAM).split(),
+#                     # The resolvers to time from here, as the relays do.
+#                     "bench": bench_wanted(self.store),
 #                     "upgrade": upgrade_order(self.store, who),
 #                     "upgrade_ack": bool(body.get("upgrade_result")),
 #                     "panel": panel_where(self.store),
@@ -9959,6 +10084,8 @@ exit 0
 #            "plan": tpl["name"] if tpl else "",
 #            "renews": (user["quota_reset_at"] or "")[:10],
 #            "expires": (user["expires_at"] or "")[:10],
+#            # The moment itself, for the days left beside the date.
+#            "expires_at": user["expires_at"] or "",
 #            "speed_kbps": user["speed_kbps"] or 0,
 #            # Which warning thresholds this account has crossed. The relay's
 #            # page turns this into the banner the bot used to send.
@@ -10108,16 +10235,54 @@ exit 0
 #
 #def shown_relays(store, user, relays):
 #    """The relays a customer is given as DNS addresses, in the admin's order:
-#    the ones picked for them, or else all, less those hidden from everyone.
-#    Never none - an address to type in is the one thing a customer cannot do
-#    without - and only relays that still exist. What is shown, not what may
-#    be used: every relay serves every customer."""
+#    those of their plan when it is sold on some only - the only ones that
+#    serve them - and within those the ones picked for them, or else all, less
+#    those hidden from everyone. Never none - an address to type in is the
+#    one thing a customer cannot do without - and only relays that still
+#    exist."""
 #    keys = user.keys() if hasattr(user, "keys") else user
 #    picked = (user["relays"] if "relays" in keys else None) or ""
 #    want = {ip.strip() for ip in picked.split(",") if ip.strip()}
 #    ordered, hidden = server_order(store, relays)
+#    sold = user_plan_relays(store, user, relays)
+#    if sold:
+#        ordered = [ip for ip in ordered if ip in sold]
 #    visible = [ip for ip in ordered if ip not in hidden]
 #    return [ip for ip in visible if ip in want] or visible or ordered
+#
+#
+#def plan_relays(raw, relays=None):
+#    """The relays a plan is sold on - of those that still exist, when given -
+#    or [] for every relay. A plan whose relays are all gone is on every one
+#    again, rather than on none."""
+#    out = [ip.strip() for ip in (raw or "").split(",") if ip.strip()]
+#    if relays is not None:
+#        out = [ip for ip in out if ip in relays]
+#    return out
+#
+#
+#def user_plan_relays(store, user, relays):
+#    """The relays this customer's plan is sold on; [] for every relay."""
+#    keys = user.keys() if hasattr(user, "keys") else user
+#    plan_id = user["plan_id"] if "plan_id" in keys else None
+#    if not plan_id:
+#        return []
+#    row = store.one("SELECT relays FROM plans WHERE id = ?", (plan_id,))
+#    return plan_relays(row["relays"] if row and "relays" in row.keys() else "", relays)
+#
+#
+#def kept_off(store, relay, relays):
+#    """Accounts whose plan is sold on other relays than this one: left off
+#    its allowlist and its DoH, so a plan for one server is no way into
+#    another. They are sent to the customer panel there, as anybody not let
+#    in is."""
+#    out = set()
+#    for r in store.q("SELECT u.id, p.relays FROM users u JOIN plans p ON p.id = u.plan_id"
+#                     " WHERE COALESCE(p.relays, '') != ''"):
+#        sold = plan_relays(r["relays"], relays)
+#        if sold and relay not in sold:
+#            out.add(r["id"])
+#    return out
 #
 #
 #def server_note(store, user, ip):
@@ -12852,37 +13017,79 @@ exit 0
 ## With the door closed (smartdns-acl enforce on), an address that is not
 ## registered gets no DNS at all - so a customer whose line changed its address
 ## cannot even look up the customer panel to register the new one, unless they
-## know to change their device's DNS. For such an address, port 53 goes to a
-## resolver of its own that answers the customer panel's name and refuses
-## everything else: the page that lets them back in, and nothing it could use
-## to ride along free.
+## know to change their device's DNS. For such an address - never registered,
+## or a customer whose volume or days ran out, since only active ones are on
+## the allowlist - port 53 goes to a resolver of its own. It answers the
+## customer panel's names truly and every other name with this relay's own
+## address, and port 80 from them goes to a page that sends them on to the
+## panel. That is what a phone or a console checks for when it joins a
+## network, so it offers to open the panel by itself - the way a hotel's
+## wifi brings up its sign-in page - and any plain http address shows it too.
+## HTTPS addresses cannot be shown anything else, and stay closed. Nothing
+## here carries anybody anywhere free.
 #GATE_PORT = 5299
+#PORTAL_PORT = 5298
+#GATE_DOT_PORT = 8853
+#GATE_DOH_PORT = 5297
 #GATE_CONF = os.path.join(PROFILE_DIR, "gate.conf")
 #GATE_UNIT = "smartdns-dns-gate"
 #GATE_UNIT_FILE = "/etc/systemd/system/smartdns-dns-gate.service"
 #GATE_CHAIN = "gatedns"
 #GATE_KEEP = ("bind-interfaces", "listen-address=", "domain-needed", "bogus-priv", "no-hosts",
 #             "interface=", "except-interface=")
+## Where the page on port 80 sends people: this relay's own customer panel, or
+## when it has none to show, the one the panel names.
+#PORTAL = {"url": ""}
+#PANEL_URL_RE = re.compile(r"https://[a-z0-9.-]{3,253}(:\d{1,5})?/")
+#
+#
+#def portal_target(named):
+#    """The customer panel to send the unregistered to, from this relay."""
+#    if PANEL_TO["url"]:
+#        return PANEL_TO["url"]
+#    own = ((CFG or {}).get("PANEL_DOMAIN") or "").strip().lower().strip(".")
+#    if is_domain(own):
+#        return "https://%s:%d/" % (own, PANEL_TLS_PORT)
+#    named = str(named or "")
+#    return named if PANEL_URL_RE.fullmatch(named) else ""
 #
 #
 #def gate_names():
-#    """The names an unregistered address may look up."""
-#    name = ((CFG or {}).get("PANEL_DOMAIN") or "").strip().lower().strip(".")
-#    return [name] if is_domain(name) else []
+#    """The names an unregistered address may look up truly: this relay's
+#    own, and the panel's the page sends them to."""
+#    names = []
+#    for name in (((CFG or {}).get("PANEL_DOMAIN") or ""),
+#                 urllib.parse.urlparse(PORTAL["url"]).hostname or ""):
+#        name = name.strip().lower().strip(".")
+#        if is_domain(name) and name not in names:
+#            names.append(name)
+#    return names
 #
 #
-#def gate_conf_text(names, upstream):
+#def gate_conf_text(names, upstream, here=""):
 #    lines = ["# generated by smartdns-sync - do not edit",
-#             "# Only the service's own names, for addresses not registered yet.",
-#             "port=%d" % GATE_PORT, "no-resolv", "cache-size=100"]
+#             "# For addresses not let in: the customer panel's names answered truly,",
+#             "# every other name with this relay, whose port 80 sends them to the panel.",
+#             "port=%d" % GATE_PORT, "no-resolv", "cache-size=100", "local-ttl=0"]
 #    lines += [l for l in base_settings() if l.startswith(GATE_KEEP)]
 #    lines += ["server=/%s/%s" % (n, u) for n in names for u in upstream]
+#    if is_ipv4(here):
+#        lines.append("address=/#/%s" % here)
 #    return "\n".join(lines) + "\n"
 #
 #
 #def gate_rules():
-#    return ['iifname != "lo" ip saddr != @allowed udp dport 53 redirect to :%d' % GATE_PORT,
-#            'iifname != "lo" ip saddr != @allowed tcp dport 53 redirect to :%d' % GATE_PORT]
+#    # A limit per address first: this resolver answers anybody on the
+#    # internet, and every answer is this relay's address.
+#    return ['iifname != "lo" ip saddr != @allowed udp dport 53 meter gateflood '
+#            '{ ip saddr limit rate over 20/second burst 40 packets } drop',
+#            'iifname != "lo" ip saddr != @allowed udp dport 53 redirect to :%d' % GATE_PORT,
+#            'iifname != "lo" ip saddr != @allowed tcp dport 53 redirect to :%d' % GATE_PORT,
+#            'iifname != "lo" ip saddr != @allowed tcp dport 80 redirect to :%d' % PORTAL_PORT,
+#            # DoT and DoH, to nginx's doors for the gate (relay-nginx.conf):
+#            # the gate's answers there too, and no way on to anywhere.
+#            'iifname != "lo" ip saddr != @allowed tcp dport 853 redirect to :%d' % GATE_DOT_PORT,
+#            'iifname != "lo" ip saddr != @allowed tcp dport 443 redirect to :%d' % GATE_DOH_PORT]
 #
 #
 #def apply_gate_dns():
@@ -12899,7 +13106,7 @@ exit 0
 #        if sh("systemctl", "is-active", GATE_UNIT).stdout.strip() == "active":
 #            sh("systemctl", "stop", GATE_UNIT)
 #        return False
-#    text = gate_conf_text(names, upstream)
+#    text = gate_conf_text(names, upstream, (CFG or {}).get("SELF_IP") or "")
 #    try:
 #        with open(GATE_CONF) as fh:
 #            old = fh.read()
@@ -12918,10 +13125,18 @@ exit 0
 #        nft("add", "chain", "inet", "smartdns", GATE_CHAIN,
 #            "{ type nat hook prerouting priority -110 ; policy accept ; }")
 #        listed = nft("list", "chain", "inet", "smartdns", GATE_CHAIN)
-#    if ("redirect to :%d" % GATE_PORT) not in (listed.stdout or ""):
+#    # Every rule, not just the first: a relay upgraded from before the page on
+#    # port 80 has the DNS ones only.
+#    have = listed.stdout or ""
+#    if any(mark not in have for mark in ("redirect to :%d" % GATE_PORT,
+#                                         "redirect to :%d" % PORTAL_PORT,
+#                                         "redirect to :%d" % GATE_DOT_PORT,
+#                                         "redirect to :%d" % GATE_DOH_PORT, "gateflood")):
 #        nft("flush", "chain", "inet", "smartdns", GATE_CHAIN)
 #        for rule in gate_rules():
-#            nft("add", "rule", "inet", "smartdns", GATE_CHAIN, *rule.split())
+#            r = nft("add", "rule", "inet", "smartdns", GATE_CHAIN, *rule.split())
+#            if r.returncode != 0:
+#                log(WARN, "gate rule refused: %s: %s" % (rule, (r.stderr or "").strip()))
 #    return True
 #
 #MAIN_DNS_PORT = 53
@@ -13673,6 +13888,8 @@ exit 0
 #        payload["resolvers"] = NODE_STATE["resolvers"]
 #    if NODE_STATE["tunnels"] is not None:
 #        payload["tunnel_state"] = NODE_STATE["tunnels"]
+#    if BENCH_STATE["ms"]:
+#        payload["resolver_bench"] = {"at": int(BENCH_STATE["at"]), "ms": BENCH_STATE["ms"]}
 #    payload["version"] = installed_version()
 #    finished_upgrade = upgrade_result()
 #    if finished_upgrade:
@@ -13707,6 +13924,8 @@ exit 0
 #        apply_node_resolvers(answer.get("upstream"))
 #    except Exception as e:
 #        log_exception("resolvers not applied: %s" % e)
+#    # How fast each resolver answers this node, for the admin panel's card.
+#    maybe_bench(answer.get("bench"))
 #    try:
 #        apply_relay_tunnels(answer.get("tunnels"))
 #    except Exception as e:
@@ -14288,6 +14507,10 @@ exit 0
 #    if to != PANEL_TO["url"]:
 #        log(INFO, "customer panel here %s" % ("sends people to " + to if to else "is on"))
 #        PANEL_TO["url"] = to
+#    target = portal_target(answer.get("portal"))
+#    if target != PORTAL["url"]:
+#        log(INFO, "addresses not let in are sent to %s" % (target or "nowhere"))
+#        PORTAL["url"] = target
 #    if services:
 #        USAGE_PENDING.clear()
 #    if "exit_usage" in payload:
@@ -15442,6 +15665,23 @@ exit 0
 #        if n < 1024 or unit == "ترابایت":
 #            return ("%d %s" if unit == "بایت" else "%.2f %s") % (n, unit)
 #        n /= 1024
+#
+#
+#def time_left_fa(ts, now=None):
+#    """How long until a plan's end, in the words a customer counts in: days,
+#    or hours on the last day; "" when there is no end or it cannot be read."""
+#    try:
+#        t = datetime.fromisoformat(str(ts))
+#    except (TypeError, ValueError):
+#        return ""
+#    if t.tzinfo is None:
+#        t = t.replace(tzinfo=timezone.utc)
+#    left = (t - (now or datetime.now(timezone.utc))).total_seconds()
+#    if left <= 0:
+#        return "تمام شده"
+#    if left < 86400:
+#        return "%d ساعت" % max(1, int(left // 3600))
+#    return "%d روز" % int(left // 86400)
 #
 #
 ## ---------------------------------------------------------------- DoH page
@@ -16954,6 +17194,9 @@ exit 0
 #                     else "بدون محدودیت"))
 #        if info.get("expires"):
 #            rows.append(("پایان دوره", info["expires"]))
+#            left = time_left_fa(info.get("expires_at"))
+#            if left:
+#                rows.append(("زمان باقی‌مانده", left))
 #        elif info.get("renews"):
 #            rows.append(("تمدید", info["renews"]))
 #        rows.append(("کیف پول", "%s تومان" % format(info.get("wallet") or 0, ",")))
@@ -17028,6 +17271,65 @@ exit 0
 #        return self.send_html("".join(body))
 #
 #
+#class PortalPage(http.server.BaseHTTPRequestHandler):
+#    """Port 80 of an address not let in - see "the way back": whatever it
+#    asked for, the customer panel. Only ever a redirect to https: no form, no
+#    cookie, nothing to point anything at."""
+#
+#    server_version = "smartdns"
+#    protocol_version = "HTTP/1.0"
+#    timeout = 10
+#
+#    def log_message(self, fmt, *args):
+#        pass        # every scanner on the internet knocks here
+#
+#    def log_request(self, code="-", size="-"):
+#        pass
+#
+#    def answer(self, body=True):
+#        to = PORTAL["url"]
+#        if not to:
+#            self.send_response(503)
+#            self.send_header("Content-Length", "0")
+#            self.end_headers()
+#            return
+#        page = ("<!doctype html><meta charset='utf-8'><meta name='viewport' "
+#                "content='width=device-width'><title>%s</title><p dir='rtl' "
+#                "style='font:18px sans-serif;text-align:center;margin-top:3em'>"
+#                "برای استفاده از سرویس، وارد پنل مشتری شوید:<br><br>"
+#                "<a href='%s'>%s</a></p>"
+#                % (html.escape(urllib.parse.urlparse(to).hostname or ""),
+#                   html.escape(to, quote=True), html.escape(to))).encode("utf-8")
+#        self.send_response(302)
+#        self.send_header("Location", to)
+#        self.send_header("Content-Type", "text/html; charset=utf-8")
+#        self.send_header("Content-Length", str(len(page)))
+#        self.send_header("Cache-Control", "no-store")
+#        self.end_headers()
+#        if body:
+#            self.wfile.write(page)
+#
+#    def do_GET(self):
+#        self.answer()
+#
+#    def do_POST(self):
+#        self.answer()
+#
+#    def do_HEAD(self):
+#        self.answer(body=False)
+#
+#
+#def serve_portal():
+#    try:
+#        httpd = http.server.ThreadingHTTPServer(("0.0.0.0", PORTAL_PORT), PortalPage)
+#    except OSError as e:
+#        log(WARN, "the page for addresses not let in could not start on %d: %s"
+#            % (PORTAL_PORT, e))
+#        return
+#    httpd.daemon_threads = True
+#    httpd.serve_forever()
+#
+#
 #def main():
 #    global CFG, CONFIG
 #    if "--node" in sys.argv[1:]:
@@ -17040,6 +17342,7 @@ exit 0
 #    if not os.path.exists(ACL):
 #        sys.exit("%s is missing - run the installer first" % ACL)
 #    threading.Thread(target=sync_loop, daemon=True).start()
+#    threading.Thread(target=serve_portal, daemon=True).start()
 #
 #    # Over TLS or not at all. This panel asks for a password and hands back a
 #    # session cookie, and there is no version of that which is safe over plain
@@ -17237,9 +17540,13 @@ exit 0
 #  853  DoT. nginx ends TLS and passes the stream here on 127.0.0.1:8054 with
 #       a PROXY protocol line in front, which says who connected.
 #
-#Both are behind the same gate as port 53: an address that is not registered
-#is dropped before it gets here. This adds a way in for customers who already
-#have one, not a way round the registration.
+#Both are behind the same gate as port 53. An address that is not let in -
+#never registered, or out of volume or days - reaches here only through the
+#gate's own doors (8853 for DoT; 5297 and the DoH server on 8454, which marks
+#its requests X-Gate), and is answered from the gate's resolver: the customer
+#panel's names, and this relay for everything else, so its phone offers to
+#open the panel. This adds a way in for customers who already have one, not a
+#way round the registration.
 #
 #Queries are answered by the same dnsmasq resolvers as port 53. On DoT the
 #connecting address says whose template to use; on DoH the connection comes
@@ -17398,6 +17705,24 @@ exit 0
 #
 #
 #LIMIT = Limiter()
+#
+## The gate's resolver (smartdns-sync, "the way back"): for an address not let
+## in, the customer panel's names answered truly and every other name with
+## this relay, whose port 80 sends it to the panel. Held to a stricter rate
+## than a customer: anybody on the internet may reach it.
+#GATE_PORT = 5299
+#GATE_LIMIT = Limiter(rate=10, burst=40)
+#
+#
+#def gate_answer(query, kind, who):
+#    """The gate's answer to a query that came in by DoT or DoH from an
+#    address not let in; refused over the rate, and a failure said as one."""
+#    if not GATE_LIMIT.allow("gate:" + who, "gate %s, %s" % (kind, who)):
+#        return refused(query)
+#    try:
+#        return ask(query, GATE_PORT)
+#    except (OSError, ConnectionError):
+#        return servfail(query)
 #
 #
 #class Stats:
@@ -17723,6 +18048,12 @@ exit 0
 #        # address arriving from anywhere else has found a way round it.
 #        if ip not in LOOPBACK:
 #            return self.fail(403, "not through the relay")
+#        # The gate's own DoH server: an address not let in, answered from the
+#        # gate's resolver whatever address is in the path - the token is no
+#        # way round registering.
+#        if self.headers.get("X-Gate") == "1":
+#            return self.reply(gate_answer(query, "doh",
+#                                          (self.headers.get("X-Client-IP") or "-").strip()))
 #        state = STATE_NOW
 #        port = MAIN_PORT
 #        uid = "0"
@@ -17747,6 +18078,9 @@ exit 0
 #            keep_for_report("doh:" + uid, query, reply, state)
 #        if uid != "0":
 #            WATCH.note("doh", uid, query, reply, state)
+#        self.reply(reply)
+#
+#    def reply(self, reply):
 #        self.send_response(200)
 #        self.send_header("Content-Type", "application/dns-message")
 #        self.send_header("Content-Length", str(len(reply)))
@@ -17793,9 +18127,12 @@ exit 0
 #                if size < 12 or size > MAX_QUERY:
 #                    return
 #                query = read_exact(sock, size)
-#                # The gate drops strangers on 853 before they get here; this
-#                # is the second lock, for a relay whose gate is being changed.
-#                if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
+#                # An address not let in reaches here only through the gate's
+#                # door (8853): it is answered from the gate's resolver - the
+#                # customer panel's names, and this relay for everything else.
+#                if not ok:
+#                    reply = gate_answer(query, "dot", ip)
+#                elif LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
 #                    STATS.count("dot", ip)
 #                    try:
 #                        reply = ask(query, port)
@@ -18313,6 +18650,11 @@ exit 0
 #            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
 #            if have and "owner_admin" not in have:
 #                self.db.execute("ALTER TABLE %s ADD COLUMN owner_admin INTEGER" % table)
+#        # The relays a plan is sold on - the panel's too, here as well so a
+#        # plan saved before the panel has started after an upgrade keeps them.
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(plans)")}
+#        if have and "relays" not in have:
+#            self.db.execute("ALTER TABLE plans ADD COLUMN relays TEXT")
 #        for table in ("users", "admins"):
 #            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
 #            if have and "reset_days" not in have:
@@ -21129,13 +21471,17 @@ exit 0
 #    """Each resolver's time from each relay, and from this machine: the
 #    fastest in each column marked, one that did not answer said so."""
 #    cols = []
-#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"
-#                     " ORDER BY key"):
+#    nodes = node_list()
+#    # The relays first - their column is the one customers feel, and the
+#    # one the choices below are labelled from - then the nodes.
+#    for r in sorted(STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"),
+#                    key=lambda r: (r["key"].split(":", 1)[1] in nodes, r["key"])):
 #        try:
 #            got = json.loads(r["value"])
 #        except ValueError:
 #            continue
-#        cols.append(("رله " + r["key"].split(":", 1)[1], got.get("ms") or {}, got.get("at") or 0))
+#        ip = r["key"].split(":", 1)[1]
+#        cols.append(("%s %s" % (server_word(ip), ip), got.get("ms") or {}, got.get("at") or 0))
 #    if EXIT_BENCH["ms"] and not (one_server() and cols):
 #        cols.append(("این سرور", EXIT_BENCH["ms"], int(EXIT_BENCH["at"])))
 #    if not cols:
@@ -21168,7 +21514,8 @@ exit 0
 #    ages = [int(time.time() - at) // 60 for _, _, at in cols if at]
 #    out.append("</table><p class='muted'>میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر "
 #               "ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: "
-#               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری: %s.</p>"
+#               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. ستون هر نود زمانی است که nginx همان نود "
+#               "برای پیدا کردن آدرس سرویس‌ها منتظر می‌ماند. آخرین اندازه‌گیری: %s.</p>"
 #               % ("حدود %d دقیقه پیش" % max(ages) if ages and max(ages) else "همین الان"))
 #    # For the option labels: the relays' figure, where there is one.
 #    first = cols[0][1]
@@ -21214,15 +21561,30 @@ exit 0
 #    out.append("<form method='post' action='/%s/dns-bench'><button class='ghost'>"
 #               "اندازه‌گیری دوباره</button></form>" % p)
 #
-#    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
-#                   " ORDER BY key")
-#    if rows:
-#        out.append("<table><tr><th>رله</th><th>در حال استفاده</th><th>وضعیت</th></tr>")
-#        for r in rows:
-#            try:
-#                st = json.loads(r["value"])
-#            except ValueError:
-#                continue
+#    # Where each server stands: the relays' own reports, then the nodes',
+#    # which only say what their nginx now asks and what went wrong.
+#    states = []
+#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
+#                     " ORDER BY key"):
+#        try:
+#            states.append((r["key"].split(":", 1)[1], json.loads(r["value"])))
+#        except ValueError:
+#            continue
+#    nodes = node_list()
+#    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'node_resolvers:%'"
+#                     " ORDER BY key"):
+#        ip = r["key"].split(":", 1)[1]
+#        if ip not in nodes:
+#            continue
+#        try:
+#            st = json.loads(r["value"])
+#        except ValueError:
+#            continue
+#        states.append((ip, {"applied": (st.get("using") or "").split(),
+#                            "error": st.get("error") or ""}))
+#    if states:
+#        out.append("<table><tr><th>سرور</th><th>در حال استفاده</th><th>وضعیت</th></tr>")
+#        for ip, st in states:
 #            applied = st.get("applied") or []
 #            tested = st.get("tested") or {}
 #            used = "، ".join("<code>%s</code>%s" % (
@@ -21235,8 +21597,8 @@ exit 0
 #                state = "<span class='ok'>اعمال شد</span>"
 #            else:
 #                state = "<span class='muted'>در انتظار همگام‌سازی</span>"
-#            out.append("<tr><td><code>%s</code></td><td dir='ltr'>%s</td><td>%s</td></tr>"
-#                       % (html.escape(r["key"].split(":", 1)[1]), used, state))
+#            out.append("<tr><td>%s <code>%s</code></td><td dir='ltr'>%s</td><td>%s</td></tr>"
+#                       % (server_word(ip), html.escape(ip), used, state))
 #        out.append("</table>")
 #    out.append("</div>")
 #    return "".join(out)
@@ -22866,19 +23228,58 @@ exit 0
 #    return "<br><span class='muted'>%s</span>" % html.escape(name or "سایر")
 #
 #
-#def plan_fields(form, tpls, plan=None, exits=None):
+#def relay_exit_now(ip):
+#    """The server abroad a relay's traffic goes out of: the one the admin
+#    picked for it, else this one."""
+#    main = exit_address()
+#    picked = setting("relay_exit:" + ip) or ""
+#    return picked if picked in [main] + node_list() else main
+#
+#
+#def plan_ticks(plan, servers):
+#    """The servers a plan is ticked for: those it is sold on; or, for one
+#    made when a plan named the server abroad instead, the relays that go
+#    out of that one - the same customers, shown the way it is now done."""
+#    sold = [ip.strip() for ip in (plan.get("relays") or "").split(",") if ip.strip()]
+#    if sold:
+#        return {ip for ip in sold if ip in servers}
+#    old = plan.get("exit") or ""
+#    if old:
+#        return {ip for ip in servers
+#                if not is_single_server(ip) and relay_exit_now(ip) == old}
+#    return set()
+#
+#
+#def plan_exit_for(relays):
+#    """The server abroad a plan's customers are put on: the one all its
+#    relays go out of, when they share one and there is more than one to
+#    choose from - so they go out of it from any relay; else none, and each
+#    relay's own is theirs."""
+#    if not relays or not node_list() or any(is_single_server(ip) for ip in relays):
+#        return None
+#    exits = {relay_exit_now(ip) for ip in relays}
+#    return exits.pop() if len(exits) == 1 else None
+#
+#
+#def server_label(ip):
+#    note = setting("server_note:" + ip) or ""
+#    return "%s%s" % (ip, " — " + note if note else "")
+#
+#
+#def plan_fields(form, tpls, plan=None, servers=None):
 #    """The inputs of one plan, bound to the form with that id - a row of
-#    the table or the new-plan card use the same ones. With `exits`, the
-#    servers abroad, a column to sell the plan on one of them or on all."""
+#    the table or the new-plan card use the same ones. With `servers`, the
+#    relays and single servers, a tick for each to sell the plan on some of
+#    them only; none ticked is all of them."""
 #    plan = plan or {}
 #    where = ""
-#    if exits:
-#        here, now = exits[0], plan.get("exit") or ""
-#        where = "<td><select form='%s' name='exit' dir='ltr'>%s</select></td>" % (
-#            form, "<option value=''%s>همه</option>" % ("" if now in exits else " selected")
-#            + "".join("<option value='%s'%s>%s</option>" % (
-#                x, " selected" if x == now else "", "%s — این سرور" % x if x == here else x)
-#                for x in exits))
+#    if servers:
+#        now = plan_ticks(plan, servers)
+#        where = "<td style='white-space:nowrap'>%s</td>" % "".join(
+#            "<label style='display:block' dir='ltr'><input form='%s' type='checkbox' "
+#            "name='relay' value='%s'%s> %s</label>"
+#            % (form, ip, " checked" if ip in now else "", html.escape(server_label(ip)))
+#            for ip in servers)
 #    tid = plan.get("template_id")
 #    sel = "".join("<option value='%d'%s>%s</option>"
 #                  % (t["id"], " selected" if t["id"] == tid else "",
@@ -25125,12 +25526,14 @@ exit 0
 #                       " ORDER BY p.active DESC, p.template_id, p.price, p.id",
 #                       (s["id"] if s else 0,))
 #        p = CFG["ADMIN_PATH"]
-#        exits = [exit_address()] + node_list() if node_list() and (
+#        # With more than one server, a tick for each: the ones the plan is
+#        # sold on, which are then the only ones that serve its customers.
+#        servers = ordered_servers()[0] if len(relay_list()) > 1 and (
 #            s is None or s["can_route"]) else None
 #        head = ("<tr><th>نام</th><th>قالب</th><th>روز</th><th>حجم (گیگ)</th>"
 #                "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>دستگاه</th>"
 #                "<th>توضیح برای مشتری</th>"
-#                + ("<th>سرور خارج</th>" if exits else "") + "<th>%s</th><th></th></tr>")
+#                + ("<th>سرورها (DNS)</th>" if servers else "") + "<th>%s</th><th></th></tr>")
 #        out = ["<div class='card'><h2>پلن‌ها (%d)</h2>" % len(rows)]
 #        if not rows:
 #            out.append("<p class='muted'>هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، "
@@ -25156,7 +25559,7 @@ exit 0
 #                    "<input type='hidden' name='id' value='%d'>"
 #                    "<button class='del'>حذف</button></form></td></tr>"
 #                    % ("" if r["active"] else " class='off'",
-#                       plan_fields(form, tpls, dict(r), exits), r["holders"],
+#                       plan_fields(form, tpls, dict(r), servers), r["holders"],
 #                       form, p, r["id"], form,
 #                       p, r["id"], 0 if r["active"] else 1,
 #                       "دیگر فروخته نشود؛ دارندگانش تا آخر دوره می‌مانند"
@@ -25176,12 +25579,19 @@ exit 0
 #                   "روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو "
 #                   "شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از "
 #                   "خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ "
-#                   "حجم پذیرفته نمی‌شود.</p><p class='muted'>🎁 «تست رایگان»: فروخته "
+#                   "حجم پذیرفته نمی‌شود.</p>%s<p class='muted'>🎁 «تست رایگان»: فروخته "
 #                   "نمی‌شود؛ مشتری با یک کلیک می‌گیردش، در پنل خودش یا ربات. شرطش "
 #                   "تلگرامِ وصل‌شده است، و هر تلگرام و هر حساب فقط یک بار. کسی که همین "
 #                   "حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. "
 #                   "یک پلن تست در یک زمان.</p></div>"
-#                   % (p, head % "", plan_fields("pnew", tpls, exits=exits)))
+#                   % (p, head % "", plan_fields("pnew", tpls, servers=servers),
+#                      "<p class='muted'>سرورها (DNS): پلنی که برای چند سرور تیک خورده، "
+#                      "فقط روی همان‌ها کار می‌کند و مشتری‌اش فقط DNS همان‌ها را می‌بیند؛ "
+#                      "اگر DNS سرور دیگری را بزند، پنل مشتری برایش باز می‌شود. بدون تیک، "
+#                      "روی همه. اگر همهٔ سرورهای تیک‌خورده از یک سرور خارج بروند، مشتری "
+#                      "از هر رله‌ای هم که وصل شود از همان سرور خارج می‌رود. تیک‌ها همان "
+#                      "لحظه برای همهٔ دارندگان پلن اعمال می‌شود، نه فقط خریدهای بعدی.</p>"
+#                      if servers else ""))
 #        if s is None:
 #            out.append(devices_card(p))
 #            out.append(discounts_card(p))
@@ -26293,26 +26703,46 @@ exit 0
 #            devices = number(one("devices") or "1")
 #            if devices is None or devices != int(devices) or not 1 <= devices <= 5:
 #                return self.redirect("plans?m=!تعداد دستگاه باید از ۱ تا ۵ باشد")
-#            # The server abroad it is sold on; empty for all of them.
-#            where = one("exit").strip()
-#            if where and where not in [exit_address()] + node_list():
-#                return self.redirect("plans?m=!این سرور خارج در فهرست نیست")
+#            # The servers it is sold on, in the order customers see them; none
+#            # for all. Only an admin who may pick servers picks these; for
+#            # anybody else a plan keeps what it had.
+#            servers = ordered_servers()[0]
+#            may_pick = seller() is None or seller()["can_route"]
+#            ticked = [ip for ip in servers if ip in (params.get("relay") or [])]
+#            if any(ip not in servers for ip in params.get("relay") or []):
+#                return self.redirect("plans?m=!این سرور در فهرست نیست")
+#            if len(ticked) == len(servers):
+#                ticked = []          # every one is all of them
+#            old = STORE.one("SELECT relays, exit FROM plans WHERE id = ?", (pid,)) \
+#                if pid else None
+#            if may_pick:
+#                relays = ",".join(ticked) or None
+#                # The server abroad they go out of, when those all share one.
+#                where = plan_exit_for(ticked)
+#            else:
+#                relays = old["relays"] if old else None
+#                where = old["exit"] if old else None
 #            values = (name, tid, int(days), quota, int(price), int(speed * 1000),
-#                      one("note").strip()[:120], 1 if trial else 0, where or None,
-#                      int(devices))
+#                      one("note").strip()[:120], 1 if trial else 0, where,
+#                      int(devices), relays)
 #            if pid:
 #                cur = STORE.run("UPDATE plans SET name = ?, template_id = ?, days = ?,"
 #                                " quota_bytes = ?, price = ?, speed_kbps = ?, note = ?,"
-#                                " is_trial = ?, exit = ?, devices = ? WHERE id = ?",
-#                                values + (pid,))
+#                                " is_trial = ?, exit = ?, devices = ?, relays = ?"
+#                                " WHERE id = ?", values + (pid,))
 #                if not cur.rowcount:
 #                    return self.redirect("plans?m=!این پلن پیدا نشد")
+#                if old and (old["relays"] or None) != relays:
+#                    log(INFO, "plan #%d now sold on %s" % (pid, relays or "every server"))
+#                    return self.redirect("plans?m=پلن ذخیره شد؛ سرورهایش همین حالا برای همهٔ "
+#                                         "دارندگانش اعمال شد، بقیه برای خریدهای بعدی")
 #                # Those who hold it keep what they bought; the change is for the
 #                # next purchase or renewal.
 #                return self.redirect("plans?m=پلن ذخیره شد؛ برای خریدهای بعدی")
 #            STORE.run("INSERT INTO plans (name, template_id, days, quota_bytes, price,"
-#                      " speed_kbps, note, is_trial, exit, devices, active, created_at,"
-#                      " owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+#                      " speed_kbps, note, is_trial, exit, devices, relays, active,"
+#                      " created_at, owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+#                      " 1, ?, ?)",
 #                      values + (now(), seller()["id"] if seller() else None))
 #            return self.redirect("plans?m=%s" % (
 #                "پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش"
@@ -27333,7 +27763,8 @@ exit 0
 #                    own = {}
 #                STORE.run("UPDATE users SET relay_exits = ? WHERE id = ?",
 #                          (json.dumps(own, sort_keys=True) if own else None, u["id"]))
-#            STORE.run("DELETE FROM settings WHERE key = ?", ("node_resolvers:" + ip,))
+#            STORE.run("DELETE FROM settings WHERE key IN (?, ?)",
+#                      ("node_resolvers:" + ip, "resolver_bench:" + ip))
 #            STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ? OR key LIKE ?"
 #                      " OR key = ?", ("relay_tunnel:%%:" + ip, "relay_tunnel_state:%%:" + ip,
 #                                      "node_tunnel_state:%s:%%" % ip, "node_slot:" + ip))
@@ -30602,6 +31033,7 @@ exit 0
 #import urllib.error
 #import urllib.parse
 #import urllib.request
+#from datetime import datetime, timezone
 #
 #try:
 #    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30679,6 +31111,23 @@ exit 0
 #
 #def money(n):
 #    return format(n or 0, ",")
+#
+#
+#def time_left_fa(ts, now=None):
+#    """How long until a plan's end: days, or hours on the last day; "" when
+#    it cannot be read. The same words as the customer's page."""
+#    try:
+#        t = datetime.fromisoformat(str(ts))
+#    except (TypeError, ValueError):
+#        return ""
+#    if t.tzinfo is None:
+#        t = t.replace(tzinfo=timezone.utc)
+#    left = (t - (now or datetime.now(timezone.utc))).total_seconds()
+#    if left <= 0:
+#        return "تمام شده"
+#    if left < 86400:
+#        return "%d ساعت" % max(1, int(left // 3600))
+#    return "%d روز" % int(left // 86400)
 #
 #
 #FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -31246,6 +31695,9 @@ exit 0
 #            lines.append("مصرف: %s" % size_fa(u["used_bytes"]))
 #        if u["expires_at"]:
 #            lines.append("پایان دوره: %s" % u["expires_at"][:10])
+#            left = time_left_fa(u["expires_at"])
+#            if left:
+#                lines.append("زمان باقی‌مانده: %s" % left)
 #        lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
 #        if u["dns"]:
 #            lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
@@ -36825,6 +37277,7 @@ exit 0
 #"برای «": "for “",
 #"برای آماده کردن پشتیبان، اول در «تنظیمات» رمز بکاپ بگذارید؛ بکاپی که پشتیبان نگه می‌دارد با همان رمز باز می‌شود.": "To get a standby ready, first set a backup password in “Settings”; the backup the standby keeps opens with that password.",
 #"برای استفاده از ربات، اول عضو کانال «": "To use the bot, first join the channel “",
+#"برای استفاده از سرویس، وارد پنل مشتری شوید:": "To use the service, open your customer panel:",
 #"برای بکاپ یک رمز بگذارید": "Set a password for the backup",
 #"برای تست رایگان، اول حسابتان را به تلگرام وصل کنید": "For the free trial, first link your account to Telegram",
 #"برای خرید یا تمدید، اول حسابتان را به تلگرام وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.": "To buy or renew, first link your account to Telegram. Each Telegram links to only one account.",
@@ -36970,6 +37423,7 @@ exit 0
 #"تلگرامتان عوض شده؟ جدا کردن تلگرام": "Changed your Telegram? Unlink Telegram",
 #"تمام": "Done",
 #"تمام شد؛ سرویس مشتری‌هایش قطع است تا تمدیدش کنید.": "has run out; their customers’ service is cut until you renew it.",
+#"تمام شده": "ended",
 #"تمام می‌شود.": ".",
 #"تمام می‌شود. برای قطع نشدن، زودتر تمدید کنید.": "ends. To avoid being cut off, renew early.",
 #"تمدید": "Renewal",
@@ -37487,6 +37941,8 @@ exit 0
 #"رینبو سیکس": "Rainbow Six Siege",
 #"زبان ربات": "Bot language",
 #"زمان": "Time",
+#"زمان باقی‌مانده": "Time left",
+#"زمان باقی‌مانده:": "Time left:",
 #"زمان جواب": "Response time",
 #"زمان جواب هنوز اندازه گرفته نشده؛ رله‌ها چند دقیقه بعد از این نسخه اولین اندازه‌گیری را می‌فرستند.": "Response time has not been measured yet; the relays send the first measurement a few minutes after this version.",
 #"زنده، با": "Live, with",
@@ -37541,6 +37997,8 @@ exit 0
 #"سرور پشتیبان:": "Standby server:",
 #"سرور پشتیبانی تعیین نشده": "No standby server set",
 #"سرورها": "Servers",
+#"سرورها (DNS)": "Servers (DNS)",
+#"سرورها (DNS): پلنی که برای چند سرور تیک خورده، فقط روی همان‌ها کار می‌کند و مشتری‌اش فقط DNS همان‌ها را می‌بیند؛ اگر DNS سرور دیگری را بزند، پنل مشتری برایش باز می‌شود. بدون تیک، روی همه. اگر همهٔ سرورهای تیک‌خورده از یک سرور خارج بروند، مشتری از هر رله‌ای هم که وصل شود از همان سرور خارج می‌رود. تیک‌ها همان لحظه برای همهٔ دارندگان پلن اعمال می‌شود، نه فقط خریدهای بعدی.": "Servers (DNS): a plan ticked for some servers works on those only, and its customers see only their DNS; one who uses another server's DNS is shown the customer panel there. No ticks is all of them. When every ticked server goes out of one server abroad, the customer goes out of that one from any relay too. The ticks apply at once to everyone on the plan, not only to later purchases.",
 #"سرورها برای مشتری": "Servers for customers",
 #"سرورها برای مشتری ذخیره شد": "Servers for customers saved",
 #"سرورهای ایران": "Iran servers",
@@ -37868,7 +38326,7 @@ exit 0
 #"مگابیت بر ثانیه، میانگین ۵ دقیقهٔ اخیر": "Mbit/s, average of the last 5 minutes",
 #"مگابیت بر ثانیه، ۰=بی‌حد": "Mbit/s, 0 = no limit",
 #"مگابیت بر ثانیه؛ خالی یا ۰ یعنی بی‌حد": "Mbit/s; empty or 0 means no limit",
-#"میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری:": "The median of three real DNS questions, in milliseconds; ✓ the fastest in each column and ● the ones picked now. What matters for customers is the relays column: that is where their questions are asked from. Last measured:",
+#"میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود. ستون هر نود زمانی است که nginx همان نود برای پیدا کردن آدرس سرویس‌ها منتظر می‌ماند. آخرین اندازه‌گیری:": "The median of three real DNS questions, in milliseconds; ✓ the fastest in each column and ● the ones chosen now. What matters to customers is the relays' columns: their questions are asked from there. A node's column is how long that node's nginx waits to find the services' addresses. Last measured:",
 #"میانگین هر ۵ دقیقه. رله هر نیم دقیقه گزارش می‌دهد، پس اوج لحظه‌ای کوتاه در این نمودار دیده نمی‌شود.": "Average of every 5 minutes. The relay reports every half minute, so a brief momentary peak does not show in this chart.",
 #"میانگین ۵ دقیقهٔ اخیر": "Average of the last 5 minutes",
 #"میلی‌ثانیه": "ms",
@@ -38124,6 +38582,7 @@ exit 0
 #"پلن دیگر فروخته نمی‌شود؛ کسانی که دارندش تا آخر دوره می‌مانند": "The plan is no longer sold; those who have it keep it until their period ends",
 #"پلن دیگری": "another plan",
 #"پلن ذخیره شد؛ برای خریدهای بعدی": "Plan saved; for later purchases",
+#"پلن ذخیره شد؛ سرورهایش همین حالا برای همهٔ دارندگانش اعمال شد، بقیه برای خریدهای بعدی": "Plan saved; its servers apply now to everyone on it, the rest from the next purchase",
 #"پلن را انتخاب کنید:": "Choose a plan:",
 #"پلن را انتخاب کنید، مبلغش را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار روی حسابتان فعال می‌شود.": "Choose a plan, pay its price and send a photo of the receipt. After it is approved, the plan is activated on your account automatically.",
 #"پلن ساخته شد و در پنل مشتری دیده می‌شود": "Plan created; it shows in the customer panel",

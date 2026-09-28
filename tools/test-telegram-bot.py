@@ -277,6 +277,14 @@ check("the customer hears it was approved", "تأیید شد" in tg.last(CUSTOME
 message(CUSTOMER, botmod.B_ACCOUNT)
 check("and their account shows the plan", "ماهانه" in tg.last(CUSTOMER)["text"]
       and "فعال" in tg.last(CUSTOMER)["text"])
+check("  with the days left, beside the end date",
+      re.search(r"زمان باقی‌مانده: (29|30) روز", tg.last(CUSTOMER)["text"]) is not None,
+      tg.last(CUSTOMER).get("text"))
+_now = botmod.datetime(2026, 9, 29, 12, tzinfo=botmod.timezone.utc)
+check("  in hours on the last day, and said when it is over",
+      botmod.time_left_fa("2026-09-29T17:30:00+00:00", _now) == "5 ساعت"
+      and botmod.time_left_fa("2026-09-29T11:00:00+00:00", _now) == "تمام شده"
+      and botmod.time_left_fa("", _now) == "")
 message(ADMIN_TG, "/stats")
 check("the operator's numbers", "گزارش روزانه" in tg.last(ADMIN_TG)["text"]
       and "200,000" in tg.last(ADMIN_TG)["text"])

@@ -110,13 +110,16 @@ print("through the real server")
 seen = []
 
 
+EXTRA = {}
+
+
 def fake_post(path, payload):
     seen.append((path, dict(payload)))
     if path == "/user-info":
-        return {"ok": True, "name": "علی", "ip": "5.200.1.2", "used": 0,
-                "quota": 0, "status": "active", "wallet": 0, "plan": "",
-                "renews": "", "expires": "", "speed_kbps": 0, "warned": 0,
-                "seen_ip": payload.get("ip")}
+        return dict({"ok": True, "name": "علی", "ip": "5.200.1.2", "used": 0,
+                     "quota": 0, "status": "active", "wallet": 0, "plan": "",
+                     "renews": "", "expires": "", "speed_kbps": 0, "warned": 0,
+                     "seen_ip": payload.get("ip")}, **EXTRA)
     return {"ok": True, "message": "آی‌پی %s ثبت شد" % payload.get("ip")}
 
 
@@ -177,6 +180,21 @@ check("and to nowhere else, whatever the form says",
 status, where = post(urllib.parse.urlencode({"ip": "5.123.45.69", "back": "/"}))
 check("a good address typed there is registered like any other",
       seen and seen[0][1].get("ip") == "5.123.45.69", str(seen))
+
+print("the days left")
+ends = sync.datetime.now(sync.timezone.utc) + sync.timedelta(days=12, hours=3)
+EXTRA.update(expires=ends.isoformat()[:10], expires_at=ends.isoformat())
+c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+c.request("GET", "/", headers={"Cookie": "sdu=tok"})
+body = c.getresponse().read().decode("utf-8")
+check("beside the end date on the account page", "زمان باقی‌مانده" in body
+      and "12 روز" in body and ends.isoformat()[:10] in body)
+EXTRA.pop("expires_at")
+c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+c.request("GET", "/", headers={"Cookie": "sdu=tok"})
+body = c.getresponse().read().decode("utf-8")
+check("  and a panel that does not send the moment yet shows the date alone",
+      "زمان باقی‌مانده" not in body and ends.isoformat()[:10] in body)
 httpd.shutdown()
 shutil.rmtree(tmp, ignore_errors=True)
 

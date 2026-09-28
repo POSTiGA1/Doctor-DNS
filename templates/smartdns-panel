@@ -620,6 +620,10 @@ MIGRATIONS = [
     # Which relays this customer is shown as DNS addresses, comma separated;
     # null for the ones shown to everybody. Every relay still serves them.
     ("users", "relays", "TEXT"),
+    # The relays a plan is sold on, comma separated; null for every relay.
+    # Unlike the customer's own ticks above, these are kept: a customer on
+    # such a plan is on no other relay's allowlist.
+    ("plans", "relays", "TEXT"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -766,6 +770,22 @@ def bench_wanted(store):
         if ip not in ips:
             ips.append(ip)
     return {"ips": ips, "now": store.setting("bench_now") or ""}
+
+
+def note_bench(store, who, timed):
+    """How fast each resolver answered a relay or node, as it measured."""
+    if not isinstance(timed, dict) or not isinstance(timed.get("ms"), dict):
+        return
+    try:
+        at = int(timed.get("at") or 0)
+    except (TypeError, ValueError):
+        return
+    text = json.dumps({"at": at,
+                       "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
+                              for k, v in list(timed["ms"].items())[:32]}},
+                      sort_keys=True)
+    if store.setting("resolver_bench:" + who) != text:
+        store.set_setting("resolver_bench:" + who, text)
 
 # Fractions of the quota at which the user is warned, and the bit each one
 # sets in users.warned.
@@ -5173,14 +5193,7 @@ class API(http.server.BaseHTTPRequestHandler):
                     if isinstance(servers, dict)}}, sort_keys=True)
                 if self.store.setting("forward_check:" + who) != text:
                     self.store.set_setting("forward_check:" + who, text)
-            timed = body.get("resolver_bench")
-            if isinstance(timed, dict) and isinstance(timed.get("ms"), dict):
-                text = json.dumps({"at": int(timed.get("at") or 0),
-                                   "ms": {str(k)[:15]: (int(v) if isinstance(v, (int, float)) else None)
-                                          for k, v in list(timed["ms"].items())[:32]}},
-                                  sort_keys=True)
-                if self.store.setting("resolver_bench:" + who) != text:
-                    self.store.set_setting("resolver_bench:" + who, text)
+            note_bench(self.store, who, body.get("resolver_bench"))
             report = body.get("upstream")
             if isinstance(report, dict):
                 text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -5218,14 +5231,18 @@ class API(http.server.BaseHTTPRequestHandler):
             # uid travels as well as the label built from it: the relay uses
             # it as the shaping mark, and parsing it back out of "u12" would
             # be a second place that has to agree about the format.
+            # Customers whose plan is sold on other relays are not this one's.
+            off = kept_off(self.store, who, self.relays)
             allowed = [{"ip": ip, "name": "u%d" % v["uid"], "uid": v["uid"],
                         "kbps": v["kbps"], "user": v.get("user", ""),
                         "profile": str(v["tid"]) if str(v["tid"]) in profiles else ""}
-                       for ip, v in sorted(by_ip.items())]
+                       for ip, v in sorted(by_ip.items()) if v["uid"] not in off]
             extra = [r["domain"] for r in self.store.q(
                 "SELECT domain FROM custom_domains ORDER BY domain")]
             try:
-                doh = doh_tokens(self.store, profiles, DEFAULT_TEMPLATE[0])
+                doh = {h: t for h, t in doh_tokens(self.store, profiles,
+                                                   DEFAULT_TEMPLATE[0]).items()
+                       if t["uid"] not in off}
             except Exception as e:
                 doh = {}
                 log_exception("DoH tokens not built: %r" % e)
@@ -5272,6 +5289,9 @@ class API(http.server.BaseHTTPRequestHandler):
                                     # Where its customer panel sends people,
                                     # when the admin took the panel off it.
                                     "panel_to": panel_elsewhere(self.store, who),
+                                    # Where a relay with no panel of its own
+                                    # sends the addresses it does not let in.
+                                    "portal": panel_on_url(self.store) or "",
                                     # Its tunnels to the nodes, by node.
                                     "node_tunnels": {
                                         n: dict(spec, on=True)
@@ -5416,6 +5436,7 @@ class API(http.server.BaseHTTPRequestHandler):
                                "error": str(state.get("error") or "")[:300]}, sort_keys=True)
             if self.store.setting("node_resolvers:" + who) != text:
                 self.store.set_setting("node_resolvers:" + who, text)
+        note_bench(self.store, who, body.get("resolver_bench"))
         if isinstance(body.get("version"), str) and \
                 self.store.setting("version:" + who) != body["version"][:20]:
             self.store.set_setting("version:" + who, body["version"][:20])
@@ -5434,6 +5455,8 @@ class API(http.server.BaseHTTPRequestHandler):
                         self.store.set_setting(key, "1" if up else "0")
         return 200, {"relays": list(self.relays),
                      "upstream": (self.store.setting("dns_upstream") or DEFAULT_UPSTREAM).split(),
+                     # The resolvers to time from here, as the relays do.
+                     "bench": bench_wanted(self.store),
                      "upgrade": upgrade_order(self.store, who),
                      "upgrade_ack": bool(body.get("upgrade_result")),
                      "panel": panel_where(self.store),
@@ -5687,6 +5710,8 @@ class API(http.server.BaseHTTPRequestHandler):
             "plan": tpl["name"] if tpl else "",
             "renews": (user["quota_reset_at"] or "")[:10],
             "expires": (user["expires_at"] or "")[:10],
+            # The moment itself, for the days left beside the date.
+            "expires_at": user["expires_at"] or "",
             "speed_kbps": user["speed_kbps"] or 0,
             # Which warning thresholds this account has crossed. The relay's
             # page turns this into the banner the bot used to send.
@@ -5836,16 +5861,54 @@ def server_order(store, relays):
 
 def shown_relays(store, user, relays):
     """The relays a customer is given as DNS addresses, in the admin's order:
-    the ones picked for them, or else all, less those hidden from everyone.
-    Never none - an address to type in is the one thing a customer cannot do
-    without - and only relays that still exist. What is shown, not what may
-    be used: every relay serves every customer."""
+    those of their plan when it is sold on some only - the only ones that
+    serve them - and within those the ones picked for them, or else all, less
+    those hidden from everyone. Never none - an address to type in is the
+    one thing a customer cannot do without - and only relays that still
+    exist."""
     keys = user.keys() if hasattr(user, "keys") else user
     picked = (user["relays"] if "relays" in keys else None) or ""
     want = {ip.strip() for ip in picked.split(",") if ip.strip()}
     ordered, hidden = server_order(store, relays)
+    sold = user_plan_relays(store, user, relays)
+    if sold:
+        ordered = [ip for ip in ordered if ip in sold]
     visible = [ip for ip in ordered if ip not in hidden]
     return [ip for ip in visible if ip in want] or visible or ordered
+
+
+def plan_relays(raw, relays=None):
+    """The relays a plan is sold on - of those that still exist, when given -
+    or [] for every relay. A plan whose relays are all gone is on every one
+    again, rather than on none."""
+    out = [ip.strip() for ip in (raw or "").split(",") if ip.strip()]
+    if relays is not None:
+        out = [ip for ip in out if ip in relays]
+    return out
+
+
+def user_plan_relays(store, user, relays):
+    """The relays this customer's plan is sold on; [] for every relay."""
+    keys = user.keys() if hasattr(user, "keys") else user
+    plan_id = user["plan_id"] if "plan_id" in keys else None
+    if not plan_id:
+        return []
+    row = store.one("SELECT relays FROM plans WHERE id = ?", (plan_id,))
+    return plan_relays(row["relays"] if row and "relays" in row.keys() else "", relays)
+
+
+def kept_off(store, relay, relays):
+    """Accounts whose plan is sold on other relays than this one: left off
+    its allowlist and its DoH, so a plan for one server is no way into
+    another. They are sent to the customer panel there, as anybody not let
+    in is."""
+    out = set()
+    for r in store.q("SELECT u.id, p.relays FROM users u JOIN plans p ON p.id = u.plan_id"
+                     " WHERE COALESCE(p.relays, '') != ''"):
+        sold = plan_relays(r["relays"], relays)
+        if sold and relay not in sold:
+            out.add(r["id"])
+    return out
 
 
 def server_note(store, user, ip):

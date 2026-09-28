@@ -11,9 +11,13 @@ requests on loopback:
   853  DoT. nginx ends TLS and passes the stream here on 127.0.0.1:8054 with
        a PROXY protocol line in front, which says who connected.
 
-Both are behind the same gate as port 53: an address that is not registered
-is dropped before it gets here. This adds a way in for customers who already
-have one, not a way round the registration.
+Both are behind the same gate as port 53. An address that is not let in -
+never registered, or out of volume or days - reaches here only through the
+gate's own doors (8853 for DoT; 5297 and the DoH server on 8454, which marks
+its requests X-Gate), and is answered from the gate's resolver: the customer
+panel's names, and this relay for everything else, so its phone offers to
+open the panel. This adds a way in for customers who already have one, not a
+way round the registration.
 
 Queries are answered by the same dnsmasq resolvers as port 53. On DoT the
 connecting address says whose template to use; on DoH the connection comes
@@ -172,6 +176,24 @@ class Limiter:
 
 
 LIMIT = Limiter()
+
+# The gate's resolver (smartdns-sync, "the way back"): for an address not let
+# in, the customer panel's names answered truly and every other name with
+# this relay, whose port 80 sends it to the panel. Held to a stricter rate
+# than a customer: anybody on the internet may reach it.
+GATE_PORT = 5299
+GATE_LIMIT = Limiter(rate=10, burst=40)
+
+
+def gate_answer(query, kind, who):
+    """The gate's answer to a query that came in by DoT or DoH from an
+    address not let in; refused over the rate, and a failure said as one."""
+    if not GATE_LIMIT.allow("gate:" + who, "gate %s, %s" % (kind, who)):
+        return refused(query)
+    try:
+        return ask(query, GATE_PORT)
+    except (OSError, ConnectionError):
+        return servfail(query)
 
 
 class Stats:
@@ -497,6 +519,12 @@ class DoH(http.server.BaseHTTPRequestHandler):
         # address arriving from anywhere else has found a way round it.
         if ip not in LOOPBACK:
             return self.fail(403, "not through the relay")
+        # The gate's own DoH server: an address not let in, answered from the
+        # gate's resolver whatever address is in the path - the token is no
+        # way round registering.
+        if self.headers.get("X-Gate") == "1":
+            return self.reply(gate_answer(query, "doh",
+                                          (self.headers.get("X-Client-IP") or "-").strip()))
         state = STATE_NOW
         port = MAIN_PORT
         uid = "0"
@@ -521,6 +549,9 @@ class DoH(http.server.BaseHTTPRequestHandler):
             keep_for_report("doh:" + uid, query, reply, state)
         if uid != "0":
             WATCH.note("doh", uid, query, reply, state)
+        self.reply(reply)
+
+    def reply(self, reply):
         self.send_response(200)
         self.send_header("Content-Type", "application/dns-message")
         self.send_header("Content-Length", str(len(reply)))
@@ -567,9 +598,12 @@ class DoT(socketserver.BaseRequestHandler):
                 if size < 12 or size > MAX_QUERY:
                     return
                 query = read_exact(sock, size)
-                # The gate drops strangers on 853 before they get here; this
-                # is the second lock, for a relay whose gate is being changed.
-                if ok and LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
+                # An address not let in reaches here only through the gate's
+                # door (8853): it is answered from the gate's resolver - the
+                # customer panel's names, and this relay for everything else.
+                if not ok:
+                    reply = gate_answer(query, "dot", ip)
+                elif LIMIT.allow("dot:" + ip, "DoT, %s" % ip):
                     STATS.count("dot", ip)
                     try:
                         reply = ask(query, port)

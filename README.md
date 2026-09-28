@@ -62,9 +62,10 @@ certificate naming no console host at all.
 | **Wallet and invitations** | customers top up a wallet by receipt and buy from it at once, with no slip; each has an invitation link, and a share of what the people they bring pay goes into their wallet - the percent, and whether every purchase or only the first, the operator's to set |
 | **Sellers** | an admin who buys the service from you and sells it on: only the customers who came by their own link or bot, their own plans, prices and card number, their own Telegram bot, the templates you allow; a cap on customers, traffic and days - past it, all their customers stop; disabled or deleted with everything of theirs in one button; a page of their own stats |
 | **Admins** | the owner signs in with a username chosen at install; other admins see only the parts ticked for them, and the owner can see the panel as any of them sees it |
-| **Customer panel** | sign up, register an address, see usage, buy a plan and send the slip, the wallet and the invitation link, each server's DNS, DoT and DoH with the operator's note, tickets, link Telegram and reset a forgotten password with a Telegram code |
+| **Customer panel** | sign up, register an address, see usage and the days left, buy a plan and send the slip, the wallet and the invitation link, each server's DNS, DoT and DoH with the operator's note, tickets, link Telegram and reset a forgotten password with a Telegram code |
 | **Encrypted DNS** | each relay and single server has its own DNS over HTTPS on 443 and DNS over TLS on 853 - its domain given at install, or later from the admin panel, which gets the certificate by itself - a personal address for each customer on each server, an iPhone profile and a Windows 11 command for each; like plain DNS it answers only a registered address |
-| **Servers for customers** | the order customers see the servers in, a note beside each ("for Irancell"), and hiding one from everybody while it is repaired; which servers each customer is shown, ticked per customer |
+| **Servers for customers** | the order customers see the servers in, a note beside each ("for Irancell"), and hiding one from everybody while it is repaired; which servers each customer is shown, ticked per customer; and which servers each plan works on, ticked per plan - its customers get no service on the others |
+| **The panel comes up by itself** | an address not registered, or out of volume or days, that uses our DNS: its phone or console shows "sign in to network" and the customer panel opens - over plain DNS, DoT and DoH; any `http://` site shows it too |
 | **Usage dashboard** | the customer's speed now, 7 and 30 days against the period before, when the allowance runs out, daily download and upload, 24 hours of speed, busy hours, a connection check, and usage by service — kept as service, day and bytes for 30 days, never as a list of sites; the operator sees the same charts without the services |
 | **Upstream DNS** | the operator picks the public resolvers — Cloudflare, Quad9, Google, OpenDNS, AdGuard or any address — and each relay tests the pick from Iran before it takes it |
 | **Operator panel** | customers, plans, receipts, tickets, templates, domains, host monitoring, backup and restore; everybody's usage with each seller's share, and the owner's own customers' apart |
@@ -335,7 +336,8 @@ anything free; the installer stops you at 22, 53, 80, 443, 1119, 4070, 8443, 844
 8446, 18119 and the tunnel's port, and `smartdns-access port` applies the same rule later, plus a
 check that nothing else is already listening.
 
-On a relay, ports 5299 to 5999 are the templates' own resolvers and 20000 to
+On a relay, ports 5299 to 5999 are the templates' own resolvers, 5297, 5298,
+8853 and 8454 the panel that comes up for addresses not let in, and 20000 to
 20999 the tunnels to nodes; both are the machine's own business - keep them
 free, and nothing needs opening. A single server with a domain needs 853 open
 like a relay, for DNS over TLS.
@@ -400,6 +402,14 @@ smartdns-acl enforce status   # which it is right now
 smartdns-acl enforce off      # stay open, and cancel the automatic close
 ```
 
+While the relay is closed, an address not registered - or a customer out of
+volume or days - is answered the customer panel's name truly and every other
+name with the relay itself, and its port 80 is sent to the customer panel. A
+phone or console then shows "sign in to network" by itself and the panel
+opens, as a hotel's wifi does; DoT and DoH the same. HTTPS sites show only
+"cannot be reached" - that is the browser's own security. None of it gives
+any service away, and each address is held to a rate.
+
 `ENFORCE=no` on the installer's command line opts out from the start.
 
 ## After installing
@@ -419,8 +429,10 @@ you can no longer reach.
 - **Plans** (admin panel → Plans): a template for some days, with an
   allowance and a price. The customer picks one on their page or in the bot
   and sends the slip; approving it puts the plan on their account. Buying the
-  same plan again before it ends is a renewal. Where to pay goes on the
-  admin panel's Payment page.
+  same plan again before it ends is a renewal. With more than one server,
+  tick the servers each plan works on: its customers see only their DNS, and
+  on any other server the customer panel comes up for them. Where to pay goes
+  on the admin panel's Payment page.
 - **Free trial**: a plan ticked as one, taken with one tap and no slip - with
   a linked Telegram account, once per Telegram account and once per account.
 - **Tickets**: from the customer's page, the bot, and the admin panel's

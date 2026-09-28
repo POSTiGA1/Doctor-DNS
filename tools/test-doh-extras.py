@@ -147,8 +147,48 @@ def dot_queries(ip, n):
 rc = dot_queries("203.0.113.5", 5)
 check("DoT answers up to the address's limit, then REFUSED", rc == [0, 0, 0, 5, 5], repr(rc))
 check("and counts by address", doh.STATS.dot == {"203.0.113.5": 3}, repr(doh.STATS.dot))
-check("a stranger on DoT is refused and not counted",
-      dot_queries("198.51.100.99", 1) == [5] and "198.51.100.99" not in doh.STATS.dot)
+
+# The gate's resolver, told apart by its answer: NXDOMAIN, where the
+# customers' says NOERROR.
+gate = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+gate.bind(("127.0.0.1", 0))
+
+
+def gate_answers():
+    while True:
+        try:
+            data, addr = gate.recvfrom(512)
+        except OSError:
+            return
+        gate.sendto(data[:2] + bytes([0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]) + data[12:], addr)
+
+
+threading.Thread(target=gate_answers, daemon=True).start()
+doh.GATE_PORT = gate.getsockname()[1]
+check("an address not let in, come by the gate's door, gets the gate's answers, "
+      "not counted", dot_queries("198.51.100.99", 2) == [3, 3]
+      and "198.51.100.99" not in doh.STATS.dot)
+doh.GATE_LIMIT = doh.Limiter(rate=0.001, burst=2)
+check("  held to the gate's own rate", dot_queries("198.51.100.98", 3) == [3, 3, 5])
+
+
+def post_gate(token, client="198.51.100.97", gate_mark="1"):
+    c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+    c.request("POST", "/dns-query/" + token, QUERY,
+              {"Content-Type": "application/dns-message", "X-Real-IP": "127.0.0.1",
+               "X-Gate": gate_mark, "X-Client-IP": client})
+    r = c.getresponse()
+    return r.status, r.read()
+
+
+status, body = post_gate("NotAnyonesToken12345678")
+check("DoH from the gate's server: the gate's answer, whatever address is in the path",
+      status == 200 and body[3] & 0x0F == 3, repr((status, body[:4])))
+status, body = post_gate(TOKEN, client="198.51.100.96")
+check("  a customer's own address too: a token is no way round registering",
+      status == 200 and body[3] & 0x0F == 3 and doh.STATS.doh == {"7": 3})
+status, _ = post_gate("NotAnyonesToken12345678", gate_mark="")
+check("  and without the mark, an unknown address is refused as before", status == 403)
 
 print("the counts, handed over")
 sdir = os.path.join(tmp, "stats")

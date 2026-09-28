@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""The way back: the customer panel's name for an address not registered.
+"""The way back: the customer panel, for an address not let in.
 
 What has to hold: while the relay's door is closed, port 53 from an address
-that is not registered goes to a resolver of its own, which knows the
-customer panel's name and nothing else - no service, no hijack, no upstream
-for the rest; the redirect and the resolver are set once, not rebuilt every
-sync; and when the door opens, or there is no panel name to give, both go.
+that is not let in - never registered, or out of volume or days - goes to a
+resolver of its own, which answers the customer panel's names truly and every
+other name with the relay itself - no service, no hijack, no upstream for the
+rest - at a limited rate per address; port 80 from such an address goes to a
+page that sends it to the customer panel, the relay's own or, with none, the
+one the panel names; the redirects and the resolver are set once, not rebuilt
+every sync, and put right on a relay upgraded from before the page; and when
+the door opens, or there is no panel to send anybody to, all of it goes.
 """
+import http.client
+import threading
 import importlib.machinery
 import importlib.util
 import os
@@ -98,6 +104,8 @@ check("the way back is set up", sync.apply_gate_dns() is True)
 conf = open(sync.GATE_CONF).read()
 check("its resolver knows the customer panel's name, asked of the relay's upstream",
       "server=/users.example.com/1.1.1.1" in conf and "server=/users.example.com/9.9.9.9" in conf)
+check("  every other name answered with the relay itself, never kept",
+      "address=/#/198.51.100.7" in conf and "local-ttl=0" in conf)
 check("  and nothing else: no upstream for the rest, no service rule",
       "\nserver=1.1.1.1" not in conf and "tiktok" not in conf and "no-resolv" in conf)
 check("  on its own port, listening where the main resolver does",
@@ -108,16 +116,81 @@ check("unregistered port 53 goes to it, both kinds",
       any("udp dport 53 redirect to :5299" in r for r in chain["rules"])
       and any("tcp dport 53 redirect to :5299" in r for r in chain["rules"])
       and all("saddr != @allowed" in r for r in chain["rules"]))
+check("  at a limited rate per address, before it is answered",
+      "gateflood" in chain["rules"][0] and "drop" in chain["rules"][0])
+check("unregistered port 80 goes to the page that sends them to the panel",
+      any("tcp dport 80 redirect to :5298" in r for r in chain["rules"]))
+check("and DoT and DoH to nginx's doors for the gate",
+      any("tcp dport 853 redirect to :8853" in r for r in chain["rules"])
+      and any("tcp dport 443 redirect to :5297" in r for r in chain["rules"]))
 calls.clear()
 sync.apply_gate_dns()
 check("the next sync changes nothing", not any(c[:2] in (("nft", "flush"), ("nft", "add"))
                                                 or c[:2] == ("systemctl", "restart")
                                                 for c in calls), str(calls))
 
+chain["rules"] = [r for r in chain["rules"] if ":5298" not in r and "gateflood" not in r]
+sync.apply_gate_dns()
+check("a relay upgraded from before the page is given it",
+      any(":5298" in r for r in chain["rules"]) and len(chain["rules"]) == 6)
+
+print("a relay with no panel of its own")
+sync.CFG = {"PANEL_DOMAIN": "", "SELF_IP": "198.51.100.8"}
+sync.PANEL_TO["url"] = ""
+check("its page sends people to the panel the panel names",
+      sync.portal_target("https://users.example.com:8443/") == "https://users.example.com:8443/")
+check("  never to anything that is not an https address",
+      sync.portal_target("http://evil.example/") == "" and sync.portal_target(None) == "")
+sync.PORTAL["url"] = sync.portal_target("https://users.example.com:8443/")
+check("and its resolver answers that panel's name truly",
+      sync.apply_gate_dns() is True and "server=/users.example.com/1.1.1.1" in
+      open(sync.GATE_CONF).read() and "address=/#/198.51.100.8" in open(sync.GATE_CONF).read())
+sync.CFG = {"PANEL_DOMAIN": "r2.example.com", "SELF_IP": "198.51.100.8"}
+check("with a panel of its own, its own",
+      sync.portal_target("https://users.example.com:8443/") == "https://r2.example.com:8443/")
+sync.PANEL_TO["url"] = "https://users.example.com:8443/"
+check("  unless the admin took that panel off it",
+      sync.portal_target("") == "https://users.example.com:8443/")
+sync.PANEL_TO["url"] = ""
+
+print("the page on port 80")
+srv = sync.http.server.HTTPServer(("127.0.0.1", 0), sync.PortalPage)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def ask(method, path, host="connectivitycheck.gstatic.com"):
+    c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+    c.request(method, path, headers={"Host": host})
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, r.getheader("Location"), body
+
+
+sync.PORTAL["url"] = "https://users.example.com:8443/"
+st, loc, body = ask("GET", "/generate_204")
+check("Android's check is sent to the panel, which is what makes it offer to open it",
+      st == 302 and loc == "https://users.example.com:8443/", repr((st, loc)))
+check("  with a link on the page for whatever does not follow",
+      b"users.example.com:8443" in body and b"dir='rtl'" in body)
+check("so is the iPhone's, and any http site",
+      ask("GET", "/hotspot-detect.html", "captive.apple.com")[:2] == (302, loc)
+      and ask("GET", "/", "example.org")[:2] == (302, loc))
+check("  a HEAD too, with no page", ask("HEAD", "/")[:2] == (302, loc))
+sync.PORTAL["url"] = ""
+check("with nowhere to send them, nothing", ask("GET", "/")[0] == 503)
+srv.shutdown()
+src = open(os.path.join(HERE, "..", "templates", "smartdns-sync"), encoding="utf-8").read()
+check("it runs beside the sync, and never stops the relay if the port is taken",
+      "threading.Thread(target=serve_portal, daemon=True).start()" in src
+      and "could not start on %d" in src)
+sync.CFG = {"PANEL_DOMAIN": "users.example.com", "SELF_IP": "198.51.100.7"}
+
 print("undone")
 sync.CFG = {"PANEL_DOMAIN": ""}
+sync.PORTAL["url"] = ""
 sync.apply_gate_dns()
-check("with no panel name, the redirect goes and the resolver stops",
+check("with no panel to send anybody to, the redirects go and the resolver stops",
       not chain["rules"] and "smartdns-dns-gate" not in active)
 sync.CFG = {"PANEL_DOMAIN": "users.example.com"}
 sync.apply_gate_dns()

@@ -219,6 +219,11 @@ class Store:
             have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
             if have and "owner_admin" not in have:
                 self.db.execute("ALTER TABLE %s ADD COLUMN owner_admin INTEGER" % table)
+        # The relays a plan is sold on - the panel's too, here as well so a
+        # plan saved before the panel has started after an upgrade keeps them.
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(plans)")}
+        if have and "relays" not in have:
+            self.db.execute("ALTER TABLE plans ADD COLUMN relays TEXT")
         for table in ("users", "admins"):
             have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
             if have and "reset_days" not in have:
@@ -3035,13 +3040,17 @@ def bench_table(picks):
     """Each resolver's time from each relay, and from this machine: the
     fastest in each column marked, one that did not answer said so."""
     cols = []
-    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"
-                     " ORDER BY key"):
+    nodes = node_list()
+    # The relays first - their column is the one customers feel, and the
+    # one the choices below are labelled from - then the nodes.
+    for r in sorted(STORE.q("SELECT key, value FROM settings WHERE key LIKE 'resolver_bench:%'"),
+                    key=lambda r: (r["key"].split(":", 1)[1] in nodes, r["key"])):
         try:
             got = json.loads(r["value"])
         except ValueError:
             continue
-        cols.append(("رله " + r["key"].split(":", 1)[1], got.get("ms") or {}, got.get("at") or 0))
+        ip = r["key"].split(":", 1)[1]
+        cols.append(("%s %s" % (server_word(ip), ip), got.get("ms") or {}, got.get("at") or 0))
     if EXIT_BENCH["ms"] and not (one_server() and cols):
         cols.append(("این سرور", EXIT_BENCH["ms"], int(EXIT_BENCH["at"])))
     if not cols:
@@ -3074,7 +3083,8 @@ def bench_table(picks):
     ages = [int(time.time() - at) // 60 for _, _, at in cols if at]
     out.append("</table><p class='muted'>میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر "
                "ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: "
-               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. آخرین اندازه‌گیری: %s.</p>"
+               "سؤال‌هایشان از آن‌جا پرسیده می‌شود. ستون هر نود زمانی است که nginx همان نود "
+               "برای پیدا کردن آدرس سرویس‌ها منتظر می‌ماند. آخرین اندازه‌گیری: %s.</p>"
                % ("حدود %d دقیقه پیش" % max(ages) if ages and max(ages) else "همین الان"))
     # For the option labels: the relays' figure, where there is one.
     first = cols[0][1]
@@ -3120,15 +3130,30 @@ def upstream_card():
     out.append("<form method='post' action='/%s/dns-bench'><button class='ghost'>"
                "اندازه‌گیری دوباره</button></form>" % p)
 
-    rows = STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
-                   " ORDER BY key")
-    if rows:
-        out.append("<table><tr><th>رله</th><th>در حال استفاده</th><th>وضعیت</th></tr>")
-        for r in rows:
-            try:
-                st = json.loads(r["value"])
-            except ValueError:
-                continue
+    # Where each server stands: the relays' own reports, then the nodes',
+    # which only say what their nginx now asks and what went wrong.
+    states = []
+    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'upstream_state:%'"
+                     " ORDER BY key"):
+        try:
+            states.append((r["key"].split(":", 1)[1], json.loads(r["value"])))
+        except ValueError:
+            continue
+    nodes = node_list()
+    for r in STORE.q("SELECT key, value FROM settings WHERE key LIKE 'node_resolvers:%'"
+                     " ORDER BY key"):
+        ip = r["key"].split(":", 1)[1]
+        if ip not in nodes:
+            continue
+        try:
+            st = json.loads(r["value"])
+        except ValueError:
+            continue
+        states.append((ip, {"applied": (st.get("using") or "").split(),
+                            "error": st.get("error") or ""}))
+    if states:
+        out.append("<table><tr><th>سرور</th><th>در حال استفاده</th><th>وضعیت</th></tr>")
+        for ip, st in states:
             applied = st.get("applied") or []
             tested = st.get("tested") or {}
             used = "، ".join("<code>%s</code>%s" % (
@@ -3141,8 +3166,8 @@ def upstream_card():
                 state = "<span class='ok'>اعمال شد</span>"
             else:
                 state = "<span class='muted'>در انتظار همگام‌سازی</span>"
-            out.append("<tr><td><code>%s</code></td><td dir='ltr'>%s</td><td>%s</td></tr>"
-                       % (html.escape(r["key"].split(":", 1)[1]), used, state))
+            out.append("<tr><td>%s <code>%s</code></td><td dir='ltr'>%s</td><td>%s</td></tr>"
+                       % (server_word(ip), html.escape(ip), used, state))
         out.append("</table>")
     out.append("</div>")
     return "".join(out)
@@ -4772,19 +4797,58 @@ def operator_label(ip):
     return "<br><span class='muted'>%s</span>" % html.escape(name or "سایر")
 
 
-def plan_fields(form, tpls, plan=None, exits=None):
+def relay_exit_now(ip):
+    """The server abroad a relay's traffic goes out of: the one the admin
+    picked for it, else this one."""
+    main = exit_address()
+    picked = setting("relay_exit:" + ip) or ""
+    return picked if picked in [main] + node_list() else main
+
+
+def plan_ticks(plan, servers):
+    """The servers a plan is ticked for: those it is sold on; or, for one
+    made when a plan named the server abroad instead, the relays that go
+    out of that one - the same customers, shown the way it is now done."""
+    sold = [ip.strip() for ip in (plan.get("relays") or "").split(",") if ip.strip()]
+    if sold:
+        return {ip for ip in sold if ip in servers}
+    old = plan.get("exit") or ""
+    if old:
+        return {ip for ip in servers
+                if not is_single_server(ip) and relay_exit_now(ip) == old}
+    return set()
+
+
+def plan_exit_for(relays):
+    """The server abroad a plan's customers are put on: the one all its
+    relays go out of, when they share one and there is more than one to
+    choose from - so they go out of it from any relay; else none, and each
+    relay's own is theirs."""
+    if not relays or not node_list() or any(is_single_server(ip) for ip in relays):
+        return None
+    exits = {relay_exit_now(ip) for ip in relays}
+    return exits.pop() if len(exits) == 1 else None
+
+
+def server_label(ip):
+    note = setting("server_note:" + ip) or ""
+    return "%s%s" % (ip, " — " + note if note else "")
+
+
+def plan_fields(form, tpls, plan=None, servers=None):
     """The inputs of one plan, bound to the form with that id - a row of
-    the table or the new-plan card use the same ones. With `exits`, the
-    servers abroad, a column to sell the plan on one of them or on all."""
+    the table or the new-plan card use the same ones. With `servers`, the
+    relays and single servers, a tick for each to sell the plan on some of
+    them only; none ticked is all of them."""
     plan = plan or {}
     where = ""
-    if exits:
-        here, now = exits[0], plan.get("exit") or ""
-        where = "<td><select form='%s' name='exit' dir='ltr'>%s</select></td>" % (
-            form, "<option value=''%s>همه</option>" % ("" if now in exits else " selected")
-            + "".join("<option value='%s'%s>%s</option>" % (
-                x, " selected" if x == now else "", "%s — این سرور" % x if x == here else x)
-                for x in exits))
+    if servers:
+        now = plan_ticks(plan, servers)
+        where = "<td style='white-space:nowrap'>%s</td>" % "".join(
+            "<label style='display:block' dir='ltr'><input form='%s' type='checkbox' "
+            "name='relay' value='%s'%s> %s</label>"
+            % (form, ip, " checked" if ip in now else "", html.escape(server_label(ip)))
+            for ip in servers)
     tid = plan.get("template_id")
     sel = "".join("<option value='%d'%s>%s</option>"
                   % (t["id"], " selected" if t["id"] == tid else "",
@@ -7031,12 +7095,14 @@ class Admin(http.server.BaseHTTPRequestHandler):
                        " ORDER BY p.active DESC, p.template_id, p.price, p.id",
                        (s["id"] if s else 0,))
         p = CFG["ADMIN_PATH"]
-        exits = [exit_address()] + node_list() if node_list() and (
+        # With more than one server, a tick for each: the ones the plan is
+        # sold on, which are then the only ones that serve its customers.
+        servers = ordered_servers()[0] if len(relay_list()) > 1 and (
             s is None or s["can_route"]) else None
         head = ("<tr><th>نام</th><th>قالب</th><th>روز</th><th>حجم (گیگ)</th>"
                 "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>دستگاه</th>"
                 "<th>توضیح برای مشتری</th>"
-                + ("<th>سرور خارج</th>" if exits else "") + "<th>%s</th><th></th></tr>")
+                + ("<th>سرورها (DNS)</th>" if servers else "") + "<th>%s</th><th></th></tr>")
         out = ["<div class='card'><h2>پلن‌ها (%d)</h2>" % len(rows)]
         if not rows:
             out.append("<p class='muted'>هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، "
@@ -7062,7 +7128,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     "<input type='hidden' name='id' value='%d'>"
                     "<button class='del'>حذف</button></form></td></tr>"
                     % ("" if r["active"] else " class='off'",
-                       plan_fields(form, tpls, dict(r), exits), r["holders"],
+                       plan_fields(form, tpls, dict(r), servers), r["holders"],
                        form, p, r["id"], form,
                        p, r["id"], 0 if r["active"] else 1,
                        "دیگر فروخته نشود؛ دارندگانش تا آخر دوره می‌مانند"
@@ -7082,12 +7148,19 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    "روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو "
                    "شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از "
                    "خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ "
-                   "حجم پذیرفته نمی‌شود.</p><p class='muted'>🎁 «تست رایگان»: فروخته "
+                   "حجم پذیرفته نمی‌شود.</p>%s<p class='muted'>🎁 «تست رایگان»: فروخته "
                    "نمی‌شود؛ مشتری با یک کلیک می‌گیردش، در پنل خودش یا ربات. شرطش "
                    "تلگرامِ وصل‌شده است، و هر تلگرام و هر حساب فقط یک بار. کسی که همین "
                    "حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. "
                    "یک پلن تست در یک زمان.</p></div>"
-                   % (p, head % "", plan_fields("pnew", tpls, exits=exits)))
+                   % (p, head % "", plan_fields("pnew", tpls, servers=servers),
+                      "<p class='muted'>سرورها (DNS): پلنی که برای چند سرور تیک خورده، "
+                      "فقط روی همان‌ها کار می‌کند و مشتری‌اش فقط DNS همان‌ها را می‌بیند؛ "
+                      "اگر DNS سرور دیگری را بزند، پنل مشتری برایش باز می‌شود. بدون تیک، "
+                      "روی همه. اگر همهٔ سرورهای تیک‌خورده از یک سرور خارج بروند، مشتری "
+                      "از هر رله‌ای هم که وصل شود از همان سرور خارج می‌رود. تیک‌ها همان "
+                      "لحظه برای همهٔ دارندگان پلن اعمال می‌شود، نه فقط خریدهای بعدی.</p>"
+                      if servers else ""))
         if s is None:
             out.append(devices_card(p))
             out.append(discounts_card(p))
@@ -8199,26 +8272,46 @@ class Admin(http.server.BaseHTTPRequestHandler):
             devices = number(one("devices") or "1")
             if devices is None or devices != int(devices) or not 1 <= devices <= 5:
                 return self.redirect("plans?m=!تعداد دستگاه باید از ۱ تا ۵ باشد")
-            # The server abroad it is sold on; empty for all of them.
-            where = one("exit").strip()
-            if where and where not in [exit_address()] + node_list():
-                return self.redirect("plans?m=!این سرور خارج در فهرست نیست")
+            # The servers it is sold on, in the order customers see them; none
+            # for all. Only an admin who may pick servers picks these; for
+            # anybody else a plan keeps what it had.
+            servers = ordered_servers()[0]
+            may_pick = seller() is None or seller()["can_route"]
+            ticked = [ip for ip in servers if ip in (params.get("relay") or [])]
+            if any(ip not in servers for ip in params.get("relay") or []):
+                return self.redirect("plans?m=!این سرور در فهرست نیست")
+            if len(ticked) == len(servers):
+                ticked = []          # every one is all of them
+            old = STORE.one("SELECT relays, exit FROM plans WHERE id = ?", (pid,)) \
+                if pid else None
+            if may_pick:
+                relays = ",".join(ticked) or None
+                # The server abroad they go out of, when those all share one.
+                where = plan_exit_for(ticked)
+            else:
+                relays = old["relays"] if old else None
+                where = old["exit"] if old else None
             values = (name, tid, int(days), quota, int(price), int(speed * 1000),
-                      one("note").strip()[:120], 1 if trial else 0, where or None,
-                      int(devices))
+                      one("note").strip()[:120], 1 if trial else 0, where,
+                      int(devices), relays)
             if pid:
                 cur = STORE.run("UPDATE plans SET name = ?, template_id = ?, days = ?,"
                                 " quota_bytes = ?, price = ?, speed_kbps = ?, note = ?,"
-                                " is_trial = ?, exit = ?, devices = ? WHERE id = ?",
-                                values + (pid,))
+                                " is_trial = ?, exit = ?, devices = ?, relays = ?"
+                                " WHERE id = ?", values + (pid,))
                 if not cur.rowcount:
                     return self.redirect("plans?m=!این پلن پیدا نشد")
+                if old and (old["relays"] or None) != relays:
+                    log(INFO, "plan #%d now sold on %s" % (pid, relays or "every server"))
+                    return self.redirect("plans?m=پلن ذخیره شد؛ سرورهایش همین حالا برای همهٔ "
+                                         "دارندگانش اعمال شد، بقیه برای خریدهای بعدی")
                 # Those who hold it keep what they bought; the change is for the
                 # next purchase or renewal.
                 return self.redirect("plans?m=پلن ذخیره شد؛ برای خریدهای بعدی")
             STORE.run("INSERT INTO plans (name, template_id, days, quota_bytes, price,"
-                      " speed_kbps, note, is_trial, exit, devices, active, created_at,"
-                      " owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                      " speed_kbps, note, is_trial, exit, devices, relays, active,"
+                      " created_at, owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                      " 1, ?, ?)",
                       values + (now(), seller()["id"] if seller() else None))
             return self.redirect("plans?m=%s" % (
                 "پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش"
@@ -9239,7 +9332,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     own = {}
                 STORE.run("UPDATE users SET relay_exits = ? WHERE id = ?",
                           (json.dumps(own, sort_keys=True) if own else None, u["id"]))
-            STORE.run("DELETE FROM settings WHERE key = ?", ("node_resolvers:" + ip,))
+            STORE.run("DELETE FROM settings WHERE key IN (?, ?)",
+                      ("node_resolvers:" + ip, "resolver_bench:" + ip))
             STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ? OR key LIKE ?"
                       " OR key = ?", ("relay_tunnel:%%:" + ip, "relay_tunnel_state:%%:" + ip,
                                       "node_tunnel_state:%s:%%" % ip, "node_slot:" + ip))

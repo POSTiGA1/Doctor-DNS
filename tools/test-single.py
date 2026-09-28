@@ -105,7 +105,10 @@ if BASH:
           and "proxy_pass $https_target;" in doh)
     check("DoT on 853 and the DoH server on loopback, with the certificate",
           "listen 853 ssl;" in doh and "listen 127.0.0.1:8453 ssl http2;" in doh
-          and doh.count("include /etc/nginx/smartdns-doh-cert.conf;") == 2)
+          and doh.count("include /etc/nginx/smartdns-doh-cert.conf;") == 3)
+    check("  and the gate's doors for DoT and DoH, as on a relay",
+          "listen 8853 ssl;" in doh and "listen 5297;" in doh
+          and "listen 127.0.0.1:8454 ssl http2 proxy_protocol;" in doh)
     for name, text in (("exit", exit_conf), ("single", solo), ("single with DoH", doh)):
         check("%s: no placeholder left, braces balanced" % name,
               "__" not in text and text.count("{") == text.count("}"), text[:300])

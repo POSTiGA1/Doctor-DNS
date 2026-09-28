@@ -145,8 +145,9 @@ store.set_setting("dns_upstream", "8.8.8.8 1.1.1.1")
 code, reply = api.do_node({"node": "93.184.216.20", "host": {"cpu": 12.5},
                            "logs": "node log", "nginx_logs": "err",
                            "resolvers": {"using": "8.8.8.8 1.1.1.1", "error": ""}})
-check("a node is told the relays to let in and the resolvers to ask",
+check("a node is told the relays to let in, the resolvers to ask and to time",
       code == 200 and reply == {"relays": list(relays), "upstream": ["8.8.8.8", "1.1.1.1"],
+                                "bench": panel.bench_wanted(store),
                                 "tunnels": {}, "upgrade": None, "upgrade_ack": False,
                                 "panel": {"host": panel.exit_self(), "standby": ""},
                                 "standby": None}, reply)
@@ -362,16 +363,19 @@ check("  and back to each relay's own", urow()["exit"] is None and urow()["relay
 admin.STORE.run("INSERT OR IGNORE INTO templates (name, is_default, created_at)"
                 " VALUES ('default', 1, '2026-01-01')")
 tid = admin.STORE.one("SELECT id FROM templates ORDER BY id LIMIT 1")["id"]
-check("a plan's exit can be only one of the exits",
+check("a plan's servers can be only the servers",
       act("plan-save", name="x", template_id=str(tid), days="30", quota_gb="10", price="1",
-          exit="192.0.2.1").startswith("plans?m=!"))
+          relay="192.0.2.1").startswith("plans?m=!"))
+admin.STORE.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("relay_exit:198.51.100.2", "93.184.216.20"))
 act("plan-save", name="France", template_id=str(tid), days="30", quota_gb="10", price="1",
-    exit="93.184.216.20")
-act("plan-save", name="All", template_id=str(tid), days="30", quota_gb="10", price="1", exit="")
+    relay="198.51.100.2")
+act("plan-save", name="All", template_id=str(tid), days="30", quota_gb="10", price="1")
 fr = admin.STORE.one("SELECT * FROM plans WHERE name = 'France'")
 every = admin.STORE.one("SELECT * FROM plans WHERE name = 'All'")
-check("  kept: one exit, or null for all of them", fr["exit"] == "93.184.216.20"
-      and every["exit"] is None)
+check("  one ticked for a relay that goes out of one exit is put on it; one for all, none",
+      fr["exit"] == "93.184.216.20" and fr["relays"] == "198.51.100.2"
+      and every["exit"] is None and every["relays"] is None)
 admin.STORE.run("UPDATE users SET exit = NULL, relay_exits = ? WHERE id = ?",
                 (json.dumps({"198.51.100.1": main}), nima))
 admin.STORE.apply_plan(nima, every["id"])
@@ -385,8 +389,8 @@ panel.apply_plan(store, nima, fr["id"])
 check("  the same when the panel gives it - a receipt, a trial, the bot",
       store.one("SELECT exit FROM users WHERE id = ?", (nima,))["exit"] == "93.184.216.20")
 page = admin.Admin.plans(Rec())
-check("the plans page has the column, with «همه»", "<th>سرور خارج</th>" in page
-      and "همه</option>" in page)
+check("the plans page has a tick per server", "<th>سرورها (DNS)</th>" in page
+      and "name='relay' value='198.51.100.2' checked" in page)
 act("user-exit", id=str(nima), **{"r_198.51.100.1": "93.184.216.20", "r_198.51.100.2": ""})
 act("node-del", ip="93.184.216.20")
 check("  a node taken off sends its customers back to their relays' own",

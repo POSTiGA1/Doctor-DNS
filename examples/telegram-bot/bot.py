@@ -39,6 +39,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -116,6 +117,23 @@ def size_fa(n):
 
 def money(n):
     return format(n or 0, ",")
+
+
+def time_left_fa(ts, now=None):
+    """How long until a plan's end: days, or hours on the last day; "" when
+    it cannot be read. The same words as the customer's page."""
+    try:
+        t = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return ""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    left = (t - (now or datetime.now(timezone.utc))).total_seconds()
+    if left <= 0:
+        return "تمام شده"
+    if left < 86400:
+        return "%d ساعت" % max(1, int(left // 3600))
+    return "%d روز" % int(left // 86400)
 
 
 FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -683,6 +701,9 @@ class Bot:
             lines.append("مصرف: %s" % size_fa(u["used_bytes"]))
         if u["expires_at"]:
             lines.append("پایان دوره: %s" % u["expires_at"][:10])
+            left = time_left_fa(u["expires_at"])
+            if left:
+                lines.append("زمان باقی‌مانده: %s" % left)
         lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
         if u["dns"]:
             lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
