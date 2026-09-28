@@ -364,6 +364,27 @@ check("the link from the web panel works through /start",
 check("and the empty account the bot had opened is gone",
       store.one("SELECT count(*) c FROM users WHERE telegram_id = ?", (SARA,))["c"] == 1)
 
+print("an account deleted in the admin panel")
+GONE = 333
+message(GONE, botmod.B_ACCOUNT, name="رضا")
+first = store.user_by_telegram(GONE)
+bot.state.pop(GONE, None)                          # they leave before the questions
+admin.STORE.delete_user(first["id"])
+message(GONE, botmod.B_ACCOUNT, name="رضا")
+again = store.user_by_telegram(GONE)
+check("the same Telegram id opens a new one, with no restart of the bot",
+      again is not None, tg.last(GONE).get("text"))
+check("and is asked the questions again, not shown an error",
+      "اسمتان چیست" in tg.last(GONE)["text"], tg.last(GONE).get("text"))
+bot.state.pop(GONE, None)
+admin.STORE.delete_user(again["id"])
+store.set_setting("ref_on", "1")
+store.set_setting("ref_percent", "10")
+inviter = store.user_by_telegram(CUSTOMER)
+message(GONE, "/start ref_" + panel.ref_code(store, inviter), name="رضا")
+check("so does one coming back through an invitation, which is written down",
+      (store.user_by_telegram(GONE) or {"referred_by": None})["referred_by"] == inviter["id"])
+
 print("the panel's messages must be the panel's")
 req = urllib.request.Request("http://127.0.0.1:%d/" % hook.server_address[1],
                              data=b'{"event":"x"}', method="POST")

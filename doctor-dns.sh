@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.1"
+VERSION="0.9.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -30504,10 +30504,18 @@ exit 0
 #        """The customer's account, opened on first use. Not on /start: a
 #        customer arriving to link a web account must not get a second one."""
 #        uid = sender["id"]
-#        if uid not in self.known:
-#            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-#            self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
-#            self.known.add(uid)
+#        if uid in self.known:
+#            try:
+#                return self.panel.call("GET", "/users/%d" % uid)["user"]
+#            except ApiError as e:
+#                # Deleted in the admin panel since: open a new one, as for
+#                # somebody the bot has never seen.
+#                if e.body.get("error") != "user_not_found":
+#                    raise
+#                self.known.discard(uid)
+#        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#        self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
+#        self.known.add(uid)
 #        return self.panel.call("GET", "/users/%d" % uid)["user"]
 #
 #    # -- updates from Telegram ------------------------------------------------
@@ -30604,9 +30612,12 @@ exit 0
 #                                "کنید، کد بازیابی همین‌جا می‌آید.", MENU)
 #            except ApiError as e:
 #                return self.say(chat, "⚠️ " + str(e), MENU)
-#        if arg.startswith("ref_") and sender["id"] not in self.known:
+#        if arg.startswith("ref_"):
 #            # Somebody's invitation link. The account is opened now, with it:
 #            # the panel writes down the inviter only for an account it opens.
+#            # Asked even for a Telegram id the bot knows, which may since have
+#            # been deleted in the admin panel; for one that is still there the
+#            # panel only answers that it exists.
 #            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
 #            try:
 #                self.panel.call("POST", "/users", {"telegram_id": sender["id"],
