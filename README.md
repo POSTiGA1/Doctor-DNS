@@ -74,7 +74,7 @@ certificate naming no console host at all.
 | **Upgrades** | from GitHub with one button: the installer is checked against the hash GitHub published, this server is upgraded first, then every relay, node and single server one by one |
 | **Monitoring and backups** | alerts for a server gone quiet, a full disk or connection table, a certificate not renewed, high memory or processor; a monthly traffic cap per server; an encrypted backup of the whole panel sent by the bot |
 | **Usage resets** | a customer's or a seller's usage back to zero every so many days, whatever the plan |
-| **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, the wallet, the invitation link, every server's DNS, DoT and DoH, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report, a message to many customers at once), set up from the admin panel; a seller sets up their own |
+| **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, the wallet, the invitation link, every server's DNS, DoT and DoH, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report, a message to many customers at once, with photos and videos); a channel customers must join first; set up from the admin panel; a seller sets up their own |
 | **English** | the admin panel, the customer's page and the bot, in Persian or English |
 | **API** | to plug in a sales bot of your own: [docs/bot-api.md](docs/bot-api.md) (in Persian) |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
@@ -453,7 +453,11 @@ you can no longer reach.
   every so many days. Click a name for their page of stats; disable, reset
   and delete are beside each name.
 - **A message to many customers** (Bot page): to all of them, the active
-  ones, those whose term ends soon, or those on one plan.
+  ones, those whose term ends soon, or those on one plan. Words, a photo or
+  a video; up to ten files at once, which arrive as one album.
+- **A channel to join first** (Bot page): with a channel set, the bot does
+  nothing for a customer until they have joined it. The bot has to be an
+  admin of the channel. Each seller can set their own.
 - **Public DNS** (Settings): one button opens every relay to everyone - no
   sign-up, no registered address, no allowance - and the same button closes
   it again.

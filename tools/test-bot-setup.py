@@ -148,6 +148,46 @@ check("a revoked key is replaced by a new one",
       store.one("SELECT count(*) c FROM api_tokens WHERE revoked_at IS NULL")["c"] == 1
       and admin.read_env(admin.BOT_ENV)["API_KEY"] != env["API_KEY"])
 
+print("a channel to join first")
+asked = []
+
+
+def channel_check(token, chat):
+    asked.append(chat)
+    if chat == "@not_admin_here":
+        return None, "ربات در این کانال ادمین نیست؛ اول ربات را ادمین کانال کنید"
+    return "فروش DNS", None
+
+
+admin.bot_channel_check = channel_check
+check("none at first", admin.read_env(admin.BOT_ENV).get("JOIN_CHANNEL", "") == "")
+where = act("bot-setup", token="", admins="100200300", channel="https://t.me/dns_sales")
+env = admin.read_env(admin.BOT_ENV)
+check("a public one, however it is written, is kept by its @name with its link",
+      "m=!" not in where and env["JOIN_CHANNEL"] == "@dns_sales"
+      and env["JOIN_LINK"] == "https://t.me/dns_sales" and env["JOIN_TITLE"] == "فروش DNS",
+      where)
+check("after asking Telegram whether the bot is an admin there", asked == ["@dns_sales"])
+check("and the page shows it", "@dns_sales" in Rec().bot_page())
+where = act("bot-setup", token="", admins="100200300", channel="@not_admin_here")
+check("one where the bot is not an admin is refused, and the old one stays",
+      "ادمین" in where and admin.read_env(admin.BOT_ENV)["JOIN_CHANNEL"] == "@dns_sales")
+check("so is a name that is not one", "m=!" in act(
+    "bot-setup", token="", admins="100200300", channel="@a b"))
+check("a private one needs its invitation link", "لینک دعوت" in act(
+    "bot-setup", token="", admins="100200300", channel="-1001234567890"))
+check("an invitation link alone is not enough to find it", "آیدی عددی" in act(
+    "bot-setup", token="", admins="100200300", channel="https://t.me/+AbCdEfGh1234"))
+act("bot-setup", token="", admins="100200300", channel="-1001234567890",
+    channel_link="https://t.me/+AbCdEfGh1234")
+env = admin.read_env(admin.BOT_ENV)
+check("a private one by its number, with its link",
+      env["JOIN_CHANNEL"] == "-1001234567890" and env["JOIN_LINK"] == "https://t.me/+AbCdEfGh1234")
+asked.clear()
+act("bot-setup", token="", admins="100200300", channel="")
+check("left empty, it is off, and Telegram is not asked",
+      admin.read_env(admin.BOT_ENV)["JOIN_CHANNEL"] == "" and not asked)
+
 print("the page afterwards")
 page = Rec().bot_page()
 check("the token is shown only by its last four", TOKEN not in page and "...xxxx" in page)

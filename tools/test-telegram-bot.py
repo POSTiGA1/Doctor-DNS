@@ -385,6 +385,94 @@ message(GONE, "/start ref_" + panel.ref_code(store, inviter), name="رضا")
 check("so does one coming back through an invitation, which is written down",
       (store.user_by_telegram(GONE) or {"referred_by": None})["referred_by"] == inviter["id"])
 
+print("a channel to join first")
+
+
+class ChannelTelegram(FakeTelegram):
+    """Answers who is in the channel from `members`."""
+    members = {}
+
+    def call(self, method, http_timeout=30, **params):
+        if method != "getChatMember":
+            return super().call(method, http_timeout, **params)
+        self.out.append((method, params))
+        status = self.members.get(params["user_id"], "left")
+        if status == "broken":
+            raise RuntimeError("telegram getChatMember: Bad Request: member list is "
+                               "inaccessible")
+        return {"status": status}
+
+
+ctg = ChannelTelegram()
+gated = botmod.Bot(botmod.settings(dict(
+    BOT_TOKEN="t", API_URL=cfg["api"], API_KEY="dd_botkey", ADMIN_IDS=str(ADMIN_TG),
+    JOIN_CHANNEL="@dns_sales", JOIN_TITLE="فروش DNS")), telegram=ctg)
+NEW = 444
+
+
+def say_to(b, uid, text):
+    updates[0] += 1
+    b.handle({"update_id": updates[0], "message": {
+        "message_id": updates[0], "chat": {"id": uid, "type": "private"},
+        "from": {"id": uid, "first_name": "نیما"}, "text": text}})
+
+
+def tap_on(b, uid, data):
+    updates[0] += 1
+    b.handle({"update_id": updates[0], "callback_query": {
+        "id": str(updates[0]), "data": data, "from": {"id": uid},
+        "message": {"message_id": 1, "chat": {"id": uid}}}})
+
+
+def join_buttons(uid):
+    markup = ctg.last(uid).get("reply_markup") or {}
+    return [b for row in markup.get("inline_keyboard", []) for b in row]
+
+
+say_to(gated, NEW, "/start")
+check("somebody not in it is greeted and asked to join first",
+      "خوش آمدید" in ctg.last(NEW)["text"] and "فروش DNS" in ctg.last(NEW)["text"]
+      and [b.get("url") or b.get("callback_data") for b in join_buttons(NEW)]
+      == ["https://t.me/dns_sales", "joined"], ctg.last(NEW).get("text"))
+say_to(gated, NEW, botmod.B_ACCOUNT)
+check("every button asks the same, and no account is opened",
+      "عضو کانال" in ctg.last(NEW)["text"] and not store.user_by_telegram(NEW))
+tap_on(gated, NEW, "plans")
+check("inline buttons too", "عضو کانال" in ctg.last(NEW)["text"])
+tap_on(gated, NEW, "joined")
+check("'I have joined' before joining says not yet", "هنوز" in ctg.last(NEW)["text"])
+ChannelTelegram.members[NEW] = "member"
+tap_on(gated, NEW, "joined")
+check("after joining, the menu", ctg.last(NEW)["reply_markup"] == botmod.MENU)
+say_to(gated, NEW, botmod.B_ACCOUNT)
+check("and the bot serves them", store.user_by_telegram(NEW) is not None
+      and "اسمتان چیست" in ctg.last(NEW)["text"])
+gated.state.pop(NEW, None)
+asked = sum(1 for m, _ in ctg.out if m == "getChatMember")
+say_to(gated, NEW, botmod.B_HELP)
+check("Telegram is not asked again at every tap",
+      sum(1 for m, _ in ctg.out if m == "getChatMember") == asked)
+say_to(gated, ADMIN_TG, "/stats")
+check("the operator is never asked to join", "گزارش روزانه" in ctg.last(ADMIN_TG)["text"])
+ChannelTelegram.members[555] = "broken"
+say_to(gated, 555, "/start")
+check("when Telegram cannot say - the bot no longer an admin there - nobody is kept out",
+      ctg.last(555)["reply_markup"] == botmod.MENU)
+ChannelTelegram.members[666] = "restricted"
+say_to(gated, 666, "/start")
+check("somebody restricted who has left is not in it", "عضو کانال" in ctg.last(666)["text"])
+ChannelTelegram.members[NEW] = "left"
+gated.members.clear()
+say_to(gated, NEW, botmod.B_HELP)
+check("and somebody who leaves is asked again", "عضو کانال" in ctg.last(NEW)["text"])
+code = panel.ref_code(store, store.user_by_telegram(CUSTOMER))
+say_to(gated, 777, "/start ref_" + code)
+check("an invitation is written down even before they join", "عضو کانال" in ctg.last(777)["text"]
+      and store.user_by_telegram(777)["referred_by"] == store.user_by_telegram(CUSTOMER)["id"])
+open_bot = botmod.settings(dict(BOT_TOKEN="t", API_URL="x", API_KEY="k",
+                                JOIN_CHANNEL="-1001234567890"))
+check("a private channel with no link to join by asks nobody", open_bot["channel"] == "")
+
 print("the panel's messages must be the panel's")
 req = urllib.request.Request("http://127.0.0.1:%d/" % hook.server_address[1],
                              data=b'{"event":"x"}', method="POST")

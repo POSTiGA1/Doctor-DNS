@@ -19,6 +19,9 @@ Settings come from the environment (see bot.env.example):
     PAY_TEXT         how to pay, only if the admin panel's Payment page is
                      empty - that one wins
     SUPPORT_TEXT     shown under "help" (optional)
+    JOIN_CHANNEL     a channel to join before anything else, @name or -100...
+                     (optional; the bot must be an admin there)
+    JOIN_LINK        its invitation link, for a private channel
 """
 import base64
 import hashlib
@@ -61,7 +64,15 @@ def settings(env=os.environ):
         "telegram": env.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/"),
         # The language the bot speaks, set in the admin panel's bot page.
         "lang": "en" if env.get("BOT_LANG", "").strip() == "en" else "fa",
+        "channel": env.get("JOIN_CHANNEL", "").strip(),
+        "channel_title": env.get("JOIN_TITLE", "").strip(),
     }
+    cfg["channel_link"] = env.get("JOIN_LINK", "").strip() or (
+        "https://t.me/" + cfg["channel"][1:] if cfg["channel"].startswith("@") else "")
+    if cfg["channel"] and not cfg["channel_link"]:
+        # Nobody could get in: better no gate than one without a door.
+        log("JOIN_CHANNEL %s has no JOIN_LINK; not asking anybody to join" % cfg["channel"])
+        cfg["channel"] = ""
     missing = [k for k in ("token", "api", "key") if not cfg[k]]
     if missing:
         sys.exit("missing settings: %s (see bot.env.example)"
@@ -89,6 +100,10 @@ STATUS = {"pending": "در انتظار خرید پلن", "active": "فعال �
           "over_quota": "حجم تمام شده ⛔", "expired": "دوره تمام شده ⛔",
           "suspended": "مسدود ⛔"}
 MAX_FILE = 4 * 1024 * 1024
+# Telegram's longest caption under a photo or video.
+CAPTION_MAX = 1024
+# How long "is in the channel" is believed before Telegram is asked again.
+MEMBER_FRESH = 600
 
 
 def size_fa(n):
@@ -252,25 +267,35 @@ class Telegram:
         return self.call("sendMessage", chat_id=chat, text=text[:4000], reply_markup=markup,
                          link_preview_options={"is_disabled": True})
 
-    def photo(self, chat, blob, caption, markup=None):
-        """sendPhoto needs a real upload, so this one is multipart."""
+    def upload(self, method, files, **fields):
+        """A call carrying files, which has to be multipart: `files` maps
+        each part's name to its bytes, `fields` are the rest (None left out,
+        a list or dict sent as JSON). Telegram's answer; HTTPError when it
+        refuses."""
         boundary = secrets.token_hex(16)
         parts = []
-        for name, value in (("chat_id", str(chat)), ("caption", caption[:1000]),
-                            ("reply_markup", json.dumps(markup) if markup else None)):
-            if value is not None:
-                parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
-                              % (boundary, name, value)).encode())
-        parts.append(('--%s\r\nContent-Disposition: form-data; name="photo"; '
-                      'filename="receipt"\r\nContent-Type: application/octet-stream\r\n\r\n'
-                      % boundary).encode() + blob + b"\r\n")
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if isinstance(value, (list, dict)):
+                value = json.dumps(value)
+            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+                          % (boundary, key, value)).encode())
+        for name, blob in files.items():
+            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; '
+                          'filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
+                          % (boundary, name, name)).encode() + blob + b"\r\n")
         parts.append(("--%s--\r\n" % boundary).encode())
-        req = urllib.request.Request(self.base + "sendPhoto", data=b"".join(parts),
+        req = urllib.request.Request(self.base + method, data=b"".join(parts),
                                      headers={"Content-Type": "multipart/form-data; boundary="
                                               + boundary})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read()).get("result")
+
+    def photo(self, chat, blob, caption, markup=None):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read()).get("result")
+            return self.upload("sendPhoto", {"photo": blob}, chat_id=chat,
+                               caption=caption[:1000], reply_markup=markup)
         except urllib.error.HTTPError:
             # A PDF, or something Telegram will not show as a photo: say it in words.
             return self.send(chat, caption + "\n\n(فایل رسید عکس نبود؛ در پنل ببینید)", markup)
@@ -302,6 +327,10 @@ class Bot:
         self.known = set()       # telegram ids the panel already has an account for
         self.seen = []           # recent webhook ids, so a repeat is dropped
         self.lock = threading.Lock()
+        # The photo or video of the broadcast going out: its bytes until
+        # Telegram has taken it once, then Telegram's own id for it.
+        self.media = {}
+        self.members = {}        # telegram id -> when Telegram last said they are in the channel
 
     # -- helpers ------------------------------------------------------------
     def is_admin(self, uid):
@@ -371,6 +400,8 @@ class Bot:
             return self.say(chat, "لغو شد.", MENU)
         if text.startswith("/start"):
             return self.on_start(chat, sender, text)
+        if not self.in_channel(sender["id"]):
+            return self.ask_to_join(chat)
         if self.is_admin(sender["id"]) and text in ("/stats", "/receipts"):
             return self.admin_command(chat, text)
 
@@ -453,7 +484,45 @@ class Bot:
                 self.known.add(sender["id"])
             except ApiError as e:
                 log("invitation start failed: %s" % e)
+        # After the invitation is written down: somebody who joins the
+        # channel first still counts as invited.
+        if not self.in_channel(sender["id"]):
+            return self.ask_to_join(chat, "سلام! 👋 به ربات خوش آمدید.\n\n")
         return self.say(chat, "سلام! 👋 به ربات خوش آمدید.\n\n" + self.help_text(), MENU)
+
+    # -- the channel a customer must be in first --------------------------------
+    def in_channel(self, uid):
+        """True when there is no channel to join, for the operator, and for
+        somebody Telegram says is in it - remembered for a while, so every
+        tap is not a question to Telegram. When Telegram cannot say - the bot
+        is no longer an admin there, or Telegram is not answering - nobody
+        is kept out for it."""
+        channel = self.cfg.get("channel")
+        if not channel or self.is_admin(uid):
+            return True
+        if time.time() - self.members.get(uid, 0) < MEMBER_FRESH:
+            return True
+        try:
+            m = self.tg.call("getChatMember", chat_id=channel, user_id=uid)
+        except Exception as e:
+            if re.search(r"(?i)user not found|member not found|participant_id_invalid", str(e)):
+                return False
+            log("could not ask %s whether %s is in it: %s" % (channel, uid, e))
+            return True
+        status = (m or {}).get("status")
+        if status in ("creator", "administrator", "member") or (
+                status == "restricted" and m.get("is_member")):
+            self.members[uid] = time.time()
+            return True
+        return False
+
+    def ask_to_join(self, chat, before=""):
+        name = self.cfg.get("channel_title") or self.cfg["channel"]
+        self.say(chat, before + "برای استفاده از ربات، اول عضو کانال «%s» شوید و بعد "
+                 "«✅ عضو شدم» را بزنید." % name,
+                 {"inline_keyboard": [
+                     [{"text": "📢 عضویت در کانال", "url": self.cfg["channel_link"]}],
+                     [{"text": "✅ عضو شدم", "callback_data": "joined"}]]})
 
     # -- a web sign-in for everybody who comes through the bot ----------------
     def ready(self, chat, sender):
@@ -884,6 +953,14 @@ class Bot:
             if not self.is_admin(sender["id"]):
                 return
             return self.admin_button(chat, q, kind, int(arg))
+        if kind == "joined":
+            self.members.pop(sender["id"], None)
+            if not self.in_channel(sender["id"]):
+                return self.ask_to_join(chat, "هنوز عضو کانال نشده‌اید. ")
+            return self.say(chat, "✅ ممنون! حالا از دکمه‌های پایین استفاده کنید.\n\n"
+                            + self.help_text(), MENU)
+        if not self.in_channel(sender["id"]):
+            return self.ask_to_join(chat)
         if kind == "buy":
             return self.chose_plan(chat, sender, int(arg))
         if kind == "plans":
@@ -1036,6 +1113,9 @@ class Bot:
                     self.say(admin, text)
             return
         chat = ev.get("telegram_id")
+        if kind == "broadcast" and chat and data.get("media"):
+            time.sleep(0.05)
+            return self.send_broadcast(chat, data)
         if not chat or not text:
             return
         if kind == "broadcast":
@@ -1048,6 +1128,65 @@ class Bot:
         elif kind in ("quota.warning", "quota.exhausted", "plan.expiring", "plan.expired"):
             markup = {"inline_keyboard": [[{"text": "🛒 تمدید", "callback_data": "plans"}]]}
         self.say(chat, text, markup)
+
+    def send_broadcast(self, chat, data):
+        """A broadcast with photos or videos - one on its own, several as an
+        album - with the words under them, or after them when they are too
+        long for a caption."""
+        bid, kinds = data.get("broadcast_id"), data["media"]
+        kinds = [kinds] if isinstance(kinds, str) else list(kinds)[:10]
+        words = data.get("text") or ""
+        text = self.t(words)
+        caption = text if len(text) <= CAPTION_MAX else None
+        # The files' bytes, or once Telegram has them, Telegram's ids for them.
+        have = self.media.get(bid)
+        if have is None:
+            try:
+                have = [base64.b64decode(self.panel.call(
+                    "GET", "/broadcasts/%d/media/%d" % (int(bid), n))["data"])
+                    for n in range(len(kinds))]
+            except Exception as e:
+                log("broadcast #%s: its photos or videos could not be had (%s); the words "
+                    "alone" % (bid, e))
+                return self.say(chat, words) if words else None
+            # Only the one going out now is kept.
+            self.media = {bid: have}
+        files = {"f%d" % n: blob for n, blob in enumerate(have) if isinstance(blob, bytes)}
+        try:
+            if len(kinds) == 1:
+                kind = kinds[0]
+                method = "sendPhoto" if kind == "photo" else "sendVideo"
+                if files:
+                    sent = [self.tg.upload(method, {kind: have[0]}, chat_id=chat,
+                                           caption=caption)]
+                else:
+                    self.tg.call(method, chat_id=chat, caption=caption, **{kind: have[0]})
+            else:
+                album = [{"type": kind, "media": "attach://f%d" % n if "f%d" % n in files
+                          else have[n]} for n, kind in enumerate(kinds)]
+                if caption:
+                    album[0]["caption"] = caption
+                if files:
+                    sent = self.tg.upload("sendMediaGroup", files, chat_id=chat, media=album)
+                else:
+                    self.tg.call("sendMediaGroup", chat_id=chat, media=album)
+        except Exception as e:
+            # Most often somebody who has blocked the bot.
+            return log("broadcast #%s to %s: %s" % (bid, chat, e))
+        if files:
+            ids = [telegram_file_id(m, k) for m, k in zip(sent or [], kinds)]
+            if len(ids) == len(kinds) and all(ids):
+                self.media = {bid: ids}
+        if caption is None and words:
+            self.say(chat, words)
+
+
+def telegram_file_id(message, kind):
+    """The id Telegram keeps a sent photo or video under, to send it again
+    without uploading it; a photo's is its largest size."""
+    got = (message or {}).get(kind)
+    got = got[-1] if isinstance(got, list) and got else got
+    return got.get("file_id") if isinstance(got, dict) else None
 
 
 # ---------------------------------------------------------- panel webhooks

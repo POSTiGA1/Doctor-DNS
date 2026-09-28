@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.2"
+VERSION="0.9.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -4320,6 +4320,9 @@ exit 0
 #
 #CONFIG = "/etc/smart-dns/panel.env"
 #DB = "/var/lib/smart-dns/panel.db"
+## The photos and videos of broadcasts, <broadcast id>-<place in it>; the
+## admin panel writes them and clears them out after a week.
+#BROADCAST_DIR = "/var/lib/smart-dns/broadcast"
 #CERT = "/etc/smart-dns/sync.crt"
 #KEY = "/etc/smart-dns/sync.key"
 #API_PORT = 8443
@@ -4969,6 +4972,9 @@ exit 0
 #    ("templates", "owner_admin", "INTEGER"),
 #    ("api_tokens", "admin_id", "INTEGER"),
 #    ("broadcasts", "admin_id", "INTEGER"),
+#    # The photos and videos sent with the message, their kinds in order -
+#    # "photo,video" - the files themselves under BROADCAST_DIR.
+#    ("broadcasts", "media", "TEXT"),
 #    # Usage back to zero every so many days, whatever the plan: the admin's
 #    # choice per customer and per seller, and when it next happens.
 #    ("users", "reset_days", "INTEGER"),
@@ -6156,6 +6162,10 @@ exit 0
 ## ------------------------------------------------------------------ quota
 #def refused(error, message):
 #    return {"ok": False, "error": error, "message": message}
+#
+#
+#def broadcast_file(bid, n):
+#    return os.path.join(BROADCAST_DIR, "%d-%d" % (int(bid), int(n)))
 #
 #
 #def telegram_required(store, user):
@@ -10418,6 +10428,8 @@ exit 0
 #         "reply_ticket"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/close$"),
 #         "close_ticket"),
+#        ("GET", re.compile(r"/api/v1/broadcasts/(\d{1,12})/media/(\d{1,2})$"),
+#         "broadcast_media"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages/"
 #                           r"(\d{1,12})/image$"), "ticket_image"),
 #        # The operator's own, for a key with admin rights only.
@@ -10894,6 +10906,27 @@ exit 0
 #                              (int(mid), int(tid))):
 #            return 404, refused("image_not_found", "این عکس پیدا نشد")
 #        return self.ticket_answer(ticket_picture(self.store, user, mid))
+#
+#    def api_broadcast_media(self, body, bid, n):
+#        """One photo or video of a broadcast, by its place in the message,
+#        for a bot that was sent it - a seller's bot carries the owner's
+#        broadcasts to its customers too."""
+#        row = self.store.one(
+#            "SELECT b.media FROM broadcasts b WHERE b.id = ? AND b.media IS NOT NULL"
+#            " AND EXISTS (SELECT 1 FROM webhook_outbox w WHERE w.token_id = ?"
+#            " AND w.id BETWEEN b.first_row AND b.last_row)", (int(bid), self._key["id"]))
+#        kinds = row["media"].split(",") if row else []
+#        blob = None
+#        if int(n) < len(kinds):
+#            try:
+#                with open(broadcast_file(bid, n), "rb") as fh:
+#                    blob = fh.read()
+#            except OSError:
+#                pass
+#        if not blob:
+#            return 404, refused("media_not_found", "فایل این پیام همگانی نیست")
+#        return 200, {"ok": True, "kind": kinds[int(n)],
+#                     "data": base64.b64encode(blob).decode("ascii")}
 #
 #
 #class BotServer(TLSServer):
@@ -18208,6 +18241,8 @@ exit 0
 #        have = {r[1] for r in self.db.execute("PRAGMA table_info(broadcasts)")}
 #        if "admin_id" not in have:
 #            self.db.execute("ALTER TABLE broadcasts ADD COLUMN admin_id INTEGER")
+#        if "media" not in have:
+#            self.db.execute("ALTER TABLE broadcasts ADD COLUMN media TEXT")
 #        # The panel's too; here as well so a wallet page opened before the
 #        # panel has started after an upgrade finds it.
 #        self.db.execute(
@@ -18450,6 +18485,25 @@ exit 0
 #        # belongs to the delimiter, not to the file.
 #        return data[:-2] if data.endswith(b"\r\n") else data
 #    raise ValueError("no file was chosen")
+#
+#
+#def parse_uploads(body, content_type, field):
+#    """Every file under one name, in the order the form had them - for a form
+#    with several file boxes of that name. Empty boxes are left out."""
+#    marker = "boundary="
+#    if marker not in (content_type or ""):
+#        return []
+#    boundary = content_type.split(marker, 1)[1].strip().strip('"')
+#    want = ('name="%s"' % field).encode("latin-1")
+#    out = []
+#    for part in body.split(b"--" + boundary.encode("latin-1")):
+#        head, blank, data = part.partition(b"\r\n\r\n")
+#        if not blank or want not in head:
+#            continue
+#        data = data[:-2] if data.endswith(b"\r\n") else data
+#        if data:
+#            out.append(data)
+#    return out
 #
 #
 ## ------------------------------------------------------------------ backups
@@ -21858,6 +21912,63 @@ exit 0
 ## Telegram. Queued like any other message to the bot, one per customer, and
 ## the bot sends them one after another at a pace Telegram accepts.
 #BROADCAST_MAX = 3000
+## Photos and videos with it - one, or up to ten as an album: kept on disk,
+## not in the database, so that the backups the bot sends stay under
+## Telegram's 50 MB. The bot fetches them once per broadcast and hands
+## Telegram's own copies to everybody after the first. The column holds their
+## kinds in order, "photo,video,photo"; the files are <id>-0, <id>-1 ... A
+## week is well past the day the panel keeps trying to reach the bot.
+#BROADCAST_DIR = "/var/lib/smart-dns/broadcast"
+#BROADCAST_PHOTO_MAX = 10 * 1024 * 1024
+#BROADCAST_VIDEO_MAX = 20 * 1024 * 1024
+#BROADCAST_FILES_MAX = 10            # Telegram's most in one album
+#BROADCAST_TOTAL_MAX = 50 * 1024 * 1024
+#BROADCAST_KEEP_DAYS = 7
+## The words that go under a photo or video: past this Telegram refuses a
+## caption, so a longer text is sent as a message of its own after it.
+#CAPTION_MAX = 1024
+#
+#
+#def broadcast_media_kind(blob):
+#    """"photo" or "video" from a file's first bytes, or None."""
+#    if image_kind(blob):
+#        return "photo"
+#    if blob[4:8] == b"ftyp":        # MP4, and the iPhone's MOV
+#        return "video"
+#    return None
+#
+#
+#def broadcast_file(bid, n):
+#    return os.path.join(BROADCAST_DIR, "%d-%d" % (int(bid), int(n)))
+#
+#
+#def broadcast_media_label(media):
+#    """"🖼 3 عکس 🎬 فیلم " for the list of those sent."""
+#    kinds = (media or "").split(",") if media else []
+#    out = ""
+#    for kind, icon, word in (("photo", "🖼", "عکس"), ("video", "🎬", "فیلم")):
+#        n = kinds.count(kind)
+#        if n == 1:
+#            out += "%s %s " % (icon, word)
+#        elif n:
+#            out += "%s %d %s " % (icon, n, word)
+#    return out
+#
+#
+#def sweep_broadcast_media():
+#    """Drop the files of broadcasts older than BROADCAST_KEEP_DAYS."""
+#    cutoff = time.time() - BROADCAST_KEEP_DAYS * 86400
+#    try:
+#        names = os.listdir(BROADCAST_DIR)
+#    except OSError:
+#        return
+#    for name in names:
+#        path = os.path.join(BROADCAST_DIR, name)
+#        try:
+#            if os.path.getmtime(path) < cutoff:
+#                os.unlink(path)
+#        except OSError:
+#            pass
 #
 #
 #def broadcast_targets():
@@ -21911,16 +22022,37 @@ exit 0
 #                       % (key, html.escape(label), len(reach),
 #                          " (%d نفر دیگر تلگرام ندارند)" % without if without else ""))
 #    out = ["<div class='card'><h2>📣 پیام همگانی</h2>"
-#           "<form method='post' action='/%s/broadcast-send' onsubmit=\"return confirm("
+#           "<form method='post' action='/%s/broadcast-send' enctype='multipart/form-data'"
+#           " onsubmit=\"return confirm("
 #           "'این پیام برای همه‌ی کسانی که انتخاب کرده‌اید فرستاده شود؟')\">"
 #           "<div class='f'><label>متن پیام</label><textarea name='text' rows='5' "
-#           "maxlength='%d' required style='width:100%%'></textarea></div>"
+#           "maxlength='%d' style='width:100%%'></textarea></div>"
+#           "<div class='f'><label>عکس یا فیلم (اختیاری)</label>"
+#           "<div id='bc-media'>%s</div></div>"
 #           "<div class='f'><label>برای</label><select name='target'>%s</select></div>"
 #           "<button>فرستادن</button></form>"
+#           # A box for each file: choosing one opens the next, up to the
+#           # most an album holds; emptying one takes it away.
+#           "<script>(function(){var box=document.getElementById('bc-media'),"
+#           "most=%d,first=box.firstChild.cloneNode(true);"
+#           "box.addEventListener('change',function(){"
+#           "var ins=box.querySelectorAll('input');"
+#           "for(var i=0;i<ins.length-1;i++)if(!ins[i].value)box.removeChild(ins[i].parentNode);"
+#           "ins=box.querySelectorAll('input');"
+#           "if(ins[ins.length-1].value&&ins.length<most)box.appendChild(first.cloneNode(true));"
+#           "});})();</script>"
 #           "<p class='muted'>پیام فقط به مشتری‌هایی می‌رسد که تلگرامشان به ربات وصل است. ربات "
 #           "پیام‌ها را یکی‌یکی و با فاصله می‌فرستد تا تلگرام محدودش نکند؛ برای همین اگر مشتری "
 #           "زیاد باشد، چند دقیقه طول می‌کشد. عدد کنار هر گزینه، تعداد همین لحظه است.</p>"
-#           % (p, BROADCAST_MAX, "".join(options))]
+#           "<p class='muted'>عکس JPG، PNG یا WEBP تا ۱۰ مگابایت، فیلم MP4 تا ۲۰ مگابایت؛ "
+#           "با انتخاب هر فایل، جای فایل بعدی باز می‌شود. تا %d فایل، روی هم تا ۵۰ مگابایت؛ "
+#           "چند فایل با هم به شکل یک آلبوم می‌رسند. متن زیر عکس یا فیلم می‌آید؛ اگر بیشتر "
+#           "از %d نویسه باشد، جدا و بعد از آن فرستاده می‌شود. پیام می‌تواند فقط عکس یا "
+#           "فقط فیلم هم باشد.</p>"
+#           % (p, BROADCAST_MAX,
+#              "<div style='margin-bottom:6px'><input type='file' name='media' "
+#              "accept='image/jpeg,image/png,image/webp,video/mp4,video/quicktime'></div>",
+#              "".join(options), BROADCAST_FILES_MAX, BROADCAST_FILES_MAX, CAPTION_MAX)]
 #    try:
 #        rows = STORE.q("SELECT * FROM broadcasts WHERE COALESCE(admin_id, 0) = ?"
 #                       " ORDER BY id DESC LIMIT 10", (seller_id() or 0,))
@@ -21934,9 +22066,11 @@ exit 0
 #            done = STORE.one("SELECT count(*) c FROM webhook_outbox WHERE id BETWEEN ? AND ?"
 #                             " AND delivered_at IS NOT NULL",
 #                             (r["first_row"] or 0, r["last_row"] or -1))["c"]
-#            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+#            media = r["media"] if "media" in r.keys() else None
+#            out.append("<tr><td>%s</td><td>%s</td><td>%s%s</td><td>%s</td></tr>"
 #                       % (html.escape(r["created_at"][:16].replace("T", " ")),
 #                          html.escape(labels.get(r["target"], r["target"])),
+#                          broadcast_media_label(media),
 #                          html.escape(r["text"][:80] + ("…" if len(r["text"]) > 80 else "")),
 #                          "%d از %d" % (done, r["recipients"])))
 #        out.append("</table>")
@@ -22021,6 +22155,59 @@ exit 0
 #    if not res.get("ok"):
 #        return None, "تلگرام این توکن را نمی‌شناسد"
 #    return res["result"].get("username") or "", None
+#
+#
+## The channel a customer must join before the bot serves them: a public one
+## by its @name, or a private one by its number with its invitation link.
+#CHANNEL_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
+#CHANNEL_LINK_RE = re.compile(r"https://t\.me/(\+|joinchat/)[A-Za-z0-9_-]{8,64}")
+#
+#
+#def parse_channel(raw, link):
+#    """(what Telegram knows the channel by, the link customers join by) from
+#    what the admin wrote; ("", "") for none. ValueError says what is wrong."""
+#    raw, link = (raw or "").strip(), (link or "").strip()
+#    if not raw:
+#        return "", ""
+#    if re.fullmatch(r"-100\d{6,15}", raw):
+#        if not CHANNEL_LINK_RE.fullmatch(link):
+#            raise ValueError("برای کانال خصوصی، لینک دعوت کانال را هم بنویسید "
+#                             "(مثل https://t.me/+AbCd...)")
+#        return raw, link
+#    if CHANNEL_LINK_RE.fullmatch(raw):
+#        raise ValueError("از روی لینک دعوت نمی‌شود کانال را پیدا کرد؛ برای کانال خصوصی "
+#                         "آیدی عددی آن را بنویسید (با -100 شروع می‌شود) و لینک را در خانهٔ "
+#                         "لینک")
+#    name = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)|^@", "", raw).strip("/")
+#    if not CHANNEL_NAME_RE.fullmatch(name):
+#        raise ValueError("آیدی کانال درست نیست؛ مثل @my_channel")
+#    return "@" + name, "https://t.me/" + name
+#
+#
+#def bot_channel_check(token, chat):
+#    """Whether this bot can see who is in the channel - Telegram only tells
+#    a bot that is an admin there. (the channel's title, None) or (None, why)."""
+#    def ask(method, **params):
+#        url = "%s/bot%s/%s?%s" % (TELEGRAM_API, token, method, urllib.parse.urlencode(params))
+#        try:
+#            with urllib.request.urlopen(url, timeout=15) as r:
+#                return json.loads(r.read())
+#        except urllib.error.HTTPError as e:
+#            try:
+#                return json.loads(e.read())
+#            except ValueError:
+#                return {"ok": False}
+#
+#    try:
+#        found = ask("getChat", chat_id=chat)
+#        if not found.get("ok"):
+#            return None, "تلگرام این کانال را پیدا نکرد؛ آیدی را درست بنویسید"
+#        me = ask("getChatMember", chat_id=chat, user_id=token.split(":", 1)[0])
+#    except Exception as e:
+#        return None, "به تلگرام نرسیدیم: %s" % str(e)[:80]
+#    if not me.get("ok") or me["result"].get("status") not in ("administrator", "creator"):
+#        return None, "ربات در این کانال ادمین نیست؛ اول ربات را ادمین کانال کنید"
+#    return found["result"].get("title") or chat, None
 #
 #
 #BOT_LOG_LINES = 200
@@ -23419,6 +23606,13 @@ exit 0
 #        STORE.run("DELETE FROM webhook_outbox WHERE token_id = ?", (k["id"],))
 #        STORE.run("DELETE FROM api_idempotency WHERE token_id = ?", (k["id"],))
 #        STORE.run("DELETE FROM api_tokens WHERE id = ?", (k["id"],))
+#    for b in STORE.q("SELECT id, media FROM broadcasts WHERE admin_id = ?"
+#                     " AND media IS NOT NULL", (aid,)):
+#        for n in range(len(b["media"].split(","))):
+#            try:
+#                os.remove(broadcast_file(b["id"], n))
+#            except OSError:
+#                pass
 #    STORE.run("DELETE FROM broadcasts WHERE admin_id = ?", (aid,))
 #    for key in ("pay_text", "bot_link", "bot_username"):
 #        STORE.run("DELETE FROM settings WHERE key = ?", ("%s:%d" % (key, aid),))
@@ -25056,6 +25250,16 @@ exit 0
 #            "<div class='f'><label>زبان ربات</label><select name='lang'>"
 #            "<option value='fa'%s>فارسی</option><option value='en'%s>English</option>"
 #            "</select></div>"
+#            "<div class='f'><label>عضویت اجباری در کانال (اختیاری)</label>"
+#            "<input name='channel' dir='ltr' value='%s' placeholder='@my_channel'"
+#            " style='width:100%%'></div>"
+#            "<div class='f'><label>لینک دعوت (فقط برای کانال خصوصی)</label>"
+#            "<input name='channel_link' dir='ltr' value='%s'"
+#            " placeholder='https://t.me/+AbCd...' style='width:100%%'></div>"
+#            "<p class='muted'>اگر کانال بنویسید، هر مشتری اول باید عضو آن شود تا ربات برایش "
+#            "کار کند. ربات را در کانال <b>ادمین</b> کنید؛ تلگرام فقط به ادمین می‌گوید چه کسی "
+#            "عضو است. کانال عمومی را با @ بنویسید؛ کانال خصوصی را با آیدی عددی‌اش (با -100 "
+#            "شروع می‌شود) و لینک دعوتش. خالی بگذارید تا خاموش شود.</p>"
 #            "<button>%s</button></form>"
 #            "<p class='muted'>شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از "
 #            "همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد%s، "
@@ -25068,6 +25272,9 @@ exit 0
 #               html.escape(env.get("SUPPORT_TEXT", "").replace("\\n", " "), quote=True),
 #               "" if env.get("BOT_LANG") == "en" else " selected",
 #               " selected" if env.get("BOT_LANG") == "en" else "",
+#               html.escape(env.get("JOIN_CHANNEL", ""), quote=True),
+#               html.escape(env.get("JOIN_LINK", "") if env.get("JOIN_CHANNEL", "")
+#                           .startswith("-") else "", quote=True),
 #               "ذخیره و ری‌استارت ربات" if configured else "راه‌اندازی ربات",
 #               " که فقط مشتری‌ها، پلن‌ها و کارت شما را می‌بیند" if s else " (صفحهٔ API)"))
 #        if configured:
@@ -26136,6 +26343,15 @@ exit 0
 #            username, why = bot_getme(token)
 #            if why:
 #                return self.redirect("bot?m=!%s" % why)
+#            try:
+#                channel, channel_link = parse_channel(one("channel"), one("channel_link"))
+#            except ValueError as e:
+#                return self.redirect("bot?m=!%s" % e)
+#            channel_title = ""
+#            if channel:
+#                channel_title, why = bot_channel_check(token, channel)
+#                if why:
+#                    return self.redirect("bot?m=!%s" % why)
 #            # The key the bot speaks with. The one it already has, if it is
 #            # still good - only a hash is kept here, so a key cannot be read
 #            # back, only reused from the bot's own file or made anew.
@@ -26164,7 +26380,9 @@ exit 0
 #                "BOT_TOKEN": token, "API_URL": bot_api_url().rstrip("/"), "API_KEY": key,
 #                "WEBHOOK_SECRET": secret, "LISTEN": listen, "ADMIN_IDS": admins,
 #                "PAY_TEXT": "", "SUPPORT_TEXT": " ".join(one("support").split())[:200],
-#                "BOT_LANG": "en" if one("lang") == "en" else "fa"})
+#                "BOT_LANG": "en" if one("lang") == "en" else "fa",
+#                "JOIN_CHANNEL": channel, "JOIN_LINK": channel_link,
+#                "JOIN_TITLE": " ".join(channel_title.split())[:80]})
 #            systemctl("enable", unit)
 #            started = systemctl("restart", unit)
 #            log(INFO, "telegram bot @%s set up for admin(s) %s" % (username, admins))
@@ -26341,12 +26559,43 @@ exit 0
 #            return self.redirect("me?m=رمز عوض شد؛ از بقیهٔ دستگاه‌ها بیرون آمدید")
 #
 #        if rest == "broadcast-send":
-#            text = one("text").replace("\r\n", "\n").strip()
-#            if not text:
-#                return self.redirect("bot?m=!متن پیام را بنویسید")
+#            # Multipart, for the photo or video, so the text fields come out
+#            # of the same body as the file does.
+#            raw = getattr(self, "raw_body", None)
+#            ctype = self.headers.get("Content-Type") if raw is not None else None
+#
+#            def field(name):
+#                if raw is None:
+#                    return one(name)
+#                try:
+#                    return parse_upload(raw, ctype, name).decode("utf-8", "replace").strip()
+#                except ValueError:
+#                    return ""
+#
+#            text = field("text").replace("\r\n", "\n").strip()
+#            target = field("target")
+#            blobs = parse_uploads(raw, ctype, "media") if raw is not None else []
+#            kinds = []
+#            if len(blobs) > BROADCAST_FILES_MAX:
+#                return self.redirect("bot?m=!حداکثر %d عکس یا فیلم" % BROADCAST_FILES_MAX)
+#            if sum(len(b) for b in blobs) > BROADCAST_TOTAL_MAX:
+#                return self.redirect("bot?m=!عکس‌ها و فیلم‌ها روی هم بیشتر از ۵۰ مگابایت است")
+#            for blob in blobs:
+#                kind = broadcast_media_kind(blob)
+#                if not kind:
+#                    return self.redirect("bot?m=!فقط عکس JPG، PNG، WEBP یا فیلم MP4")
+#                if len(blob) > (BROADCAST_PHOTO_MAX if kind == "photo"
+#                                else BROADCAST_VIDEO_MAX):
+#                    return self.redirect("bot?m=!%s" % (
+#                        "عکس بزرگ‌تر از ۱۰ مگابایت است" if kind == "photo"
+#                        else "فیلم بزرگ‌تر از ۲۰ مگابایت است"))
+#                kinds.append(kind)
+#            media = ",".join(kinds) or None
+#            if not text and not blobs:
+#                return self.redirect("bot?m=!متن پیام را بنویسید یا عکس یا فیلم بگذارید")
 #            if len(text) > BROADCAST_MAX:
 #                return self.redirect("bot?m=!پیام بیشتر از %d نویسه است" % BROADCAST_MAX)
-#            audience = broadcast_audience(one("target"))
+#            audience = broadcast_audience(target)
 #            if audience is None:
 #                return self.redirect("bot?m=!گیرنده‌ها را انتخاب کنید")
 #            ids, _without = audience
@@ -26367,18 +26616,33 @@ exit 0
 #                         for o in set(owners.values())}
 #            stamp = now()
 #            first = last = None
+#            sweep_broadcast_media()
 #            with STORE.lock:
 #                cur = STORE.db.execute("INSERT INTO broadcasts (text, target, recipients,"
-#                                       " created_at, admin_id) VALUES (?, ?, ?, ?, ?)",
-#                                       (text, one("target"), len(ids), stamp, seller_id()))
+#                                       " created_at, admin_id, media) VALUES (?, ?, ?, ?, ?, ?)",
+#                                       (text, target, len(ids), stamp, seller_id(), media))
 #                bid = cur.lastrowid
+#                # On disk before the bot can hear of them: nothing reaches
+#                # the bot until the commit below.
+#                try:
+#                    if blobs:
+#                        os.makedirs(BROADCAST_DIR, mode=0o700, exist_ok=True)
+#                    for n, blob in enumerate(blobs):
+#                        with open(broadcast_file(bid, n), "wb") as fh:
+#                            fh.write(blob)
+#                except OSError as e:
+#                    STORE.db.rollback()
+#                    log(WARN, "broadcast media not saved: %s" % e)
+#                    return self.redirect("bot?m=!فایل ذخیره نشد: %s" % e.strerror)
+#                data = {"broadcast_id": bid, "text": text}
+#                if kinds:
+#                    data["media"] = kinds
 #                for uid in ids:
 #                    tg = STORE.db.execute("SELECT telegram_id, owner_admin FROM users"
 #                                          " WHERE id = ?", (uid,)).fetchone()
 #                    payload = json.dumps({"event": "broadcast", "created_at": stamp,
 #                                          "telegram_id": tg[0], "user_id": uid,
-#                                          "data": {"broadcast_id": bid, "text": text}},
-#                                         ensure_ascii=False)
+#                                          "data": data}, ensure_ascii=False)
 #                    for k in by_seller.get(tg[1], keys):
 #                        row = STORE.db.execute(
 #                            "INSERT INTO webhook_outbox (token_id, event, payload, created_at,"
@@ -26389,7 +26653,8 @@ exit 0
 #                STORE.db.execute("UPDATE broadcasts SET first_row = ?, last_row = ?"
 #                                 " WHERE id = ?", (first, last, bid))
 #                STORE.db.commit()
-#            log(INFO, "broadcast #%d to %d customers (%s)" % (bid, len(ids), one("target")))
+#            log(INFO, "broadcast #%d to %d customers (%s)%s"
+#                % (bid, len(ids), target, " with %s" % media if media else ""))
 #            return self.redirect("bot?m=پیام برای %d نفر در صف فرستادن است" % len(ids))
 #
 #        if rest == "bot-power":
@@ -30191,6 +30456,9 @@ exit 0
 #    PAY_TEXT         how to pay, only if the admin panel's Payment page is
 #                     empty - that one wins
 #    SUPPORT_TEXT     shown under "help" (optional)
+#    JOIN_CHANNEL     a channel to join before anything else, @name or -100...
+#                     (optional; the bot must be an admin there)
+#    JOIN_LINK        its invitation link, for a private channel
 #"""
 #import base64
 #import hashlib
@@ -30233,7 +30501,15 @@ exit 0
 #        "telegram": env.get("TELEGRAM_API", "https://api.telegram.org").rstrip("/"),
 #        # The language the bot speaks, set in the admin panel's bot page.
 #        "lang": "en" if env.get("BOT_LANG", "").strip() == "en" else "fa",
+#        "channel": env.get("JOIN_CHANNEL", "").strip(),
+#        "channel_title": env.get("JOIN_TITLE", "").strip(),
 #    }
+#    cfg["channel_link"] = env.get("JOIN_LINK", "").strip() or (
+#        "https://t.me/" + cfg["channel"][1:] if cfg["channel"].startswith("@") else "")
+#    if cfg["channel"] and not cfg["channel_link"]:
+#        # Nobody could get in: better no gate than one without a door.
+#        log("JOIN_CHANNEL %s has no JOIN_LINK; not asking anybody to join" % cfg["channel"])
+#        cfg["channel"] = ""
 #    missing = [k for k in ("token", "api", "key") if not cfg[k]]
 #    if missing:
 #        sys.exit("missing settings: %s (see bot.env.example)"
@@ -30261,6 +30537,10 @@ exit 0
 #          "over_quota": "حجم تمام شده ⛔", "expired": "دوره تمام شده ⛔",
 #          "suspended": "مسدود ⛔"}
 #MAX_FILE = 4 * 1024 * 1024
+## Telegram's longest caption under a photo or video.
+#CAPTION_MAX = 1024
+## How long "is in the channel" is believed before Telegram is asked again.
+#MEMBER_FRESH = 600
 #
 #
 #def size_fa(n):
@@ -30424,25 +30704,35 @@ exit 0
 #        return self.call("sendMessage", chat_id=chat, text=text[:4000], reply_markup=markup,
 #                         link_preview_options={"is_disabled": True})
 #
-#    def photo(self, chat, blob, caption, markup=None):
-#        """sendPhoto needs a real upload, so this one is multipart."""
+#    def upload(self, method, files, **fields):
+#        """A call carrying files, which has to be multipart: `files` maps
+#        each part's name to its bytes, `fields` are the rest (None left out,
+#        a list or dict sent as JSON). Telegram's answer; HTTPError when it
+#        refuses."""
 #        boundary = secrets.token_hex(16)
 #        parts = []
-#        for name, value in (("chat_id", str(chat)), ("caption", caption[:1000]),
-#                            ("reply_markup", json.dumps(markup) if markup else None)):
-#            if value is not None:
-#                parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
-#                              % (boundary, name, value)).encode())
-#        parts.append(('--%s\r\nContent-Disposition: form-data; name="photo"; '
-#                      'filename="receipt"\r\nContent-Type: application/octet-stream\r\n\r\n'
-#                      % boundary).encode() + blob + b"\r\n")
+#        for key, value in fields.items():
+#            if value is None:
+#                continue
+#            if isinstance(value, (list, dict)):
+#                value = json.dumps(value)
+#            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+#                          % (boundary, key, value)).encode())
+#        for name, blob in files.items():
+#            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; '
+#                          'filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
+#                          % (boundary, name, name)).encode() + blob + b"\r\n")
 #        parts.append(("--%s--\r\n" % boundary).encode())
-#        req = urllib.request.Request(self.base + "sendPhoto", data=b"".join(parts),
+#        req = urllib.request.Request(self.base + method, data=b"".join(parts),
 #                                     headers={"Content-Type": "multipart/form-data; boundary="
 #                                              + boundary})
+#        with urllib.request.urlopen(req, timeout=300) as r:
+#            return json.loads(r.read()).get("result")
+#
+#    def photo(self, chat, blob, caption, markup=None):
 #        try:
-#            with urllib.request.urlopen(req, timeout=60) as r:
-#                return json.loads(r.read()).get("result")
+#            return self.upload("sendPhoto", {"photo": blob}, chat_id=chat,
+#                               caption=caption[:1000], reply_markup=markup)
 #        except urllib.error.HTTPError:
 #            # A PDF, or something Telegram will not show as a photo: say it in words.
 #            return self.send(chat, caption + "\n\n(فایل رسید عکس نبود؛ در پنل ببینید)", markup)
@@ -30474,6 +30764,10 @@ exit 0
 #        self.known = set()       # telegram ids the panel already has an account for
 #        self.seen = []           # recent webhook ids, so a repeat is dropped
 #        self.lock = threading.Lock()
+#        # The photo or video of the broadcast going out: its bytes until
+#        # Telegram has taken it once, then Telegram's own id for it.
+#        self.media = {}
+#        self.members = {}        # telegram id -> when Telegram last said they are in the channel
 #
 #    # -- helpers ------------------------------------------------------------
 #    def is_admin(self, uid):
@@ -30543,6 +30837,8 @@ exit 0
 #            return self.say(chat, "لغو شد.", MENU)
 #        if text.startswith("/start"):
 #            return self.on_start(chat, sender, text)
+#        if not self.in_channel(sender["id"]):
+#            return self.ask_to_join(chat)
 #        if self.is_admin(sender["id"]) and text in ("/stats", "/receipts"):
 #            return self.admin_command(chat, text)
 #
@@ -30625,7 +30921,45 @@ exit 0
 #                self.known.add(sender["id"])
 #            except ApiError as e:
 #                log("invitation start failed: %s" % e)
+#        # After the invitation is written down: somebody who joins the
+#        # channel first still counts as invited.
+#        if not self.in_channel(sender["id"]):
+#            return self.ask_to_join(chat, "سلام! 👋 به ربات خوش آمدید.\n\n")
 #        return self.say(chat, "سلام! 👋 به ربات خوش آمدید.\n\n" + self.help_text(), MENU)
+#
+#    # -- the channel a customer must be in first --------------------------------
+#    def in_channel(self, uid):
+#        """True when there is no channel to join, for the operator, and for
+#        somebody Telegram says is in it - remembered for a while, so every
+#        tap is not a question to Telegram. When Telegram cannot say - the bot
+#        is no longer an admin there, or Telegram is not answering - nobody
+#        is kept out for it."""
+#        channel = self.cfg.get("channel")
+#        if not channel or self.is_admin(uid):
+#            return True
+#        if time.time() - self.members.get(uid, 0) < MEMBER_FRESH:
+#            return True
+#        try:
+#            m = self.tg.call("getChatMember", chat_id=channel, user_id=uid)
+#        except Exception as e:
+#            if re.search(r"(?i)user not found|member not found|participant_id_invalid", str(e)):
+#                return False
+#            log("could not ask %s whether %s is in it: %s" % (channel, uid, e))
+#            return True
+#        status = (m or {}).get("status")
+#        if status in ("creator", "administrator", "member") or (
+#                status == "restricted" and m.get("is_member")):
+#            self.members[uid] = time.time()
+#            return True
+#        return False
+#
+#    def ask_to_join(self, chat, before=""):
+#        name = self.cfg.get("channel_title") or self.cfg["channel"]
+#        self.say(chat, before + "برای استفاده از ربات، اول عضو کانال «%s» شوید و بعد "
+#                 "«✅ عضو شدم» را بزنید." % name,
+#                 {"inline_keyboard": [
+#                     [{"text": "📢 عضویت در کانال", "url": self.cfg["channel_link"]}],
+#                     [{"text": "✅ عضو شدم", "callback_data": "joined"}]]})
 #
 #    # -- a web sign-in for everybody who comes through the bot ----------------
 #    def ready(self, chat, sender):
@@ -31056,6 +31390,14 @@ exit 0
 #            if not self.is_admin(sender["id"]):
 #                return
 #            return self.admin_button(chat, q, kind, int(arg))
+#        if kind == "joined":
+#            self.members.pop(sender["id"], None)
+#            if not self.in_channel(sender["id"]):
+#                return self.ask_to_join(chat, "هنوز عضو کانال نشده‌اید. ")
+#            return self.say(chat, "✅ ممنون! حالا از دکمه‌های پایین استفاده کنید.\n\n"
+#                            + self.help_text(), MENU)
+#        if not self.in_channel(sender["id"]):
+#            return self.ask_to_join(chat)
 #        if kind == "buy":
 #            return self.chose_plan(chat, sender, int(arg))
 #        if kind == "plans":
@@ -31208,6 +31550,9 @@ exit 0
 #                    self.say(admin, text)
 #            return
 #        chat = ev.get("telegram_id")
+#        if kind == "broadcast" and chat and data.get("media"):
+#            time.sleep(0.05)
+#            return self.send_broadcast(chat, data)
 #        if not chat or not text:
 #            return
 #        if kind == "broadcast":
@@ -31220,6 +31565,65 @@ exit 0
 #        elif kind in ("quota.warning", "quota.exhausted", "plan.expiring", "plan.expired"):
 #            markup = {"inline_keyboard": [[{"text": "🛒 تمدید", "callback_data": "plans"}]]}
 #        self.say(chat, text, markup)
+#
+#    def send_broadcast(self, chat, data):
+#        """A broadcast with photos or videos - one on its own, several as an
+#        album - with the words under them, or after them when they are too
+#        long for a caption."""
+#        bid, kinds = data.get("broadcast_id"), data["media"]
+#        kinds = [kinds] if isinstance(kinds, str) else list(kinds)[:10]
+#        words = data.get("text") or ""
+#        text = self.t(words)
+#        caption = text if len(text) <= CAPTION_MAX else None
+#        # The files' bytes, or once Telegram has them, Telegram's ids for them.
+#        have = self.media.get(bid)
+#        if have is None:
+#            try:
+#                have = [base64.b64decode(self.panel.call(
+#                    "GET", "/broadcasts/%d/media/%d" % (int(bid), n))["data"])
+#                    for n in range(len(kinds))]
+#            except Exception as e:
+#                log("broadcast #%s: its photos or videos could not be had (%s); the words "
+#                    "alone" % (bid, e))
+#                return self.say(chat, words) if words else None
+#            # Only the one going out now is kept.
+#            self.media = {bid: have}
+#        files = {"f%d" % n: blob for n, blob in enumerate(have) if isinstance(blob, bytes)}
+#        try:
+#            if len(kinds) == 1:
+#                kind = kinds[0]
+#                method = "sendPhoto" if kind == "photo" else "sendVideo"
+#                if files:
+#                    sent = [self.tg.upload(method, {kind: have[0]}, chat_id=chat,
+#                                           caption=caption)]
+#                else:
+#                    self.tg.call(method, chat_id=chat, caption=caption, **{kind: have[0]})
+#            else:
+#                album = [{"type": kind, "media": "attach://f%d" % n if "f%d" % n in files
+#                          else have[n]} for n, kind in enumerate(kinds)]
+#                if caption:
+#                    album[0]["caption"] = caption
+#                if files:
+#                    sent = self.tg.upload("sendMediaGroup", files, chat_id=chat, media=album)
+#                else:
+#                    self.tg.call("sendMediaGroup", chat_id=chat, media=album)
+#        except Exception as e:
+#            # Most often somebody who has blocked the bot.
+#            return log("broadcast #%s to %s: %s" % (bid, chat, e))
+#        if files:
+#            ids = [telegram_file_id(m, k) for m, k in zip(sent or [], kinds)]
+#            if len(ids) == len(kinds) and all(ids):
+#                self.media = {bid: ids}
+#        if caption is None and words:
+#            self.say(chat, words)
+#
+#
+#def telegram_file_id(message, kind):
+#    """The id Telegram keeps a sent photo or video under, to send it again
+#    without uploading it; a photo's is its largest size."""
+#    got = (message or {}).get(kind)
+#    got = got[-1] if isinstance(got, list) and got else got
+#    return got.get("file_id") if isinstance(got, dict) else None
 #
 #
 ## ---------------------------------------------------------- panel webhooks
@@ -35919,6 +36323,7 @@ exit 0
 #"» حذف شود؟": "” be deleted?",
 #"» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون می‌آید.": "” get a new password? They will be signed out of every device.",
 #"» روی خود رله است، نه یک DNS": "” is on the relay itself, not a DNS server",
+#"» شوید و بعد «✅ عضو شدم» را بزنید.": "”, then press “✅ I have joined”.",
 #"» فعال شد تا": "” active until",
 #"، آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را روشن می‌کند.": ", puts the bot’s address behind the customer panel’s “Connect Telegram” button, and turns the bot on.",
 #"، آپلود": ", upload",
@@ -35995,6 +36400,7 @@ exit 0
 #"آیدی عددی تلگرام خودتان را از": "Get your numeric Telegram ID from",
 #"آیدی عددی تلگرام خودتان را بنویسید": "Write your own numeric Telegram ID",
 #"آیدی عددی تلگرام شما (چند تا با ویرگول)": "Your numeric Telegram ID (several, separated by commas)",
+#"آیدی کانال درست نیست؛ مثل @my_channel": "That is not a channel id; like @my_channel",
 #"آیفون و آیپد": "iPhone and iPad",
 #"آیفون: بعد از دانلود پروفایل، تنظیمات ← پروفایل دانلودشده ← نصب. اندروید: تنظیمات ← Private DNS ← نام میزبان، و نام DoT یک سرور. کروم و فایرفاکس: بخش DNS امن تنظیماتشان، و آدرس DoH یک سرور.": "iPhone: after downloading the profile, Settings → Profile Downloaded → Install. Android: Settings → Private DNS → hostname, and one server’s DoT name. Chrome and Firefox: the secure DNS part of their settings, and one server’s DoH address.",
 #"آی‌پی": "IP",
@@ -36054,6 +36460,7 @@ exit 0
 #"از دکمه‌های پایین استفاده کنید.": "Use the buttons below.",
 #"از رله": "through the relay",
 #"از رلهٔ": "from relay",
+#"از روی لینک دعوت نمی‌شود کانال را پیدا کرد؛ برای کانال خصوصی آیدی عددی آن را بنویسید (با -100 شروع می‌شود) و لینک را در خانهٔ لینک": "A channel cannot be found from its invitation link; for a private channel write its number (it starts with -100) and put the link in the link box",
 #"از سرور خارج": "from the exit server",
 #"از قبل DNS جداگانه دارد؛ اول حذفش کنید": "already has a separate DNS; delete that first",
 #"از قبل اضافه شده": "already added",
@@ -36137,6 +36544,7 @@ exit 0
 #"اگر این حساب به تلگرام وصل باشد، کد شش‌رقمی به تلگرامتان فرستاده شد؛": "If this account is linked to Telegram, a six-digit code was sent to your Telegram;",
 #"اگر جای دیگری وارد حسابتان باشید، با تغییر رمز از آنجا خارج می‌شوید.": "If you are signed in to your account anywhere else, changing the password signs you out there.",
 #"اگر حسابتان به تلگرام وصل باشد، یک کد شش‌رقمی به تلگرامتان می‌فرستیم.": "If your account is linked to Telegram, we send a six-digit code to your Telegram.",
+#"اگر کانال بنویسید، هر مشتری اول باید عضو آن شود تا ربات برایش کار کند. ربات را در کانال": "With a channel here, every customer has to join it before the bot works for them. Make the bot an",
 #"ایج آو امپایرز": "Age of Empires",
 #"این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته": "This Idempotency-Key was already used for another request",
 #"این آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، بگذارید.": "Put this address in your console or router as both DNS 1 and DNS 2.",
@@ -36290,6 +36698,7 @@ exit 0
 #"برای": "for",
 #"برای «": "for “",
 #"برای آماده کردن پشتیبان، اول در «تنظیمات» رمز بکاپ بگذارید؛ بکاپی که پشتیبان نگه می‌دارد با همان رمز باز می‌شود.": "To get a standby ready, first set a backup password in “Settings”; the backup the standby keeps opens with that password.",
+#"برای استفاده از ربات، اول عضو کانال «": "To use the bot, first join the channel “",
 #"برای بکاپ یک رمز بگذارید": "Set a password for the backup",
 #"برای تست رایگان، اول حسابتان را به تلگرام وصل کنید": "For the free trial, first link your account to Telegram",
 #"برای خرید یا تمدید، اول حسابتان را به تلگرام وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.": "To buy or renew, first link your account to Telegram. Each Telegram links to only one account.",
@@ -36305,6 +36714,7 @@ exit 0
 #"برای همهٔ قالب‌ها مسدود است (": "is blocked for every template (",
 #"برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت (اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت (DOH) یا (DOT) جلویشان.": "To find which domain a service needs: pick the customer, press the button and ask them to open the service that does not work during that time. “via relay” means it went through the server, “direct” means it went directly (if the service does not accept Iran, add those domains on the domains page), “filtered” means Iran’s own filter. DoH and DoT queries show too, marked (DOH) or (DOT).",
 #"برای کار کردن، این‌ها هم باید روشن باشند:": "For it to work, these must be on too:",
+#"برای کانال خصوصی، لینک دعوت کانال را هم بنویسید (مثل https://t.me/+AbCd...)": "For a private channel, write its invitation link too (like https://t.me/+AbCd...)",
 #"برای کدام خریدها": "For which purchases",
 #"برداشتن": "Remove",
 #"برداشته شد": "Removed",
@@ -36429,6 +36839,7 @@ exit 0
 #"تلگرام از حساب جدا شد": "Telegram unlinked from the account",
 #"تلگرام از حساب جدا شد؛ مشتری می‌تواند تلگرام تازه را وصل کند": "Telegram unlinked from the account; the customer can link a new Telegram",
 #"تلگرام این توکن را نمی‌شناسد": "Telegram does not know this token",
+#"تلگرام این کانال را پیدا نکرد؛ آیدی را درست بنویسید": "Telegram did not find this channel; check the id",
 #"تلگرام جواب نداد (HTTP": "Telegram did not answer (HTTP",
 #"تلگرامتان عوض شده؟ جدا کردن تلگرام": "Changed your Telegram? Unlink Telegram",
 #"تمام": "Done",
@@ -36799,6 +37210,7 @@ exit 0
 #"ربات تلگرام @": "Telegram bot @",
 #"ربات جواب می‌دهد که حساب وصل شد. بعد از آن اگر رمز را فراموش کنید، از صفحهٔ ورود کد بازیابی به همین تلگرام می‌آید.": "The bot answers that the account is linked. After that, if you forget your password, the recovery code comes to this Telegram from the sign-in page.",
 #"ربات خاموش شد": "Bot turned off",
+#"ربات در این کانال ادمین نیست؛ اول ربات را ادمین کانال کنید": "The bot is not an admin of this channel; make it an admin there first",
 #"ربات راه‌اندازی نشده": "The bot is not set up",
 #"ربات راه‌اندازی نشده (صفحهٔ «ربات»).": "The bot is not set up (the “Bot” page).",
 #"ربات روشن شد": "Bot turned on",
@@ -37070,14 +37482,17 @@ exit 0
 #"عدد سهمیه درست نیست": "The quota number is not valid",
 #"عدد مثبت به موجودی اضافه می‌کند و عدد منفی از آن کم می‌کند؛ موجودی کمتر از صفر نمی‌شود. به مشتری هم پیام می‌رود.": "A positive number adds to the balance and a negative one takes from it; the balance never goes below zero. The customer is told too.",
 #"عددها را درست بنویسید": "Write the numbers correctly",
+#"عضویت اجباری در کانال (اختیاری)": "Channel to join first (optional)",
 #"عوض می‌شود": "changes",
 #"عکس": "Picture",
 #"عکس (اختیاری)": "Picture (optional)",
 #"عکس (اختیاری، مثلاً اسکرین‌شات خطا)": "Picture (optional, e.g. a screenshot of the error)",
 #"عکس (رسید و تیکت) در این فایل با کلید سرور دیگری رمزگذاری شده و این‌جا باز نمی‌شود. اگر از سرور دیگری آورده‌اید، فایل": "Pictures (receipts and tickets) in this file are encrypted with another server’s key and cannot be opened here. If you brought it from another server, the file",
+#"عکس JPG، PNG یا WEBP تا ۱۰ مگابایت، فیلم MP4 تا ۲۰ مگابایت؛ با انتخاب هر فایل، جای فایل بعدی باز می‌شود. تا": "A JPG, PNG or WEBP photo up to 10 MB, an MP4 video up to 20 MB; choosing a file opens a box for the next one. Up to",
 #"عکس این رسید نیست (یا بعد از تصمیم پاک شده)": "This receipt has no picture (or it was deleted after the decision)",
 #"عکس با آن رمزگذاری شده و الان باز نمی‌شود. فایل را از نسخهٔ پشتیبانش برگردانید. تا آن موقع عکس‌های تازه بدون رمز نگه داشته می‌شوند.": "pictures are encrypted with it and cannot be opened now. Put the file back from its backup. Until then new pictures are kept unencrypted.",
 #"عکس بزرگ‌تر از": "The picture is larger than",
+#"عکس بزرگ‌تر از ۱۰ مگابایت است": "The photo is larger than 10 MB",
 #"عکس بزرگ‌تر از ۴ مگابایت است": "The picture is larger than 4 MB",
 #"عکس خراب بود، دوباره بفرستید": "The picture was broken, send it again",
 #"عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)": "Receipt picture (picture or PDF, at most 4 MB)",
@@ -37086,7 +37501,10 @@ exit 0
 #"عکس رسیدها و تیکت‌ها رمزگذاری شده نگه داشته می‌شوند و کلیدشان در": "Receipt and ticket pictures are kept encrypted and their key is in",
 #"عکس فیش واریزی را بفرستید تا مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ مگابایت. اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.": "Send a photo of the payment slip so the admin can review it and top up your account. A picture or PDF, at most 4 MB. If you send a new receipt, it replaces the previous one.",
 #"عکس پیدا نشد": "Picture not found",
+#"عکس یا فیلم": "photos or videos",
+#"عکس یا فیلم (اختیاری)": "Photo or video (optional)",
 #"عکس‌ها رمزگذاری نمی‌شوند: کتابخانهٔ OpenSSL روی این سرور پیدا نشد.": "Pictures are not encrypted: the OpenSSL library was not found on this server.",
+#"عکس‌ها و فیلم‌ها روی هم بیشتر از ۵۰ مگابایت است": "The photos and videos come to more than 50 MB together",
 #"عیب‌یابی": "Diagnose",
 #"عیب‌یابی سرویس‌ها": "Service diagnosis",
 #"غیرفعال": "Inactive",
@@ -37100,14 +37518,17 @@ exit 0
 #"فایرفاکس": "Firefox",
 #"فایل": "File",
 #"فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا تأیید می‌خواهد. بکاپی که ربات فرستاده (": "The file is only checked and described first; replacing needs its own confirmation. A backup the bot sent (",
+#"فایل این پیام همگانی نیست": "This broadcast's file is not here",
 #"فایل باز شد ولی خراب است:": "The file opened but is broken:",
 #"فایل بزرگ‌تر از": "The file is larger than",
 #"فایل بزرگ‌تر از ۴ مگابایت است": "The file is larger than 4 MB",
 #"فایل خالی بود": "The file was empty",
 #"فایل خراب بود، دوباره بفرستید": "The file was broken, send it again",
 #"فایل خیلی بزرگ است": "The file is too large",
+#"فایل ذخیره نشد:": "The file was not saved:",
 #"فایل ربات روی این سرور نیست. نصب‌کننده را یک بار دیگر روی همین سرور اجرا کنید تا اضافه شود.": "The bot file is not on this server. Run the installer on this server once more to add it.",
 #"فایل ربات روی این سرور نیست؛ نصب‌کننده را دوباره اجرا کنید": "The bot file is not on this server; run the installer again",
+#"فایل، روی هم تا ۵۰ مگابایت؛ چند فایل با هم به شکل یک آلبوم می‌رسند. متن زیر عکس یا فیلم می‌آید؛ اگر بیشتر از": "files, 50 MB together; several files arrive together as one album. The text goes under the photo or video; if it is longer than",
 #"فایلی انتخاب نشده بود": "No file was chosen",
 #"فایلی برای بازگردانی منتظر نیست. از": "No file is waiting to be restored. From",
 #"فایلی فرستاده نشد": "No file was sent",
@@ -37152,6 +37573,7 @@ exit 0
 #"فقط عکس (JPG، PNG یا WEBP) قبول می‌شود": "Only a picture (JPG, PNG or WEBP) is accepted",
 #"فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود": "Only a picture (JPG, PNG, WEBP) or PDF is accepted",
 #"فقط عکس JPG، PNG یا WEBP": "Only JPG, PNG or WEBP pictures",
+#"فقط عکس JPG، PNG، WEBP یا فیلم MP4": "Only a JPG, PNG or WEBP photo, or an MP4 video",
 #"فقط مشتری‌های شما این‌ها را می‌بینند. خالی بگذارید تا توضیح مالک پنل (خاکستری) نشان داده شود.": "Only your customers see these. Leave one empty to show the panel owner’s note (in grey).",
 #"فقط هشدار": "Alert only",
 #"فقط همین یک بار": "Only this once",
@@ -37160,6 +37582,8 @@ exit 0
 #"فورتنایت": "Fortnite",
 #"فورزا": "Forza",
 #"فیس‌ایت": "FACEIT",
+#"فیلم": "Video",
+#"فیلم بزرگ‌تر از ۲۰ مگابایت است": "The video is larger than 20 MB",
 #"قاعدهٔ فایروال تونل بار نشد؛ درگاه": "The tunnel firewall rule did not load; port",
 #"قالب": "Template",
 #"قالب تازه": "New template",
@@ -37196,6 +37620,7 @@ exit 0
 #"لیست اپراتورها — سرور خارج": "Operators list — exit server",
 #"لینک ثبت‌نام در همین سایت": "Sign-up link on this site",
 #"لینک ثبت‌نام مشتری‌های شما": "Sign-up link for your customers",
+#"لینک دعوت (فقط برای کانال خصوصی)": "Invitation link (private channel only)",
 #"لینک دعوت ربات": "Bot invitation link",
 #"لینک دعوت سایت": "Site invitation link",
 #"لینک ربات": "Bot link",
@@ -37225,6 +37650,7 @@ exit 0
 #"متن پیام": "Message text",
 #"متن پیام را بنویسید": "Write the message text",
 #"متن پیام را بنویسید (یا «انصراف»).": "Write your message (or “Cancel”).",
+#"متن پیام را بنویسید یا عکس یا فیلم بگذارید": "Write a message, or add a photo or video",
 #"متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):": "Write your message (you can also send a photo with a caption):",
 #"مثلاً 203.0.113.7": "e.g. 203.0.113.7",
 #"مثلاً مخصوص ایرانسل": "e.g. for Irancell",
@@ -37376,6 +37802,7 @@ exit 0
 #"نود و سرورها": "Nodes and servers",
 #"نویسه": "characters",
 #"نویسه است": "characters",
+#"نویسه باشد، جدا و بعد از آن فرستاده می‌شود. پیام می‌تواند فقط عکس یا فقط فیلم هم باشد.": "characters, it is sent on its own after it. A message can also be just a photo or just a video.",
 #"نویسه، چند خطی.": "characters, several lines.",
 #"نید فور اسپید": "Need for Speed",
 #"نیست": "is not",
@@ -37454,6 +37881,7 @@ exit 0
 #"هنوز تیکتی نفرستاده‌اید.": "You have not sent any tickets yet.",
 #"هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از": "You have not made any custom domains, blocks or separate DNS yet; from the",
 #"هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.": "No bot is connected to the panel yet (API page); until there is one this rule is not enforced, so nobody gets stuck.",
+#"هنوز عضو کانال نشده‌اید.": "You have not joined the channel yet.",
 #"هنوز قالبی نیست": "No templates yet",
 #"هنوز لاگی نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ سرورهای قدیمی‌تر بعد از ارتقا.": "They have not sent logs yet. Each Iran server sends its log every 5 minutes; older servers after they are upgraded.",
 #"هنوز مصرفی از این سرور ثبت نشده.": "No usage recorded from this server yet.",
@@ -37687,6 +38115,7 @@ exit 0
 #"کم شد": "taken away",
 #"کمتر": "less",
 #"کمی صبر کنید": "Wait a little",
+#"کنید؛ تلگرام فقط به ادمین می‌گوید چه کسی عضو است. کانال عمومی را با @ بنویسید؛ کانال خصوصی را با آیدی عددی‌اش (با -100 شروع می‌شود) و لینک دعوتش. خالی بگذارید تا خاموش شود.": "of the channel; Telegram tells only an admin who is in it. Write a public channel with @, a private one by its number (it starts with -100) and its invitation link. Leave it empty to turn this off.",
 #"که انتخاب کنید از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین می‌رود.": "you choose starts over from the moment it is approved, and what is left of the current plan is lost.",
 #"که فقط مشتری‌ها، پلن‌ها و کارت شما را می‌بیند": "that sees only your customers, plans and card",
 #"کوئری DoH": "DoH query",
@@ -37823,6 +38252,8 @@ exit 0
 #"✅ ربات به پنل وصل است.": "✅ The bot is connected to the panel.",
 #"✅ رم": "✅ RAM",
 #"✅ سرور خارج": "✅ Exit server",
+#"✅ عضو شدم": "✅ I have joined",
+#"✅ ممنون! حالا از دکمه‌های پایین استفاده کنید.": "✅ Thank you! Now use the buttons below.",
 #"✅ همهٔ سرورها به نسخهٔ": "✅ All servers upgraded to version",
 #"✅ پردازندهٔ": "✅ Processor of",
 #"✅ گواهی HTTPS": "✅ HTTPS certificate",
@@ -37879,6 +38310,7 @@ exit 0
 #"📡 DNSها: آدرس DNS معمولی، DoH و DoT": "📡 DNS: the plain DNS address, DoH and DoT",
 #"📡 DNSهای شما": "📡 Your DNS",
 #"📢 تبلیغات": "📢 Ads",
+#"📢 عضویت در کانال": "📢 Join the channel",
 #"📣 پیام همگانی": "📣 Broadcast message",
 #"📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):": "📱 Android — Settings → Network → Private DNS → hostname (DoT):",
 #"📱 دستگاه اضافه": "📱 Extra device",

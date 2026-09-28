@@ -48,6 +48,9 @@ from datetime import datetime, timedelta, timezone
 
 CONFIG = "/etc/smart-dns/panel.env"
 DB = "/var/lib/smart-dns/panel.db"
+# The photos and videos of broadcasts, <broadcast id>-<place in it>; the
+# admin panel writes them and clears them out after a week.
+BROADCAST_DIR = "/var/lib/smart-dns/broadcast"
 CERT = "/etc/smart-dns/sync.crt"
 KEY = "/etc/smart-dns/sync.key"
 API_PORT = 8443
@@ -697,6 +700,9 @@ MIGRATIONS = [
     ("templates", "owner_admin", "INTEGER"),
     ("api_tokens", "admin_id", "INTEGER"),
     ("broadcasts", "admin_id", "INTEGER"),
+    # The photos and videos sent with the message, their kinds in order -
+    # "photo,video" - the files themselves under BROADCAST_DIR.
+    ("broadcasts", "media", "TEXT"),
     # Usage back to zero every so many days, whatever the plan: the admin's
     # choice per customer and per seller, and when it next happens.
     ("users", "reset_days", "INTEGER"),
@@ -1884,6 +1890,10 @@ class Health:
 # ------------------------------------------------------------------ quota
 def refused(error, message):
     return {"ok": False, "error": error, "message": message}
+
+
+def broadcast_file(bid, n):
+    return os.path.join(BROADCAST_DIR, "%d-%d" % (int(bid), int(n)))
 
 
 def telegram_required(store, user):
@@ -6146,6 +6156,8 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
          "reply_ticket"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/close$"),
          "close_ticket"),
+        ("GET", re.compile(r"/api/v1/broadcasts/(\d{1,12})/media/(\d{1,2})$"),
+         "broadcast_media"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/tickets/(\d{1,12})/messages/"
                            r"(\d{1,12})/image$"), "ticket_image"),
         # The operator's own, for a key with admin rights only.
@@ -6622,6 +6634,27 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
                               (int(mid), int(tid))):
             return 404, refused("image_not_found", "این عکس پیدا نشد")
         return self.ticket_answer(ticket_picture(self.store, user, mid))
+
+    def api_broadcast_media(self, body, bid, n):
+        """One photo or video of a broadcast, by its place in the message,
+        for a bot that was sent it - a seller's bot carries the owner's
+        broadcasts to its customers too."""
+        row = self.store.one(
+            "SELECT b.media FROM broadcasts b WHERE b.id = ? AND b.media IS NOT NULL"
+            " AND EXISTS (SELECT 1 FROM webhook_outbox w WHERE w.token_id = ?"
+            " AND w.id BETWEEN b.first_row AND b.last_row)", (int(bid), self._key["id"]))
+        kinds = row["media"].split(",") if row else []
+        blob = None
+        if int(n) < len(kinds):
+            try:
+                with open(broadcast_file(bid, n), "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                pass
+        if not blob:
+            return 404, refused("media_not_found", "فایل این پیام همگانی نیست")
+        return 200, {"ok": True, "kind": kinds[int(n)],
+                     "data": base64.b64encode(blob).decode("ascii")}
 
 
 class BotServer(TLSServer):
