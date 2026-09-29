@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.11"
+VERSION="0.9.12"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -5107,6 +5107,10 @@ exit 0
 #    ("plans", "relay_exits", "TEXT"),
 #    # The group an operator's own domain is in (custom_groups); null for none.
 #    ("custom_domains", "group_id", "INTEGER"),
+#    # When this customer last moved more than a trickle through a relay, and
+#    # which one: what "online" is on the admin panel's home page.
+#    ("users", "last_seen", "TEXT"),
+#    ("users", "last_server", "TEXT"),
 #    # Blocks and forwards per template; the ones made before that are for all.
 #    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -6255,6 +6259,9 @@ exit 0
 #                        "UPDATE admins SET used_bytes = used_bytes + ? WHERE id ="
 #                        " (SELECT owner_admin FROM users WHERE id = ?)", (delta, row["user_id"]))
 #                    touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
+#                if delta >= ONLINE_MIN_BYTES:
+#                    self.db.execute("UPDATE users SET last_seen = ?, last_server = ?"
+#                                    " WHERE id = ?", (now(), relay, row["user_id"]))
 #                # Upload and download apart, for the charts. The relay sends
 #                # both beside the total; one that does not is an older relay,
 #                # and its growth goes down as download rather than nowhere.
@@ -7309,6 +7316,22 @@ exit 0
 #        store.q("PRAGMA wal_checkpoint(TRUNCATE)")
 #        print("sealed %d pictures kept from before" % done, flush=True)
 #    return done
+#
+#
+## ----------------------------------------------------------------- online
+## A customer is online while their traffic through a relay keeps coming:
+## more than a trickle in one of its half-minute reports - a phone's
+## background chatter is less - and the last such report under three
+## minutes ago. Only what the relay carries counts, so a customer who is on
+## the internet but using nothing their template routes is not "online".
+#ONLINE_MIN_BYTES = 16 * 1024
+#ONLINE_WINDOW = 180
+#
+#
+#def online_since(stamp=None):
+#    """The last_seen from which a customer counts as online now."""
+#    return ((stamp or datetime.now(timezone.utc)) - timedelta(seconds=ONLINE_WINDOW)).isoformat(
+#        timespec="seconds")
 #
 #
 ## ----------------------------------------------------------------- usage
@@ -9122,6 +9145,7 @@ exit 0
 #        "expiring_soon": one("SELECT count(*) FROM users u WHERE status = 'active'"
 #                             " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
 #        "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
+#        "online": one("SELECT count(*) FROM users u WHERE last_seen >= ?", (online_since(),)),
 #    }
 #
 #
@@ -9134,11 +9158,12 @@ exit 0
 #            "درآمد ۷ روز: %s تومان\n"
 #            "تیکت منتظر جواب: %d\n"
 #            "تست رایگان امروز: %d\n"
-#            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود"
+#            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود\n"
+#            "آنلاین الان: %d"
 #            % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
 #               s["new_today"], s["receipts_pending"], s["approved_today"],
 #               format(s["income_today"], ","), format(s["income_7d"], ","),
-#               s["tickets_open"], s["trials_today"], s["expiring_soon"]))
+#               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0)))
 #
 #
 #def daily_report_due(store, stamp=None):
@@ -18816,6 +18841,11 @@ exit 0
 #            self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
 #        if have and "relay_exits" not in have:
 #            self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
+#        # When a customer was last online, and where - the panel's too.
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
+#        for col in ("last_seen", "last_server"):
+#            if have and col not in have:
+#                self.db.execute("ALTER TABLE users ADD COLUMN %s TEXT" % col)
 #        for table in ("users", "admins"):
 #            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
 #            if have and "reset_days" not in have:
@@ -21309,6 +21339,83 @@ exit 0
 #    systemctl("restart", "smartdns-panel")
 #
 #
+## Who is online: the panel writes last_seen when a relay reports more than a
+## trickle of a customer's traffic (see ONLINE_MIN_BYTES there), every half
+## minute; three minutes without is offline.
+#ONLINE_WINDOW = 180
+#
+#
+#def online_since():
+#    return (datetime.now(timezone.utc) - timedelta(seconds=ONLINE_WINDOW)).isoformat(
+#        timespec="seconds")
+#
+#
+#def is_online(row):
+#    seen = row["last_seen"] if "last_seen" in row.keys() else None
+#    return bool(seen) and seen >= online_since()
+#
+#
+#def online_rows(extra="", args=()):
+#    """The customers online now - a seller's own, with `extra` - busiest
+#    first: each with what they moved in the last ten minutes or so."""
+#    try:
+#        rows = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id, u.last_seen,"
+#                       " u.last_server, u.owner_admin FROM users u WHERE u.last_seen >= ?"
+#                       + extra, (online_since(),) + tuple(args))
+#    except sqlite3.OperationalError:
+#        return []                   # a panel that has not added the column yet
+#    if not rows:
+#        return []
+#    t = datetime.now(TEHRAN)
+#    start = (t - timedelta(minutes=5)).replace(second=0, microsecond=0)
+#    start = start.replace(minute=start.minute - start.minute % 5)
+#    took = max(60.0, (t - start).total_seconds())
+#    moved = {r["user_id"]: (r["up"], r["down"]) for r in STORE.q(
+#        "SELECT user_id, SUM(up) up, SUM(down) down FROM usage WHERE grain = '5m'"
+#        " AND bucket >= ? AND user_id IN (%s) GROUP BY user_id"
+#        % ",".join("?" * len(rows)), (start.strftime("%Y-%m-%dT%H:%M"),)
+#        + tuple(r["id"] for r in rows))}
+#    out = []
+#    for r in rows:
+#        up, down = moved.get(r["id"], (0, 0))
+#        out.append(dict(r, up_bps=int(up * 8 / took), down_bps=int(down * 8 / took)))
+#    return sorted(out, key=lambda x: x["down_bps"] + x["up_bps"], reverse=True)
+#
+#
+#def online_card(p, rows, show_seller=False, most=100):
+#    """The home page's customers online now."""
+#    out = ["<div class='card' id='online'><h2>🟢 آنلاین الان (%d)</h2>" % len(rows)]
+#    if not rows:
+#        out.append("<p class='muted'>الان کسی آنلاین نیست.</p>")
+#    else:
+#        sellers = {}
+#        if show_seller:
+#            sellers = {a["id"]: a["username"] for a in STORE.q(
+#                "SELECT id, username FROM admins WHERE own_only = 1")}
+#        out.append("<table><tr><th>مشتری</th><th>سرور</th>%s<th>سرعت، ۱۰ دقیقهٔ اخیر</th>"
+#                   "<th>آخرین ترافیک</th></tr>" % ("<th>فروشنده</th>" if show_seller else ""))
+#        for r in rows[:most]:
+#            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
+#            server = r["last_server"] or ""
+#            out.append(
+#                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a></td>"
+#                "<td>%s</td>%s<td class='muted'><span dir='ltr'>↓%s/s ↑%s/s</span></td>"
+#                "<td class='muted'>%s</td></tr>"
+#                % (p, r["id"], html.escape(who),
+#                   html.escape(server_label(server)) if server else "—",
+#                   "<td>%s</td>" % html.escape(sellers.get(r["owner_admin"], "—"))
+#                   if show_seller else "",
+#                   human(r["down_bps"] // 8), human(r["up_bps"] // 8),
+#                   html.escape(ago(r["last_seen"]))))
+#        out.append("</table>")
+#        if len(rows) > most:
+#            out.append("<p class='muted'>و %d نفر دیگر.</p>" % (len(rows) - most))
+#    out.append("<p class='muted'>آنلاین یعنی در ۳ دقیقهٔ اخیر از راه رله ترافیک داشته. فقط "
+#               "سرویس‌هایی که قالبش از رله می‌برد شمرده می‌شوند؛ کسی که فقط چیزهای دیگر را "
+#               "باز کرده این‌جا نمی‌آید.</p></div>")
+#    return "".join(out)
+#
+#
 #def forget_server(ip):
 #    """What a server taken off the panel leaves behind that would still show
 #    on the home page: its health samples, for up to a day, and any alert
@@ -22209,6 +22316,9 @@ exit 0
 # font-weight:600;vertical-align:-3px;line-height:1}
 #td .logo{margin-inline-end:5px}
 #.logo.plain{color:var(--muted)}
+#.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
+# vertical-align:1px}
+#.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
 #.doms{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
 # gap:2px 14px;padding:4px 30px 12px;border-top:1px solid var(--row);margin-top:2px}
 #.doms label{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px;
@@ -25636,12 +25746,20 @@ exit 0
 #        act = STORE.one("SELECT count(*) c FROM users u WHERE status = 'active'" + extra, args)
 #        ips = STORE.one("SELECT count(*) c FROM ips i JOIN users u ON u.id = i.user_id"
 #                        " WHERE 1 = 1" + extra, args)
+#        online = online_rows(extra, args) if may("users") else None
 #        out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
-#        for n, l in ((u["c"], "کاربر"), (act["c"], "فعال"),
-#                     (ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")):
+#        stats = [(u["c"], "کاربر"), (act["c"], "فعال")]
+#        if online is not None:
+#            stats.append((len(online), "آنلاین"))
+#        stats += [(ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")]
+#        for n, l in stats:
 #            out.append("<div class='stat'><div class='n'>%s</div>"
 #                       "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
 #        out.append("</div></div>")
+#        if online is not None:
+#            out.append(online_card(CFG["ADMIN_PATH"], online,
+#                                   show_seller=seller() is None
+#                                   and bool(STORE.one("SELECT 1 FROM admins WHERE own_only = 1"))))
 #        s = seller()
 #        if s is not None:
 #            # Their own customers' usage, drawn as the owner's home page draws
@@ -25847,7 +25965,7 @@ exit 0
 #                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
 #                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
-#                "<tr><td class='who' title='%s'><code>%s</code></td>"
+#                "<tr><td class='who' title='%s'>%s<code>%s</code></td>"
 #                "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
 #                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
 #                "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -25882,7 +26000,9 @@ exit 0
 #                # was a username have a phone number instead, and the ones
 #                # that came through the bot have neither - so the column shows
 #                # whichever this account actually has.
-#                % (html.escape(who, quote=True), html.escape(who),
+#                % (html.escape(who, quote=True),
+#                   "<span class='dot on' title='آنلاین'></span>" if is_online(r) else "",
+#                   html.escape(who),
 #                   html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
 #                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
 #                   % (p, r["id"], human(r["used_bytes"])),
@@ -37878,6 +37998,7 @@ exit 0
 #"آخرین (UTC)": "Last (UTC)",
 #"آخرین استفاده": "Last used",
 #"آخرین بار": "Last seen",
+#"آخرین ترافیک": "Last traffic",
 #"آخرین تست:": "Last test:",
 #"آخرین تغییر": "Last change",
 #"آخرین خریدها": "Latest purchases",
@@ -37920,6 +38041,9 @@ exit 0
 #"آمار سرور": "Server stats",
 #"آمار و کارها": "Stats and actions",
 #"آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر بیرون ماندید، از روی خود سرور:": "there, or it will not be reachable from outside. If you get locked out, from the server itself:",
+#"آنلاین": "Online",
+#"آنلاین الان:": "Online now:",
+#"آنلاین یعنی در ۳ دقیقهٔ اخیر از راه رله ترافیک داشته. فقط سرویس‌هایی که قالبش از رله می‌برد شمرده می‌شوند؛ کسی که فقط چیزهای دیگر را باز کرده این‌جا نمی‌آید.": "Online means traffic through a relay in the last 3 minutes. Only the services their template routes through the relay count; someone who has opened only other things does not show here.",
 #"آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود.": "What matters for customers is the relays column: that is where their questions are asked from.",
 #"آپدیت": "Upgrade",
 #"آپدیت این سرور به": "Upgrading this server to",
@@ -38050,6 +38174,7 @@ exit 0
 #"الان نشد": "Not now",
 #"الان نشد، چند دقیقه دیگر": "Not now, in a few minutes",
 #"الان پلن فعال دارید؛ تست رایگان برای وقتی است که پلنی ندارید": "You have an active plan right now; the free trial is for when you have no plan",
+#"الان کسی آنلاین نیست.": "Nobody is online right now.",
 #"الدر اسکرولز آنلاین": "Elder Scrolls Online",
 #"الدن رینگ": "Elden Ring",
 #"امروز": "Today",
@@ -38956,6 +39081,7 @@ exit 0
 #"سرعت کل ۲۴ ساعت اخیر": "Total speed, last 24 hours",
 #"سرعت ۲۴ ساعت": "Speed, 24 hours",
 #"سرعت ۲۴ ساعت اخیر": "Speed, last 24 hours",
+#"سرعت، ۱۰ دقیقهٔ اخیر": "Speed, last 10 minutes",
 #"سرور": "Server",
 #"سرور ایران": "Iran server",
 #"سرور خارج": "Exit server",
@@ -39352,6 +39478,7 @@ exit 0
 #"نفر تا ۳ روز دیگر تمام می‌شود": "people end within 3 days",
 #"نفر در صف فرستادن است": "people queued for sending",
 #"نفر دیگر تلگرام ندارند)": "more have no Telegram)",
+#"نفر دیگر.": "more.",
 #"نمایش لاگ کامل": "Show the full log",
 #"نمودار مصرف": "Usage chart",
 #"نود": "Node",
@@ -39901,6 +40028,7 @@ exit 0
 #"🛒 خرید / تمدید": "🛒 Buy / Renew",
 #"🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید": "🛒 Buy / Renew: choose a plan and send the receipt",
 #"🛒 خرید پلن": "🛒 Buy a plan",
+#"🟢 آنلاین الان (": "🟢 Online now (",
 #"🤖 لینک ربات:": "🤖 Bot link:",
 #"🧾 پرداخت با رسید": "🧾 Pay with a receipt"
 #}

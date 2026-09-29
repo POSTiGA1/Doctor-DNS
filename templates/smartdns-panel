@@ -648,6 +648,10 @@ MIGRATIONS = [
     ("plans", "relay_exits", "TEXT"),
     # The group an operator's own domain is in (custom_groups); null for none.
     ("custom_domains", "group_id", "INTEGER"),
+    # When this customer last moved more than a trickle through a relay, and
+    # which one: what "online" is on the admin panel's home page.
+    ("users", "last_seen", "TEXT"),
+    ("users", "last_server", "TEXT"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -1796,6 +1800,9 @@ class Store:
                         "UPDATE admins SET used_bytes = used_bytes + ? WHERE id ="
                         " (SELECT owner_admin FROM users WHERE id = ?)", (delta, row["user_id"]))
                     touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
+                if delta >= ONLINE_MIN_BYTES:
+                    self.db.execute("UPDATE users SET last_seen = ?, last_server = ?"
+                                    " WHERE id = ?", (now(), relay, row["user_id"]))
                 # Upload and download apart, for the charts. The relay sends
                 # both beside the total; one that does not is an older relay,
                 # and its growth goes down as download rather than nowhere.
@@ -2850,6 +2857,22 @@ def seal_existing(store):
         store.q("PRAGMA wal_checkpoint(TRUNCATE)")
         print("sealed %d pictures kept from before" % done, flush=True)
     return done
+
+
+# ----------------------------------------------------------------- online
+# A customer is online while their traffic through a relay keeps coming:
+# more than a trickle in one of its half-minute reports - a phone's
+# background chatter is less - and the last such report under three
+# minutes ago. Only what the relay carries counts, so a customer who is on
+# the internet but using nothing their template routes is not "online".
+ONLINE_MIN_BYTES = 16 * 1024
+ONLINE_WINDOW = 180
+
+
+def online_since(stamp=None):
+    """The last_seen from which a customer counts as online now."""
+    return ((stamp or datetime.now(timezone.utc)) - timedelta(seconds=ONLINE_WINDOW)).isoformat(
+        timespec="seconds")
 
 
 # ----------------------------------------------------------------- usage
@@ -4663,6 +4686,7 @@ def admin_stats(store, seller=None):
         "expiring_soon": one("SELECT count(*) FROM users u WHERE status = 'active'"
                              " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
         "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
+        "online": one("SELECT count(*) FROM users u WHERE last_seen >= ?", (online_since(),)),
     }
 
 
@@ -4675,11 +4699,12 @@ def daily_report_text(s):
             "درآمد ۷ روز: %s تومان\n"
             "تیکت منتظر جواب: %d\n"
             "تست رایگان امروز: %d\n"
-            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود"
+            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود\n"
+            "آنلاین الان: %d"
             % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
                s["new_today"], s["receipts_pending"], s["approved_today"],
                format(s["income_today"], ","), format(s["income_7d"], ","),
-               s["tickets_open"], s["trials_today"], s["expiring_soon"]))
+               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0)))
 
 
 def daily_report_due(store, stamp=None):

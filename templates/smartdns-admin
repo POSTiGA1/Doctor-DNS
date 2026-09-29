@@ -232,6 +232,11 @@ class Store:
             self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
         if have and "relay_exits" not in have:
             self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
+        # When a customer was last online, and where - the panel's too.
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
+        for col in ("last_seen", "last_server"):
+            if have and col not in have:
+                self.db.execute("ALTER TABLE users ADD COLUMN %s TEXT" % col)
         for table in ("users", "admins"):
             have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
             if have and "reset_days" not in have:
@@ -2725,6 +2730,83 @@ def set_nodes(ips):
     systemctl("restart", "smartdns-panel")
 
 
+# Who is online: the panel writes last_seen when a relay reports more than a
+# trickle of a customer's traffic (see ONLINE_MIN_BYTES there), every half
+# minute; three minutes without is offline.
+ONLINE_WINDOW = 180
+
+
+def online_since():
+    return (datetime.now(timezone.utc) - timedelta(seconds=ONLINE_WINDOW)).isoformat(
+        timespec="seconds")
+
+
+def is_online(row):
+    seen = row["last_seen"] if "last_seen" in row.keys() else None
+    return bool(seen) and seen >= online_since()
+
+
+def online_rows(extra="", args=()):
+    """The customers online now - a seller's own, with `extra` - busiest
+    first: each with what they moved in the last ten minutes or so."""
+    try:
+        rows = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id, u.last_seen,"
+                       " u.last_server, u.owner_admin FROM users u WHERE u.last_seen >= ?"
+                       + extra, (online_since(),) + tuple(args))
+    except sqlite3.OperationalError:
+        return []                   # a panel that has not added the column yet
+    if not rows:
+        return []
+    t = datetime.now(TEHRAN)
+    start = (t - timedelta(minutes=5)).replace(second=0, microsecond=0)
+    start = start.replace(minute=start.minute - start.minute % 5)
+    took = max(60.0, (t - start).total_seconds())
+    moved = {r["user_id"]: (r["up"], r["down"]) for r in STORE.q(
+        "SELECT user_id, SUM(up) up, SUM(down) down FROM usage WHERE grain = '5m'"
+        " AND bucket >= ? AND user_id IN (%s) GROUP BY user_id"
+        % ",".join("?" * len(rows)), (start.strftime("%Y-%m-%dT%H:%M"),)
+        + tuple(r["id"] for r in rows))}
+    out = []
+    for r in rows:
+        up, down = moved.get(r["id"], (0, 0))
+        out.append(dict(r, up_bps=int(up * 8 / took), down_bps=int(down * 8 / took)))
+    return sorted(out, key=lambda x: x["down_bps"] + x["up_bps"], reverse=True)
+
+
+def online_card(p, rows, show_seller=False, most=100):
+    """The home page's customers online now."""
+    out = ["<div class='card' id='online'><h2>🟢 آنلاین الان (%d)</h2>" % len(rows)]
+    if not rows:
+        out.append("<p class='muted'>الان کسی آنلاین نیست.</p>")
+    else:
+        sellers = {}
+        if show_seller:
+            sellers = {a["id"]: a["username"] for a in STORE.q(
+                "SELECT id, username FROM admins WHERE own_only = 1")}
+        out.append("<table><tr><th>مشتری</th><th>سرور</th>%s<th>سرعت، ۱۰ دقیقهٔ اخیر</th>"
+                   "<th>آخرین ترافیک</th></tr>" % ("<th>فروشنده</th>" if show_seller else ""))
+        for r in rows[:most]:
+            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
+            server = r["last_server"] or ""
+            out.append(
+                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a></td>"
+                "<td>%s</td>%s<td class='muted'><span dir='ltr'>↓%s/s ↑%s/s</span></td>"
+                "<td class='muted'>%s</td></tr>"
+                % (p, r["id"], html.escape(who),
+                   html.escape(server_label(server)) if server else "—",
+                   "<td>%s</td>" % html.escape(sellers.get(r["owner_admin"], "—"))
+                   if show_seller else "",
+                   human(r["down_bps"] // 8), human(r["up_bps"] // 8),
+                   html.escape(ago(r["last_seen"]))))
+        out.append("</table>")
+        if len(rows) > most:
+            out.append("<p class='muted'>و %d نفر دیگر.</p>" % (len(rows) - most))
+    out.append("<p class='muted'>آنلاین یعنی در ۳ دقیقهٔ اخیر از راه رله ترافیک داشته. فقط "
+               "سرویس‌هایی که قالبش از رله می‌برد شمرده می‌شوند؛ کسی که فقط چیزهای دیگر را "
+               "باز کرده این‌جا نمی‌آید.</p></div>")
+    return "".join(out)
+
+
 def forget_server(ip):
     """What a server taken off the panel leaves behind that would still show
     on the home page: its health samples, for up to a day, and any alert
@@ -3625,6 +3707,9 @@ details.svc>summary label{flex:1}
  font-weight:600;vertical-align:-3px;line-height:1}
 td .logo{margin-inline-end:5px}
 .logo.plain{color:var(--muted)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
+ vertical-align:1px}
+.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
 .doms{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
  gap:2px 14px;padding:4px 30px 12px;border-top:1px solid var(--row);margin-top:2px}
 .doms label{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px;
@@ -7052,12 +7137,20 @@ class Admin(http.server.BaseHTTPRequestHandler):
         act = STORE.one("SELECT count(*) c FROM users u WHERE status = 'active'" + extra, args)
         ips = STORE.one("SELECT count(*) c FROM ips i JOIN users u ON u.id = i.user_id"
                         " WHERE 1 = 1" + extra, args)
+        online = online_rows(extra, args) if may("users") else None
         out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
-        for n, l in ((u["c"], "کاربر"), (act["c"], "فعال"),
-                     (ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")):
+        stats = [(u["c"], "کاربر"), (act["c"], "فعال")]
+        if online is not None:
+            stats.append((len(online), "آنلاین"))
+        stats += [(ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")]
+        for n, l in stats:
             out.append("<div class='stat'><div class='n'>%s</div>"
                        "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
         out.append("</div></div>")
+        if online is not None:
+            out.append(online_card(CFG["ADMIN_PATH"], online,
+                                   show_seller=seller() is None
+                                   and bool(STORE.one("SELECT 1 FROM admins WHERE own_only = 1"))))
         s = seller()
         if s is not None:
             # Their own customers' usage, drawn as the owner's home page draws
@@ -7263,7 +7356,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                         "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
                         "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
             out.append(
-                "<tr><td class='who' title='%s'><code>%s</code></td>"
+                "<tr><td class='who' title='%s'>%s<code>%s</code></td>"
                 "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
                 "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
                 "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -7298,7 +7391,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 # was a username have a phone number instead, and the ones
                 # that came through the bot have neither - so the column shows
                 # whichever this account actually has.
-                % (html.escape(who, quote=True), html.escape(who),
+                % (html.escape(who, quote=True),
+                   "<span class='dot on' title='آنلاین'></span>" if is_online(r) else "",
+                   html.escape(who),
                    html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
                    "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
                    % (p, r["id"], human(r["used_bytes"])),
