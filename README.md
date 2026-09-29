@@ -147,6 +147,15 @@ Safe to re-run — configs are backed up, and a step that would change nothing
 does nothing. `sudo bash doctor-dns.sh --uninstall` puts the machine back,
 undoing only what this script did.
 
+Uninstall asks two things. First, whether the database (customers, plans,
+admins, settings) goes too: kept, a reinstall on the same server brings it all
+back; deleted, a last copy stays in `/var/backups/smart-dns` and the next
+install starts from nothing. Then it names the packages - nginx, dnsmasq,
+coturn, certbot - and asks whether they go too, with their config. python3,
+curl, openssl, nftables and the certificates in `/etc/letsencrypt` are never
+removed. Without the questions:
+`sudo DELETE_DB=1 PURGE_PACKAGES=1 bash doctor-dns.sh --uninstall`.
+
 ### On one server (single)
 
 Choose **3) single** at the first question, or run

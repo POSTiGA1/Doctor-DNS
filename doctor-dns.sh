@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.8"
+VERSION="0.9.9"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -736,6 +736,9 @@ case "${1:-}" in
         printf '\nenvironment (sudo does not pass these, put them after it):\n'
         printf '  ASSUME_YES=1   take the default for every question\n'
         printf '  ENFORCE=no     leave a relay open to everyone\n'
+        printf '  DELETE_DB=1    on --uninstall, delete the database too, without asking\n'
+        printf '  PURGE_PACKAGES=1  on --uninstall, remove nginx, dnsmasq, coturn and certbot\n'
+        printf '                 too, with their config, without asking\n'
         printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|direct\n'
         printf '  TUNNEL_PORT=8444     the tunnel between relay and exit, asked on the exit\n'
         printf '  ROLE=node PANEL_IP=<main exit> SYNC_TOKEN=<token>   another exit, joined to\n'
@@ -821,13 +824,50 @@ uninstall() {
     printf '    will restore : nginx config, and stop the services set up here\n'
     printf '    will delete  : the config files, helper commands and timers added\n'
     if [ -n "$packages" ]; then
-        printf '    will NOT remove these packages, in case something else needs them:\n'
+        printf '    will NOT remove these packages, unless you ask for it below:\n'
         printf '                   %s\n' "$packages"
     fi
     printf '    backups kept : %s\n\n' "$BACKUP_DIR"
     if [ -z "${ASSUME_YES:-}" ]; then
         read -r -p "  proceed? [y/N]: " ok
         case "$ok" in y|Y|yes) ;; *) die "cancelled" ;; esac
+    fi
+    # The database stays unless the admin says otherwise: the customers, their
+    # balances and usage, the admins and every setting. Kept, installing here
+    # again picks it all up; deleted, the next install starts from nothing.
+    local forget_db=""
+    if [ -f "$STATE_DIR/panel.db" ]; then
+        if [ "${DELETE_DB:-}" = 1 ]; then
+            forget_db=1
+        elif [ -z "${ASSUME_YES:-}" ]; then
+            printf '\n  The database - customers, plans, admins and every setting - is kept, so\n'
+            printf '  installing here again picks it all up. Delete it too, to start from nothing?\n'
+            read -r -p "  delete the database? [y/N]: " ok
+            case "$ok" in y|Y|yes) forget_db=1 ;; esac
+        fi
+    fi
+    # The packages too, if the admin wants: what this install added, and the
+    # servers it sets up even if an earlier install left them behind (the
+    # record of what was new is only true the first time). Never the
+    # machine's own python3, curl, openssl or nftables.
+    local purge="" purge_list="" pkg
+    for pkg in nginx nginx-common nginx-core libnginx-mod-stream dnsmasq coturn certbot \
+               python3-certbot-dns-cloudflare $packages; do
+        case " python3 curl openssl nftables $purge_list " in *" $pkg "*) continue ;; esac
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
+            && purge_list="$purge_list $pkg"
+    done
+    purge_list="$(echo $purge_list)"
+    if [ -z "$purge_list" ]; then
+        :
+    elif [ "${PURGE_PACKAGES:-}" = 1 ]; then
+        purge=1
+    elif [ -z "${ASSUME_YES:-}" ]; then
+        printf '\n  Remove these packages too, with their config?\n'
+        printf '      %s\n' "$purge_list"
+        printf '  Anything else on this machine using them goes with them.\n'
+        read -r -p "  remove the packages? [y/N]: " ok
+        case "$ok" in y|Y|yes) purge=1 ;; esac
     fi
 
     step "Stopping services"
@@ -938,11 +978,46 @@ uninstall() {
         rm -rf /etc/smart-dns
         info "credentials moved to $BACKUP_DIR/smart-dns-config.$STAMP"
     fi
-    # The database is the customers, their balances and their usage. It is
-    # never deleted by an uninstall, and it is not moved either, so that
-    # reinstalling on the same machine simply picks it up again.
-    if [ -f "$STATE_DIR/panel.db" ]; then
+    # The database is the customers, their balances and their usage. Unless
+    # the admin asked for it gone, it is not deleted or moved, so that
+    # reinstalling on the same machine simply picks it up again. Asked for
+    # gone, a last copy goes to the backups first - where no install looks.
+    if [ -f "$STATE_DIR/panel.db" ] && [ -n "$forget_db" ]; then
+        mkdir -p "$BACKUP_DIR"
+        if python3 - "$STATE_DIR/panel.db" "$BACKUP_DIR/panel.db.$STAMP" <<'PY' 2>/dev/null
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("VACUUM INTO ?", (sys.argv[2],))
+db.close()
+PY
+        then
+            info "a last copy of the database: $BACKUP_DIR/panel.db.$STAMP"
+        elif cp -a "$STATE_DIR/panel.db" "$BACKUP_DIR/panel.db.$STAMP" 2>/dev/null; then
+            info "a last copy of the database: $BACKUP_DIR/panel.db.$STAMP"
+        else
+            warn "could not copy the database first - left where it is: $STATE_DIR/panel.db"
+            forget_db=""
+        fi
+    elif [ -f "$STATE_DIR/panel.db" ]; then
         info "database left where it is: $STATE_DIR/panel.db"
+    fi
+
+    if [ -n "$purge" ]; then
+        step "Removing the packages"
+        if [ -n "$purge_list" ]; then
+            systemctl stop nginx dnsmasq coturn >/dev/null 2>&1 || true
+            # shellcheck disable=SC2086
+            if DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq $purge_list >/dev/null 2>&1; then
+                info "purged, with their config: $purge_list"
+                DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -qq >/dev/null 2>&1 || true
+            else
+                warn "apt could not purge them - try: apt-get purge $purge_list"
+            fi
+        fi
+        rm -rf /usr/local/lib/smart-dns
+        # Kept on purpose: a reinstall with the same domain uses them again,
+        # and Let's Encrypt gives only five of the same name a week.
+        [ -d /etc/letsencrypt/live ] && info "HTTPS certificates kept in /etc/letsencrypt"
     fi
 
     step "Restarting what is left"
@@ -950,7 +1025,8 @@ uninstall() {
     # nginx is only left running if it was already enabled before we arrived,
     # i.e. it is not on the list we just disabled. In that case it now has its
     # original config back and should be put back into service.
-    case " $(recall_flat services-enabled) " in
+    case "$purge: $(recall_flat services-enabled) " in
+        1:*) ;;
         *" nginx "*) info "nginx was installed here by this script - left stopped" ;;
         *)
             if nginx -t >/dev/null 2>&1; then
@@ -966,11 +1042,17 @@ uninstall() {
     # files are no longer here, and that install would skip its own upgrade
     # question on the strength of it.
     rm -f "$STATE_DIR/version"
+    # Everything the panel kept beside the database goes with it: its media,
+    # its standby copy, the installer it saved for upgrades.
+    if [ -n "$forget_db" ]; then
+        rm -rf "$STATE_DIR"
+        info "database deleted - the next install here starts from nothing"
+    fi
     # Only if nothing else put anything there; never blow away a
     # directory a later stage of this project may be using.
     rmdir "$STATE_DIR" 2>/dev/null || true
     printf '\n%sRemoved.%s Backups are still in %s if you want anything back.\n\n' "$G" "$N" "$BACKUP_DIR"
-    if [ -n "$packages" ]; then
+    if [ -n "$packages" ] && [ -z "$purge" ]; then
         printf '    To also remove the packages it installed:\n\n'
         printf '        apt-get purge %s\n\n' "$packages"
     fi
