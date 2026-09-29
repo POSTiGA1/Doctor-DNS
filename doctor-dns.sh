@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.10"
+VERSION="0.9.11"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -20741,6 +20741,10 @@ exit 0
 #    """What is wrong with the servers now, and what changed lately."""
 #    open_ = [r["key"][len("alert_state:"):] for r in STORE.q(
 #        "SELECT key FROM settings WHERE key LIKE 'alert_state:%' AND value = 'down'")]
+#    # Not about a server taken off the panel: nothing would close those.
+#    here = set(relay_list()) | set(node_list()) | {exit_address()}
+#    open_ = [k for k in open_
+#             if all(ip in here for ip in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", k))]
 #    try:
 #        recent = STORE.q("SELECT * FROM alerts ORDER BY id DESC LIMIT 15")
 #    except sqlite3.OperationalError:
@@ -21303,6 +21307,23 @@ exit 0
 #    through its firewall rule and into its API."""
 #    set_env_list("NODE_IP", ips)
 #    systemctl("restart", "smartdns-panel")
+#
+#
+#def forget_server(ip):
+#    """What a server taken off the panel leaves behind that would still show
+#    on the home page: its health samples, for up to a day, and any alert
+#    about it that was open - silent, disk, memory, its month's cap, a relay's
+#    word on it as an exit - which nothing would ever close again."""
+#    STORE.run("DELETE FROM metrics WHERE host = ?", (ip,))
+#    STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
+#              ("alert_state:%:" + ip, "alert_state:exit:" + ip + ":%"))
+#    STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("net_month:" + ip, "cap:" + ip))
+#
+#
+#def current_hosts():
+#    """The hosts the home page's servers table may show: this exit, and the
+#    relays, single servers and nodes the panel has now."""
+#    return {"exit"} | set(relay_list()) | set(node_list())
 #
 #
 #def seen_cell(host):
@@ -25642,9 +25663,13 @@ exit 0
 #            out.append(total_usage_card(CFG["ADMIN_PATH"]))
 #        out.append(doh_card())
 #
-#        rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
-#                       " FROM metrics GROUP BY host) l"
-#                       " ON l.host = m.host AND l.at = m.at ORDER BY m.host")
+#        # Only the servers the panel has now: one taken off before this
+#        # version cleared its samples would stay here, "cut", for a day.
+#        hosts = current_hosts()
+#        rows = [r for r in STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
+#                                   " FROM metrics GROUP BY host) l"
+#                                   " ON l.host = m.host AND l.at = m.at ORDER BY m.host")
+#                if r["host"] in hosts]
 #        out.append("<div class='card'><h2>سرورها</h2>")
 #        if not rows:
 #            out.append("<p class='muted'>هنوز آماری نرسیده.</p>")
@@ -28269,6 +28294,7 @@ exit 0
 #                      " OR key = ?", ("relay_tunnel:%%:" + ip, "relay_tunnel_state:%%:" + ip,
 #                                      "node_tunnel_state:%s:%%" % ip, "node_slot:" + ip))
 #            set_nodes([n for n in nodes if n != ip])
+#            forget_server(ip)
 #            return self.redirect("nodes?m=سرور %s برداشته شد" % ip)
 #
 #        if rest == "standby-save":
@@ -28522,6 +28548,7 @@ exit 0
 #                STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
 #                          ("relay_tunnel:%s:%%" % ip, "relay_tunnel_state:%s:%%" % ip))
 #                apply_exit_tunnel(ip)
+#                forget_server(ip)
 #            return self.redirect("nodes?m=%s" % (
 #                "رله %s اضافه شد؛ حالا نصب‌کننده را روی آن اجرا کنید" % ip if rest == "relay-add"
 #                else "رله %s برداشته شد" % ip))

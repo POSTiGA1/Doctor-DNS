@@ -392,7 +392,38 @@ check("the plans page has a line per server, with the exits",
       "<th>سرورها</th>" in page and "name='re_198.51.100.2'" in page
       and "<option value='93.184.216.20' selected>" in page)
 act("user-exit", id=str(nima), **{"r_198.51.100.1": "93.184.216.20", "r_198.51.100.2": ""})
+# What a node leaves on the home page once taken off: its samples, and an
+# alert about it that nothing would close again.
+for host in ("exit", "198.51.100.1", "93.184.216.20", "192.0.2.77"):
+    admin.STORE.run("INSERT INTO metrics (host, at, cpu) VALUES (?, ?, 1)", (host, panel.now()))
+for key in ("silent:93.184.216.20", "disk:93.184.216.20", "cap80:93.184.216.20",
+            "exit:198.51.100.1:93.184.216.20", "silent:198.51.100.1"):
+    admin.STORE.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, 'down')",
+                    ("alert_state:" + key,))
 act("node-del", ip="93.184.216.20")
+check("  a node taken off leaves no samples behind",
+      not admin.STORE.q("SELECT 1 FROM metrics WHERE host = '93.184.216.20'")
+      and admin.STORE.q("SELECT 1 FROM metrics WHERE host = '198.51.100.1'"))
+open_alerts = {r["key"] for r in admin.STORE.q(
+    "SELECT key FROM settings WHERE key LIKE 'alert_state:%' AND value = 'down'")}
+check("  nor an open alert about it, and the others' stay",
+      not any("93.184.216.20" in k for k in open_alerts)
+      and "alert_state:silent:198.51.100.1" in open_alerts)
+check("  the home page's servers are the ones the panel has now, not a stranger's samples",
+      admin.current_hosts() == {"exit", "198.51.100.1", "198.51.100.2"}
+      and "if r[\"host\"] in hosts]" in read("templates/smartdns-admin"))
+admin.STORE.run("INSERT OR REPLACE INTO settings (key, value) VALUES"
+                " ('alert_state:silent:192.0.2.77', 'down')")
+admin.STORE.run("INSERT INTO alerts (key, ok, text, at) VALUES ('silent:192.0.2.77', 0,"
+                " 'gone-one', ?)", (panel.now(),))
+admin.STORE.run("INSERT INTO alerts (key, ok, text, at) VALUES ('silent:198.51.100.1', 0,"
+                " 'still-here', ?)", (panel.now(),))
+card = admin.alerts_card()
+check("  an alert left open about a server taken off before is not shown",
+      "gone-one" not in card.split("<details>")[0] and "still-here" in card)
+admin.STORE.run("DELETE FROM metrics")
+admin.STORE.run("DELETE FROM settings WHERE key LIKE 'alert_state:%'")
+admin.STORE.run("DELETE FROM alerts")
 check("  a node taken off sends its customers back to their relays' own",
       urow()["exit"] is None and urow()["relay_exits"] is None)
 check("  and its plans are sold on all of them",
@@ -670,7 +701,11 @@ check("  one is added from its own form, marked single before it has said so",
       act("single-add", ip="93.184.216.40").startswith("nodes?m=")
       and "93.184.216.40" in admin.relay_list() and admin.is_single_server("93.184.216.40"))
 check("  and not over a node", act("single-add", ip="93.184.216.20").startswith("nodes?m=!"))
+admin.STORE.run("INSERT INTO metrics (host, at, cpu) VALUES ('93.184.216.40', ?, 1)",
+                (panel.now(),))
 act("relay-del", ip="93.184.216.40")
+check("  and a relay or single server taken off leaves no samples either",
+      not admin.STORE.q("SELECT 1 FROM metrics WHERE host = '93.184.216.40'"))
 check("  taken off, it is no longer marked", not admin.is_single_server("93.184.216.40")
       and "93.184.216.40" not in admin.relay_list())
 
