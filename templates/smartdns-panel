@@ -624,6 +624,10 @@ MIGRATIONS = [
     # Unlike the customer's own ticks above, these are kept: a customer on
     # such a plan is on no other relay's allowlist.
     ("plans", "relays", "TEXT"),
+    # The server abroad the admin picked for a plan: "" for automatic - the
+    # one its relays share, kept in `exit` - and null for a plan from before,
+    # whose `exit` is then the admin's own pick.
+    ("plans", "exit_pick", "TEXT"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),

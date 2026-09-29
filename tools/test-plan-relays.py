@@ -188,12 +188,63 @@ check("  and a single server is its own way out",
       store.one("SELECT exit FROM plans WHERE id = ?", (p_eu["id"],))["exit"] is None)
 store.run("DELETE FROM settings WHERE key = ?", ("single:" + SG,))
 
+print("picking the server abroad")
+page = Rec().plans()
+check("with more than one abroad, a column to pick it, automatic first",
+      "<th>سرور خارج</th>" in page and "<option value=''" in page and "خودکار" in page)
+act("plan-save", id=str(p_eu["id"]), **plan_form(name="اروپا", relay=[TR, DE], exit=MAIN))
+row = store.one("SELECT exit, exit_pick FROM plans WHERE id = ?", (p_eu["id"],))
+check("a pick is kept, whatever its relays go out of", row["exit"] == MAIN
+      and row["exit_pick"] == MAIN)
+check("  and shown picked", "value='%s' selected" % MAIN in Rec().plans())
+check("  only one of the servers abroad",
+      "m=!" in act("plan-save", id=str(p_eu["id"]), **plan_form(name="اروپا", exit="192.0.2.9")))
+act("plan-save", id=str(p_tr["id"]), **plan_form(relay=[TR]))
+check("automatic follows the relay: Turkey's goes out of the node",
+      store.one("SELECT exit FROM plans WHERE id = ?", (p_tr["id"],))["exit"] == NODE)
+admin.Admin.action(Rec(), "relay-exit", {"ip": [TR], "exit": [MAIN]})
+check("  and when that relay is moved to another, the plan goes with it",
+      store.one("SELECT exit FROM plans WHERE id = ?", (p_tr["id"],))["exit"] == MAIN
+      and store.one("SELECT exit FROM plans WHERE id = ?", (p_eu["id"],))["exit"] == MAIN)
+store.set_setting("relay_exit:" + TR, NODE)
+admin.refresh_auto_exits()
+
+print("one relay, two servers abroad")
+with open(admin.PANEL_ENV, "w") as fh:
+    fh.write("RELAY_IP=%s\nNODE_IP=%s\n" % (TR, NODE))
+page = Rec().plans()
+check("no relay ticks, but the server abroad to pick",
+      "name='relay'" not in page and "<th>سرور خارج</th>" in page)
+act("plan-save", **plan_form(name="VIP ترکیه", exit=NODE))
+act("plan-save", **plan_form(name="VIP آلمان", exit=MAIN))
+vt = store.one("SELECT * FROM plans WHERE name = 'VIP ترکیه'")
+vg = store.one("SELECT * FROM plans WHERE name = 'VIP آلمان'")
+check("  a plan for each", vt["exit"] == NODE and vg["exit"] == MAIN and vt["relays"] is None)
+act("plan-save", id=str(vt["id"]), **plan_form(name="VIP ترکیه", price="120000", exit=NODE))
+check("  and saving one again keeps it", store.one("SELECT exit FROM plans WHERE id = ?",
+                                                   (vt["id"],))["exit"] == NODE)
+store.run("INSERT INTO users (username, created_at, status) VALUES ('tina', ?, 'active')",
+          (panel.now(),))
+tina = store.one("SELECT id FROM users WHERE username = 'tina'")["id"]
+panel.apply_plan(store, tina, vt["id"])
+check("  whose customer goes out of it", store.one("SELECT exit FROM users WHERE id = ?",
+                                                   (tina,))["exit"] == NODE)
+
 print("a plan from before")
 store.run("INSERT INTO plans (name, template_id, days, quota_bytes, price, exit, created_at)"
           " VALUES ('قدیمی', 1, 30, 1, 1000, ?, ?)", (NODE, panel.now()))
 old = dict(store.one("SELECT * FROM plans WHERE name = 'قدیمی'"))
-check("one that named a server abroad is shown ticked for the relays that go out of it",
-      admin.plan_ticks(old, relays) == {TR})
+check("one that named a server abroad shows it picked", admin.plan_exit_pick(old) == NODE
+      and "value='%s' selected" % NODE in Rec().plans())
+act("plan-save", id=str(old["id"]), **plan_form(name="قدیمی", exit=NODE))
+check("  and keeps it when saved", store.one("SELECT exit, exit_pick FROM plans WHERE id = ?",
+                                             (old["id"],))["exit"] == NODE)
+admin.Admin.action(Rec(), "node-del", {"ip": [NODE]})
+check("a node taken off: plans picked for it are on automatic again",
+      store.one("SELECT exit_pick FROM plans WHERE id = ?", (vt["id"],))["exit_pick"] == ""
+      and store.one("SELECT exit FROM plans WHERE id = ?", (vt["id"],))["exit"] is None)
+with open(admin.PANEL_ENV, "w") as fh:
+    fh.write("RELAY_IP=%s,%s,%s\n" % (TR, DE, SG))
 
 print("an admin who may not pick servers")
 store.run("INSERT INTO admins (username, password_hash, password_salt, perms, own_only,"

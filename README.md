@@ -431,8 +431,9 @@ you can no longer reach.
   and sends the slip; approving it puts the plan on their account. Buying the
   same plan again before it ends is a renewal. With more than one server,
   tick the servers each plan works on: its customers see only their DNS, and
-  on any other server the customer panel comes up for them. Where to pay goes
-  on the admin panel's Payment page.
+  on any other server the customer panel comes up for them. With more than
+  one server abroad, pick the one each plan goes out of - from any relay - or
+  leave it on automatic. Where to pay goes on the admin panel's Payment page.
 - **Free trial**: a plan ticked as one, taken with one tap and no slip - with
   a linked Telegram account, once per Telegram account and once per account.
 - **Tickets**: from the customer's page, the bot, and the admin panel's
