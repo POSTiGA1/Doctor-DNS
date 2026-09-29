@@ -429,11 +429,13 @@ you can no longer reach.
 - **Plans** (admin panel → Plans): a template for some days, with an
   allowance and a price. The customer picks one on their page or in the bot
   and sends the slip; approving it puts the plan on their account. Buying the
-  same plan again before it ends is a renewal. With more than one server,
-  tick the servers each plan works on: its customers see only their DNS, and
-  on any other server the customer panel comes up for them. With more than
-  one server abroad, pick the one each plan goes out of - from any relay - or
-  leave it on automatic. Where to pay goes on the admin panel's Payment page.
+  same plan again before it ends is a renewal. With more than one relay or
+  server abroad, each plan has a line per server: "-" (not on it; its
+  customers do not see its DNS, and are shown the customer panel if they use
+  it), "automatic" (that relay's own server abroad), or a particular server
+  abroad, the only one they go out of from that relay - with one relay and
+  two servers abroad, a "VIP Germany" and a "VIP Turkey" plan. Where to pay
+  goes on the admin panel's Payment page.
 - **Free trial**: a plan ticked as one, taken with one tap and no slip - with
   a linked Telegram account, once per Telegram account and once per account.
 - **Tickets**: from the customer's page, the bot, and the admin panel's

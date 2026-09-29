@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.7"
+VERSION="0.9.8"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -5002,6 +5002,11 @@ exit 0
 #    # one its relays share, kept in `exit` - and null for a plan from before,
 #    # whose `exit` is then the admin's own pick.
 #    ("plans", "exit_pick", "TEXT"),
+#    # Relay by relay, what a plan is sold on and the server abroad each goes
+#    # out of: {relay: "auto" | exit}; a relay not in it is not the plan's.
+#    # Null for a plan from before, told by `relays` and `exit` above - which
+#    # are kept filled from this too.
+#    ("plans", "relay_exits", "TEXT"),
 #    # Blocks and forwards per template; the ones made before that are for all.
 #    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -6714,11 +6719,12 @@ exit 0
 #    # and another plan ends.
 #    extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
 #    set_devices(db, uid, plan_devices(plan) + extra, extra)
-#    # A plan sold with an exit of its own puts the customer on it, on
-#    # every relay; one sold with all of them leaves their exit alone.
-#    if "exit" in plan.keys() and plan["exit"]:
-#        db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
-#                   (plan["exit"], uid))
+#    # A plan that names servers abroad puts the customer on them - one for
+#    # every relay, or relay by relay; one on automatic leaves theirs alone.
+#    exits = plan_user_exits(plan)
+#    if exits:
+#        db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
+#                   exits + (uid,))
 #    return ("پلن «%s» تمدید شد تا %s" if renewing
 #            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
 #
@@ -8698,6 +8704,35 @@ exit 0
 #    """Where the panel is, and its standby - so a server whose panel moved
 #    to the standby keeps to it."""
 #    return {"host": exit_self(), "standby": store.setting("standby") or ""}
+#
+#
+#def plan_user_exits(plan):
+#    """What buying a plan does to the customer's server abroad: (one for
+#    every relay, None) when all its relays name the same one, (None, {relay:
+#    exit} as JSON) when they differ, or None when it names none and theirs
+#    is left as it was. A plan from before has one `exit` or none."""
+#    keys = plan.keys()
+#    raw = plan["relay_exits"] if "relay_exits" in keys else None
+#    if raw:
+#        try:
+#            picked = json.loads(raw)
+#        except ValueError:
+#            picked = {}
+#        if not isinstance(picked, dict):
+#            picked = {}
+#        named = {str(r): str(e) for r, e in picked.items() if e and e != "auto"}
+#        if not named:
+#            return None
+#        if len(set(named.values())) == 1 and len(named) == len(picked):
+#            return (next(iter(named.values())), None)
+#        return (None, json.dumps(named, sort_keys=True))
+#    # 0.9.6's automatic kept the one its relays shared then; each relay's
+#    # own is what it means.
+#    if "exit_pick" in keys and plan["exit_pick"] == "":
+#        return None
+#    if "exit" in keys and plan["exit"]:
+#        return (plan["exit"], None)
+#    return None
 #
 #
 #def panel_off(store, ip):
@@ -18661,6 +18696,8 @@ exit 0
 #            self.db.execute("ALTER TABLE plans ADD COLUMN relays TEXT")
 #        if have and "exit_pick" not in have:
 #            self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
+#        if have and "relay_exits" not in have:
+#            self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
 #        for table in ("users", "admins"):
 #            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
 #            if have and "reset_days" not in have:
@@ -18760,11 +18797,13 @@ exit 0
 #            extra = (user["extra_devices"] or 0) if renewing and \
 #                "extra_devices" in user.keys() else 0
 #            set_devices(self.db, uid, plan_devices(plan) + extra, extra)
-#            # A plan sold with an exit of its own puts the customer on it, on
-#            # every relay; one sold with all of them leaves their exit alone.
-#            if "exit" in plan.keys() and plan["exit"]:
-#                self.db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
-#                                (plan["exit"], uid))
+#            # A plan that names servers abroad puts the customer on them - one
+#            # for every relay, or relay by relay; one on automatic leaves
+#            # theirs alone.
+#            exits = plan_user_exits(plan)
+#            if exits:
+#                self.db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
+#                                exits + (uid,))
 #            self.db.commit()
 #        return ("پلن «%s» تمدید شد تا %s" if renewing
 #                else "پلن «%s» فعال شد تا %s") % (plan["name"],
@@ -23242,39 +23281,59 @@ exit 0
 #    return picked if picked in [main] + node_list() else main
 #
 #
-#def plan_ticks(plan, servers):
-#    """The servers a plan is ticked for: those it is sold on."""
-#    sold = [ip.strip() for ip in (plan.get("relays") or "").split(",") if ip.strip()]
-#    return {ip for ip in sold if ip in servers}
-#
-#
 #def plan_exit_pick(plan):
-#    """The server abroad the admin picked for a plan, "" for automatic. A
-#    plan from before the pick was kept apart names its own in `exit`."""
+#    """For a plan saved before relay by relay: the server abroad the admin
+#    picked for it, "" for automatic - in 0.9.6 kept apart, before that in
+#    `exit` itself."""
 #    if plan.get("exit_pick") is not None:
 #        return plan.get("exit_pick") or ""
 #    return plan.get("exit") or ""
 #
 #
-#def refresh_auto_exits():
-#    """Plans on automatic whose relays now go out of another server abroad -
-#    a relay's own was changed, or a node came or went - follow them."""
-#    for r in STORE.q("SELECT id, relays, exit FROM plans WHERE exit_pick = ''"
-#                     " AND COALESCE(relays, '') != ''"):
-#        want = plan_exit_for([ip for ip in r["relays"].split(",") if ip])
-#        if (r["exit"] or None) != want:
-#            STORE.run("UPDATE plans SET exit = ? WHERE id = ?", (want, r["id"]))
+#def plan_route(plan, servers):
+#    """What a plan is on, server by server: {server: "auto" | exit}, the
+#    servers it is not sold on left out. A plan from before reads as the same
+#    customers would have got: its ticked relays, or every one, each on the
+#    server abroad it named or on automatic."""
+#    raw = plan.get("relay_exits")
+#    if raw:
+#        try:
+#            picked = json.loads(raw)
+#        except ValueError:
+#            picked = {}
+#        if isinstance(picked, dict):
+#            return {ip: str(picked[ip]) for ip in servers if picked.get(ip)}
+#    sold = [ip.strip() for ip in (plan.get("relays") or "").split(",") if ip.strip()]
+#    sold = [ip for ip in sold if ip in servers] or list(servers)
+#    pick = plan_exit_pick(plan)
+#    return {ip: "auto" if is_single_server(ip) or not pick else pick for ip in sold}
 #
 #
-#def plan_exit_for(relays):
-#    """The server abroad a plan's customers are put on: the one all its
-#    relays go out of, when they share one and there is more than one to
-#    choose from - so they go out of it from any relay; else none, and each
-#    relay's own is theirs."""
-#    if not relays or not node_list() or any(is_single_server(ip) for ip in relays):
+#def plan_user_exits(plan):
+#    """What buying a plan does to the customer's server abroad - the same
+#    as the panel's, for a plan given here by hand."""
+#    keys = plan.keys()
+#    raw = plan["relay_exits"] if "relay_exits" in keys else None
+#    if raw:
+#        try:
+#            picked = json.loads(raw)
+#        except ValueError:
+#            picked = {}
+#        if not isinstance(picked, dict):
+#            picked = {}
+#        named = {str(r): str(e) for r, e in picked.items() if e and e != "auto"}
+#        if not named:
+#            return None
+#        if len(set(named.values())) == 1 and len(named) == len(picked):
+#            return (next(iter(named.values())), None)
+#        return (None, json.dumps(named, sort_keys=True))
+#    # 0.9.6's automatic kept the one its relays shared then; each relay's
+#    # own is what it means.
+#    if "exit_pick" in keys and plan["exit_pick"] == "":
 #        return None
-#    exits = {relay_exit_now(ip) for ip in relays}
-#    return exits.pop() if len(exits) == 1 else None
+#    if "exit" in keys and plan["exit"]:
+#        return (plan["exit"], None)
+#    return None
 #
 #
 #def server_label(ip):
@@ -23285,26 +23344,27 @@ exit 0
 #def plan_fields(form, tpls, plan=None, servers=None, exits=None):
 #    """The inputs of one plan, bound to the form with that id - a row of
 #    the table or the new-plan card use the same ones. With `servers`, the
-#    relays and single servers, a tick for each to sell the plan on some of
-#    them only; none ticked is all of them. With `exits`, the servers abroad,
-#    which one its customers go out of, from any relay; automatic is the one
-#    its relays share, or else each relay's own."""
+#    relays and single servers, a line for each: not on it, automatic - the
+#    server abroad that relay goes out of - or one of `exits`, the servers
+#    abroad, which it then goes out of for this plan's customers."""
 #    plan = plan or {}
 #    where = ""
 #    if servers:
-#        now = plan_ticks(plan, servers)
-#        where = "<td style='white-space:nowrap'>%s</td>" % "".join(
-#            "<label style='display:block' dir='ltr'><input form='%s' type='checkbox' "
-#            "name='relay' value='%s'%s> %s</label>"
-#            % (form, ip, " checked" if ip in now else "", html.escape(server_label(ip)))
-#            for ip in servers)
-#    if exits:
-#        here, pick = exits[0], plan_exit_pick(plan)
-#        where += "<td><select form='%s' name='exit' dir='ltr'>%s</select></td>" % (
-#            form, "<option value=''%s>خودکار</option>" % ("" if pick in exits else " selected")
-#            + "".join("<option value='%s'%s>%s</option>" % (
-#                x, " selected" if x == pick else "", "%s — این سرور" % x if x == here else x)
-#                for x in exits))
+#        route = plan_route(plan, servers) if plan else {ip: "auto" for ip in servers}
+#        lines = []
+#        for ip in servers:
+#            now = route.get(ip, "off")
+#            choices = [("off", "—"), ("auto", "خودکار")]
+#            if not is_single_server(ip):
+#                choices += [(x, x) for x in exits or []]
+#            lines.append(
+#                "<label style='display:block;white-space:nowrap' dir='ltr'>%s "
+#                "<select form='%s' name='re_%s'>%s</select></label>"
+#                % (html.escape(server_label(ip)), form, ip, "".join(
+#                    "<option value='%s'%s>%s</option>" % (v, " selected" if v == now else "",
+#                                                          html.escape(t))
+#                    for v, t in choices)))
+#        where = "<td>%s</td>" % "".join(lines)
 #    tid = plan.get("template_id")
 #    sel = "".join("<option value='%d'%s>%s</option>"
 #                  % (t["id"], " selected" if t["id"] == tid else "",
@@ -25554,14 +25614,15 @@ exit 0
 #        # With more than one server, a tick for each: the ones the plan is
 #        # sold on, which are then the only ones that serve its customers.
 #        may_route = s is None or s["can_route"]
-#        servers = ordered_servers()[0] if len(relay_list()) > 1 and may_route else None
-#        # With more than one server abroad, which one it goes out of.
-#        exits = [exit_address()] + node_list() if node_list() and may_route else None
+#        # One line per server once there is anything to choose: more than
+#        # one relay, or more than one server abroad to go out of.
+#        exits = [exit_address()] + node_list()
+#        servers = ordered_servers()[0] if may_route and (
+#            len(relay_list()) > 1 or node_list()) else None
 #        head = ("<tr><th>نام</th><th>قالب</th><th>روز</th><th>حجم (گیگ)</th>"
 #                "<th>قیمت (تومان)</th><th>سرعت Mb/s</th><th>دستگاه</th>"
 #                "<th>توضیح برای مشتری</th>"
-#                + ("<th>سرورها (DNS)</th>" if servers else "")
-#                + ("<th>سرور خارج</th>" if exits else "") + "<th>%s</th><th></th></tr>")
+#                + ("<th>سرورها</th>" if servers else "") + "<th>%s</th><th></th></tr>")
 #        out = ["<div class='card'><h2>پلن‌ها (%d)</h2>" % len(rows)]
 #        if not rows:
 #            out.append("<p class='muted'>هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، "
@@ -25613,16 +25674,13 @@ exit 0
 #                   "حالا سرویس فعال دارد نمی‌گیردش، تا باقی‌ماندهٔ پلنش از بین نرود. "
 #                   "یک پلن تست در یک زمان.</p></div>"
 #                   % (p, head % "", plan_fields("pnew", tpls, servers=servers, exits=exits),
-#                      ("<p class='muted'>سرورها (DNS): پلنی که برای چند سرور تیک خورده، "
-#                      "فقط روی همان‌ها کار می‌کند و مشتری‌اش فقط DNS همان‌ها را می‌بیند؛ "
-#                      "اگر DNS سرور دیگری را بزند، پنل مشتری برایش باز می‌شود. بدون تیک، "
-#                      "روی همه. تیک‌ها همان لحظه برای همهٔ دارندگان پلن اعمال می‌شود، نه "
-#                      "فقط خریدهای بعدی.</p>" if servers else "")
-#                   + ("<p class='muted'>سرور خارج: مشتری این پلن از هر رله‌ای که وصل شود، "
-#                      "از همین سرور خارج بیرون می‌رود و خودش نمی‌تواند عوضش کند؛ اگر از کار "
-#                      "بیفتد، تا برگشتنش از بقیه. «خودکار» یعنی سرور خارجی که رله‌های "
-#                      "تیک‌خورده با هم دارند، و اگر یکی نیست، سرور خارج خود هر رله. از "
-#                      "خرید یا تمدید بعدی اعمال می‌شود.</p>" if exits else "")))
+#                      "<p class='muted'>سرورها: برای هر سرور انتخاب کنید پلن روی آن باشد یا "
+#                      "نه، و مشتری از آن رله از کدام سرور خارج بیرون برود. «—» یعنی پلن روی "
+#                      "این سرور نیست: مشتری DNS آن را نمی‌بیند و اگر بزند، پنل مشتری برایش "
+#                      "باز می‌شود. «خودکار» یعنی سرور خارج خود آن رله. یک سرور خارج مشخص "
+#                      "یعنی مشتری از آن رله فقط از همان بیرون می‌رود، و اگر از کار بیفتد، تا "
+#                      "برگشتنش از بقیه. روی/نبودن پلن همان لحظه برای همهٔ دارندگانش اعمال "
+#                      "می‌شود؛ سرور خارج از خرید یا تمدید بعدی.</p>" if servers else ""))
 #        if s is None:
 #            out.append(devices_card(p))
 #            out.append(discounts_card(p))
@@ -26734,39 +26792,50 @@ exit 0
 #            devices = number(one("devices") or "1")
 #            if devices is None or devices != int(devices) or not 1 <= devices <= 5:
 #                return self.redirect("plans?m=!تعداد دستگاه باید از ۱ تا ۵ باشد")
-#            # The servers it is sold on, in the order customers see them; none
-#            # for all. Only an admin who may pick servers picks these; for
-#            # anybody else a plan keeps what it had.
+#            # Server by server: not on it, automatic, or a server abroad. Only
+#            # an admin who may pick servers picks these, and only from the
+#            # form that has them; otherwise a plan keeps what it had.
 #            servers = ordered_servers()[0]
 #            may_pick = seller() is None or seller()["can_route"]
-#            ticked = [ip for ip in servers if ip in (params.get("relay") or [])]
-#            if any(ip not in servers for ip in params.get("relay") or []):
-#                return self.redirect("plans?m=!این سرور در فهرست نیست")
-#            if len(ticked) == len(servers):
-#                ticked = []          # every one is all of them
-#            old = STORE.one("SELECT relays, exit, exit_pick FROM plans WHERE id = ?", (pid,)) \
-#                if pid else None
+#            old = STORE.one("SELECT relays, exit, exit_pick, relay_exits FROM plans"
+#                            " WHERE id = ?", (pid,)) if pid else None
 #            exits = [exit_address()] + node_list()
-#            if may_pick:
-#                relays = ",".join(ticked) or None
-#                # The server abroad: the admin's pick, when there is more than
-#                # one to pick from; else automatic, the one its relays share.
-#                pick = one("exit").strip() if node_list() else ""
-#                if pick and pick not in exits:
-#                    return self.redirect("plans?m=!این سرور خارج در فهرست نیست")
-#                where = pick or plan_exit_for(ticked)
+#            asked = [k[3:] for k in params if k.startswith("re_")]
+#            if may_pick and asked:
+#                if any(ip not in servers for ip in asked):
+#                    return self.redirect("plans?m=!این سرور در فهرست نیست")
+#                route = {}
+#                for ip in servers:
+#                    way = one("re_" + ip).strip() or "off"
+#                    if way == "off":
+#                        continue
+#                    if way != "auto" and (way not in exits or is_single_server(ip)):
+#                        return self.redirect("plans?m=!این سرور خارج در فهرست نیست")
+#                    route[ip] = way
+#                if not route:
+#                    return self.redirect("plans?m=!پلن دست‌کم روی یک سرور باشد")
+#                if len(route) == len(servers) and set(route.values()) == {"auto"}:
+#                    relays = routed = where = None      # every server, automatic
+#                else:
+#                    relays = ",".join(route) if len(route) < len(servers) else None
+#                    routed = json.dumps(route, sort_keys=True)
+#                    # One server abroad for all of them: the plan's own.
+#                    named = set(route.values())
+#                    where = named.pop() if len(named) == 1 and "auto" not in named else None
+#                pick = None
+#            elif old:
+#                relays, where, pick, routed = (old["relays"], old["exit"], old["exit_pick"],
+#                                               old["relay_exits"])
 #            else:
-#                relays = old["relays"] if old else None
-#                where = old["exit"] if old else None
-#                pick = plan_exit_pick(dict(old)) if old else ""
+#                relays = routed = where = pick = None
 #            values = (name, tid, int(days), quota, int(price), int(speed * 1000),
 #                      one("note").strip()[:120], 1 if trial else 0, where,
-#                      int(devices), relays, pick)
+#                      int(devices), relays, pick, routed)
 #            if pid:
 #                cur = STORE.run("UPDATE plans SET name = ?, template_id = ?, days = ?,"
 #                                " quota_bytes = ?, price = ?, speed_kbps = ?, note = ?,"
 #                                " is_trial = ?, exit = ?, devices = ?, relays = ?,"
-#                                " exit_pick = ? WHERE id = ?", values + (pid,))
+#                                " exit_pick = ?, relay_exits = ? WHERE id = ?", values + (pid,))
 #                if not cur.rowcount:
 #                    return self.redirect("plans?m=!این پلن پیدا نشد")
 #                if old and (old["relays"] or None) != relays:
@@ -26777,9 +26846,9 @@ exit 0
 #                # next purchase or renewal.
 #                return self.redirect("plans?m=پلن ذخیره شد؛ برای خریدهای بعدی")
 #            STORE.run("INSERT INTO plans (name, template_id, days, quota_bytes, price,"
-#                      " speed_kbps, note, is_trial, exit, devices, relays, exit_pick, active,"
-#                      " created_at, owner_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-#                      " 1, ?, ?)",
+#                      " speed_kbps, note, is_trial, exit, devices, relays, exit_pick,"
+#                      " relay_exits, active, created_at, owner_admin) VALUES (?, ?, ?, ?, ?,"
+#                      " ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
 #                      values + (now(), seller()["id"] if seller() else None))
 #            return self.redirect("plans?m=%s" % (
 #                "پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش"
@@ -27783,7 +27852,6 @@ exit 0
 #                    return self.redirect("nodes?m=!%s یکی از رله‌هاست" % ip)
 #                set_nodes(nodes + [ip])
 #                node_slot(ip)
-#                refresh_auto_exits()
 #                return self.redirect("nodes?m=سرور %s اضافه شد؛ حالا نصب‌کننده را روی آن اجرا "
 #                                     "کنید" % ip)
 #            if ip not in nodes:
@@ -27794,6 +27862,15 @@ exit 0
 #            STORE.run("UPDATE plans SET exit = NULL WHERE exit = ?", (ip,))
 #            # A plan picked for it is on automatic again.
 #            STORE.run("UPDATE plans SET exit_pick = '' WHERE exit_pick = ?", (ip,))
+#            for pl in STORE.q("SELECT id, relay_exits FROM plans WHERE relay_exits LIKE ?",
+#                              ("%" + ip + "%",)):
+#                try:
+#                    route = json.loads(pl["relay_exits"])
+#                except ValueError:
+#                    continue
+#                route = {r: ("auto" if e == ip else e) for r, e in route.items()}
+#                STORE.run("UPDATE plans SET relay_exits = ? WHERE id = ?",
+#                          (json.dumps(route, sort_keys=True), pl["id"]))
 #            STORE.run("UPDATE settings SET value = '' WHERE key = 'standby' AND value = ?", (ip,))
 #            for u in STORE.q("SELECT id, relay_exits FROM users WHERE relay_exits LIKE ?",
 #                             ("%" + ip + "%",)):
@@ -27809,7 +27886,6 @@ exit 0
 #                      " OR key = ?", ("relay_tunnel:%%:" + ip, "relay_tunnel_state:%%:" + ip,
 #                                      "node_tunnel_state:%s:%%" % ip, "node_slot:" + ip))
 #            set_nodes([n for n in nodes if n != ip])
-#            refresh_auto_exits()
 #            return self.redirect("nodes?m=سرور %s برداشته شد" % ip)
 #
 #        if rest == "standby-save":
@@ -27980,7 +28056,6 @@ exit 0
 #                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
 #                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 #                          ("relay_exit:" + ip, to))
-#            refresh_auto_exits()
 #            return self.redirect("nodes?m=رلهٔ %s تا یک دقیقه دیگر از %s می‌رود" % (ip, to))
 #
 #        if rest == "relay-tunnel":
@@ -38031,16 +38106,14 @@ exit 0
 #"سرور خارج اصلی": "Main exit server",
 #"سرور خارج این مشتری برای هر رله ذخیره شد": "This customer’s exit server saved for each relay",
 #"سرور خارج — پنل": "Exit server — panel",
-#"سرور خارج: مشتری این پلن از هر رله‌ای که وصل شود، از همین سرور خارج بیرون می‌رود و خودش نمی‌تواند عوضش کند؛ اگر از کار بیفتد، تا برگشتنش از بقیه. «خودکار» یعنی سرور خارجی که رله‌های تیک‌خورده با هم دارند، و اگر یکی نیست، سرور خارج خود هر رله. از خرید یا تمدید بعدی اعمال می‌شود.": "Server abroad: a customer on this plan goes out of this server abroad from whichever relay they use, and cannot change it; while it is down, out of the others. \"Automatic\" is the server abroad the ticked relays share, or each relay's own when they do not share one. It applies from the next purchase or renewal.",
 #"سرور دیگر به نسخهٔ": "other servers to",
 #"سرور پشتیبان یکی از نودهاست؛ اول یک نود اضافه کنید.": "The standby server is one of the nodes; add a node first.",
 #"سرور پشتیبان:": "Standby server:",
 #"سرور پشتیبانی تعیین نشده": "No standby server set",
 #"سرورها": "Servers",
-#"سرورها (DNS)": "Servers (DNS)",
-#"سرورها (DNS): پلنی که برای چند سرور تیک خورده، فقط روی همان‌ها کار می‌کند و مشتری‌اش فقط DNS همان‌ها را می‌بیند؛ اگر DNS سرور دیگری را بزند، پنل مشتری برایش باز می‌شود. بدون تیک، روی همه. تیک‌ها همان لحظه برای همهٔ دارندگان پلن اعمال می‌شود، نه فقط خریدهای بعدی.": "Servers (DNS): a plan ticked for some servers works on those only, and its customers see only their DNS; one who uses another server's DNS is shown the customer panel there. No ticks is all of them. The ticks apply at once to everyone on the plan, not only to later purchases.",
 #"سرورها برای مشتری": "Servers for customers",
 #"سرورها برای مشتری ذخیره شد": "Servers for customers saved",
+#"سرورها: برای هر سرور انتخاب کنید پلن روی آن باشد یا نه، و مشتری از آن رله از کدام سرور خارج بیرون برود. «—» یعنی پلن روی این سرور نیست: مشتری DNS آن را نمی‌بیند و اگر بزند، پنل مشتری برایش باز می‌شود. «خودکار» یعنی سرور خارج خود آن رله. یک سرور خارج مشخص یعنی مشتری از آن رله فقط از همان بیرون می‌رود، و اگر از کار بیفتد، تا برگشتنش از بقیه. روی/نبودن پلن همان لحظه برای همهٔ دارندگانش اعمال می‌شود؛ سرور خارج از خرید یا تمدید بعدی.": "Servers: for each server, pick whether the plan is on it, and which server abroad its customers go out of from that relay. \"—\" is not on it: the customer is not shown its DNS, and one who uses it is shown the customer panel. \"Automatic\" is that relay's own server abroad. A particular server abroad is the only one they go out of from that relay, and while it is down, the others. Being on a server or not applies at once to everyone on the plan; the server abroad from the next purchase or renewal.",
 #"سرورهای ایران": "Iran servers",
 #"سرورهای خارج (": "Exit servers (",
 #"سرورهای دیگر": "The other servers",
@@ -38618,6 +38691,7 @@ exit 0
 #"پلن تازه": "New plan",
 #"پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش": "Free trial plan created; customers with a linked Telegram get it once",
 #"پلن حذف شد": "Plan deleted",
+#"پلن دست‌کم روی یک سرور باشد": "A plan has to be on at least one server",
 #"پلن دوباره فروخته می‌شود": "The plan is sold again",
 #"پلن دیگر فروخته نمی‌شود؛ کسانی که دارندش تا آخر دوره می‌مانند": "The plan is no longer sold; those who have it keep it until their period ends",
 #"پلن دیگری": "another plan",

@@ -628,6 +628,11 @@ MIGRATIONS = [
     # one its relays share, kept in `exit` - and null for a plan from before,
     # whose `exit` is then the admin's own pick.
     ("plans", "exit_pick", "TEXT"),
+    # Relay by relay, what a plan is sold on and the server abroad each goes
+    # out of: {relay: "auto" | exit}; a relay not in it is not the plan's.
+    # Null for a plan from before, told by `relays` and `exit` above - which
+    # are kept filled from this too.
+    ("plans", "relay_exits", "TEXT"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -2340,11 +2345,12 @@ def put_plan(db, uid, plan_id, stamp=None):
     # and another plan ends.
     extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
     set_devices(db, uid, plan_devices(plan) + extra, extra)
-    # A plan sold with an exit of its own puts the customer on it, on
-    # every relay; one sold with all of them leaves their exit alone.
-    if "exit" in plan.keys() and plan["exit"]:
-        db.execute("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?",
-                   (plan["exit"], uid))
+    # A plan that names servers abroad puts the customer on them - one for
+    # every relay, or relay by relay; one on automatic leaves theirs alone.
+    exits = plan_user_exits(plan)
+    if exits:
+        db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
+                   exits + (uid,))
     return ("پلن «%s» تمدید شد تا %s" if renewing
             else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
 
@@ -4324,6 +4330,35 @@ def panel_where(store):
     """Where the panel is, and its standby - so a server whose panel moved
     to the standby keeps to it."""
     return {"host": exit_self(), "standby": store.setting("standby") or ""}
+
+
+def plan_user_exits(plan):
+    """What buying a plan does to the customer's server abroad: (one for
+    every relay, None) when all its relays name the same one, (None, {relay:
+    exit} as JSON) when they differ, or None when it names none and theirs
+    is left as it was. A plan from before has one `exit` or none."""
+    keys = plan.keys()
+    raw = plan["relay_exits"] if "relay_exits" in keys else None
+    if raw:
+        try:
+            picked = json.loads(raw)
+        except ValueError:
+            picked = {}
+        if not isinstance(picked, dict):
+            picked = {}
+        named = {str(r): str(e) for r, e in picked.items() if e and e != "auto"}
+        if not named:
+            return None
+        if len(set(named.values())) == 1 and len(named) == len(picked):
+            return (next(iter(named.values())), None)
+        return (None, json.dumps(named, sort_keys=True))
+    # 0.9.6's automatic kept the one its relays shared then; each relay's
+    # own is what it means.
+    if "exit_pick" in keys and plan["exit_pick"] == "":
+        return None
+    if "exit" in keys and plan["exit"]:
+        return (plan["exit"], None)
+    return None
 
 
 def panel_off(store, ip):

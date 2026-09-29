@@ -363,18 +363,17 @@ check("  and back to each relay's own", urow()["exit"] is None and urow()["relay
 admin.STORE.run("INSERT OR IGNORE INTO templates (name, is_default, created_at)"
                 " VALUES ('default', 1, '2026-01-01')")
 tid = admin.STORE.one("SELECT id FROM templates ORDER BY id LIMIT 1")["id"]
-check("a plan's servers can be only the servers",
+check("a plan's server abroad can be only one of them",
       act("plan-save", name="x", template_id=str(tid), days="30", quota_gb="10", price="1",
-          relay="192.0.2.1").startswith("plans?m=!"))
-admin.STORE.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                ("relay_exit:198.51.100.2", "93.184.216.20"))
+          **{"re_198.51.100.1": "off", "re_198.51.100.2": "192.0.2.1"}).startswith("plans?m=!"))
 act("plan-save", name="France", template_id=str(tid), days="30", quota_gb="10", price="1",
-    relay="198.51.100.2")
-act("plan-save", name="All", template_id=str(tid), days="30", quota_gb="10", price="1")
+    **{"re_198.51.100.1": "93.184.216.20", "re_198.51.100.2": "93.184.216.20"})
+act("plan-save", name="All", template_id=str(tid), days="30", quota_gb="10", price="1",
+    **{"re_198.51.100.1": "auto", "re_198.51.100.2": "auto"})
 fr = admin.STORE.one("SELECT * FROM plans WHERE name = 'France'")
 every = admin.STORE.one("SELECT * FROM plans WHERE name = 'All'")
-check("  one ticked for a relay that goes out of one exit is put on it; one for all, none",
-      fr["exit"] == "93.184.216.20" and fr["relays"] == "198.51.100.2"
+check("  one on an exit from every relay is put on it; one for all, none",
+      fr["exit"] == "93.184.216.20" and fr["relays"] is None
       and every["exit"] is None and every["relays"] is None)
 admin.STORE.run("UPDATE users SET exit = NULL, relay_exits = ? WHERE id = ?",
                 (json.dumps({"198.51.100.1": main}), nima))
@@ -389,8 +388,9 @@ panel.apply_plan(store, nima, fr["id"])
 check("  the same when the panel gives it - a receipt, a trial, the bot",
       store.one("SELECT exit FROM users WHERE id = ?", (nima,))["exit"] == "93.184.216.20")
 page = admin.Admin.plans(Rec())
-check("the plans page has a tick per server", "<th>سرورها (DNS)</th>" in page
-      and "name='relay' value='198.51.100.2' checked" in page)
+check("the plans page has a line per server, with the exits",
+      "<th>سرورها</th>" in page and "name='re_198.51.100.2'" in page
+      and "<option value='93.184.216.20' selected>" in page)
 act("user-exit", id=str(nima), **{"r_198.51.100.1": "93.184.216.20", "r_198.51.100.2": ""})
 act("node-del", ip="93.184.216.20")
 check("  a node taken off sends its customers back to their relays' own",
