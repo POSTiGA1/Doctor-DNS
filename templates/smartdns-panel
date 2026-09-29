@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash  TEXT,
     password_salt  TEXT,
     username       TEXT,
+    -- No longer written or shown: a customer is their username. Kept so a
+    -- database from before still opens.
     first_name     TEXT,
     created_at     TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'active',
@@ -389,6 +391,17 @@ CREATE TABLE IF NOT EXISTS custom_domains (
     added_at TEXT NOT NULL
 );
 
+-- Named groups of those domains, each a row of its own on a template's page
+-- (service "cg<id>", group "main"), with the icon the admin gave it. A
+-- domain's group is custom_domains.group_id; null for one in no group.
+CREATE TABLE IF NOT EXISTS custom_groups (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    icon       BLOB,
+    icon_type  TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- Domains the operator wants closed: answered "no such name", subdomains
 -- and all, on every relay - including a name the service itself routes.
 -- For every template, `all_templates`, which includes templates made later;
@@ -633,6 +646,8 @@ MIGRATIONS = [
     # Null for a plan from before, told by `relays` and `exit` above - which
     # are kept filled from this too.
     ("plans", "relay_exits", "TEXT"),
+    # The group an operator's own domain is in (custom_groups); null for none.
+    ("custom_domains", "group_id", "INTEGER"),
     # Blocks and forwards per template; the ones made before that are for all.
     ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
     ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -1323,13 +1338,13 @@ class Store:
     # Not quota_bytes = 0 on an active account, which is the trap here: zero
     # means unlimited everywhere in this file, so the account that was meant
     # to get nothing would get everything. The status is what decides.
-    def create_user(self, tg_id, username, first_name):
+    def create_user(self, tg_id, username):
         self.run(
             "INSERT OR IGNORE INTO users"
-            " (telegram_id, username, first_name, created_at, status,"
+            " (telegram_id, username, created_at, status,"
             "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
-            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-            (tg_id, username, first_name, now()),
+            " VALUES (?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (tg_id, username, now()),
         )
         return self.user_by_telegram(tg_id)
 
@@ -1339,7 +1354,7 @@ class Store:
     def user_by_username(self, username):
         return self.one("SELECT * FROM users WHERE username = ?", (username,))
 
-    def create_web_user(self, username, first_name, password):
+    def create_web_user(self, username, password):
         """Open an account from the web panel, with no Telegram behind it.
 
         It starts with nothing, the same as one opened any other way - the way
@@ -1350,11 +1365,11 @@ class Store:
         salt = secrets.token_hex(16)
         self.run(
             "INSERT INTO users"
-            " (telegram_id, username, password_hash, password_salt, first_name,"
+            " (telegram_id, username, password_hash, password_salt,"
             "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
             "  expires_at)"
-            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-            (username, hash_password(password, salt), salt, first_name, now()),
+            " VALUES (NULL, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (username, hash_password(password, salt), salt, now()),
         )
         return self.user_by_username(username)
 
@@ -1547,7 +1562,6 @@ class Store:
             by_ip[r["ip"]] = {"uid": r["uid"], "tid": tid,
                               "kbps": r["kbps"] or 0, "user": r["uname"]}
             used.add(tid)
-        custom = self.custom_domains()
         profiles = {}
         for tid in used:
             # The default routes everything, which is what the relay's main
@@ -1569,9 +1583,7 @@ class Store:
                 # into this profile's own config, and a template that does not
                 # route them simply has no rule for them anywhere. One of them
                 # switched off inside the template is left out the same way.
-                "custom": [d for d in custom
-                           if d not in self.template_domains_off(tid)]
-                          if self.routes_custom(tid) else [],
+                "custom": self.custom_for(tid),
                 # Whether this profile still wants epic-pin's work. Those pins
                 # name exact hosts, so they beat any rule that routes the
                 # parent domain - which means a template that has ticked the
@@ -1638,6 +1650,23 @@ class Store:
         if row and row["is_default"]:
             return True
         return ("custom", "main") in self.template_groups(template_id)
+
+    def custom_for(self, template_id):
+        """The operator's own domains this template routes: those in no group
+        while it routes them (routes_custom), and a group's while that group is
+        ticked - less any switched off one at a time. The default routes all."""
+        row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+        if row and row["is_default"]:
+            return self.custom_domains()
+        ticked = self.template_groups(template_id)
+        off = self.template_domains_off(template_id)
+        out = []
+        for r in self.q("SELECT domain, group_id FROM custom_domains ORDER BY domain"):
+            row_key = (("custom", "main") if r["group_id"] is None
+                       else ("cg%d" % r["group_id"], "main"))
+            if row_key in ticked and r["domain"] not in off:
+                out.append(r["domain"])
+        return out
 
     def backup(self):
         """A consistent copy of the database, minus the metrics.
@@ -3041,7 +3070,7 @@ def qlog_reasoner(store, user, catalogue):
     bypass = set(store.bypass_for(tid, catalogue)) if tid else set()
     index = service_index(catalogue)
     label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
-    custom = set(store.custom_domains())
+    custom = set(store.custom_for(tid) if tid else store.custom_domains())
     rules = store.template_rules(tid)
     blocked = set(rules["blocked"])
     forwards = rules["forwards"]
@@ -3592,9 +3621,9 @@ def new_password():
                     for _ in range(3))
 
 
-def give_credentials(store, user, username, name):
-    """A web sign-in for an account that came through the bot: the name and
-    username the customer chose, and a password made here."""
+def give_credentials(store, user, username):
+    """A web sign-in for an account that came through the bot: the username
+    the customer chose, and a password made here."""
     if user["username"]:
         return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
     wanted = normal_username(username)
@@ -3603,13 +3632,12 @@ def give_credentials(store, user, username, name):
                                        "یا زیرخط باشد")
     if store.user_by_username(wanted):
         return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
-    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
     password = new_password()
     salt = secrets.token_hex(16)
     try:
-        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
+        store.run("UPDATE users SET username = ?, password_hash = ?,"
                   " password_salt = ?, must_change_password = 0 WHERE id = ?",
-                  (wanted, name, hash_password(password, salt), salt, user["id"]))
+                  (wanted, hash_password(password, salt), salt, user["id"]))
     except sqlite3.IntegrityError:
         return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
     log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
@@ -4045,7 +4073,7 @@ def admin_ticket_reply(store, tid, body):
 
 
 def who_label(user):
-    return (user["first_name"] or user["username"] or user["phone"]
+    return (user["username"] or user["phone"]
             or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
                 else "#%d" % user["id"]))
 
@@ -5550,8 +5578,6 @@ class API(http.server.BaseHTTPRequestHandler):
         password = body.get("password") or ""
         if len(password) < 8:
             return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
-        name = (body.get("name") or "").strip()[:60]
-
         if self.store.user_by_username(username):
             return {"ok": False,
                     "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
@@ -5564,7 +5590,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
                                             "بگیرید"}
         try:
-            user = self.store.create_web_user(username, name, password)
+            user = self.store.create_web_user(username, password)
         except sqlite3.IntegrityError:
             # Two signups claiming the same name in the same instant. The
             # unique index is what actually decides between them; this only
@@ -5580,7 +5606,7 @@ class API(http.server.BaseHTTPRequestHandler):
         print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
         emit_admin(self.store, "user.created", {
             "user_id": user["id"], "via": "web",
-            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
+            "text": "مشتری تازه از پنل وب: %s" % username})
         return {"ok": True, "session": self.store.open_session(user["id"]),
                 "message": "حساب ساخته شد"}
 
@@ -5739,7 +5765,10 @@ class API(http.server.BaseHTTPRequestHandler):
         plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
         return {
             "ok": True,
-            "name": user["first_name"] or user["username"] or "",
+            # What the customer page puts at the top. Under "name" still, for
+            # a relay not yet upgraded; it is the username now.
+            "name": user["username"] or "",
+            "username": user["username"] or "",
             "telegram_id": user["telegram_id"],
             "ip": ips[0]["ip"] if ips else None,
             "used": user["used_bytes"],
@@ -5983,7 +6012,6 @@ def user_view(store, user, relays):
     return {
         "id": user["id"],
         "telegram_id": user["telegram_id"],
-        "name": user["first_name"] or "",
         "username": user["username"],
         "panel_url": store.setting("customer_panel_url") or None,
         "status": user["status"],
@@ -6044,7 +6072,7 @@ def admin_receipt(store, row):
 RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
                 " t.plan_id,"
                 " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
-                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
+                " u.id AS uid, u.username, u.phone, u.telegram_id"
                 " FROM transactions t JOIN users u ON u.id = t.user_id"
                 " LEFT JOIN plans p ON p.id = t.plan_id")
 
@@ -6124,10 +6152,10 @@ class AdminAPI:
             like = "%" + q.replace("%", "").replace("_", "") + "%"
             rows = self.store.q(
                 "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+                " WHERE (u.username LIKE ? OR u.phone LIKE ?"
                 " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
                 " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
-                (like, like, like, q, q, q) + more)
+                (like, like, q, q, q) + more)
         return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
                                            for r in rows]}
 
@@ -6214,7 +6242,7 @@ class AdminAPI:
             return 400, refused("bad_status", "status یکی از open، answered، closed "
                                               "یا all است")
         rows = self.store.q(
-            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.username, u.phone, u.telegram_id,"
             " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
             " FROM tickets t JOIN users u ON u.id = t.user_id"
             + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
@@ -6525,10 +6553,11 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
                 return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
         created = not user
         if created:
-            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
             # No username: that column is what a customer signs in to the web
             # panel with, and a Telegram handle there could collide with one.
-            user = self.store.create_user(tg, None, name or None)
+            # The bot asks for one next. A "name" sent by an older bot is not
+            # kept.
+            user = self.store.create_user(tg, None)
             print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
                   flush=True)
             # A reseller's link makes them the reseller's; somebody else's
@@ -6607,7 +6636,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         user, err = self.customer(tg)
         if err:
             return err
-        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
+        res = give_credentials(self.store, user, body.get("username"))
         if not res["ok"]:
             return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
         return 200, res

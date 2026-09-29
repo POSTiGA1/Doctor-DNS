@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.9"
+VERSION="0.9.10"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2110,6 +2110,9 @@ EOF
     # domain, for the admin to tick at the foot of a template's page.
     note_file /usr/local/share/smart-dns/blocks.json
     payload BLOCKS > /usr/local/share/smart-dns/blocks.json
+    # The logos drawn beside the services on a template's page.
+    note_file /usr/local/share/smart-dns/icons.json
+    payload ICONS > /usr/local/share/smart-dns/icons.json
     # Only the relays reach the sync API. The panel's service runs this before
     # every start, so a relay added to RELAY_IP by hand is let in the next time
     # the panel restarts - exactly when the panel itself would let it in.
@@ -4525,6 +4528,8 @@ exit 0
 #    password_hash  TEXT,
 #    password_salt  TEXT,
 #    username       TEXT,
+#    -- No longer written or shown: a customer is their username. Kept so a
+#    -- database from before still opens.
 #    first_name     TEXT,
 #    created_at     TEXT NOT NULL,
 #    status         TEXT NOT NULL DEFAULT 'active',
@@ -4845,6 +4850,17 @@ exit 0
 #    added_at TEXT NOT NULL
 #);
 #
+#-- Named groups of those domains, each a row of its own on a template's page
+#-- (service "cg<id>", group "main"), with the icon the admin gave it. A
+#-- domain's group is custom_domains.group_id; null for one in no group.
+#CREATE TABLE IF NOT EXISTS custom_groups (
+#    id         INTEGER PRIMARY KEY,
+#    name       TEXT NOT NULL,
+#    icon       BLOB,
+#    icon_type  TEXT,
+#    created_at TEXT NOT NULL
+#);
+#
 #-- Domains the operator wants closed: answered "no such name", subdomains
 #-- and all, on every relay - including a name the service itself routes.
 #-- For every template, `all_templates`, which includes templates made later;
@@ -5089,6 +5105,8 @@ exit 0
 #    # Null for a plan from before, told by `relays` and `exit` above - which
 #    # are kept filled from this too.
 #    ("plans", "relay_exits", "TEXT"),
+#    # The group an operator's own domain is in (custom_groups); null for none.
+#    ("custom_domains", "group_id", "INTEGER"),
 #    # Blocks and forwards per template; the ones made before that are for all.
 #    ("blocked_domains", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
 #    ("dns_forwards", "all_templates", "INTEGER NOT NULL DEFAULT 1"),
@@ -5779,13 +5797,13 @@ exit 0
 #    # Not quota_bytes = 0 on an active account, which is the trap here: zero
 #    # means unlimited everywhere in this file, so the account that was meant
 #    # to get nothing would get everything. The status is what decides.
-#    def create_user(self, tg_id, username, first_name):
+#    def create_user(self, tg_id, username):
 #        self.run(
 #            "INSERT OR IGNORE INTO users"
-#            " (telegram_id, username, first_name, created_at, status,"
+#            " (telegram_id, username, created_at, status,"
 #            "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
-#            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-#            (tg_id, username, first_name, now()),
+#            " VALUES (?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (tg_id, username, now()),
 #        )
 #        return self.user_by_telegram(tg_id)
 #
@@ -5795,7 +5813,7 @@ exit 0
 #    def user_by_username(self, username):
 #        return self.one("SELECT * FROM users WHERE username = ?", (username,))
 #
-#    def create_web_user(self, username, first_name, password):
+#    def create_web_user(self, username, password):
 #        """Open an account from the web panel, with no Telegram behind it.
 #
 #        It starts with nothing, the same as one opened any other way - the way
@@ -5806,11 +5824,11 @@ exit 0
 #        salt = secrets.token_hex(16)
 #        self.run(
 #            "INSERT INTO users"
-#            " (telegram_id, username, password_hash, password_salt, first_name,"
+#            " (telegram_id, username, password_hash, password_salt,"
 #            "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
 #            "  expires_at)"
-#            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-#            (username, hash_password(password, salt), salt, first_name, now()),
+#            " VALUES (NULL, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (username, hash_password(password, salt), salt, now()),
 #        )
 #        return self.user_by_username(username)
 #
@@ -6003,7 +6021,6 @@ exit 0
 #            by_ip[r["ip"]] = {"uid": r["uid"], "tid": tid,
 #                              "kbps": r["kbps"] or 0, "user": r["uname"]}
 #            used.add(tid)
-#        custom = self.custom_domains()
 #        profiles = {}
 #        for tid in used:
 #            # The default routes everything, which is what the relay's main
@@ -6025,9 +6042,7 @@ exit 0
 #                # into this profile's own config, and a template that does not
 #                # route them simply has no rule for them anywhere. One of them
 #                # switched off inside the template is left out the same way.
-#                "custom": [d for d in custom
-#                           if d not in self.template_domains_off(tid)]
-#                          if self.routes_custom(tid) else [],
+#                "custom": self.custom_for(tid),
 #                # Whether this profile still wants epic-pin's work. Those pins
 #                # name exact hosts, so they beat any rule that routes the
 #                # parent domain - which means a template that has ticked the
@@ -6094,6 +6109,23 @@ exit 0
 #        if row and row["is_default"]:
 #            return True
 #        return ("custom", "main") in self.template_groups(template_id)
+#
+#    def custom_for(self, template_id):
+#        """The operator's own domains this template routes: those in no group
+#        while it routes them (routes_custom), and a group's while that group is
+#        ticked - less any switched off one at a time. The default routes all."""
+#        row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+#        if row and row["is_default"]:
+#            return self.custom_domains()
+#        ticked = self.template_groups(template_id)
+#        off = self.template_domains_off(template_id)
+#        out = []
+#        for r in self.q("SELECT domain, group_id FROM custom_domains ORDER BY domain"):
+#            row_key = (("custom", "main") if r["group_id"] is None
+#                       else ("cg%d" % r["group_id"], "main"))
+#            if row_key in ticked and r["domain"] not in off:
+#                out.append(r["domain"])
+#        return out
 #
 #    def backup(self):
 #        """A consistent copy of the database, minus the metrics.
@@ -7497,7 +7529,7 @@ exit 0
 #    bypass = set(store.bypass_for(tid, catalogue)) if tid else set()
 #    index = service_index(catalogue)
 #    label = {svc["key"]: svc.get("label") or svc["key"] for svc in catalogue}
-#    custom = set(store.custom_domains())
+#    custom = set(store.custom_for(tid) if tid else store.custom_domains())
 #    rules = store.template_rules(tid)
 #    blocked = set(rules["blocked"])
 #    forwards = rules["forwards"]
@@ -8048,9 +8080,9 @@ exit 0
 #                    for _ in range(3))
 #
 #
-#def give_credentials(store, user, username, name):
-#    """A web sign-in for an account that came through the bot: the name and
-#    username the customer chose, and a password made here."""
+#def give_credentials(store, user, username):
+#    """A web sign-in for an account that came through the bot: the username
+#    the customer chose, and a password made here."""
 #    if user["username"]:
 #        return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
 #    wanted = normal_username(username)
@@ -8059,13 +8091,12 @@ exit 0
 #                                       "یا زیرخط باشد")
 #    if store.user_by_username(wanted):
 #        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
-#    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
 #    password = new_password()
 #    salt = secrets.token_hex(16)
 #    try:
-#        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
+#        store.run("UPDATE users SET username = ?, password_hash = ?,"
 #                  " password_salt = ?, must_change_password = 0 WHERE id = ?",
-#                  (wanted, name, hash_password(password, salt), salt, user["id"]))
+#                  (wanted, hash_password(password, salt), salt, user["id"]))
 #    except sqlite3.IntegrityError:
 #        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
 #    log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
@@ -8501,7 +8532,7 @@ exit 0
 #
 #
 #def who_label(user):
-#    return (user["first_name"] or user["username"] or user["phone"]
+#    return (user["username"] or user["phone"]
 #            or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
 #                else "#%d" % user["id"]))
 #
@@ -10006,8 +10037,6 @@ exit 0
 #        password = body.get("password") or ""
 #        if len(password) < 8:
 #            return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
-#        name = (body.get("name") or "").strip()[:60]
-#
 #        if self.store.user_by_username(username):
 #            return {"ok": False,
 #                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
@@ -10020,7 +10049,7 @@ exit 0
 #            return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
 #                                            "بگیرید"}
 #        try:
-#            user = self.store.create_web_user(username, name, password)
+#            user = self.store.create_web_user(username, password)
 #        except sqlite3.IntegrityError:
 #            # Two signups claiming the same name in the same instant. The
 #            # unique index is what actually decides between them; this only
@@ -10036,7 +10065,7 @@ exit 0
 #        print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
 #        emit_admin(self.store, "user.created", {
 #            "user_id": user["id"], "via": "web",
-#            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
+#            "text": "مشتری تازه از پنل وب: %s" % username})
 #        return {"ok": True, "session": self.store.open_session(user["id"]),
 #                "message": "حساب ساخته شد"}
 #
@@ -10195,7 +10224,10 @@ exit 0
 #        plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
 #        return {
 #            "ok": True,
-#            "name": user["first_name"] or user["username"] or "",
+#            # What the customer page puts at the top. Under "name" still, for
+#            # a relay not yet upgraded; it is the username now.
+#            "name": user["username"] or "",
+#            "username": user["username"] or "",
 #            "telegram_id": user["telegram_id"],
 #            "ip": ips[0]["ip"] if ips else None,
 #            "used": user["used_bytes"],
@@ -10439,7 +10471,6 @@ exit 0
 #    return {
 #        "id": user["id"],
 #        "telegram_id": user["telegram_id"],
-#        "name": user["first_name"] or "",
 #        "username": user["username"],
 #        "panel_url": store.setting("customer_panel_url") or None,
 #        "status": user["status"],
@@ -10500,7 +10531,7 @@ exit 0
 #RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
 #                " t.plan_id,"
 #                " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
-#                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
+#                " u.id AS uid, u.username, u.phone, u.telegram_id"
 #                " FROM transactions t JOIN users u ON u.id = t.user_id"
 #                " LEFT JOIN plans p ON p.id = t.plan_id")
 #
@@ -10580,10 +10611,10 @@ exit 0
 #            like = "%" + q.replace("%", "").replace("_", "") + "%"
 #            rows = self.store.q(
 #                "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-#                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
+#                " WHERE (u.username LIKE ? OR u.phone LIKE ?"
 #                " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
 #                " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
-#                (like, like, like, q, q, q) + more)
+#                (like, like, q, q, q) + more)
 #        return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
 #                                           for r in rows]}
 #
@@ -10670,7 +10701,7 @@ exit 0
 #            return 400, refused("bad_status", "status یکی از open، answered، closed "
 #                                              "یا all است")
 #        rows = self.store.q(
-#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
 #            " FROM tickets t JOIN users u ON u.id = t.user_id"
 #            + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
@@ -10981,10 +11012,11 @@ exit 0
 #                return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
 #        created = not user
 #        if created:
-#            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
 #            # No username: that column is what a customer signs in to the web
 #            # panel with, and a Telegram handle there could collide with one.
-#            user = self.store.create_user(tg, None, name or None)
+#            # The bot asks for one next. A "name" sent by an older bot is not
+#            # kept.
+#            user = self.store.create_user(tg, None)
 #            print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
 #                  flush=True)
 #            # A reseller's link makes them the reseller's; somebody else's
@@ -11063,7 +11095,7 @@ exit 0
 #        user, err = self.customer(tg)
 #        if err:
 #            return err
-#        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
+#        res = give_credentials(self.store, user, body.get("username"))
 #        if not res["ok"]:
 #            return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
 #        return 200, res
@@ -15229,8 +15261,6 @@ exit 0
 #             if ref else "") +
 #            "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
 #            "<form method='post' action='/signup'>%s"
-#            "<label>نام</label>"
-#            "<input name='name' maxlength='60' autocomplete='name'>"
 #            "<label>نام کاربری</label>"
 #            "<input name='username' required minlength='3' maxlength='32' "
 #            "pattern='[A-Za-z0-9._-]{3,32}' placeholder='ali_reza' "
@@ -16813,7 +16843,6 @@ exit 0
 #                       "password": form.get("password", ""),
 #                       "ip": self.client_ip()}
 #            if path == "/signup":
-#                payload["name"] = form.get("name", "")
 #                # Whose invitation this came by; the panel decides if it counts.
 #                payload["ref"] = form.get("ref", "")[:16]
 #                back = ("/signup?ref=" + urllib.parse.quote(payload["ref"])
@@ -17335,7 +17364,10 @@ exit 0
 #            gauge = ("<div class='bar'><i class='%s' style='width:%d%%'></i></div>"
 #                     % (cls, pct))
 #
-#        body = ["<h1>%s</h1>" % html.escape(info.get("name") or "حساب شما"),
+#        # The username - "name" from a panel not yet upgraded, which sent
+#        # the customer's name there.
+#        body = ["<h1>%s</h1>" % html.escape(info.get("username") or info.get("name")
+#                                             or "حساب شما"),
 #                "<div class='sub'>%s</div>" % html.escape(brand()),
 #                banner, account_notice(info)]
 #        for k, v in rows:
@@ -18574,6 +18606,7 @@ exit 0
 #font and stylesheet host worth using is either blocked or slow.
 #"""
 #
+#import base64
 #import glob
 #import hashlib
 #import hmac
@@ -18591,6 +18624,7 @@ exit 0
 #import socket
 #import sqlite3
 #import ssl
+#import struct
 #import subprocess
 #import sys
 #import threading
@@ -18605,6 +18639,8 @@ exit 0
 #DB = "/var/lib/smart-dns/panel.db"
 #SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
 #GAMES_FILE = "/usr/local/share/smart-dns/games.json"
+## The services' logos, from Simple Icons, and which row gets which.
+#ICONS_FILE = "/usr/local/share/smart-dns/icons.json"
 #BLOCKS_FILE = "/usr/local/share/smart-dns/blocks.json"
 ## Put there by the installer and served from here - see above about CDNs. The
 ## version goes in the font's address, so a browser's kept copy is never stale.
@@ -18800,6 +18836,16 @@ exit 0
 #            self.db.execute("ALTER TABLE broadcasts ADD COLUMN admin_id INTEGER")
 #        if "media" not in have:
 #            self.db.execute("ALTER TABLE broadcasts ADD COLUMN media TEXT")
+#        # The operator's own domains in named groups - the panel's too, here
+#        # as well so the domains page opened before the panel has started
+#        # after an upgrade finds them.
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS custom_groups ("
+#            " id INTEGER PRIMARY KEY, name TEXT NOT NULL, icon BLOB, icon_type TEXT,"
+#            " created_at TEXT NOT NULL)")
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(custom_domains)")}
+#        if have and "group_id" not in have:
+#            self.db.execute("ALTER TABLE custom_domains ADD COLUMN group_id INTEGER")
 #        # The panel's too; here as well so a wallet page opened before the
 #        # panel has started after an upgrade finds it.
 #        self.db.execute(
@@ -19738,7 +19784,7 @@ exit 0
 #    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
 #    mine_only = (" AND u.owner_admin IS NULL" if owner == "own" else
 #                 " AND u.owner_admin = ?" if owner else "")
-#    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#    top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
 #                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
 #                  " WHERE g.grain = '1d' AND g.bucket >= ?" + mine_only + " GROUP BY u.id"
 #                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10",
@@ -19795,9 +19841,9 @@ exit 0
 #                   "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
 #        for r in top:
 #            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
-#            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
+#            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a>"
 #                       "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
-#                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
+#                       % (p, r["id"], html.escape(who),
 #                          human(r["down"]), human(r["up"]),
 #                          round(100.0 * (r["down"] + r["up"]) / total)))
 #        out.append("</table>")
@@ -21770,17 +21816,166 @@ exit 0
 #    return services
 #
 #
+#def custom_groups():
+#    """The operator's groups of their own domains, by name."""
+#    try:
+#        return STORE.q("SELECT id, name, icon, icon_type FROM custom_groups"
+#                       " ORDER BY name COLLATE NOCASE, id")
+#    except sqlite3.OperationalError:
+#        return []
+#
+#
 #def catalogue_now():
 #    """The catalogue with the operator's own domains filled in.
 #
 #    Those live in the database, not the catalogue file, so CATALOGUE carries
 #    their service with an empty list - and the template page, drawn from it,
 #    showed "your domains" as having none while the relay was routing them.
+#    The ones in no group fill that service; each group is a service of its
+#    own, "cg<id>", drawn under "my groups" with its icon.
 #    """
-#    custom = [r["domain"] for r in STORE.q(
-#        "SELECT domain FROM custom_domains ORDER BY domain")]
-#    return [dict(svc, groups=[dict(g, domains=custom) for g in svc["groups"]])
-#            if svc["key"] == "custom" else svc for svc in CATALOGUE]
+#    try:
+#        rows = STORE.q("SELECT domain, group_id FROM custom_domains ORDER BY domain")
+#    except sqlite3.OperationalError:
+#        rows = [{"domain": r["domain"], "group_id": None} for r in STORE.q(
+#            "SELECT domain FROM custom_domains ORDER BY domain")]
+#    loose = [r["domain"] for r in rows if r["group_id"] is None]
+#    out = [dict(svc, groups=[dict(g, domains=loose) for g in svc["groups"]])
+#           if svc["key"] == "custom" else svc for svc in CATALOGUE]
+#    for grp in custom_groups():
+#        out.append({"key": "cg%d" % grp["id"], "label": grp["name"], "section": "mine",
+#                    "group_id": grp["id"], "icon_uri": group_icon_uri(grp),
+#                    "groups": [{"key": "main", "label": grp["name"],
+#                                "domains": [r["domain"] for r in rows
+#                                            if r["group_id"] == grp["id"]]}]})
+#    return out
+#
+#
+## -------------------------------------------------------------------- logos
+## Beside each row of a template's page: the service's own logo from Simple
+## Icons - for the few since taken out there, from the last release that had
+## them - a plain icon from Lucide for a row no brand is, by its kind or its
+## section, and the icon the admin gave a group of their own.
+#ICONS = {}
+#GROUP_ICON_SVG_MAX = 16 * 1024
+#GROUP_ICON_PNG_MAX = 64 * 1024
+#
+#
+#def load_icons():
+#    try:
+#        with open(ICONS_FILE, encoding="utf-8") as fh:
+#            data = json.load(fh)
+#        return data if isinstance(data, dict) else {}
+#    except Exception:
+#        return {}
+#
+#
+## What a plain icon may be made of: shapes, with numbers for attributes.
+#LINE_ICON = re.compile(r'(<(path|line|circle|rect|polyline|polygon|ellipse)'
+#                       r'(\s+[a-z0-9-]+="[0-9A-Za-z.,\- ]*")*\s*/>)+')
+#
+#
+#def row_icon(svc, grp):
+#    """The icon a row is drawn with - the group's own, else its service's,
+#    else its section's - or None."""
+#    rows = ICONS.get("rows") or {}
+#    slug = (rows.get("%s/%s" % (svc["key"], grp["key"])) or rows.get(svc["key"])
+#            or (ICONS.get("sections") or {}).get(grp.get("section") or svc.get("section")))
+#    return slug if slug in (ICONS.get("icons") or {}) else None
+#
+#
+#def logo_ink(hexcolour):
+#    """A brand's colour, or None where it would vanish into one theme or the
+#    other - black on the dark one, white on the light one. Those take the
+#    text's colour instead."""
+#    try:
+#        r, g, b = (int(hexcolour[i:i + 2], 16) / 255 for i in (0, 2, 4))
+#    except (TypeError, ValueError):
+#        return None
+#    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b)]
+#    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+#    return "#" + hexcolour.upper() if 0.07 < lum < 0.7 else None
+#
+#
+#def row_logo(svc, grp, title, used):
+#    """What goes before a row's name: an <svg> using the page's sprite, the
+#    group's uploaded icon, or the first letter of its name."""
+#    if svc.get("icon_uri"):
+#        return "<img class='logo' src='%s' alt=''>" % html.escape(svc["icon_uri"])
+#    slug = row_icon(svc, grp)
+#    if slug:
+#        used.add(slug)
+#        icon = ICONS["icons"][slug]
+#        # A plain icon is not a brand: it takes the muted text colour.
+#        if icon.get("line"):
+#            return ("<svg class='logo plain' viewBox='0 0 24 24' aria-hidden='true'>"
+#                    "<use href='#si-%s'/></svg>" % slug)
+#        ink = logo_ink(icon.get("hex"))
+#        return ("<svg class='logo' viewBox='0 0 24 24' aria-hidden='true'%s>"
+#                "<use href='#si-%s'/></svg>"
+#                % (" style='color:%s'" % ink if ink else "", slug))
+#    letter = (title or "?").strip()[:1].upper() or "?"
+#    return "<span class='logo letter' aria-hidden='true'>%s</span>" % html.escape(letter)
+#
+#
+#def logo_sprite(used):
+#    """Each logo on the page once, for the rows to point at."""
+#    if not used:
+#        return ""
+#    icons = ICONS.get("icons") or {}
+#    out = []
+#    for slug in sorted(used):
+#        icon = icons[slug]
+#        if icon.get("line"):
+#            # Markup, so only what LINE_ICON allows: a file that says more
+#            # draws nothing rather than something.
+#            if not LINE_ICON.fullmatch(icon["line"]):
+#                continue
+#            out.append("<symbol id='si-%s' viewBox='0 0 24 24' fill='none' "
+#                       "stroke='currentColor' stroke-width='2' stroke-linecap='round' "
+#                       "stroke-linejoin='round'>%s</symbol>" % (slug, icon["line"]))
+#        else:
+#            out.append("<symbol id='si-%s' viewBox='0 0 24 24'><path fill='currentColor' "
+#                       "d='%s'/></symbol>" % (slug, html.escape(icon.get("path") or "")))
+#    return ("<svg width='0' height='0' style='position:absolute' aria-hidden='true'>%s</svg>"
+#            % "".join(out))
+#
+#
+#def group_icon_uri(grp):
+#    """A group's icon as a data: URI for an <img> - where an SVG's scripts,
+#    if it had any, are never run."""
+#    if not grp["icon"] or grp["icon_type"] not in ("image/svg+xml", "image/png"):
+#        return ""
+#    return "data:%s;base64,%s" % (grp["icon_type"],
+#                                  base64.b64encode(bytes(grp["icon"])).decode())
+#
+#
+#def check_group_icon(blob):
+#    """(type, bytes) for an icon the admin uploaded, or raise ValueError with
+#    what is wrong with it. An SVG up to 16 KB or a PNG up to 64 KB and
+#    512x512, as HyperDNS takes them."""
+#    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+#        if len(blob) > GROUP_ICON_PNG_MAX:
+#            raise ValueError("PNG بیشتر از ۶۴ کیلوبایت است")
+#        if blob[12:16] != b"IHDR":
+#            raise ValueError("این PNG خراب است")
+#        w, h = struct.unpack(">II", blob[16:24])
+#        if not (0 < w <= 512 and 0 < h <= 512):
+#            raise ValueError("PNG بزرگ‌تر از ۵۱۲×۵۱۲ است")
+#        return "image/png", blob
+#    head = blob[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+#    if head.startswith(b"<?xml") or head.startswith(b"<svg") or head.startswith(b"<!--"):
+#        if len(blob) > GROUP_ICON_SVG_MAX:
+#            raise ValueError("SVG بیشتر از ۱۶ کیلوبایت است")
+#        text = blob.decode("utf-8", "replace").lower()
+#        if "<svg" not in text:
+#            raise ValueError("این فایل SVG نیست")
+#        # Shown only as an <img>, where none of this runs - but an icon has
+#        # no business carrying any of it either.
+#        if re.search(r"<script|<foreignobject|<!entity|\son[a-z]+\s*=|javascript:", text):
+#            raise ValueError("SVG اسکریپت یا چیز فعال دارد؛ یک SVG ساده بدهید")
+#        return "image/svg+xml", blob
+#    raise ValueError("فقط SVG یا PNG")
 #
 #
 ## -------------------------------------------------------------------- pages
@@ -21962,7 +22157,6 @@ exit 0
 #.pill.warn{background:var(--warn-bg);color:var(--warn)}
 #.pill.bad{background:var(--err-bg);color:var(--bad)}
 #.card details>summary{cursor:pointer}
-#.who small{display:block;color:var(--muted);font-size:11px}
 #.card.wide{padding:16px 12px}
 #table.users td{padding:8px 5px}
 #table.users th{padding:9px 5px}
@@ -21987,6 +22181,13 @@ exit 0
 #details.svc[open]>summary::before{transform:rotate(-90deg)}
 #details.svc[open]{border-color:var(--line2)}
 #details.svc>summary label{flex:1}
+#.logo{width:18px;height:18px;vertical-align:-4px;margin-inline-end:7px;flex:none;
+# object-fit:contain;display:inline-block}
+#.logo.letter{display:inline-flex;align-items:center;justify-content:center;
+# border-radius:5px;background:var(--row);color:var(--muted);font-size:11px;
+# font-weight:600;vertical-align:-3px;line-height:1}
+#td .logo{margin-inline-end:5px}
+#.logo.plain{color:var(--muted)}
 #.doms{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
 # gap:2px 14px;padding:4px 30px 12px;border-top:1px solid var(--row);margin-top:2px}
 #.doms label{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px;
@@ -22689,9 +22890,9 @@ exit 0
 #
 #
 #def ticket_who(row):
-#    return "%s · %s" % (row["first_name"] or "", row["username"] or row["phone"]
-#                        or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
-#                            else "#%d" % row["user_id"]))
+#    return (row["username"] or row["phone"]
+#            or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
+#                else "#%d" % row["user_id"]))
 #
 #
 #def image_kind(blob):
@@ -23690,6 +23891,7 @@ exit 0
 #    "template-new": "templates", "template-save": "templates", "template-delete": "templates",
 #    "template-rules": "templates", "template-blocklists": "templates",
 #    "domain-add": "templates", "domain-del": "templates", "blocked-add": "templates",
+#    "group-add": "templates", "group-save": "templates", "group-del": "templates",
 #    "blocked-del": "templates", "forward-add": "templates", "forward-del": "templates",
 #    "bot-setup": "bot", "bot-power": "bot", "bot-test": "bot", "bot-link-save": "bot",
 #    "broadcast-send": "bot", "api-key-new": "bot", "api-key-revoke": "bot",
@@ -23742,7 +23944,7 @@ exit 0
 ## And inside those, what is set for every customer at once.
 #RESELLER_NEVER = {"domains", "discount-save", "discount-active", "discount-delete",
 #                  "devices-settings", "wallet-settings", "ref-settings", "domain-add",
-#                  "domain-del", "blocked-add", "blocked-del", "forward-add", "forward-del",
+#                  "domain-del", "group-add", "group-save", "group-del", "blocked-add", "blocked-del", "forward-add", "forward-del",
 #                  # The bot page is their own bot; the API page is every key.
 #                  "api", "api-key-new", "api-key-revoke", "api-webhook-save",
 #                  "api-webhook-test", "bot-link-save"}
@@ -24078,7 +24280,7 @@ exit 0
 #    out.append("</div>")
 #    out.append(total_usage_card(p, sid, "مصرف مشتری‌های %s" % r["username"]))
 #    rows = STORE.q("SELECT t.id, t.amount, t.kind, t.status, t.created_at, u.username,"
-#                   " u.first_name, u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
+#                   " u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
 #                   " WHERE u.owner_admin = ? ORDER BY t.id DESC LIMIT 10", (sid,))
 #    if rows:
 #        kinds = {"topup": "شارژ کیف پول", "device": "دستگاه اضافه", "wallet": "از کیف پول"}
@@ -24090,7 +24292,7 @@ exit 0
 #        for t in rows:
 #            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
 #                       % (html.escape(t["created_at"][:16].replace("T", " ")),
-#                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
+#                          html.escape(t["username"] or "#%d" % t["uid"]),
 #                          kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
 #                          states.get(t["status"], html.escape(t["status"]))))
 #        out.append("</table></div>")
@@ -24623,13 +24825,19 @@ exit 0
 #            if svc["key"] == "custom":
 #                continue
 #            where = grp.get("section") or svc.get("section") or ""
-#            rank = order.index(where) if where in order else len(order)
+#            # The operator's own groups, first: they are what they made.
+#            if where == "mine":
+#                rank = -1
+#            else:
+#                rank = order.index(where) if where in order else len(order)
 #            rows.append((rank, svc, grp))
 #    seen = set()
 #    for rank, svc, grp in sorted(rows, key=lambda r: r[0]):
 #        if rank not in seen:
 #            seen.add(rank)
-#            if rank < len(order) and label.get(order[rank]):
+#            if rank == -1:
+#                out.append("<h3 class='sec'>گروه‌های من</h3>")
+#            elif rank < len(order) and label.get(order[rank]):
 #                out.append("<h3 class='sec'>%s</h3>" % html.escape(label[order[rank]]))
 #        yield svc, grp
 #
@@ -24889,7 +25097,7 @@ exit 0
 #    def receipts(self):
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
-#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
 #            " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
 #            " p.name AS plan_name, p.days AS plan_days,"
 #            " p.quota_bytes AS plan_quota"
@@ -24902,9 +25110,8 @@ exit 0
 #        if not pending:
 #            out.append("<p class='muted'>رسیدی نرسیده.</p>")
 #        for r in pending:
-#            who = (r["first_name"] or "") + " · " + (
-#                r["username"] or r["phone"]
-#                or str(r["telegram_id"] or "#%d" % r["user_id"]))
+#            who = (r["username"] or r["phone"]
+#                   or str(r["telegram_id"] or "#%d" % r["user_id"]))
 #            topup = r["kind"] == "topup"
 #            if r["kind"] == "device":
 #                bought = ("<div class='bought'>📱 دستگاه اضافه · %s تومان<span class='muted'>"
@@ -24970,8 +25177,7 @@ exit 0
 #            for r in decided[:40]:
 #                out.append("<tr><td>%s</td><td>%s</td><td>%s</td>"
 #                           "<td class='%s'>%s</td><td>%s</td></tr>"
-#                           % (html.escape((r["first_name"] or "") + " · " +
-#                                          (r["username"] or r["phone"] or "")),
+#                           % (html.escape(r["username"] or r["phone"] or ""),
 #                              html.escape(r["created_at"][:16]),
 #                              html.escape(
 #                                  "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
@@ -25486,7 +25692,7 @@ exit 0
 #                  health_cells("exit" if kind == "exit" and ip == here else ip))]
 #        view = server_view(kind, ip)
 #        since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
-#        top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#        top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
 #                      " SUM(g.down) down, SUM(g.up) up FROM user_server_usage g"
 #                      " JOIN users u ON u.id = g.user_id WHERE g.kind = ? AND g.server = ?"
 #                      " AND g.day >= ? GROUP BY u.id ORDER BY SUM(g.down) + SUM(g.up) DESC"
@@ -25616,7 +25822,7 @@ exit 0
 #                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
 #                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
-#                "<tr><td class='who' title='%s'><code>%s</code><small>%s</small></td>"
+#                "<tr><td class='who' title='%s'><code>%s</code></td>"
 #                "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
 #                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
 #                "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -25652,7 +25858,6 @@ exit 0
 #                # that came through the bot have neither - so the column shows
 #                # whichever this account actually has.
 #                % (html.escape(who, quote=True), html.escape(who),
-#                   html.escape(r["first_name"] or ""),
 #                   html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
 #                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
 #                   % (p, r["id"], human(r["used_bytes"])),
@@ -25797,14 +26002,14 @@ exit 0
 #    def tickets(self):
 #        wanted = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t")
 #        if wanted and wanted[0].isdigit():
-#            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
+#            row = STORE.one("SELECT t.*, u.username, u.phone,"
 #                            " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
 #                            " WHERE t.id = ?" + mine()[0], (int(wanted[0]),) + mine()[1])
 #            if row:
 #                return self.ticket_page(row)
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
-#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
 #            " FROM tickets t JOIN users u ON u.id = t.user_id WHERE 1 = 1" + mine()[0] +
 #            " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
@@ -26014,7 +26219,7 @@ exit 0
 #               "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a></p>" % p,
 #               "<div class='grid'><div class='stat'><div class='n'>%s</div>"
 #               "<div class='l'>موجودی (تومان)</div></div>" % format(user["wallet"] or 0, ",")]
-#        invited = STORE.q("SELECT id, username, phone, telegram_id, first_name, status"
+#        invited = STORE.q("SELECT id, username, phone, telegram_id, status"
 #                          " FROM users WHERE referred_by = ? ORDER BY id DESC", (uid,))
 #        earned = STORE.one("SELECT COALESCE(sum(amount), 0) s FROM wallet_moves"
 #                           " WHERE user_id = ? AND kind = 'referral'", (uid,))["s"]
@@ -26060,11 +26265,10 @@ exit 0
 #            out.append("<div class='card'><h2>دعوت‌شده‌ها (%d)</h2><table><tr><th>کاربر</th>"
 #                       "<th>وضعیت</th></tr>" % len(invited))
 #            for r in invited:
-#                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a> <span class='muted'>%s"
-#                           "</span></td><td>%s</td></tr>"
+#                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a></td><td>%s</td></tr>"
 #                           % (p, r["id"], html.escape(str(r["username"] or r["phone"]
 #                                                          or r["telegram_id"] or "#%d" % r["id"])),
-#                              html.escape(r["first_name"] or ""), html.escape(r["status"])))
+#                              html.escape(r["status"])))
 #            out.append("</table></div>")
 #        return "".join(out)
 #
@@ -26301,13 +26505,15 @@ exit 0
 #               "<button type='button' data-all-rows='0'>هیچ‌کدام</button></div>"]
 #
 #        in_group = games_by_group()
+#        logos = set()
 #        for svc, g in ordered_rows(out):
 #            key = "%s.%s" % (svc["key"], g["key"])
 #            ref = "%s/%s" % (svc["key"], g["key"])
 #            on = (svc["key"], g["key"]) in groups
 #            here = in_group.get(ref, [])
 #            label, under = group_title(svc, g, here)
-#            label = html.escape(label)
+#            logo = row_logo(svc, g, label, logos)
+#            label = logo + html.escape(label)
 #            if under:
 #                label += "<span class='under'>%s</span>" % html.escape(under)
 #            # An opt-in group is one where routing is the wrong default,
@@ -26370,7 +26576,8 @@ exit 0
 #
 #        out.append("<div style='margin-top:16px'><button>ذخیره</button> "
 #                   "<button class='danger' formaction='/%s/template-delete' "
-#                   "formnovalidate>حذف قالب</button></div></form></div>" % p)
+#                   "formnovalidate>حذف قالب</button></div></form>%s</div>"
+#                   % (p, logo_sprite(logos)))
 #        # Convenience only. Every checkbox above is a plain form control, so
 #        # the page works with this script blocked or broken - it just means
 #        # ticking five hundred boxes by hand.
@@ -26472,27 +26679,43 @@ exit 0
 #        rows = STORE.q("SELECT * FROM custom_domains ORDER BY added_at DESC")
 #        shipped = sum(len(g["domains"]) for s in CATALOGUE for g in s["groups"])
 #        p = CFG["ADMIN_PATH"]
-#        out = ["<div class='card'><h2>دامنه‌های شما (%d)</h2>" % len(rows),
+#        groups = custom_groups()
+#        name = {g["id"]: g for g in groups}
+#        pick = ""
+#        if groups:
+#            pick = ("<select name='group'><option value=''>بدون گروه</option>%s</select>"
+#                    % "".join("<option value='%d'>%s</option>" % (g["id"], html.escape(g["name"]))
+#                              for g in groups))
+#        out = [custom_groups_card(p, groups, rows),
+#               "<div class='card'><h2>دامنه‌های شما (%d)</h2>" % len(rows),
 #               "<form method='post' action='/%s/domain-add' class='row' "
 #               "style='margin-bottom:14px'>"
 #               "<input name='domain' placeholder='example.com' style='min-width:220px'>"
-#               "<input name='note' placeholder='یادداشت (اختیاری)'>"
-#               "<button>افزودن</button></form>" % p]
+#               "<input name='note' placeholder='یادداشت (اختیاری)'>%s"
+#               "<button>افزودن</button></form>" % (p, pick)]
 #        if rows:
-#            out.append("<table><tr><th>دامنه</th><th>یادداشت</th><th>افزوده</th>"
+#            out.append("<table><tr><th>دامنه</th><th>گروه</th><th>یادداشت</th><th>افزوده</th>"
 #                       "<th></th></tr>")
 #            for r in rows:
-#                out.append("<tr><td><code>%s</code></td><td class='muted'>%s</td>"
+#                g = name.get(r["group_id"]) if "group_id" in r.keys() else None
+#                where = "<span class='muted'>—</span>"
+#                if g is not None:
+#                    uri = group_icon_uri(g)
+#                    where = (("<img class='logo' src='%s' alt=''>" % html.escape(uri) if uri else "")
+#                             + html.escape(g["name"]))
+#                out.append("<tr><td><code>%s</code></td><td>%s</td><td class='muted'>%s</td>"
 #                           "<td class='muted'>%s</td>"
 #                           "<td><form method='post' action='/%s/domain-del'>"
 #                           "<input type='hidden' name='domain' value='%s'>"
 #                           "<button class='danger'>حذف</button></form></td></tr>"
-#                           % (html.escape(r["domain"]), html.escape(r["note"] or ""),
+#                           % (html.escape(r["domain"]), where, html.escape(r["note"] or ""),
 #                              (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
 #            out.append("</table>")
-#        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس "
-#                   "«دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را "
-#                   "برداشت. به‌علاوهٔ %d دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
+#        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. دامنه‌های بدون گروه "
+#                   "در سرویس «دامنه‌های دلخواه» جمع می‌شوند و هر گروه در قالب‌ها یک ردیف "
+#                   "جداست، پس در هر قالب می‌شود تیکشان را برداشت. دامنه‌ای را که هست "
+#                   "دوباره با گروه دیگری اضافه کنید تا به آن گروه برود. به‌علاوهٔ %d "
+#                   "دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
 #        out.append(blocked_card(p))
 #        out.append(forwards_card(p))
 #        return "".join(out)
@@ -27582,7 +27805,7 @@ exit 0
 #            # with those already ticked would be the panel deciding something
 #            # it just told the operator was theirs to decide.
 #            skipped = 0
-#            for svc in CATALOGUE:
+#            for svc in catalogue_now():
 #                for g in svc["groups"]:
 #                    if g.get("opt_in"):
 #                        skipped += 1
@@ -27606,12 +27829,14 @@ exit 0
 #            # out by subtraction: every domain in a routed group that did not
 #            # come back.
 #            keep = set(params.get("d") or [])
-#            # The operator's own domains are not in this form - they have one
-#            # of their own at the foot of the page - so they are kept as they are.
+#            # The operator's own domains in no group are not in this form -
+#            # they have one of their own at the foot of the page - so they are
+#            # kept as they are. Their groups are rows here like any service.
 #            STORE.run("DELETE FROM template_services WHERE template_id = ?"
 #                      " AND service_key != 'custom'", (tid,))
 #            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
-#                      " AND domain NOT IN (SELECT domain FROM custom_domains)", (tid,))
+#                      " AND domain NOT IN (SELECT domain FROM custom_domains"
+#                      " WHERE group_id IS NULL)", (tid,))
 #            for svc in catalogue_now():
 #                if svc["key"] == "custom":
 #                    continue
@@ -27669,11 +27894,85 @@ exit 0
 #                        return self.redirect(
 #                            "domains?m=!%s از قبل در سرویس %s هست"
 #                            % (domain, svc["label"]))
-#            if STORE.one("SELECT 1 FROM custom_domains WHERE domain = ?", (domain,)):
-#                return self.redirect("domains?m=!%s از قبل اضافه شده" % domain)
-#            STORE.run("INSERT INTO custom_domains (domain, note, added_at)"
-#                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
+#            gid = None
+#            if (one("group") or "").strip():
+#                grp = STORE.one("SELECT id, name FROM custom_groups WHERE id = ?",
+#                                (int(one("group")) if one("group").isdigit() else 0,))
+#                if grp is None:
+#                    return self.redirect("domains?m=!گروه پیدا نشد")
+#                gid = grp["id"]
+#            had = STORE.one("SELECT group_id FROM custom_domains WHERE domain = ?", (domain,))
+#            if had is not None:
+#                # Added again with another group: moved there.
+#                if had["group_id"] == gid:
+#                    return self.redirect("domains?m=!%s از قبل اضافه شده" % domain)
+#                STORE.run("UPDATE custom_domains SET group_id = ? WHERE domain = ?",
+#                          (gid, domain))
+#                return self.redirect("domains?m=%s به گروه دیگری رفت" % domain)
+#            STORE.run("INSERT INTO custom_domains (domain, note, added_at, group_id)"
+#                      " VALUES (?, ?, ?, ?)", (domain, one("note") or None, now(), gid))
 #            return self.redirect("domains?m=%s اضافه شد" % domain)
+#
+#        if rest in ("group-add", "group-save"):
+#            # Multipart, for the icon, so the name comes out of the same body.
+#            raw = getattr(self, "raw_body", None)
+#            ctype = self.headers.get("Content-Type") if raw is not None else None
+#
+#            def field(name):
+#                if raw is None:
+#                    return one(name)
+#                try:
+#                    return parse_upload(raw, ctype, name).decode("utf-8", "replace").strip()
+#                except ValueError:
+#                    return ""
+#
+#            name = " ".join(field("name").split())
+#            if not name:
+#                return self.redirect("domains?m=!اسم گروه را بنویسید")
+#            if len(name) > 40:
+#                return self.redirect("domains?m=!اسم گروه حداکثر ۴۰ نویسه")
+#            gid = int(field("id")) if field("id").isdigit() else None
+#            if rest == "group-save" and not STORE.one(
+#                    "SELECT 1 FROM custom_groups WHERE id = ?", (gid,)):
+#                return self.redirect("domains?m=!گروه پیدا نشد")
+#            if STORE.one("SELECT 1 FROM custom_groups WHERE name = ? COLLATE NOCASE"
+#                         " AND id IS NOT ?", (name, gid)):
+#                return self.redirect("domains?m=!گروهی با این اسم هست")
+#            icon = None
+#            blobs = parse_uploads(raw, ctype, "icon") if raw is not None else []
+#            if blobs:
+#                try:
+#                    icon = check_group_icon(blobs[0])
+#                except ValueError as e:
+#                    return self.redirect("domains?m=!آیکون: %s" % e)
+#            if rest == "group-add":
+#                STORE.run("INSERT INTO custom_groups (name, icon, icon_type, created_at)"
+#                          " VALUES (?, ?, ?, ?)",
+#                          (name, icon[1] if icon else None, icon[0] if icon else None, now()))
+#                return self.redirect("domains?m=گروه «%s» ساخته شد" % name)
+#            STORE.run("UPDATE custom_groups SET name = ? WHERE id = ?", (name, gid))
+#            if icon:
+#                STORE.run("UPDATE custom_groups SET icon = ?, icon_type = ? WHERE id = ?",
+#                          (icon[1], icon[0], gid))
+#            elif field("drop") == "1":
+#                STORE.run("UPDATE custom_groups SET icon = NULL, icon_type = NULL WHERE id = ?",
+#                          (gid,))
+#            return self.redirect("domains?m=ذخیره شد")
+#
+#        if rest == "group-del":
+#            gid = int(one("id")) if (one("id") or "").isdigit() else 0
+#            if not STORE.one("SELECT 1 FROM custom_groups WHERE id = ?", (gid,)):
+#                return self.redirect("domains?m=!گروه پیدا نشد")
+#            # The group and every domain in it, and what the templates kept
+#            # of either.
+#            n = STORE.one("SELECT COUNT(*) AS n FROM custom_domains WHERE group_id = ?",
+#                          (gid,))["n"]
+#            STORE.run("DELETE FROM template_domains_off WHERE domain IN"
+#                      " (SELECT domain FROM custom_domains WHERE group_id = ?)", (gid,))
+#            STORE.run("DELETE FROM custom_domains WHERE group_id = ?", (gid,))
+#            STORE.run("DELETE FROM template_services WHERE service_key = ?", ("cg%d" % gid,))
+#            STORE.run("DELETE FROM custom_groups WHERE id = ?", (gid,))
+#            return self.redirect("domains?m=گروه و %d دامنه‌اش پاک شد" % n)
 #
 #        if rest == "blocked-add":
 #            try:
@@ -27765,10 +28064,12 @@ exit 0
 #            # is, each un-ticked one switched off inside it - the same rows the
 #            # service list used to write. The default template routes them all.
 #            if not STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))["is_default"]:
-#                custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains")]
+#                custom = [r["domain"] for r in STORE.q(
+#                    "SELECT domain FROM custom_domains WHERE group_id IS NULL")]
 #                ticked = set(params.get("c") or []) & set(custom)
 #                STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
-#                          " AND domain IN (SELECT domain FROM custom_domains)", (tid,))
+#                          " AND domain IN (SELECT domain FROM custom_domains"
+#                          " WHERE group_id IS NULL)", (tid,))
 #                if ticked:
 #                    STORE.run("INSERT OR IGNORE INTO template_services"
 #                              " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
@@ -28450,6 +28751,53 @@ exit 0
 #                  % RULE_TABLES[table], (domain, tid))
 #
 #
+#def custom_groups_card(p, groups, rows):
+#    """The domains page's groups: make one with a name and an icon, rename
+#    it, change or drop its icon, delete it - with every domain in it."""
+#    count = {}
+#    for r in rows:
+#        gid = r["group_id"] if "group_id" in r.keys() else None
+#        count[gid] = count.get(gid, 0) + 1
+#    out = ["<div class='card'><h2>گروه‌های من</h2>"
+#           "<p class='muted'>دامنه‌های دلخواهتان را گروه کنید، مثلاً «سایت‌های دانشگاه». "
+#           "هر گروه در صفحهٔ قالب‌ها یک ردیف جدا با آیکون خودش است و یک تیک دارد. "
+#           "آیکون: SVG تا ۱۶ کیلوبایت یا PNG تا ۶۴ کیلوبایت و ۵۱۲×۵۱۲.</p>"
+#           "<form method='post' action='/%s/group-add' enctype='multipart/form-data' "
+#           "class='row' style='margin-bottom:14px'>"
+#           "<input name='name' placeholder='اسم گروه' maxlength='40' required>"
+#           "<input type='file' name='icon' accept='.svg,.png,image/svg+xml,image/png'>"
+#           "<button>ساختن گروه</button></form>" % p]
+#    if groups:
+#        out.append("<table><tr><th>گروه</th><th>دامنه</th><th>اسم و آیکون تازه</th>"
+#                   "<th></th></tr>")
+#        for g in groups:
+#            uri = group_icon_uri(g)
+#            icon = ("<img class='logo' src='%s' alt=''>" % html.escape(uri) if uri
+#                    else "<span class='logo letter'>%s</span>"
+#                    % html.escape(g["name"].strip()[:1].upper() or "?"))
+#            out.append(
+#                "<tr><td>%s%s</td><td>%d</td>"
+#                "<td><form method='post' action='/%s/group-save' "
+#                "enctype='multipart/form-data' class='row'>"
+#                "<input type='hidden' name='id' value='%d'>"
+#                "<input name='name' value='%s' maxlength='40' required size='14'>"
+#                "<input type='file' name='icon' accept='.svg,.png,image/svg+xml,image/png'>"
+#                "%s<button class='ghost'>ذخیره</button></form></td>"
+#                "<td><form method='post' action='/%s/group-del' "
+#                "onsubmit=\"return confirm('این گروه و همهٔ %d دامنهٔ داخلش پاک شوند؟')\">"
+#                "<input type='hidden' name='id' value='%d'>"
+#                "<button class='danger'>حذف</button></form></td></tr>"
+#                % (icon, html.escape(g["name"]), count.get(g["id"], 0), p, g["id"],
+#                   html.escape(g["name"]),
+#                   "<label style='display:inline'><input type='checkbox' name='drop' "
+#                   "value='1'> بدون آیکون</label> " if uri else "",
+#                   p, count.get(g["id"], 0), g["id"]))
+#        out.append("</table>")
+#        out.append("<p class='muted'>حذف گروه دامنه‌های داخلش را هم پاک می‌کند.</p>")
+#    out.append("</div>")
+#    return "".join(out)
+#
+#
 #def template_rules_card(t, p):
 #    """A template's own page, at its foot: the operator's own domains it
 #    routes, and the blocks and forwards it has - everything the operator
@@ -28459,7 +28807,9 @@ exit 0
 #        forwards = STORE.q("SELECT domain, servers FROM dns_forwards ORDER BY domain")
 #    except sqlite3.OperationalError:
 #        blocked = forwards = []
-#    custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains ORDER BY domain")]
+#    # The ones in a group are that group's row, above.
+#    custom = [r["domain"] for r in STORE.q(
+#        "SELECT domain FROM custom_domains WHERE group_id IS NULL ORDER BY domain")]
 #    out = ["<div class='card'><h2>دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب</h2>"]
 #    if not blocked and not forwards and not custom:
 #        out.append("<p class='muted'>هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از "
@@ -28837,6 +29187,7 @@ exit 0
 #    global STORE, CFG, CATALOGUE
 #    CFG = load_config()
 #    CATALOGUE = load_catalogue()
+#    ICONS.update(load_icons())
 #    GAMES[:] = load_games()
 #    SECTIONS[:] = load_sections()
 #    BLOCK_SECTIONS[:], BLOCKS[:] = load_blocks()
@@ -31581,8 +31932,7 @@ exit 0
 #                if e.body.get("error") != "user_not_found":
 #                    raise
 #                self.known.discard(uid)
-#        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-#        self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
+#        self.panel.call("POST", "/users", {"telegram_id": uid})
 #        self.known.add(uid)
 #        return self.panel.call("GET", "/users/%d" % uid)["user"]
 #
@@ -31617,10 +31967,8 @@ exit 0
 #            return self.admin_command(chat, text)
 #
 #        waiting, extra = self.state.get(chat, (None, None))
-#        if waiting == "onb_name":
-#            return self.got_name(chat, sender, text)
 #        if waiting == "onb_user":
-#            return self.got_username(chat, sender, text, extra)
+#            return self.got_username(chat, sender, text)
 #        if text in ("/doh", "/dns"):
 #            text = B_DNS
 #        if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
@@ -31688,10 +32036,9 @@ exit 0
 #            # Asked even for a Telegram id the bot knows, which may since have
 #            # been deleted in the admin panel; for one that is still there the
 #            # panel only answers that it exists.
-#            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
 #            try:
 #                self.panel.call("POST", "/users", {"telegram_id": sender["id"],
-#                                                   "name": name[:60], "ref": arg[4:20]})
+#                                                   "ref": arg[4:20]})
 #                self.known.add(sender["id"])
 #            except ApiError as e:
 #                log("invitation start failed: %s" % e)
@@ -31737,30 +32084,20 @@ exit 0
 #
 #    # -- a web sign-in for everybody who comes through the bot ----------------
 #    def ready(self, chat, sender):
-#        """True when the account has its web sign-in. Otherwise the two
-#        questions start, and whatever was pressed waits until they are done."""
+#        """True when the account has its web sign-in. Otherwise the question
+#        for a username comes first, and whatever was pressed waits for it."""
 #        u = self.account(sender)
 #        if u.get("username"):
 #            return True
-#        tg_name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-#        self.state[chat] = ("onb_name", None)
-#        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nاسمتان چیست؟",
-#                 {"keyboard": [[tg_name[:60]]] if tg_name else [[B_CANCEL]],
-#                  "resize_keyboard": True, "one_time_keyboard": True})
+#        self.state[chat] = ("onb_user", None)
+#        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nیک نام کاربری انگلیسی برای ورود به "
+#                 "پنل وب انتخاب کنید (حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
 #        return False
 #
-#    def got_name(self, chat, sender, text):
-#        if not text or text == B_CANCEL:
-#            self.state.pop(chat, None)
-#            return self.say(chat, "هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.", MENU)
-#        self.state[chat] = ("onb_user", text[:60])
-#        self.say(chat, "یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید "
-#                 "(حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
-#
-#    def got_username(self, chat, sender, text, name):
+#    def got_username(self, chat, sender, text):
 #        try:
 #            res = self.panel.call("POST", "/users/%d/credentials" % sender["id"],
-#                                  {"username": text, "name": name})
+#                                  {"username": text})
 #        except ApiError as e:
 #            if e.body.get("error") == "has_username":
 #                self.state.pop(chat, None)
@@ -31884,7 +32221,7 @@ exit 0
 #    # -- the customer's screens ---------------------------------------------
 #    def show_account(self, chat, sender):
 #        u = self.account(sender)
-#        lines = ["👤 %s" % (u["name"] or "حساب شما"),
+#        lines = ["👤 %s" % (u.get("username") or "حساب شما"),
 #                 "وضعیت: %s" % STATUS.get(u["status"], u["status"])]
 #        if u["plan"]:
 #            lines.append("پلن: %s" % u["plan"]["name"])
@@ -36996,6 +37333,397 @@ exit 0
 #}
 #__END_BLOCKS__
 
+#__BEGIN_ICONS__
+#{
+# "icons": {
+#  "adobe": {
+#   "from": "Simple Icons 13.0.0",
+#   "hex": "FF0000",
+#   "path": "M13.966 22.624l-1.69-4.281H8.122l3.892-9.144 5.662 13.425zM8.884 1.376H0v21.248zm15.116 0h-8.884L24 22.624Z",
+#   "title": "Adobe"
+#  },
+#  "apple": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701",
+#   "title": "Apple"
+#  },
+#  "battledotnet": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "4381C3",
+#   "path": "M18.94 8.296C15.9 6.892 11.534 6 7.426 6.332c.206-1.36.714-2.308 1.548-2.508 1.148-.275 2.4.48 3.594 1.854.782.102 1.71.28 2.355.429C12.747 2.013 9.828-.282 7.607.565c-1.688.644-2.553 2.97-2.448 6.094-2.2.468-3.915 1.3-5.013 2.495-.056.065-.181.227-.137.305.034.058.146-.008.194-.04 1.274-.89 2.904-1.373 5.027-1.676.303 3.333 1.713 7.56 4.055 10.952-1.28.502-2.356.536-2.946-.087-.812-.856-.784-2.318-.19-4.04a26.764 26.764 0 0 1-.807-2.254c-2.459 3.934-2.986 7.61-1.143 9.11 1.402 1.14 3.847.725 6.502-.926 1.505 1.672 3.083 2.74 4.667 3.094.084.015.287.043.332-.034.034-.06-.08-.124-.131-.149-1.408-.657-2.64-1.828-3.964-3.515 2.735-1.929 5.691-5.263 7.457-8.988 1.076.86 1.64 1.773 1.398 2.595-.336 1.131-1.615 1.84-3.403 2.185a27.697 27.697 0 0 1-1.548 1.826c4.634.16 8.08-1.22 8.458-3.565.286-1.786-1.295-3.696-4.053-5.17.696-2.139.832-4.04.346-5.588-.029-.08-.106-.27-.196-.27-.068 0-.067.13-.063.187.135 1.547-.263 3.2-1.062 5.19zm-8.533 9.869c-1.96-3.145-3.09-6.849-3.082-10.594 3.702-.124 7.474.748 10.714 2.627-1.743 3.269-4.385 6.1-7.633 7.966h.001z",
+#   "title": "Battle.net"
+#  },
+#  "cdprojekt": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "DC0D15",
+#   "path": "M18.942,20.154c-0.687,0.323-1.719,0.302-2.986-0.072l0.213,0.547l-0.389-0.226l-1.537-0.907h0.001 l-0.033-0.158C14.783,19.509,17.746,20.507,18.942,20.154z M7.929,22.045c-0.127,0.229,0.179,0.645,0.179,0.645 c-0.687-0.534-1.276,0.346-1.276,0.346c-0.039-0.385,0.397-0.669,0.397-0.669c-0.715,0.113-1.549,0.78-1.549,0.78 c-0.097-0.333,0.319-0.556,0.319-0.556c0-0.263,0.361-0.236,0.763-0.347c0.272-0.074,0.679-0.186,0.919-0.252 c0.005-0.004,0.007-0.01,0.011-0.013c0-0.002,0.303-0.348,0.671-0.745c0.291-0.31,0.614-0.648,0.868-0.88 c0.118,0.018,0.226,0.031,0.294,0.037c-0.243,0.199-0.651,0.62-0.999,0.994C8.266,21.665,8.039,21.921,7.929,22.045z M10.168,14.083 l8.822,6.05c-0.013,0.007-0.029,0.011-0.042,0.018c-0.008-0.004-0.163-0.064-0.328-0.129c-0.081-0.033-0.178-0.072-0.29-0.118 h-0.001c-0.005-0.002-0.012-0.005-0.019-0.009c-0.772-0.317-2.27-0.951-4.634-2.041c-2.4-1.112-3.815-1.798-5.028-2.388l0.001,0.002 c0,0-0.001-0.002-0.002-0.002l4.363,3.974l0.006,0.004l0.011,0.011h0.002l0.256,0.211l-1.153,0.348 c-0.001-0.006-0.005-0.013-0.006-0.018c-0.006-0.016-0.011-0.033-0.017-0.051c-0.003-0.008-0.006-0.017-0.009-0.025 c-0.006-0.017-0.012-0.033-0.018-0.05c-0.003-0.007-0.006-0.015-0.009-0.023c-0.011-0.023-0.021-0.047-0.032-0.073l-0.202,0.094 c0.09,0.197,0.121,0.356,0.121,0.482c-0.001,0.16-0.064,0.282-0.109,0.353c-0.025,0.037-0.07,0.086-0.071,0.086l0.064,0.088 c-0.004,0.011-0.008,0.023-0.014,0.035c-0.341,0.545-0.652,1.308-0.786,1.653c-0.044,0.114-0.069,0.183-0.069,0.183 c0,0,0,0.002-0.001,0.005c0.227,0.009,0.767,0.073,0.627,0.504l-0.122,0.444c-0.268-0.478-0.154-0.606-0.154-0.606 C10.544,22.894,8.968,24,8.968,24c0.052-0.411,0.506-0.697,0.768-0.847c-0.221-0.026-0.494,0.165-0.64,0.283 c0.137-0.27,0.335-0.433,0.539-0.522c-0.002-0.002-0.002-0.002-0.003-0.004c0.359-0.135,0.712-0.069,0.753-0.029l-0.002,0.001 c0.122-0.038,0.131-0.043,0.241-0.068c0.036-0.026,0.071-0.112,0.088-0.158c0.001-0.005,0.363-1.014,0.81-1.774 c-0.217-0.021-0.388-0.274-0.388-0.581c0-0.018,0.001-0.037,0.002-0.055c-0.475,0.069-0.973,0.088-1.484,0.043 c-0.016,0-0.032-0.003-0.049-0.005c0,0.001,0,0.001,0,0.001c-0.024-0.002-0.131-0.012-0.262-0.029 c-0.945-0.128-1.803-0.45-2.507-0.911l0.002,0.01c0,0-1.279-0.682-1.551-2.233l-0.309,0.195c0-1.39,0.238-2.365,0.563-3.111 l-0.38,0.037l0.38-0.534c-0.05,0.103-0.096,0.212-0.143,0.332l0.233-0.039l0-.002c0.047-0.096,0.092-0.184,0.138-0.27 c0.092-0.169,0.188-0.328,0.295-0.484c0.024-0.035,0.069-0.098,0.111-0.152c0.062-0.08,0.147-0.179,0.204-0.245 c0.051-0.06,0.166-0.172,0.22-0.221c0.041-0.037,0.114-0.096,0.147-0.12l-0.229,1.072c0.669-0.832,1.912-2.075,2.535-2.665 c-0.118-0.222-0.248-0.418-0.386-0.581L8.08,10.763l-0.025,0.019c0,0-0.416,0.314-0.565,0.412c-0.409,0.267-0.706-0.07-0.722-0.09 c0.088,0.074,0.201,0.12,0.328,0.12c0.14,0,0.267-0.055,0.357-0.144c0.092-0.088,0.147-0.209,0.147-0.343 c0-0.068-0.014-0.132-0.038-0.191c-0.044-0.097-0.12-0.178-0.214-0.23H7.35c0,0-0.104-0.06-0.082-0.158 c0.022-0.099,0.206-0.291,0.206-0.291l0.225-0.229l0.36-0.367l0.777-0.79c0.047-0.052,0.077-0.087,0.077-0.087L8.231,8.686 L8.229,8.68c0-0.009,0.006-0.037,0.053-0.123c0.065-0.119,0.22-0.335,0.224-0.343l0.001-0.001L7.242,9.117c0-0.001,0-0.001,0-0.002 c0.074-0.35,0.824-1.365,0.858-1.412L7.27,8.464c0-0.002-0.001-0.004-0.003-0.006C7.224,8.2,7.638,7.317,7.695,7.197 C7.697,7.193,7.698,7.19,7.7,7.187C7.398,7.488,7.18,7.815,7.173,7.823c0-0.291,0.223-0.709,0.223-0.709 C7.332,7.176,7.272,7.242,7.214,7.307C6.346,8.285,6.095,9.429,6.027,9.873c0,0,0,0.001-0.001,0.001 C5.881,9.963,5.97,9.854,5.9,10.022c-0.256,0.073-0.47,0.202-0.642,0.346c-0.287,0.237-0.459,0.511-0.513,0.605 c0.034-0.043,0.07-0.083,0.105-0.119C5.38,10.3,5.992,10.36,5.992,10.36s0.682,1.26,0.542,1.405 c-0.015,0.015-0.039,0.017-0.072,0.006c-0.09-0.031-0.149-0.017-0.182,0.024c-0.105,0.117-0.009,0.454-0.008,0.462l-1.809-0.778 c0.858-0.318,1.47-0.1,1.47-0.1c0,0.212,0.48,0.184,0.48,0.184l0-.001h0.001c0-0.196-0.365-0.43-0.365-0.43 s-0.327,0.136-0.716,0c-0.077-0.027-0.161-0.038-0.242-0.034C5.02,11.1,4.946,11.115,4.874,11.136 c-0.206,0.059-0.357,0.174-0.357,0.174v-0.001L4.515,11.31l1.131-4.139l0.119,1.591L8.06,3.367l0.039,4.037L14.354,0l-3.847,8.316 l0.023,0.041l2.713-1.954l-0.573,1.149l3.793-1.481l-3.539,2.585l6.612-0.81l-8.021,3.471l4.105-1.001L10.168,14.083z M11.512,11.319l0.001,0l-0.001-0.004C11.512,11.316,11.512,11.317,11.512,11.319z M9.515,12.181 c-0.095-0.395-0.223-0.757-0.371-1.076L8.2,13.182L9.515,12.181z M7.215,11.087c0.208-0.071,0.314-0.308,0.239-0.529l-0.208,0.071 c0.013,0.031,0.022,0.064,0.022,0.099c0,0.031-0.005,0.06-0.017,0.086l0.095,0.057c-0.032,0.051-0.081,0.095-0.141,0.12 c-0.036,0.016-0.074,0.022-0.112,0.022c-0.122,0-0.236-0.074-0.286-0.195c-0.004-0.01-0.01-0.022-0.012-0.034l-0.092,0.03 C6.778,11.038,7.008,11.158,7.215,11.087z",
+#   "title": "CD Projekt"
+#  },
+#  "chart-line": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M3 3v16a2 2 0 0 0 2 2h16\" /><path d=\"m19 9-5 5-4-4-3 3\" />",
+#   "title": "chart-line"
+#  },
+#  "claude": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "D97757",
+#   "path": "m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z",
+#   "title": "Claude"
+#  },
+#  "cloudflare": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "F38020",
+#   "path": "M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268zm2.7568-5.5634c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727",
+#   "title": "Cloudflare"
+#  },
+#  "code": {
+#   "from": "Lucide",
+#   "line": "<path d=\"m16 18 6-6-6-6\" /><path d=\"m8 6-6 6 6 6\" />",
+#   "title": "code"
+#  },
+#  "cpu": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M12 20v2\" /><path d=\"M12 2v2\" /><path d=\"M17 20v2\" /><path d=\"M17 2v2\" /><path d=\"M2 12h2\" /><path d=\"M2 17h2\" /><path d=\"M2 7h2\" /><path d=\"M20 12h2\" /><path d=\"M20 17h2\" /><path d=\"M20 7h2\" /><path d=\"M7 20v2\" /><path d=\"M7 2v2\" /><rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\" /><rect x=\"8\" y=\"8\" width=\"8\" height=\"8\" rx=\"1\" />",
+#   "title": "cpu"
+#  },
+#  "credit-card": {
+#   "from": "Lucide",
+#   "line": "<rect width=\"20\" height=\"14\" x=\"2\" y=\"5\" rx=\"2\" /><line x1=\"2\" x2=\"22\" y1=\"10\" y2=\"10\" /><path d=\"M6 14h2\" />",
+#   "title": "credit-card"
+#  },
+#  "discord": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "5865F2",
+#   "path": "M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z",
+#   "title": "Discord"
+#  },
+#  "docker": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "2496ED",
+#   "path": "M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.184-.186h-2.12a.186.186 0 00-.186.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z",
+#   "title": "Docker"
+#  },
+#  "download": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M12 15V3\" /><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\" /><path d=\"m7 10 5 5 5-5\" />",
+#   "title": "download"
+#  },
+#  "ea": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M16.635 6.162l-5.928 9.377H4.24l1.508-2.3h4.024l1.474-2.335H2.264L.79 13.239h2.156L0 17.84h12.072l4.563-7.259 1.652 2.66h-1.401l-1.473 2.299h4.347l1.473 2.3H24zm-11.461.107L3.7 8.604l9.52-.035 1.474-2.3z",
+#   "title": "EA"
+#  },
+#  "epicgames": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "313131",
+#   "path": "M3.537 0C2.165 0 1.66.506 1.66 1.879V18.44a4.262 4.262 0 00.02.433c.031.3.037.59.316.92.027.033.311.245.311.245.153.075.258.13.43.2l8.335 3.491c.433.199.614.276.928.27h.002c.314.006.495-.071.928-.27l8.335-3.492c.172-.07.277-.124.43-.2 0 0 .284-.211.311-.243.28-.33.285-.621.316-.92a4.261 4.261 0 00.02-.434V1.879c0-1.373-.506-1.88-1.878-1.88zm13.366 3.11h.68c1.138 0 1.688.553 1.688 1.696v1.88h-1.374v-1.8c0-.369-.17-.54-.523-.54h-.235c-.367 0-.537.17-.537.539v5.81c0 .369.17.54.537.54h.262c.353 0 .523-.171.523-.54V8.619h1.373v2.143c0 1.144-.562 1.71-1.7 1.71h-.694c-1.138 0-1.7-.566-1.7-1.71V4.82c0-1.144.562-1.709 1.7-1.709zm-12.186.08h3.114v1.274H6.117v2.603h1.648v1.275H6.117v2.774h1.74v1.275h-3.14zm3.816 0h2.198c1.138 0 1.7.564 1.7 1.708v2.445c0 1.144-.562 1.71-1.7 1.71h-.799v3.338h-1.4zm4.53 0h1.4v9.201h-1.4zm-3.13 1.235v3.392h.575c.354 0 .523-.171.523-.54V4.965c0-.368-.17-.54-.523-.54zm-3.74 10.147a1.708 1.708 0 01.591.108 1.745 1.745 0 01.49.299l-.452.546a1.247 1.247 0 00-.308-.195.91.91 0 00-.363-.068.658.658 0 00-.28.06.703.703 0 00-.224.163.783.783 0 00-.151.243.799.799 0 00-.056.299v.008a.852.852 0 00.056.31.7.7 0 00.157.245.736.736 0 00.238.16.774.774 0 00.303.058.79.79 0 00.445-.116v-.339h-.548v-.565H7.37v1.255a2.019 2.019 0 01-.524.307 1.789 1.789 0 01-.683.123 1.642 1.642 0 01-.602-.107 1.46 1.46 0 01-.478-.3 1.371 1.371 0 01-.318-.455 1.438 1.438 0 01-.115-.58v-.008a1.426 1.426 0 01.113-.57 1.449 1.449 0 01.312-.46 1.418 1.418 0 01.474-.309 1.58 1.58 0 01.598-.111 1.708 1.708 0 01.045 0zm11.963.008a2.006 2.006 0 01.612.094 1.61 1.61 0 01.507.277l-.386.546a1.562 1.562 0 00-.39-.205 1.178 1.178 0 00-.388-.07.347.347 0 00-.208.052.154.154 0 00-.07.127v.008a.158.158 0 00.022.084.198.198 0 00.076.066.831.831 0 00.147.06c.062.02.14.04.236.061a3.389 3.389 0 01.43.122 1.292 1.292 0 01.328.17.678.678 0 01.207.24.739.739 0 01.071.337v.008a.865.865 0 01-.081.382.82.82 0 01-.229.285 1.032 1.032 0 01-.353.18 1.606 1.606 0 01-.46.061 2.16 2.16 0 01-.71-.116 1.718 1.718 0 01-.593-.346l.43-.514c.277.223.578.335.9.335a.457.457 0 00.236-.05.157.157 0 00.082-.142v-.008a.15.15 0 00-.02-.077.204.204 0 00-.073-.066.753.753 0 00-.143-.062 2.45 2.45 0 00-.233-.062 5.036 5.036 0 01-.413-.113 1.26 1.26 0 01-.331-.16.72.72 0 01-.222-.243.73.73 0 01-.082-.36v-.008a.863.863 0 01.074-.359.794.794 0 01.214-.283 1.007 1.007 0 01.34-.185 1.423 1.423 0 01.448-.066 2.006 2.006 0 01.025 0zm-9.358.025h.742l1.183 2.81h-.825l-.203-.499H8.623l-.198.498h-.81zm2.197.02h.814l.663 1.08.663-1.08h.814v2.79h-.766v-1.602l-.711 1.091h-.016l-.707-1.083v1.593h-.754zm3.469 0h2.235v.658h-1.473v.422h1.334v.61h-1.334v.442h1.493v.658h-2.255zm-5.3.897l-.315.793h.624zm-1.145 5.19h8.014l-4.09 1.348z",
+#   "title": "Epic Games"
+#  },
+#  "faceit": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FF5500",
+#   "path": "M23.999 2.705a.167.167 0 00-.312-.1 1141.27 1141.27 0 00-6.053 9.375H.218c-.221 0-.301.282-.11.352 7.227 2.73 17.667 6.836 23.5 9.134.15.06.39-.08.39-.18z",
+#   "title": "FACEIT"
+#  },
+#  "figma": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "F24E1E",
+#   "path": "M15.852 8.981h-4.588V0h4.588c2.476 0 4.49 2.014 4.49 4.49s-2.014 4.491-4.49 4.491zM12.735 7.51h3.117c1.665 0 3.019-1.355 3.019-3.019s-1.355-3.019-3.019-3.019h-3.117V7.51zm0 1.471H8.148c-2.476 0-4.49-2.014-4.49-4.49S5.672 0 8.148 0h4.588v8.981zm-4.587-7.51c-1.665 0-3.019 1.355-3.019 3.019s1.354 3.02 3.019 3.02h3.117V1.471H8.148zm4.587 15.019H8.148c-2.476 0-4.49-2.014-4.49-4.49s2.014-4.49 4.49-4.49h4.588v8.98zM8.148 8.981c-1.665 0-3.019 1.355-3.019 3.019s1.355 3.019 3.019 3.019h3.117V8.981H8.148zM8.172 24c-2.489 0-4.515-2.014-4.515-4.49s2.014-4.49 4.49-4.49h4.588v4.441c0 2.503-2.047 4.539-4.563 4.539zm-.024-7.51a3.023 3.023 0 0 0-3.019 3.019c0 1.665 1.365 3.019 3.044 3.019 1.705 0 3.093-1.376 3.093-3.068v-2.97H8.148zm7.704 0h-.098c-2.476 0-4.49-2.014-4.49-4.49s2.014-4.49 4.49-4.49h.098c2.476 0 4.49 2.014 4.49 4.49s-2.014 4.49-4.49 4.49zm-.097-7.509c-1.665 0-3.019 1.355-3.019 3.019s1.355 3.019 3.019 3.019h.098c1.665 0 3.019-1.355 3.019-3.019s-1.355-3.019-3.019-3.019h-.098z",
+#   "title": "Figma"
+#  },
+#  "gamepad-2": {
+#   "from": "Lucide",
+#   "line": "<line x1=\"6\" x2=\"10\" y1=\"11\" y2=\"11\" /><line x1=\"8\" x2=\"8\" y1=\"9\" y2=\"13\" /><line x1=\"15\" x2=\"15.01\" y1=\"12\" y2=\"12\" /><line x1=\"18\" x2=\"18.01\" y1=\"10\" y2=\"10\" /><path d=\"M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z\" />",
+#   "title": "gamepad-2"
+#  },
+#  "github": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "181717",
+#   "path": "M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12",
+#   "title": "GitHub"
+#  },
+#  "gitlab": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FC6D26",
+#   "path": "m23.6004 9.5927-.0337-.0862L20.3.9814a.851.851 0 0 0-.3362-.405.8748.8748 0 0 0-.9997.0539.8748.8748 0 0 0-.29.4399l-2.2055 6.748H7.5375l-2.2057-6.748a.8573.8573 0 0 0-.29-.4412.8748.8748 0 0 0-.9997-.0537.8585.8585 0 0 0-.3362.4049L.4332 9.5015l-.0325.0862a6.0657 6.0657 0 0 0 2.0119 7.0105l.0113.0087.03.0213 4.976 3.7264 2.462 1.8633 1.4995 1.1321a1.0085 1.0085 0 0 0 1.2197 0l1.4995-1.1321 2.4619-1.8633 5.006-3.7489.0125-.01a6.0682 6.0682 0 0 0 2.0094-7.003z",
+#   "title": "GitLab"
+#  },
+#  "globe": {
+#   "from": "Lucide",
+#   "line": "<circle cx=\"12\" cy=\"12\" r=\"10\" /><path d=\"M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20\" /><path d=\"M2 12h20\" />",
+#   "title": "globe"
+#  },
+#  "gogdotcom": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "86328A",
+#   "path": "M7.15 15.24H4.36a.4.4 0 0 0-.4.4v2c0 .21.18.4.4.4h2.8v1.32h-3.5c-.56 0-1.02-.46-1.02-1.03v-3.39c0-.56.46-1.02 1.03-1.02h3.48v1.32zM8.16 11.54c0 .58-.47 1.05-1.05 1.05H2.63v-1.35h3.78a.4.4 0 0 0 .4-.4V6.39a.4.4 0 0 0-.4-.4H4.39a.4.4 0 0 0-.41.4v2.02c0 .23.18.4.4.4H6v1.35H3.68c-.58 0-1.05-.46-1.05-1.04V5.68c0-.57.47-1.04 1.05-1.04H7.1c.58 0 1.05.47 1.05 1.04v5.86zM21.36 19.36h-1.32v-4.12h-.93a.4.4 0 0 0-.4.4v3.72h-1.33v-4.12h-.93a.4.4 0 0 0-.4.4v3.72h-1.33v-4.42c0-.56.46-1.02 1.03-1.02h5.61v5.44zM21.37 11.54c0 .58-.47 1.05-1.05 1.05h-4.48v-1.35h3.78a.4.4 0 0 0 .4-.4V6.39a.4.4 0 0 0-.4-.4h-2.03a.4.4 0 0 0-.4.4v2.02c0 .23.18.4.4.4h1.62v1.35H16.9c-.58 0-1.05-.46-1.05-1.04V5.68c0-.57.47-1.04 1.05-1.04h3.43c.58 0 1.05.47 1.05 1.04v5.86zM13.72 4.64h-3.44c-.58 0-1.04.47-1.04 1.04v3.44c0 .58.46 1.04 1.04 1.04h3.44c.57 0 1.04-.46 1.04-1.04V5.68c0-.57-.47-1.04-1.04-1.04m-.3 1.75v2.02a.4.4 0 0 1-.4.4h-2.03a.4.4 0 0 1-.4-.4V6.4c0-.22.17-.4.4-.4H13c.23 0 .4.18.4.4zM12.63 13.92H9.24c-.57 0-1.03.46-1.03 1.02v3.39c0 .57.46 1.03 1.03 1.03h3.39c.57 0 1.03-.46 1.03-1.03v-3.39c0-.56-.46-1.02-1.03-1.02m-.3 1.72v2a.4.4 0 0 1-.4.4v-.01H9.94a.4.4 0 0 1-.4-.4v-1.99c0-.22.18-.4.4-.4h2c.22 0 .4.18.4.4zM23.49 1.1a1.74 1.74 0 0 0-1.24-.52H1.75A1.74 1.74 0 0 0 0 2.33v19.34a1.74 1.74 0 0 0 1.75 1.75h20.5A1.74 1.74 0 0 0 24 21.67V2.33c0-.48-.2-.92-.51-1.24m0 20.58a1.23 1.23 0 0 1-1.24 1.24H1.75A1.23 1.23 0 0 1 .5 21.67V2.33a1.23 1.23 0 0 1 1.24-1.24h20.5a1.24 1.24 0 0 1 1.24 1.24v19.34z",
+#   "title": "GOG.com"
+#  },
+#  "google": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "4285F4",
+#   "path": "M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z",
+#   "title": "Google"
+#  },
+#  "graduation-cap": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M21.42 10.922a1 1 0 0 0-.019-1.838L12.83 5.18a2 2 0 0 0-1.66 0L2.6 9.08a1 1 0 0 0 0 1.832l8.57 3.908a2 2 0 0 0 1.66 0z\" /><path d=\"M22 10v6\" /><path d=\"M6 12.5V16a6 3 0 0 0 12 0v-3.5\" />",
+#   "title": "graduation-cap"
+#  },
+#  "image": {
+#   "from": "Lucide",
+#   "line": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\" /><circle cx=\"9\" cy=\"9\" r=\"2\" /><path d=\"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21\" />",
+#   "title": "image"
+#  },
+#  "jetbrains": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M2.345 23.997A2.347 2.347 0 0 1 0 21.652V10.988C0 9.665.535 8.37 1.473 7.433l5.965-5.961A5.01 5.01 0 0 1 10.989 0h10.666A2.347 2.347 0 0 1 24 2.345v10.664a5.056 5.056 0 0 1-1.473 3.554l-5.965 5.965A5.017 5.017 0 0 1 13.007 24v-.003H2.345Zm8.969-6.854H5.486v1.371h5.828v-1.371ZM3.963 6.514h13.523v13.519l4.257-4.257a3.936 3.936 0 0 0 1.146-2.767V2.345c0-.678-.552-1.234-1.234-1.234H10.989a3.897 3.897 0 0 0-2.767 1.145L3.963 6.514Zm-.192.192L2.256 8.22a3.944 3.944 0 0 0-1.145 2.768v10.664c0 .678.552 1.234 1.234 1.234h10.666a3.9 3.9 0 0 0 2.767-1.146l1.512-1.511H3.771V6.706Z",
+#   "title": "JetBrains"
+#  },
+#  "kick": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "53FC19",
+#   "path": "M1.333 0h8v5.333H12V2.667h2.667V0h8v8H20v2.667h-2.667v2.666H20V16h2.667v8h-8v-2.667H12v-2.666H9.333V24h-8Z",
+#   "title": "Kick"
+#  },
+#  "microsoft": {
+#   "from": "Simple Icons 11.0.0",
+#   "hex": "5E5E5E",
+#   "path": "M0 0v11.408h11.408V0zm12.594 0v11.408H24V0zM0 12.594V24h11.408V12.594zm12.594 0V24H24V12.594z",
+#   "title": "Microsoft"
+#  },
+#  "microsoftazure": {
+#   "from": "Simple Icons 11.0.0",
+#   "hex": "0078D4",
+#   "path": "M22.379 23.343a1.62 1.62 0 0 0 1.536-2.14v.002L17.35 1.76A1.62 1.62 0 0 0 15.816.657H8.184A1.62 1.62 0 0 0 6.65 1.76L.086 21.204a1.62 1.62 0 0 0 1.536 2.139h4.741a1.62 1.62 0 0 0 1.535-1.103l.977-2.892 4.947 3.675c.28.208.618.32.966.32m-3.084-12.531 3.624 10.739a.54.54 0 0 1-.51.713v-.001h-.03a.54.54 0 0 1-.322-.106l-9.287-6.9h4.853m6.313 7.006c.116-.326.13-.694.007-1.058L9.79 1.76a1.722 1.722 0 0 0-.007-.02h6.034a.54.54 0 0 1 .512.366l6.562 19.445a.54.54 0 0 1-.338.684",
+#   "title": "Microsoft Azure"
+#  },
+#  "netflix": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "E50914",
+#   "path": "m5.398 0 8.348 23.602c2.346.059 4.856.398 4.856.398L10.113 0H5.398zm8.489 0v9.172l4.715 13.33V0h-4.715zM5.398 1.5V24c1.873-.225 2.81-.312 4.715-.398V14.83L5.398 1.5z",
+#   "title": "Netflix"
+#  },
+#  "nintendoswitch": {
+#   "from": "Simple Icons 13.0.0",
+#   "hex": "E60012",
+#   "path": "M14.176 24h3.674c3.376 0 6.15-2.774 6.15-6.15V6.15C24 2.775 21.226 0 17.85 0H14.1c-.074 0-.15.074-.15.15v23.7c-.001.076.075.15.226.15zm4.574-13.199c1.351 0 2.399 1.125 2.399 2.398 0 1.352-1.125 2.4-2.399 2.4-1.35 0-2.4-1.049-2.4-2.4-.075-1.349 1.05-2.398 2.4-2.398zM11.4 0H6.15C2.775 0 0 2.775 0 6.15v11.7C0 21.226 2.775 24 6.15 24h5.25c.074 0 .15-.074.15-.149V.15c.001-.076-.075-.15-.15-.15zM9.676 22.051H6.15c-2.326 0-4.201-1.875-4.201-4.201V6.15c0-2.326 1.875-4.201 4.201-4.201H9.6l.076 20.102zM3.75 7.199c0 1.275.975 2.25 2.25 2.25s2.25-.975 2.25-2.25c0-1.273-.975-2.25-2.25-2.25s-2.25.977-2.25 2.25z",
+#   "title": "Nintendo Switch"
+#  },
+#  "npm": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "CB3837",
+#   "path": "M1.763 0C.786 0 0 .786 0 1.763v20.474C0 23.214.786 24 1.763 24h20.474c.977 0 1.763-.786 1.763-1.763V1.763C24 .786 23.214 0 22.237 0zM5.13 5.323l13.837.019-.009 13.836h-3.464l.01-10.382h-3.456L12.04 19.17H5.113z",
+#   "title": "npm"
+#  },
+#  "nvidia": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "76B900",
+#   "path": "M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z",
+#   "title": "NVIDIA"
+#  },
+#  "openai": {
+#   "from": "Simple Icons 15.0.0",
+#   "hex": "412991",
+#   "path": "M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z",
+#   "title": "OpenAI"
+#  },
+#  "pickaxe": {
+#   "from": "Lucide",
+#   "line": "<path d=\"m14 13-8.381 8.38a1 1 0 0 1-3.001-3L11 9.999\" /><path d=\"M15.973 4.027A13 13 0 0 0 5.902 2.373c-1.398.342-1.092 2.158.277 2.601a19.9 19.9 0 0 1 5.822 3.024\" /><path d=\"M16.001 11.999a19.9 19.9 0 0 1 3.024 5.824c.444 1.369 2.26 1.676 2.603.278A13 13 0 0 0 20 8.069\" /><path d=\"M18.352 3.352a1.205 1.205 0 0 0-1.704 0l-5.296 5.296a1.205 1.205 0 0 0 0 1.704l2.296 2.296a1.205 1.205 0 0 0 1.704 0l5.296-5.296a1.205 1.205 0 0 0 0-1.704z\" />",
+#   "title": "pickaxe"
+#  },
+#  "play": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z\" />",
+#   "title": "play"
+#  },
+#  "playstation": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "0070D1",
+#   "path": "M8.984 2.596v17.547l3.915 1.261V6.688c0-.69.304-1.151.794-.991.636.18.76.814.76 1.505v5.875c2.441 1.193 4.362-.002 4.362-3.152 0-3.237-1.126-4.675-4.438-5.827-1.307-.448-3.728-1.186-5.39-1.502zm4.656 16.241l6.296-2.275c.715-.258.826-.625.246-.818-.586-.192-1.637-.139-2.357.123l-4.205 1.5V14.98l.24-.085s1.201-.42 2.913-.615c1.696-.18 3.785.03 5.437.661 1.848.601 2.04 1.472 1.576 2.072-.465.6-1.622 1.036-1.622 1.036l-8.544 3.107V18.86zM1.807 18.6c-1.9-.545-2.214-1.668-1.352-2.32.801-.586 2.16-1.052 2.16-1.052l5.615-2.013v2.313L4.205 17c-.705.271-.825.632-.239.826.586.195 1.637.15 2.343-.12L8.247 17v2.074c-.12.03-.256.044-.39.073-1.939.331-3.996.196-6.038-.479z",
+#   "title": "PlayStation"
+#  },
+#  "pubg": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "F4B942",
+#   "path": "M1.425 20.693c-.107-.247-.132-.4-.131-.8 0-.376.015-.478.208-1.416a38 38 0 0 0 .2-1.015c-.1-.056-.481-.376-.7-.587-.49-.472-.799-.938-.942-1.415-.059-.195-.067-.282-.056-.592.013-.341.02-.378.127-.599a2 2 0 0 1 .257-.39c.14-.15.145-.161.188-.465.024-.171.072-.493.105-.715.054-.36.056-.424.018-.592a2.84 2.84 0 0 1 .082-1.529c.358-.99 1.39-1.681 3-2.007 1.226-.249 2.815-.265 4.374-.045 1.537.218 3.344.715 5.011 1.38.214.086.392.152.396.148.014-.014-1.28-.668-1.61-.814A17 17 0 0 0 8.28 8.073C7.472 7.92 7.22 7.9 6.147 7.9c-.931 0-1.068.007-1.46.073a7 7 0 0 0-.836.18c-.1.03-.056-.046.082-.141.516-.356 1.36-.69 2.23-.886.853-.191.851-.177.023-.165-.407.006-.74.002-.74-.009s.025-.041.055-.068a10 10 0 0 0 .342-.376c.493-.56 1.253-1.22 1.923-1.667 1.278-.854 2.553-1.345 4.124-1.588.51-.08 2.061-.08 2.6 0 1.682.245 2.964.707 4.14 1.49.554.37.864.624 1.339 1.101.953.958 1.613 2.02 2.191 3.527.31.808.601 1.76.756 2.474l.072.331.164.115c.09.063.183.152.206.198s.166.448.316.894c.151.445.286.814.3.82s.026.111.026.234c0 .213-.004.225-.086.264-.106.05-1.037.255-1.16.255-.127 0-.23-.11-.322-.343l-.177-.436c-.054-.128-.172-.416-.263-.638-.302-.739-.295-.725-.394-.766-.08-.033-.128-.026-.393.064-.166.057-.35.13-.407.165a.55.55 0 0 0-.221.4c-.001.091.23.762.289.84.067.089 1.591 1.11 1.688 1.131.06.013.253-.014.528-.074l.438-.094c.003 0 .016.215.028.478.021.45.018.486-.043.607-.104.204-.003.16-1.67.723-1.314.444-1.564.497-2.353.497a4.5 4.5 0 0 1-2.388-.644c-.48-.283-1.052-.767-1.224-1.037-.133-.209-.16-.04.34-2.195.1-.427.194-.781.211-.787.017-.005.09.1.163.236s.164.266.202.29.287.14.552.259c.409.182.515.217.695.228a.82.82 0 0 0 .79-.41c.083-.131.097-.2.213-1.07l.158-1.178c.098-.725.09-.957-.046-1.248-.153-.327-.328-.474-.881-.741-.918-.444-.862-.435-1.279-.204-.158.088-.29.161-.293.164a8 8 0 0 0 .313-.006l.318-.01.52.24c.408.19.555.275.678.392.301.29.393.655.31 1.241-.052.37-.085.458-.23.615-.185.202-.334.269-.596.27-.208 0-.243-.01-.732-.24-.509-.24-.516-.242-.79-.249l-.276-.007-.039.156-.166.685c-.162.673-.477 1.976-.735 3.038-.11.454-.258 1.063-.327 1.355-.159.668-.214.86-.307 1.075-.219.503-.689.99-1.2 1.245-.578.287-1.076.342-1.828.205a45 45 0 0 0-4.48-.615c-.606-.053-2.655-.053-3.051 0-.826.111-1.187.19-1.535.337a1.93 1.93 0 0 0-.847.672c-.174.257-.253.71-.191 1.092.029.177-.008.192-.079.03zm.317-3.394c0-.028.06-.365.165-.929.1-.538.212-.748.576-1.086.604-.56 1.758-.924 3.331-1.05.557-.045 2.451-.014 3.072.05 1.287.131 1.77.195 2.88.38.906.151.886.15.7.073a58 58 0 0 0-2.054-.744c-1.222-.412-1.941-.578-3.207-.74-.625-.08-2.496-.081-3.082-.001-1.13.154-1.95.382-2.568.717-.523.282-.895.643-1.049 1.02-.09.22-.075.702.03.956.124.299.332.586.65.9.436.428.556.526.556.454m-.558-4.09c.15-.107.649-.33.963-.43.525-.169.957-.256 1.805-.367.497-.065 2.617-.093 3.284-.043l.716.053c.286.022.316-.01.392-.418l.184-.974c.19-1 .248-1.318.249-1.375 0-.105-.107-.19-.281-.217-.792-.129-2.275-.198-3.255-.153-2.203.1-3.583.628-4.102 1.566a1.6 1.6 0 0 0-.219.662q-.018.188.01.105c.143-.436.52-.88.926-1.094.237-.125.26-.132.26-.088 0 .015-.063.058-.14.096q-.273.131-.513.593c-.153.295-.193.468-.297 1.291a61 61 0 0 1-.096.74c-.021.135-.008.14.114.053m9.586-.184c.066-.052.078-.085.078-.236 0-.159-.01-.184-.102-.266-.12-.108-.188-.114-.298-.028-.161.128-.122.44.069.544.11.06.16.057.253-.014m7.349-1.91c.223-.15.319-.421.251-.712-.118-.515-.662-.73-.966-.384-.283.322-.166.91.22 1.1.178.088.361.087.495-.004m-.321-.32c-.187-.102-.245-.433-.103-.586.108-.117.285-.115.4.006.166.172.172.42.016.551-.105.088-.19.096-.313.029m-6.548-.146c.098-.139.036-.446-.105-.521-.09-.049-.204-.039-.257.022-.14.16-.142.312-.003.476.1.12.29.132.366.023z",
+#   "title": "PUBG"
+#  },
+#  "puzzle": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z\" />",
+#   "title": "puzzle"
+#  },
+#  "riotgames": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "EB0029",
+#   "path": "M13.458.86 0 7.093l3.353 12.761 2.552-.313-.701-8.024.838-.373 1.447 8.202 4.361-.535-.775-8.857.83-.37 1.591 9.025 4.412-.542-.849-9.708.84-.374 1.74 9.87L24 17.318V3.5Zm.316 19.356.222 1.256L24 23.14v-4.18l-10.22 1.256Z",
+#   "title": "Riot Games"
+#  },
+#  "roblox": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M18.926 23.998 0 18.892 5.075.002 24 5.108ZM15.348 10.09l-5.282-1.453-1.414 5.273 5.282 1.453z",
+#   "title": "Roblox"
+#  },
+#  "rockstargames": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FCAF17",
+#   "path": "M5.971 6.816h3.241c1.469 0 2.741-.448 2.741-2.084 0-1.3-1.117-1.576-2.19-1.576H6.748l-.777 3.66Zm12.834 8.753h5.168l-4.664 3.228.755 5.087-4.041-3.07L10.599 24l2.536-5.392s-2.95-3.075-2.947-3.075c-.198-.262-.265-.936-.265-1.226 0-.367.024-.739.049-1.134.028-.451.058-.933.058-1.476 0-1.338-.59-2.038-2.036-2.038H5.283l-1.18 5.525H.026L3.269 0h7.672c2.852 0 5.027.702 5.027 3.936 0 2.276-1.12 3.894-3.592 4.233v.045c1.162.276 1.598 1.062 1.598 2.527 0 .585-.018 1.098-.034 1.581-.015.428-.03.834-.03 1.243 0 .525.137 1.382.48 1.968h.567l3.028-5.06.82 5.096Zm-1.233-2.948-2.187 3.654h-3.457l2.103 2.189-1.73 3.672 3.777-2.218 2.976 2.263-.553-3.731 3.093-2.139h-3.43l-.592-3.69Z",
+#   "title": "Rockstar Games"
+#  },
+#  "server": {
+#   "from": "Lucide",
+#   "line": "<rect width=\"20\" height=\"8\" x=\"2\" y=\"2\" rx=\"2\" ry=\"2\" /><rect width=\"20\" height=\"8\" x=\"2\" y=\"14\" rx=\"2\" ry=\"2\" /><line x1=\"6\" x2=\"6.01\" y1=\"6\" y2=\"6\" /><line x1=\"6\" x2=\"6.01\" y1=\"18\" y2=\"18\" />",
+#   "title": "server"
+#  },
+#  "shield-check": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\" /><path d=\"m9 12 2 2 4-4\" />",
+#   "title": "shield-check"
+#  },
+#  "soundcloud": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FF5500",
+#   "path": "M23.999 14.165c-.052 1.796-1.612 3.169-3.4 3.169h-8.18a.68.68 0 0 1-.675-.683V7.862a.747.747 0 0 1 .452-.724s.75-.513 2.333-.513a5.364 5.364 0 0 1 2.763.755 5.433 5.433 0 0 1 2.57 3.54c.282-.08.574-.121.868-.12.884 0 1.73.358 2.347.992s.948 1.49.922 2.373ZM10.721 8.421c.247 2.98.427 5.697 0 8.672a.264.264 0 0 1-.53 0c-.395-2.946-.22-5.718 0-8.672a.264.264 0 0 1 .53 0ZM9.072 9.448c.285 2.659.37 4.986-.006 7.655a.277.277 0 0 1-.55 0c-.331-2.63-.256-5.02 0-7.655a.277.277 0 0 1 .556 0Zm-1.663-.257c.27 2.726.39 5.171 0 7.904a.266.266 0 0 1-.532 0c-.38-2.69-.257-5.21 0-7.904a.266.266 0 0 1 .532 0Zm-1.647.77a26.108 26.108 0 0 1-.008 7.147.272.272 0 0 1-.542 0 27.955 27.955 0 0 1 0-7.147.275.275 0 0 1 .55 0Zm-1.67 1.769c.421 1.865.228 3.5-.029 5.388a.257.257 0 0 1-.514 0c-.21-1.858-.398-3.549 0-5.389a.272.272 0 0 1 .543 0Zm-1.655-.273c.388 1.897.26 3.508-.01 5.412-.026.28-.514.283-.54 0-.244-1.878-.347-3.54-.01-5.412a.283.283 0 0 1 .56 0Zm-1.668.911c.4 1.268.257 2.292-.026 3.572a.257.257 0 0 1-.514 0c-.241-1.262-.354-2.312-.023-3.572a.283.283 0 0 1 .563 0Z",
+#   "title": "SoundCloud"
+#  },
+#  "sparkles": {
+#   "from": "Lucide",
+#   "line": "<path d=\"M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z\" /><path d=\"M20 2v4\" /><path d=\"M22 4h-4\" /><circle cx=\"4\" cy=\"20\" r=\"2\" />",
+#   "title": "sparkles"
+#  },
+#  "spotify": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "1ED760",
+#   "path": "M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z",
+#   "title": "Spotify"
+#  },
+#  "steam": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M11.979 0C5.678 0 .511 4.86.022 11.037l6.432 2.658c.545-.371 1.203-.59 1.912-.59.063 0 .125.004.188.006l2.861-4.142V8.91c0-2.495 2.028-4.524 4.524-4.524 2.494 0 4.524 2.031 4.524 4.527s-2.03 4.525-4.524 4.525h-.105l-4.076 2.911c0 .052.004.105.004.159 0 1.875-1.515 3.396-3.39 3.396-1.635 0-3.016-1.173-3.331-2.727L.436 15.27C1.862 20.307 6.486 24 11.979 24c6.627 0 11.999-5.373 11.999-12S18.605 0 11.979 0zM7.54 18.21l-1.473-.61c.262.543.714.999 1.314 1.25 1.297.539 2.793-.076 3.332-1.375.263-.63.264-1.319.005-1.949s-.75-1.121-1.377-1.383c-.624-.26-1.29-.249-1.878-.03l1.523.63c.956.4 1.409 1.5 1.009 2.455-.397.957-1.497 1.41-2.454 1.012H7.54zm11.415-9.303c0-1.662-1.353-3.015-3.015-3.015-1.665 0-3.015 1.353-3.015 3.015 0 1.665 1.35 3.015 3.015 3.015 1.663 0 3.015-1.35 3.015-3.015zm-5.273-.005c0-1.252 1.013-2.266 2.265-2.266 1.249 0 2.266 1.014 2.266 2.266 0 1.251-1.017 2.265-2.266 2.265-1.253 0-2.265-1.014-2.265-2.265z",
+#   "title": "Steam"
+#  },
+#  "supercell": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FFFFFF",
+#   "path": "M6.997 21.76H0v-1.583h.673v-3.01H0v-1.592h6.997l.68.747v2.14H5.759v-1.296H3.134v.927h1.132v1.15H3.134v.934h2.624v-1.296h1.92v2.14zm0-6.68H0V13.5h.673v-3.01H0V8.896h6.997l.68.747v2.14H5.759v-1.296H3.134v.927h1.132v1.149H3.134v.934h2.624v-1.295h1.92v2.14zm-.51-6.65h-4.29l-.507-.54-.451.542H0V6.545h1.73v.534h3.232v-.903H1.116L0 5.15V3.625l1.28-1.378h3.854l.509.542.45-.542h1.24v1.887H5.6V3.6H2.674v.902h3.748l1.263 1.19v1.443zm16.83 13.33H16.31v-1.584h.672v-3.01h-.672v-1.592h3.805v1.592h-.672v3.01h2.636v-1.997h1.92v2.842zm-8.157 0H8.153v-1.583h.673v-3.01h-.673v-1.592h3.806v1.592h-.673v3.01h2.636V18.18h1.92v2.842zm7.452-6.68h-4.676l-1.615-1.581v-3.02l1.616-1.584h3.684l.459.575.45-.575H24V11.5h-1.92v-1.02h-3.24v3.02h3.24v-1.04h1.919v1.27zM21.555 3.829h-2.1v1.083h2.1zm1.476 2.157h-3.576v.853h.673v1.584h-3.806V6.839h.672v-3.01h-.672v-1.59h6.595l1.082 1.082v1.698zm-7.772-2.15v3.233l-1.37 1.362h-3.69L8.836 7.069V3.837h-.673V2.246h3.724v1.59h-.59v3.01h2.083v-3.01h-.509v-1.59h2.97v1.59zm-2.562 6.65h-1.41v1.026h1.41zm.681 4.593-.68-.68V12.47h-1.412v1.025h.5v1.583H8.154v-1.583h.673v-3.01h-.673v-1.59h6.078l1.026 1.025v1.28l-.911.68.91.69v1.148h.575v1.361z",
+#   "title": "Supercell"
+#  },
+#  "thefinals": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "D31F3C",
+#   "path": "M18.523 19.319H24L14.965 6.295c-.626-.904-1.51-1.614-2.847-1.614-1.38 0-2.264.775-2.889 1.614L0 19.319h5.261l3.372-4.759 3.256 4.759h5.478l-5.934-8.712.599-.846 6.491 9.558Zm0 0",
+#   "title": "THE FINALS"
+#  },
+#  "twitch": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "9146FF",
+#   "path": "M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714Z",
+#   "title": "Twitch"
+#  },
+#  "ubisoft": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "000000",
+#   "path": "M23.561 11.988C23.301-.304 6.954-4.89.656 6.634c.282.206.661.477.943.672a11.747 11.747 0 00-.976 3.067 11.885 11.885 0 00-.184 2.071C.439 18.818 5.621 24 12.005 24c6.385 0 11.556-5.17 11.556-11.556v-.455zm-20.27 2.06c-.152 1.246-.054 1.636-.054 1.788l-.282.098c-.108-.206-.37-.932-.488-1.908C2.163 10.308 4.7 6.96 8.57 6.33c3.544-.52 6.937 1.68 7.728 4.758l-.282.098c-.087-.087-.228-.336-.77-.878-4.281-4.281-11.002-2.32-11.956 3.74zm11.002 2.081a3.145 3.145 0 01-2.59 1.355 3.15 3.15 0 01-3.155-3.155 3.159 3.159 0 012.927-3.144c1.018-.043 1.972.51 2.416 1.398a2.58 2.58 0 01-.455 2.95c.293.205.575.4.856.595zm6.58.12c-1.669 3.782-5.106 5.766-8.77 5.712-7.034-.347-9.083-8.466-4.38-11.393l.207.206c-.076.108-.358.325-.791 1.182-.51 1.041-.672 2.081-.607 2.732.369 5.67 8.314 6.83 11.045 1.214C21.057 8.217 11.822.401 3.626 6.374l-.184-.184C5.599 2.808 9.816 1.3 13.837 2.309c6.147 1.55 9.453 7.956 7.035 13.94z",
+#   "title": "Ubisoft"
+#  },
+#  "unity": {
+#   "from": "Simple Icons 16.33.0",
+#   "hex": "FFFFFF",
+#   "path": "m12.9288 4.2939 3.7997 2.1929c.1366.077.1415.2905 0 .3675l-4.515 2.6076a.4192.4192 0 0 1-.4246 0L7.274 6.8543c-.139-.0745-.1415-.293 0-.3675l3.7972-2.193V0L1.3758 5.5977V16.793l3.7177-2.1456v-4.3858c-.0025-.1565.1813-.2682.318-.1838l4.5148 2.6076a.4252.4252 0 0 1 .2136.3676v5.2127c.0025.1565-.1813.2682-.3179.1838l-3.7996-2.1929-3.7178 2.1457L12 24l9.6954-5.5977-3.7178-2.1457-3.7996 2.1929c-.1341.082-.3229-.0248-.3179-.1838V13.053c0-.1565.087-.2956.2136-.3676l4.5149-2.6076c.134-.082.3228.0224.3179.1838v4.3858l3.7177 2.1456V5.5977L12.9288 0Z",
+#   "title": "Unity"
+#  },
+#  "video": {
+#   "from": "Lucide",
+#   "line": "<path d=\"m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5\" /><rect x=\"2\" y=\"6\" width=\"14\" height=\"12\" rx=\"2\" />",
+#   "title": "video"
+#  },
+#  "xbox": {
+#   "from": "Simple Icons 11.0.0",
+#   "hex": "107C10",
+#   "path": "M4.102 21.033C6.211 22.881 8.977 24 12 24c3.026 0 5.789-1.119 7.902-2.967 1.877-1.912-4.316-8.709-7.902-11.417-3.582 2.708-9.779 9.505-7.898 11.417zm11.16-14.406c2.5 2.961 7.484 10.313 6.076 12.912C23.002 17.48 24 14.861 24 12.004c0-3.34-1.365-6.362-3.57-8.536 0 0-.027-.022-.082-.042-.063-.022-.152-.045-.281-.045-.592 0-1.985.434-4.805 3.246zM3.654 3.426c-.057.02-.082.041-.086.042C1.365 5.642 0 8.664 0 12.004c0 2.854.998 5.473 2.661 7.533-1.401-2.605 3.579-9.951 6.08-12.91-2.82-2.813-4.216-3.245-4.806-3.245-.131 0-.223.021-.281.046v-.002zM12 3.551S9.055 1.828 6.755 1.746c-.903-.033-1.454.295-1.521.339C7.379.646 9.659 0 11.984 0H12c2.334 0 4.605.646 6.766 2.085-.068-.046-.615-.372-1.52-.339C14.946 1.828 12 3.545 12 3.545v.006z",
+#   "title": "Xbox"
+#  }
+# },
+# "rows": {
+#  "adobe": "adobe",
+#  "analytics": "chart-line",
+#  "anthropic": "claude",
+#  "anticheat": "shield-check",
+#  "apple": "apple",
+#  "assets": "image",
+#  "blizzard": "battledotnet",
+#  "bypass/azure": "microsoftazure",
+#  "bypass/ea": "ea",
+#  "bypass/epic": "epicgames",
+#  "bypass/playstation": "playstation",
+#  "bypass/steam": "steam",
+#  "bypass/voice": "discord",
+#  "cloud": "cloudflare",
+#  "discord": "discord",
+#  "docker": "docker",
+#  "ea": "ea",
+#  "education": "graduation-cap",
+#  "epic": "epicgames",
+#  "figma": "figma",
+#  "finance": "credit-card",
+#  "gamebackend": "riotgames",
+#  "github": "github",
+#  "gitlab": "gitlab",
+#  "gog": "gogdotcom",
+#  "google": "google",
+#  "hardware": "cpu",
+#  "jetbrains": "jetbrains",
+#  "kick": "kick",
+#  "microsoft": "microsoft",
+#  "minecraft": "pickaxe",
+#  "netflix": "netflix",
+#  "nintendo": "nintendoswitch",
+#  "nvidia": "nvidia",
+#  "openai": "openai",
+#  "otherai": "sparkles",
+#  "othergames/cdprojekt": "cdprojekt",
+#  "othergames/faceit": "faceit",
+#  "othergames/krafton": "pubg",
+#  "othergames/misc": "puzzle",
+#  "othergames/unity": "unity",
+#  "packages": "npm",
+#  "playstation": "playstation",
+#  "pubgmobile": "pubg",
+#  "riot": "riotgames",
+#  "roblox": "roblox",
+#  "rockstar": "rockstargames",
+#  "shooters/thefinals": "thefinals",
+#  "slackzoom": "video",
+#  "soundcloud": "soundcloud",
+#  "spotify": "spotify",
+#  "steam": "steam",
+#  "supercell": "supercell",
+#  "twitch": "twitch",
+#  "ubisoft": "ubisoft",
+#  "webdev": "code",
+#  "xbox": "xbox"
+# },
+# "sections": {
+#  "ai": "sparkles",
+#  "bypass": "globe",
+#  "dev": "code",
+#  "downloads": "download",
+#  "games": "gamepad-2",
+#  "infra": "server",
+#  "media": "play",
+#  "other": "globe"
+# },
+# "source": "Brand logos: Simple Icons (CC0) - https://simpleicons.org - 16.33.0, and for those since taken out at their owners' request the last release that had them; each logo is its owner's trademark. Plain icons: Lucide (ISC) - https://lucide.dev"
+#}
+#__END_ICONS__
+
 #__BEGIN_I18N_EN__
 #{
 #"(با": "(with",
@@ -37059,10 +37787,14 @@ exit 0
 #"GOG و itch.io": "GOG / itch.io",
 #"Google Ads و AdMob": "Google Ads and AdMob",
 #"Idempotency-Key حداکثر ۱۰۰ نویسه": "Idempotency-Key at most 100 characters",
+#"PNG بزرگ‌تر از ۵۱۲×۵۱۲ است": "the PNG is larger than 512×512",
+#"PNG بیشتر از ۶۴ کیلوبایت است": "the PNG is over 64 KB",
 #"Pangle (تبلیغات تیک‌تاک)": "Pangle (TikTok’s ads)",
 #"PlayStation — STUN و API": "PlayStation — STUN and API",
 #"PowerShell را با Run as administrator باز کنید و این را بزنید:": "Open PowerShell with Run as administrator and enter this:",
 #"RedTube، YouPorn و Tube8": "RedTube, YouPorn and Tube8",
+#"SVG اسکریپت یا چیز فعال دارد؛ یک SVG ساده بدهید": "the SVG has a script or something active in it; give a plain SVG",
+#"SVG بیشتر از ۱۶ کیلوبایت است": "the SVG is over 16 KB",
 #"SYNC_SECRET در panel.env نیست": "SYNC_SECRET is missing from panel.env",
 #"Security ← DNS over HTTPS ← Max Protection ← Custom، و آدرس DoH.": "Security ← DNS over HTTPS ← Max Protection ← Custom, and the DoH address.",
 #"Taboola و Outbrain": "Taboola and Outbrain",
@@ -37097,6 +37829,7 @@ exit 0
 #"» حذف شود؟": "” be deleted?",
 #"» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون می‌آید.": "” get a new password? They will be signed out of every device.",
 #"» روی خود رله است، نه یک DNS": "” is on the relay itself, not a DNS server",
+#"» ساخته شد": "” made",
 #"» شوید و بعد «✅ عضو شدم» را بزنید.": "”, then press “✅ I have joined”.",
 #"» فعال شد تا": "” active until",
 #"، آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را روشن می‌کند.": ", puts the bot’s address behind the customer panel’s “Connect Telegram” button, and turns the bot on.",
@@ -37177,6 +37910,7 @@ exit 0
 #"آیدی کانال درست نیست؛ مثل @my_channel": "That is not a channel id; like @my_channel",
 #"آیفون و آیپد": "iPhone and iPad",
 #"آیفون: بعد از دانلود پروفایل، تنظیمات ← پروفایل دانلودشده ← نصب. اندروید: تنظیمات ← Private DNS ← نام میزبان، و نام DoT یک سرور. کروم و فایرفاکس: بخش DNS امن تنظیماتشان، و آدرس DoH یک سرور.": "iPhone: after downloading the profile, Settings → Profile Downloaded → Install. Android: Settings → Private DNS → hostname, and one server’s DoT name. Chrome and Firefox: the secure DNS part of their settings, and one server’s DoH address.",
+#"آیکون:": "Icon:",
 #"آی‌پی": "IP",
 #"آی‌پی DNS را بنویسید": "Write the DNS server IP",
 #"آی‌پی آن را این بالا اضافه کنید.": "Add its IP up here.",
@@ -37262,8 +37996,11 @@ exit 0
 #"استودیوها": "Studios",
 #"استیم": "Steam",
 #"اسم": "Name",
+#"اسم و آیکون تازه": "New name and icon",
 #"اسم پلن لازم است": "A plan name is required",
-#"اسمتان چیست؟": "What is your name?",
+#"اسم گروه": "Group name",
+#"اسم گروه حداکثر ۴۰ نویسه": "A group’s name is at most 40 characters",
+#"اسم گروه را بنویسید": "Write the group’s name",
 #"اسکواد": "Squad",
 #"اسکواد باسترز": "Squad Busters",
 #"اسکیپ فرام تارکوف": "Escape from Tarkov",
@@ -37321,6 +38058,7 @@ exit 0
 #"اگر کانال بنویسید، هر مشتری اول باید عضو آن شود تا ربات برایش کار کند. ربات را در کانال": "With a channel here, every customer has to join it before the bot works for them. Make the bot an",
 #"ایج آو امپایرز": "Age of Empires",
 #"این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته": "This Idempotency-Key was already used for another request",
+#"این PNG خراب است": "this PNG is damaged",
 #"این آدرس معتبر نیست": "This address is not valid",
 #"این آی‌پی به حساب دیگری ثبت شده است": "This IP is registered to another account",
 #"این آی‌پی خود همین سرور است": "This IP is this server itself",
@@ -37375,6 +38113,7 @@ exit 0
 #"این صفحه را رفرش نکنید: رفرش یک کلید تازهٔ دیگر می‌سازد.": "Do not refresh this page: a refresh makes another new key.",
 #"این عکس روی این سرور باز نمی‌شود": "This picture cannot be opened on this server",
 #"این عکس پیدا نشد": "Picture not found",
+#"این فایل SVG نیست": "this file is not an SVG",
 #"این فایل جایگزین دیتابیس فعلی شود؟": "Replace the current database with this file?",
 #"این فایل نسخهٔ پشتیبان سالمی نیست:": "This file is not a sound backup:",
 #"این فروشنده غیرفعال است": "This seller is disabled",
@@ -37417,6 +38156,7 @@ exit 0
 #"این کلید را در تنظیمات ربات بگذارید.": "Put this key in the bot’s settings.",
 #"این کلید پیدا نشد": "Key not found",
 #"این کلید پیدا نشد یا قبلاً باطل شده": "Key not found, or already revoked",
+#"این گروه و همهٔ": "Delete this group and all",
 #"این گروه کسی با تلگرام ندارد": "Nobody in this group has Telegram",
 #"اینسرجنسی": "Insurgency",
 #"این‌ها برای مشتری‌های قالب‌های انتخاب‌شده بالا نمی‌آیند: DNS جواب «چنین اسمی نیست» می‌دهد، با همهٔ زیردامنه‌ها. دامنه‌ای که خود سرویس از رله می‌برد هم بسته می‌شود. تا یک دقیقه بعد روی رله‌ها اعمال می‌شود؛ دستگاهی که جواب قبلی را نگه داشته ممکن است چند دقیقه دیرتر ببیند. فقط جلوی DNS ما را می‌گیرد: کسی که DNS دیگری بگذارد یا مستقیم با آی‌پی وصل شود از این رد می‌شود. هر دامنهٔ تازه برای همهٔ قالب‌هاست؛ در صفحهٔ هر قالب می‌شود تیکش را برداشت.": "These do not load for customers of the templates picked above: the DNS answers “no such name”, with all subdomains. A domain the service routes through the relay is closed too. It is applied on the relays within a minute; a device holding the old answer may see it a few minutes later. It only stops our DNS: someone who sets another DNS or connects straight by IP gets past it. Every new domain is for all templates; on each template’s page you can untick it.",
@@ -37463,9 +38203,11 @@ exit 0
 #"بدنهٔ درخواست باید یک شیء JSON باشد": "The request body must be a JSON object",
 #"بدهید.": ".",
 #"بدون آدرس": "No address",
+#"بدون آیکون": "No icon",
 #"بدون دامنه: فقط DNS معمولی": "No domain: plain DNS only",
 #"بدون محدودیت": "No limit",
 #"بدون پلن": "No plan",
+#"بدون گروه": "No group",
 #"براول استارز": "Brawl Stars",
 #"براول‌هالا": "Brawlhalla",
 #"برای": "for",
@@ -37528,6 +38270,7 @@ exit 0
 #"به سقف ماهانه‌اش رسید": "reached its monthly cap",
 #"به نسخهٔ": "to version",
 #"به کیف پول شما اضافه می‌شود.": "is added to your wallet.",
+#"به گروه دیگری رفت": "moved to another group",
 #"به‌روز": "updated",
 #"بوم بیچ": "Boom Beach",
 #"بکاپ برای ادمین‌های ربات فرستاده شد (": "Backup sent to the bot’s admins (",
@@ -37745,6 +38488,7 @@ exit 0
 #"حذف همیشگی": "Delete for good",
 #"حذف همیشگی این کاربر": "Delete this user for good",
 #"حذف کاربر": "Delete user",
+#"حذف گروه دامنه‌های داخلش را هم پاک می‌کند.": "Deleting a group deletes the domains in it too.",
 #"حساب": "Account",
 #"حساب این مشتری ←": "This customer’s account →",
 #"حساب خود": "your account",
@@ -37809,7 +38553,9 @@ exit 0
 #"دامنه": "Domain",
 #"دامنه (DoH و DoT)": "Domain (DoH and DoT)",
 #"دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.": "Domain: first make an A record pointing at that server’s IP and open its ports 80, 443 and 853; then write the domain here and save. Within a minute the server gets a certificate by itself and turns DoH and DoT on for it (it takes a few minutes, and console downloads on that server pause for about twenty seconds); then customers are shown it. If the record is not right yet, it says so here and tries again a quarter of an hour later.",
+#"دامنهٔ داخلش پاک شوند؟": "domains in it?",
 #"دامنهٔ دلخواهی که بعداً اضافه کنید، در قالبی که دست‌کم یکی از این‌ها تیک خورده، خودکار از رله می‌رود.": "A custom domain you add later goes through the relay automatically in a template where at least one of these is ticked.",
+#"دامنه‌اش پاک شد": "of its domains were deleted",
 #"دامنه‌ای ندارد.": "Has no domains.",
 #"دامنه‌ای که با نصاب می‌آید.": "domains that come with the installer.",
 #"دامنه‌ها": "Domains",
@@ -37817,6 +38563,7 @@ exit 0
 #"دامنه‌های دلخواه شما": "Your custom domains",
 #"دامنه‌های دلخواه — از رله می‌روند": "Custom domains — go through the relay",
 #"دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب": "This template’s custom domains, blocks and separate DNS",
+#"دامنه‌های دلخواهتان را گروه کنید، مثلاً «سایت‌های دانشگاه». هر گروه در صفحهٔ قالب‌ها یک ردیف جدا با آیکون خودش است و یک تیک دارد. آیکون: SVG تا ۱۶ کیلوبایت یا PNG تا ۶۴ کیلوبایت و ۵۱۲×۵۱۲.": "Put your own domains in groups, “university sites” say. Each group is a row of its own on the templates page, with its own icon and one tick. Icon: an SVG up to 16 KB, or a PNG up to 64 KB and 512×512.",
 #"دامنه‌های شما": "Your domains",
 #"دامنه‌های شما (": "Your domains (",
 #"دامنه‌های مسدود": "Blocked domains",
@@ -38144,7 +38891,7 @@ exit 0
 #"زنده، با": "Live, with",
 #"زنلس زون زیرو": "Zenless Zone Zero",
 #"زیر ده‌ها بازی است؛ روی ۴۴۳ کار می‌کند و از سرور رد می‌شود": "underlies dozens of games; it works on 443 and goes through the server",
-#"زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس «دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را برداشت. به‌علاوهٔ": "Subdomains are included automatically. These are gathered in the “Custom domains” service, so they can be unticked in any template. On top of the",
+#"زیردامنه‌ها خودکار شامل می‌شوند. دامنه‌های بدون گروه در سرویس «دامنه‌های دلخواه» جمع می‌شوند و هر گروه در قالب‌ها یک ردیف جداست، پس در هر قالب می‌شود تیکشان را برداشت. دامنه‌ای را که هست دوباره با گروه دیگری اضافه کنید تا به آن گروه برود. به‌علاوهٔ": "Subdomains are included automatically. Domains in no group are gathered in the “your own domains” service, and each group is a row of its own in the templates, so in any template they can be unticked. Add a domain that is already here again with another group to move it there. On top of the",
 #"زیرساخت و شبکه": "Infrastructure and network",
 #"زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند و جواب نمی‌دهند.": "passes the asker’s subnet (ECS) on to services. Services that refuse Iran in DNS — Tencent games like PUBG Mobile — see the relay’s Iranian IP and do not answer.",
 #"ساخت حساب": "Create account",
@@ -38154,6 +38901,7 @@ exit 0
 #"ساختن قالب برای حساب شما باز نیست": "Making templates is not open to your account",
 #"ساختن کد": "Create code",
 #"ساختن کلید": "Create key",
+#"ساختن گروه": "Make group",
 #"ساخته شد": "created",
 #"ساخته شد،": "created,",
 #"ساخته شده": "Created",
@@ -38341,6 +39089,7 @@ exit 0
 #"فعال ✅": "Active ✅",
 #"فعلاً نه، برو به حساب": "Not now, go to account",
 #"فعلاً پلنی برای فروش نیست. با پشتیبانی در تماس باشید.": "No plans are on sale right now. Please contact support.",
+#"فقط SVG یا PNG": "SVG or PNG only",
 #"فقط از آدرس": "Only from address",
 #"فقط از این آدرس‌ها (اختیاری، با ویرگول جدا)": "Only from these addresses (optional, separated by commas)",
 #"فقط از قالب‌های تیک‌خورده": "Only the ticked templates",
@@ -38609,7 +39358,6 @@ exit 0
 #"هر مشتری": "Per customer",
 #"هر مشتری فقط یک بار": "Each customer only once",
 #"هر مشتری لینک دعوت خودش را بگیرد": "Every customer gets their own invitation link",
-#"هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.": "Press one of the buttons again whenever you like.",
 #"هر پلن تعداد دستگاه خودش را دارد (ستون «دستگاه»)، یعنی چند آی‌پی هم‌زمان می‌توانند وصل باشند. اگر آی‌پی تازه‌ای بیاید و جا نباشد، قدیمی‌ترین آی‌پی حذف می‌شود. مشتری روی پلن فعالش می‌تواند از پنل یا ربات دستگاه اضافه بخرد، با رسید یا از کیف پول. دستگاه اضافه تا وقتی همان پلن را تمدید کند می‌ماند و با خرید پلن دیگر از بین می‌رود. حداکثر": "Each plan has its own number of devices (the “Devices” column): how many IPs can be connected at once. When a new IP comes and there is no room, the oldest one is removed. On an active plan, a customer can buy extra devices from the panel or the bot, by receipt or from the wallet. An extra device lasts while the same plan is renewed and ends when another plan is bought. At most",
 #"هر پلن یعنی یک قالب، برای چند روز، با یک حجم و یک قیمت. مشتری در پنل خودش پلن را انتخاب می‌کند و رسید می‌فرستد؛ با تأیید رسید همه‌چیز خودکار روی حسابش می‌نشیند. خرید دوبارهٔ همان پلن پیش از تمام شدنش تمدید است: روزها و حجم روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ حجم پذیرفته نمی‌شود.": "Each plan is a template, for a number of days, with a quota and a price. The customer picks a plan in their own panel and sends a receipt; on approval everything is put on their account automatically. Buying the same plan again before it ends is a renewal: the days and quota are added to what is left. Buying another plan starts over from that moment and what was left is lost; the customer is told this before buying. “Unlimited” only by its own tick; an empty quota box is not accepted.",
 #"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",
@@ -38919,7 +39667,13 @@ exit 0
 #"گرفتن کد اتصال": "Get a link code",
 #"گرفتن گواهی یا روشن کردن DoH نشد": "Getting the certificate or turning DoH on failed",
 #"گرفته است": "has taken it",
+#"گروه": "Group",
+#"گروه «": "Group “",
+#"گروه و": "The group and",
+#"گروه پیدا نشد": "Group not found",
 #"گروهِ «پیش‌فرض خاموش» تیک نخورد": "An “off by default” group was not ticked",
+#"گروهی با این اسم هست": "There is already a group with this name",
+#"گروه‌های من": "My groups",
 #"گری زون وارفر": "Gray Zone Warfare",
 #"گزارش DNS": "DNS report",
 #"گزارش DNS خاموش و پاک شد": "DNS report turned off and cleared",

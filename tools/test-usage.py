@@ -59,7 +59,7 @@ admin.CFG = {"ADMIN_PATH": "p"}
 admin.STORE = admin.Store(db_path)
 store.run("INSERT INTO templates (name, is_default, created_at) VALUES ('کامل', 1, ?)",
           (panel.now(),))
-u = store.create_user(111, "ali", "علی")
+u = store.create_user(111, "ali")
 store.run("UPDATE users SET status = 'active', quota_bytes = ?, used_bytes = 0,"
           " expires_at = ? WHERE id = ?",
           (100 * GB, (datetime.now(timezone.utc) + timedelta(days=20)).isoformat(), u["id"]))

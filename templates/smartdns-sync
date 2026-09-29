@@ -3548,8 +3548,6 @@ def signup_form(banner="", ref=""):
              if ref else "") +
             "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
             "<form method='post' action='/signup'>%s"
-            "<label>نام</label>"
-            "<input name='name' maxlength='60' autocomplete='name'>"
             "<label>نام کاربری</label>"
             "<input name='username' required minlength='3' maxlength='32' "
             "pattern='[A-Za-z0-9._-]{3,32}' placeholder='ali_reza' "
@@ -5132,7 +5130,6 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                        "password": form.get("password", ""),
                        "ip": self.client_ip()}
             if path == "/signup":
-                payload["name"] = form.get("name", "")
                 # Whose invitation this came by; the panel decides if it counts.
                 payload["ref"] = form.get("ref", "")[:16]
                 back = ("/signup?ref=" + urllib.parse.quote(payload["ref"])
@@ -5654,7 +5651,10 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             gauge = ("<div class='bar'><i class='%s' style='width:%d%%'></i></div>"
                      % (cls, pct))
 
-        body = ["<h1>%s</h1>" % html.escape(info.get("name") or "حساب شما"),
+        # The username - "name" from a panel not yet upgraded, which sent
+        # the customer's name there.
+        body = ["<h1>%s</h1>" % html.escape(info.get("username") or info.get("name")
+                                             or "حساب شما"),
                 "<div class='sub'>%s</div>" % html.escape(brand()),
                 banner, account_notice(info)]
         for k, v in rows:

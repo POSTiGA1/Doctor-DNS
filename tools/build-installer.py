@@ -81,6 +81,7 @@ PAYLOADS = [
     ("SERVICES", "domains/services.json"),
     ("GAMES", "domains/games.json"),
     ("BLOCKS", "domains/blocks.json"),
+    ("ICONS", "domains/icons.json"),
     ("I18N_EN", "domains/i18n-en.json"),
 ]
 

@@ -157,7 +157,9 @@ check("an admin key gets in", code == 200 and res["ok"] and "text" in res, str(r
 print("the operator hears about new customers, receipts and tickets")
 call("POST", "/users", {"telegram_id": 111, "name": "علی"}, key="dd_shop")
 ev = admin_events("user.created")
-check("a customer opened through the bot", len(ev) == 1 and "علی" in ev[0]["data"]["text"])
+check("a customer opened through the bot", len(ev) == 1 and "111" in ev[0]["data"]["text"])
+check("  a name an older bot sends is not kept, nor shown",
+      "علی" not in ev[0]["data"]["text"])
 check("only the admin key with a webhook is told",
       not admin_events("user.created", SHOP) and not admin_events("user.created", 3))
 check("addressed to no customer", ev[0]["telegram_id"] is None and ev[0]["audience"] == "admin")
@@ -175,7 +177,7 @@ check("and a customer writing into one", len(admin_events("ticket.message")) == 
 print("receipts")
 code, res = call("GET", "/admin/receipts")
 check("the pending ones, with who and what", code == 200 and len(res["receipts"]) == 1
-      and res["receipts"][0]["user"]["label"] == "علی"
+      and res["receipts"][0]["user"]["label"] == "تلگرام 111"
       and res["receipts"][0]["plan"]["name"] == "ماهانه", str(res))
 rid = res["receipts"][0]["id"]
 code, res = call("GET", "/admin/receipts/%d/image" % rid)
@@ -204,7 +206,7 @@ check("and the history", len(res["receipts"]) == 2)
 print("accounts")
 store.run("INSERT INTO ips (user_id, ip, added_at) VALUES (?, '5.6.7.8', ?)",
           (u["id"], panel.now()))
-for q in ("علی", "111", "5.6.7.8"):
+for q in ("111", "5.6.7.8"):
     code, res = call("GET", "/admin/users?q=" + urllib.request.quote(q))
     check("found by %s" % q, code == 200 and [x["id"] for x in res["users"]] == [u["id"]],
           str(res))
@@ -229,7 +231,7 @@ code, res = call("GET", "/admin/tickets")
 check("the ones waiting", code == 200 and [t["id"] for t in res["tickets"]] == [tid])
 code, res = call("GET", "/admin/tickets/%d" % tid)
 check("one, with its messages and whose it is", len(res["ticket"]["messages"]) == 2
-      and res["ticket"]["user"]["label"] == "علی")
+      and res["ticket"]["user"]["label"] == "تلگرام 111")
 code, res = call("POST", "/admin/tickets/%d/reply" % tid, {"body": "DNS رو چک کنید"})
 check("answering", code == 200 and res["ticket"]["status"] == "answered"
       and res["ticket"]["messages"][-1]["from"] == "admin")

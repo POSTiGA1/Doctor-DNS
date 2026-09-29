@@ -147,7 +147,8 @@ print("the admin panel shows it and serves the image")
 rec = Rec(); rec.wfile = Rec._W(rec)
 page = rec.receipts()
 check("the pending one is listed", "رسیدهای در انتظار (2)" in page, page[:120])
-check("it names the customer", "پرداخت‌کننده" in page)
+check("it names the customer, by what they sign in with", "09120000001" in page)
+check("  and not by a name", "پرداخت‌کننده" not in page)
 check("it links to the image", "/p/receipt/" in page)
 
 tid = store.one("SELECT id FROM transactions WHERE user_id = 2")["id"]

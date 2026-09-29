@@ -69,7 +69,7 @@ admin.SEALED_CHECK.append(lambda: admin.count_sealed(admin.STORE.db))
 
 MARK = b"BANK-SLIP-CARD-6037-9911-2233"
 PNG = b"\x89PNG\r\n\x1a\n" + MARK + os.urandom(2000)
-u = store.create_user(111, "ali", "علی")
+u = store.create_user(111, "ali")
 
 print("from before sealing")
 # As the panel wrote them before this version: the bytes as they came.
@@ -208,7 +208,7 @@ check("--make-key makes the key on a machine with nothing sealed",
 os.remove(panel.KEY_FILE)
 panel.SEALED_CHECK[:] = []
 s2 = panel.Store(panel.DB)
-someone = s2.create_user(333, "reza", "رضا")
+someone = s2.create_user(333, "reza")
 s2.run("INSERT INTO transactions (user_id, amount, kind, receipt_blob, status, created_at)"
        " VALUES (?, 1, 'card', ?, 'pending', ?)", (someone["id"], raw, panel.now()))
 panel.SEALED_CHECK[:] = []

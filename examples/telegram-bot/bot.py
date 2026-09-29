@@ -388,8 +388,7 @@ class Bot:
                 if e.body.get("error") != "user_not_found":
                     raise
                 self.known.discard(uid)
-        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
+        self.panel.call("POST", "/users", {"telegram_id": uid})
         self.known.add(uid)
         return self.panel.call("GET", "/users/%d" % uid)["user"]
 
@@ -424,10 +423,8 @@ class Bot:
             return self.admin_command(chat, text)
 
         waiting, extra = self.state.get(chat, (None, None))
-        if waiting == "onb_name":
-            return self.got_name(chat, sender, text)
         if waiting == "onb_user":
-            return self.got_username(chat, sender, text, extra)
+            return self.got_username(chat, sender, text)
         if text in ("/doh", "/dns"):
             text = B_DNS
         if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
@@ -495,10 +492,9 @@ class Bot:
             # Asked even for a Telegram id the bot knows, which may since have
             # been deleted in the admin panel; for one that is still there the
             # panel only answers that it exists.
-            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
             try:
                 self.panel.call("POST", "/users", {"telegram_id": sender["id"],
-                                                   "name": name[:60], "ref": arg[4:20]})
+                                                   "ref": arg[4:20]})
                 self.known.add(sender["id"])
             except ApiError as e:
                 log("invitation start failed: %s" % e)
@@ -544,30 +540,20 @@ class Bot:
 
     # -- a web sign-in for everybody who comes through the bot ----------------
     def ready(self, chat, sender):
-        """True when the account has its web sign-in. Otherwise the two
-        questions start, and whatever was pressed waits until they are done."""
+        """True when the account has its web sign-in. Otherwise the question
+        for a username comes first, and whatever was pressed waits for it."""
         u = self.account(sender)
         if u.get("username"):
             return True
-        tg_name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
-        self.state[chat] = ("onb_name", None)
-        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nاسمتان چیست؟",
-                 {"keyboard": [[tg_name[:60]]] if tg_name else [[B_CANCEL]],
-                  "resize_keyboard": True, "one_time_keyboard": True})
+        self.state[chat] = ("onb_user", None)
+        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nیک نام کاربری انگلیسی برای ورود به "
+                 "پنل وب انتخاب کنید (حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
         return False
 
-    def got_name(self, chat, sender, text):
-        if not text or text == B_CANCEL:
-            self.state.pop(chat, None)
-            return self.say(chat, "هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.", MENU)
-        self.state[chat] = ("onb_user", text[:60])
-        self.say(chat, "یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید "
-                 "(حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
-
-    def got_username(self, chat, sender, text, name):
+    def got_username(self, chat, sender, text):
         try:
             res = self.panel.call("POST", "/users/%d/credentials" % sender["id"],
-                                  {"username": text, "name": name})
+                                  {"username": text})
         except ApiError as e:
             if e.body.get("error") == "has_username":
                 self.state.pop(chat, None)
@@ -691,7 +677,7 @@ class Bot:
     # -- the customer's screens ---------------------------------------------
     def show_account(self, chat, sender):
         u = self.account(sender)
-        lines = ["👤 %s" % (u["name"] or "حساب شما"),
+        lines = ["👤 %s" % (u.get("username") or "حساب شما"),
                  "وضعیت: %s" % STATUS.get(u["status"], u["status"])]
         if u["plan"]:
             lines.append("پلن: %s" % u["plan"]["name"])

@@ -22,6 +22,7 @@ needing no pip step. No CDN either - the pages are opened from Iran, and every
 font and stylesheet host worth using is either blocked or slow.
 """
 
+import base64
 import glob
 import hashlib
 import hmac
@@ -39,6 +40,7 @@ import shutil
 import socket
 import sqlite3
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -53,6 +55,8 @@ CONFIG = "/etc/smart-dns/admin.env"
 DB = "/var/lib/smart-dns/panel.db"
 SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
 GAMES_FILE = "/usr/local/share/smart-dns/games.json"
+# The services' logos, from Simple Icons, and which row gets which.
+ICONS_FILE = "/usr/local/share/smart-dns/icons.json"
 BLOCKS_FILE = "/usr/local/share/smart-dns/blocks.json"
 # Put there by the installer and served from here - see above about CDNs. The
 # version goes in the font's address, so a browser's kept copy is never stale.
@@ -248,6 +252,16 @@ class Store:
             self.db.execute("ALTER TABLE broadcasts ADD COLUMN admin_id INTEGER")
         if "media" not in have:
             self.db.execute("ALTER TABLE broadcasts ADD COLUMN media TEXT")
+        # The operator's own domains in named groups - the panel's too, here
+        # as well so the domains page opened before the panel has started
+        # after an upgrade finds them.
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS custom_groups ("
+            " id INTEGER PRIMARY KEY, name TEXT NOT NULL, icon BLOB, icon_type TEXT,"
+            " created_at TEXT NOT NULL)")
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(custom_domains)")}
+        if have and "group_id" not in have:
+            self.db.execute("ALTER TABLE custom_domains ADD COLUMN group_id INTEGER")
         # The panel's too; here as well so a wallet page opened before the
         # panel has started after an upgrade finds it.
         self.db.execute(
@@ -1186,7 +1200,7 @@ def total_usage_card(p, owner=None, title="مصرف کل — همهٔ مشتری
     since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
     mine_only = (" AND u.owner_admin IS NULL" if owner == "own" else
                  " AND u.owner_admin = ?" if owner else "")
-    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+    top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
                   " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
                   " WHERE g.grain = '1d' AND g.bucket >= ?" + mine_only + " GROUP BY u.id"
                   " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10",
@@ -1243,9 +1257,9 @@ def usage_card(p, title, view, top):
                    "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
         for r in top:
             who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
-            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
+            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a>"
                        "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
-                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
+                       % (p, r["id"], html.escape(who),
                           human(r["down"]), human(r["up"]),
                           round(100.0 * (r["down"] + r["up"]) / total)))
         out.append("</table>")
@@ -3218,17 +3232,166 @@ def load_catalogue():
     return services
 
 
+def custom_groups():
+    """The operator's groups of their own domains, by name."""
+    try:
+        return STORE.q("SELECT id, name, icon, icon_type FROM custom_groups"
+                       " ORDER BY name COLLATE NOCASE, id")
+    except sqlite3.OperationalError:
+        return []
+
+
 def catalogue_now():
     """The catalogue with the operator's own domains filled in.
 
     Those live in the database, not the catalogue file, so CATALOGUE carries
     their service with an empty list - and the template page, drawn from it,
     showed "your domains" as having none while the relay was routing them.
+    The ones in no group fill that service; each group is a service of its
+    own, "cg<id>", drawn under "my groups" with its icon.
     """
-    custom = [r["domain"] for r in STORE.q(
-        "SELECT domain FROM custom_domains ORDER BY domain")]
-    return [dict(svc, groups=[dict(g, domains=custom) for g in svc["groups"]])
-            if svc["key"] == "custom" else svc for svc in CATALOGUE]
+    try:
+        rows = STORE.q("SELECT domain, group_id FROM custom_domains ORDER BY domain")
+    except sqlite3.OperationalError:
+        rows = [{"domain": r["domain"], "group_id": None} for r in STORE.q(
+            "SELECT domain FROM custom_domains ORDER BY domain")]
+    loose = [r["domain"] for r in rows if r["group_id"] is None]
+    out = [dict(svc, groups=[dict(g, domains=loose) for g in svc["groups"]])
+           if svc["key"] == "custom" else svc for svc in CATALOGUE]
+    for grp in custom_groups():
+        out.append({"key": "cg%d" % grp["id"], "label": grp["name"], "section": "mine",
+                    "group_id": grp["id"], "icon_uri": group_icon_uri(grp),
+                    "groups": [{"key": "main", "label": grp["name"],
+                                "domains": [r["domain"] for r in rows
+                                            if r["group_id"] == grp["id"]]}]})
+    return out
+
+
+# -------------------------------------------------------------------- logos
+# Beside each row of a template's page: the service's own logo from Simple
+# Icons - for the few since taken out there, from the last release that had
+# them - a plain icon from Lucide for a row no brand is, by its kind or its
+# section, and the icon the admin gave a group of their own.
+ICONS = {}
+GROUP_ICON_SVG_MAX = 16 * 1024
+GROUP_ICON_PNG_MAX = 64 * 1024
+
+
+def load_icons():
+    try:
+        with open(ICONS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+# What a plain icon may be made of: shapes, with numbers for attributes.
+LINE_ICON = re.compile(r'(<(path|line|circle|rect|polyline|polygon|ellipse)'
+                       r'(\s+[a-z0-9-]+="[0-9A-Za-z.,\- ]*")*\s*/>)+')
+
+
+def row_icon(svc, grp):
+    """The icon a row is drawn with - the group's own, else its service's,
+    else its section's - or None."""
+    rows = ICONS.get("rows") or {}
+    slug = (rows.get("%s/%s" % (svc["key"], grp["key"])) or rows.get(svc["key"])
+            or (ICONS.get("sections") or {}).get(grp.get("section") or svc.get("section")))
+    return slug if slug in (ICONS.get("icons") or {}) else None
+
+
+def logo_ink(hexcolour):
+    """A brand's colour, or None where it would vanish into one theme or the
+    other - black on the dark one, white on the light one. Those take the
+    text's colour instead."""
+    try:
+        r, g, b = (int(hexcolour[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except (TypeError, ValueError):
+        return None
+    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b)]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return "#" + hexcolour.upper() if 0.07 < lum < 0.7 else None
+
+
+def row_logo(svc, grp, title, used):
+    """What goes before a row's name: an <svg> using the page's sprite, the
+    group's uploaded icon, or the first letter of its name."""
+    if svc.get("icon_uri"):
+        return "<img class='logo' src='%s' alt=''>" % html.escape(svc["icon_uri"])
+    slug = row_icon(svc, grp)
+    if slug:
+        used.add(slug)
+        icon = ICONS["icons"][slug]
+        # A plain icon is not a brand: it takes the muted text colour.
+        if icon.get("line"):
+            return ("<svg class='logo plain' viewBox='0 0 24 24' aria-hidden='true'>"
+                    "<use href='#si-%s'/></svg>" % slug)
+        ink = logo_ink(icon.get("hex"))
+        return ("<svg class='logo' viewBox='0 0 24 24' aria-hidden='true'%s>"
+                "<use href='#si-%s'/></svg>"
+                % (" style='color:%s'" % ink if ink else "", slug))
+    letter = (title or "?").strip()[:1].upper() or "?"
+    return "<span class='logo letter' aria-hidden='true'>%s</span>" % html.escape(letter)
+
+
+def logo_sprite(used):
+    """Each logo on the page once, for the rows to point at."""
+    if not used:
+        return ""
+    icons = ICONS.get("icons") or {}
+    out = []
+    for slug in sorted(used):
+        icon = icons[slug]
+        if icon.get("line"):
+            # Markup, so only what LINE_ICON allows: a file that says more
+            # draws nothing rather than something.
+            if not LINE_ICON.fullmatch(icon["line"]):
+                continue
+            out.append("<symbol id='si-%s' viewBox='0 0 24 24' fill='none' "
+                       "stroke='currentColor' stroke-width='2' stroke-linecap='round' "
+                       "stroke-linejoin='round'>%s</symbol>" % (slug, icon["line"]))
+        else:
+            out.append("<symbol id='si-%s' viewBox='0 0 24 24'><path fill='currentColor' "
+                       "d='%s'/></symbol>" % (slug, html.escape(icon.get("path") or "")))
+    return ("<svg width='0' height='0' style='position:absolute' aria-hidden='true'>%s</svg>"
+            % "".join(out))
+
+
+def group_icon_uri(grp):
+    """A group's icon as a data: URI for an <img> - where an SVG's scripts,
+    if it had any, are never run."""
+    if not grp["icon"] or grp["icon_type"] not in ("image/svg+xml", "image/png"):
+        return ""
+    return "data:%s;base64,%s" % (grp["icon_type"],
+                                  base64.b64encode(bytes(grp["icon"])).decode())
+
+
+def check_group_icon(blob):
+    """(type, bytes) for an icon the admin uploaded, or raise ValueError with
+    what is wrong with it. An SVG up to 16 KB or a PNG up to 64 KB and
+    512x512, as HyperDNS takes them."""
+    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(blob) > GROUP_ICON_PNG_MAX:
+            raise ValueError("PNG بیشتر از ۶۴ کیلوبایت است")
+        if blob[12:16] != b"IHDR":
+            raise ValueError("این PNG خراب است")
+        w, h = struct.unpack(">II", blob[16:24])
+        if not (0 < w <= 512 and 0 < h <= 512):
+            raise ValueError("PNG بزرگ‌تر از ۵۱۲×۵۱۲ است")
+        return "image/png", blob
+    head = blob[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if head.startswith(b"<?xml") or head.startswith(b"<svg") or head.startswith(b"<!--"):
+        if len(blob) > GROUP_ICON_SVG_MAX:
+            raise ValueError("SVG بیشتر از ۱۶ کیلوبایت است")
+        text = blob.decode("utf-8", "replace").lower()
+        if "<svg" not in text:
+            raise ValueError("این فایل SVG نیست")
+        # Shown only as an <img>, where none of this runs - but an icon has
+        # no business carrying any of it either.
+        if re.search(r"<script|<foreignobject|<!entity|\son[a-z]+\s*=|javascript:", text):
+            raise ValueError("SVG اسکریپت یا چیز فعال دارد؛ یک SVG ساده بدهید")
+        return "image/svg+xml", blob
+    raise ValueError("فقط SVG یا PNG")
 
 
 # -------------------------------------------------------------------- pages
@@ -3410,7 +3573,6 @@ table.users td.acts .menu form.resetdays small{flex-basis:100%}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.bad{background:var(--err-bg);color:var(--bad)}
 .card details>summary{cursor:pointer}
-.who small{display:block;color:var(--muted);font-size:11px}
 .card.wide{padding:16px 12px}
 table.users td{padding:8px 5px}
 table.users th{padding:9px 5px}
@@ -3435,6 +3597,13 @@ details.svc>summary::before{content:'▸';color:var(--muted);font-size:11px;
 details.svc[open]>summary::before{transform:rotate(-90deg)}
 details.svc[open]{border-color:var(--line2)}
 details.svc>summary label{flex:1}
+.logo{width:18px;height:18px;vertical-align:-4px;margin-inline-end:7px;flex:none;
+ object-fit:contain;display:inline-block}
+.logo.letter{display:inline-flex;align-items:center;justify-content:center;
+ border-radius:5px;background:var(--row);color:var(--muted);font-size:11px;
+ font-weight:600;vertical-align:-3px;line-height:1}
+td .logo{margin-inline-end:5px}
+.logo.plain{color:var(--muted)}
 .doms{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
  gap:2px 14px;padding:4px 30px 12px;border-top:1px solid var(--row);margin-top:2px}
 .doms label{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:12px;
@@ -4137,9 +4306,9 @@ def webhook_url_ok(url):
 
 
 def ticket_who(row):
-    return "%s · %s" % (row["first_name"] or "", row["username"] or row["phone"]
-                        or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
-                            else "#%d" % row["user_id"]))
+    return (row["username"] or row["phone"]
+            or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
+                else "#%d" % row["user_id"]))
 
 
 def image_kind(blob):
@@ -5138,6 +5307,7 @@ ACTION_SECTION = {
     "template-new": "templates", "template-save": "templates", "template-delete": "templates",
     "template-rules": "templates", "template-blocklists": "templates",
     "domain-add": "templates", "domain-del": "templates", "blocked-add": "templates",
+    "group-add": "templates", "group-save": "templates", "group-del": "templates",
     "blocked-del": "templates", "forward-add": "templates", "forward-del": "templates",
     "bot-setup": "bot", "bot-power": "bot", "bot-test": "bot", "bot-link-save": "bot",
     "broadcast-send": "bot", "api-key-new": "bot", "api-key-revoke": "bot",
@@ -5190,7 +5360,7 @@ RESELLER_SECTIONS = {"users", "receipts", "tickets", "plans", "templates", "bot"
 # And inside those, what is set for every customer at once.
 RESELLER_NEVER = {"domains", "discount-save", "discount-active", "discount-delete",
                   "devices-settings", "wallet-settings", "ref-settings", "domain-add",
-                  "domain-del", "blocked-add", "blocked-del", "forward-add", "forward-del",
+                  "domain-del", "group-add", "group-save", "group-del", "blocked-add", "blocked-del", "forward-add", "forward-del",
                   # The bot page is their own bot; the API page is every key.
                   "api", "api-key-new", "api-key-revoke", "api-webhook-save",
                   "api-webhook-test", "bot-link-save"}
@@ -5526,7 +5696,7 @@ def admin_stats_page(p, r):
     out.append("</div>")
     out.append(total_usage_card(p, sid, "مصرف مشتری‌های %s" % r["username"]))
     rows = STORE.q("SELECT t.id, t.amount, t.kind, t.status, t.created_at, u.username,"
-                   " u.first_name, u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
+                   " u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
                    " WHERE u.owner_admin = ? ORDER BY t.id DESC LIMIT 10", (sid,))
     if rows:
         kinds = {"topup": "شارژ کیف پول", "device": "دستگاه اضافه", "wallet": "از کیف پول"}
@@ -5538,7 +5708,7 @@ def admin_stats_page(p, r):
         for t in rows:
             out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
                        % (html.escape(t["created_at"][:16].replace("T", " ")),
-                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
+                          html.escape(t["username"] or "#%d" % t["uid"]),
                           kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
                           states.get(t["status"], html.escape(t["status"]))))
         out.append("</table></div>")
@@ -6071,13 +6241,19 @@ def ordered_rows(out):
             if svc["key"] == "custom":
                 continue
             where = grp.get("section") or svc.get("section") or ""
-            rank = order.index(where) if where in order else len(order)
+            # The operator's own groups, first: they are what they made.
+            if where == "mine":
+                rank = -1
+            else:
+                rank = order.index(where) if where in order else len(order)
             rows.append((rank, svc, grp))
     seen = set()
     for rank, svc, grp in sorted(rows, key=lambda r: r[0]):
         if rank not in seen:
             seen.add(rank)
-            if rank < len(order) and label.get(order[rank]):
+            if rank == -1:
+                out.append("<h3 class='sec'>گروه‌های من</h3>")
+            elif rank < len(order) and label.get(order[rank]):
                 out.append("<h3 class='sec'>%s</h3>" % html.escape(label[order[rank]]))
         yield svc, grp
 
@@ -6337,7 +6513,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def receipts(self):
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
-            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.username, u.phone, u.telegram_id,"
             " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
             " p.name AS plan_name, p.days AS plan_days,"
             " p.quota_bytes AS plan_quota"
@@ -6350,9 +6526,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
         if not pending:
             out.append("<p class='muted'>رسیدی نرسیده.</p>")
         for r in pending:
-            who = (r["first_name"] or "") + " · " + (
-                r["username"] or r["phone"]
-                or str(r["telegram_id"] or "#%d" % r["user_id"]))
+            who = (r["username"] or r["phone"]
+                   or str(r["telegram_id"] or "#%d" % r["user_id"]))
             topup = r["kind"] == "topup"
             if r["kind"] == "device":
                 bought = ("<div class='bought'>📱 دستگاه اضافه · %s تومان<span class='muted'>"
@@ -6418,8 +6593,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             for r in decided[:40]:
                 out.append("<tr><td>%s</td><td>%s</td><td>%s</td>"
                            "<td class='%s'>%s</td><td>%s</td></tr>"
-                           % (html.escape((r["first_name"] or "") + " · " +
-                                          (r["username"] or r["phone"] or "")),
+                           % (html.escape(r["username"] or r["phone"] or ""),
                               html.escape(r["created_at"][:16]),
                               html.escape(
                                   "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
@@ -6934,7 +7108,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                   health_cells("exit" if kind == "exit" and ip == here else ip))]
         view = server_view(kind, ip)
         since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
-        top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+        top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
                       " SUM(g.down) down, SUM(g.up) up FROM user_server_usage g"
                       " JOIN users u ON u.id = g.user_id WHERE g.kind = ? AND g.server = ?"
                       " AND g.day >= ? GROUP BY u.id ORDER BY SUM(g.down) + SUM(g.up) DESC"
@@ -7064,7 +7238,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                         "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
                         "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
             out.append(
-                "<tr><td class='who' title='%s'><code>%s</code><small>%s</small></td>"
+                "<tr><td class='who' title='%s'><code>%s</code></td>"
                 "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
                 "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
                 "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -7100,7 +7274,6 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 # that came through the bot have neither - so the column shows
                 # whichever this account actually has.
                 % (html.escape(who, quote=True), html.escape(who),
-                   html.escape(r["first_name"] or ""),
                    html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
                    "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
                    % (p, r["id"], human(r["used_bytes"])),
@@ -7245,14 +7418,14 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def tickets(self):
         wanted = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t")
         if wanted and wanted[0].isdigit():
-            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
+            row = STORE.one("SELECT t.*, u.username, u.phone,"
                             " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
                             " WHERE t.id = ?" + mine()[0], (int(wanted[0]),) + mine()[1])
             if row:
                 return self.ticket_page(row)
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
-            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.username, u.phone, u.telegram_id,"
             " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
             " FROM tickets t JOIN users u ON u.id = t.user_id WHERE 1 = 1" + mine()[0] +
             " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
@@ -7462,7 +7635,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a></p>" % p,
                "<div class='grid'><div class='stat'><div class='n'>%s</div>"
                "<div class='l'>موجودی (تومان)</div></div>" % format(user["wallet"] or 0, ",")]
-        invited = STORE.q("SELECT id, username, phone, telegram_id, first_name, status"
+        invited = STORE.q("SELECT id, username, phone, telegram_id, status"
                           " FROM users WHERE referred_by = ? ORDER BY id DESC", (uid,))
         earned = STORE.one("SELECT COALESCE(sum(amount), 0) s FROM wallet_moves"
                            " WHERE user_id = ? AND kind = 'referral'", (uid,))["s"]
@@ -7508,11 +7681,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
             out.append("<div class='card'><h2>دعوت‌شده‌ها (%d)</h2><table><tr><th>کاربر</th>"
                        "<th>وضعیت</th></tr>" % len(invited))
             for r in invited:
-                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a> <span class='muted'>%s"
-                           "</span></td><td>%s</td></tr>"
+                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a></td><td>%s</td></tr>"
                            % (p, r["id"], html.escape(str(r["username"] or r["phone"]
                                                           or r["telegram_id"] or "#%d" % r["id"])),
-                              html.escape(r["first_name"] or ""), html.escape(r["status"])))
+                              html.escape(r["status"])))
             out.append("</table></div>")
         return "".join(out)
 
@@ -7749,13 +7921,15 @@ class Admin(http.server.BaseHTTPRequestHandler):
                "<button type='button' data-all-rows='0'>هیچ‌کدام</button></div>"]
 
         in_group = games_by_group()
+        logos = set()
         for svc, g in ordered_rows(out):
             key = "%s.%s" % (svc["key"], g["key"])
             ref = "%s/%s" % (svc["key"], g["key"])
             on = (svc["key"], g["key"]) in groups
             here = in_group.get(ref, [])
             label, under = group_title(svc, g, here)
-            label = html.escape(label)
+            logo = row_logo(svc, g, label, logos)
+            label = logo + html.escape(label)
             if under:
                 label += "<span class='under'>%s</span>" % html.escape(under)
             # An opt-in group is one where routing is the wrong default,
@@ -7818,7 +7992,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
 
         out.append("<div style='margin-top:16px'><button>ذخیره</button> "
                    "<button class='danger' formaction='/%s/template-delete' "
-                   "formnovalidate>حذف قالب</button></div></form></div>" % p)
+                   "formnovalidate>حذف قالب</button></div></form>%s</div>"
+                   % (p, logo_sprite(logos)))
         # Convenience only. Every checkbox above is a plain form control, so
         # the page works with this script blocked or broken - it just means
         # ticking five hundred boxes by hand.
@@ -7920,27 +8095,43 @@ class Admin(http.server.BaseHTTPRequestHandler):
         rows = STORE.q("SELECT * FROM custom_domains ORDER BY added_at DESC")
         shipped = sum(len(g["domains"]) for s in CATALOGUE for g in s["groups"])
         p = CFG["ADMIN_PATH"]
-        out = ["<div class='card'><h2>دامنه‌های شما (%d)</h2>" % len(rows),
+        groups = custom_groups()
+        name = {g["id"]: g for g in groups}
+        pick = ""
+        if groups:
+            pick = ("<select name='group'><option value=''>بدون گروه</option>%s</select>"
+                    % "".join("<option value='%d'>%s</option>" % (g["id"], html.escape(g["name"]))
+                              for g in groups))
+        out = [custom_groups_card(p, groups, rows),
+               "<div class='card'><h2>دامنه‌های شما (%d)</h2>" % len(rows),
                "<form method='post' action='/%s/domain-add' class='row' "
                "style='margin-bottom:14px'>"
                "<input name='domain' placeholder='example.com' style='min-width:220px'>"
-               "<input name='note' placeholder='یادداشت (اختیاری)'>"
-               "<button>افزودن</button></form>" % p]
+               "<input name='note' placeholder='یادداشت (اختیاری)'>%s"
+               "<button>افزودن</button></form>" % (p, pick)]
         if rows:
-            out.append("<table><tr><th>دامنه</th><th>یادداشت</th><th>افزوده</th>"
+            out.append("<table><tr><th>دامنه</th><th>گروه</th><th>یادداشت</th><th>افزوده</th>"
                        "<th></th></tr>")
             for r in rows:
-                out.append("<tr><td><code>%s</code></td><td class='muted'>%s</td>"
+                g = name.get(r["group_id"]) if "group_id" in r.keys() else None
+                where = "<span class='muted'>—</span>"
+                if g is not None:
+                    uri = group_icon_uri(g)
+                    where = (("<img class='logo' src='%s' alt=''>" % html.escape(uri) if uri else "")
+                             + html.escape(g["name"]))
+                out.append("<tr><td><code>%s</code></td><td>%s</td><td class='muted'>%s</td>"
                            "<td class='muted'>%s</td>"
                            "<td><form method='post' action='/%s/domain-del'>"
                            "<input type='hidden' name='domain' value='%s'>"
                            "<button class='danger'>حذف</button></form></td></tr>"
-                           % (html.escape(r["domain"]), html.escape(r["note"] or ""),
+                           % (html.escape(r["domain"]), where, html.escape(r["note"] or ""),
                               (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
             out.append("</table>")
-        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس "
-                   "«دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را "
-                   "برداشت. به‌علاوهٔ %d دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
+        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. دامنه‌های بدون گروه "
+                   "در سرویس «دامنه‌های دلخواه» جمع می‌شوند و هر گروه در قالب‌ها یک ردیف "
+                   "جداست، پس در هر قالب می‌شود تیکشان را برداشت. دامنه‌ای را که هست "
+                   "دوباره با گروه دیگری اضافه کنید تا به آن گروه برود. به‌علاوهٔ %d "
+                   "دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
         out.append(blocked_card(p))
         out.append(forwards_card(p))
         return "".join(out)
@@ -9030,7 +9221,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # with those already ticked would be the panel deciding something
             # it just told the operator was theirs to decide.
             skipped = 0
-            for svc in CATALOGUE:
+            for svc in catalogue_now():
                 for g in svc["groups"]:
                     if g.get("opt_in"):
                         skipped += 1
@@ -9054,12 +9245,14 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # out by subtraction: every domain in a routed group that did not
             # come back.
             keep = set(params.get("d") or [])
-            # The operator's own domains are not in this form - they have one
-            # of their own at the foot of the page - so they are kept as they are.
+            # The operator's own domains in no group are not in this form -
+            # they have one of their own at the foot of the page - so they are
+            # kept as they are. Their groups are rows here like any service.
             STORE.run("DELETE FROM template_services WHERE template_id = ?"
                       " AND service_key != 'custom'", (tid,))
             STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
-                      " AND domain NOT IN (SELECT domain FROM custom_domains)", (tid,))
+                      " AND domain NOT IN (SELECT domain FROM custom_domains"
+                      " WHERE group_id IS NULL)", (tid,))
             for svc in catalogue_now():
                 if svc["key"] == "custom":
                     continue
@@ -9117,11 +9310,85 @@ class Admin(http.server.BaseHTTPRequestHandler):
                         return self.redirect(
                             "domains?m=!%s از قبل در سرویس %s هست"
                             % (domain, svc["label"]))
-            if STORE.one("SELECT 1 FROM custom_domains WHERE domain = ?", (domain,)):
-                return self.redirect("domains?m=!%s از قبل اضافه شده" % domain)
-            STORE.run("INSERT INTO custom_domains (domain, note, added_at)"
-                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
+            gid = None
+            if (one("group") or "").strip():
+                grp = STORE.one("SELECT id, name FROM custom_groups WHERE id = ?",
+                                (int(one("group")) if one("group").isdigit() else 0,))
+                if grp is None:
+                    return self.redirect("domains?m=!گروه پیدا نشد")
+                gid = grp["id"]
+            had = STORE.one("SELECT group_id FROM custom_domains WHERE domain = ?", (domain,))
+            if had is not None:
+                # Added again with another group: moved there.
+                if had["group_id"] == gid:
+                    return self.redirect("domains?m=!%s از قبل اضافه شده" % domain)
+                STORE.run("UPDATE custom_domains SET group_id = ? WHERE domain = ?",
+                          (gid, domain))
+                return self.redirect("domains?m=%s به گروه دیگری رفت" % domain)
+            STORE.run("INSERT INTO custom_domains (domain, note, added_at, group_id)"
+                      " VALUES (?, ?, ?, ?)", (domain, one("note") or None, now(), gid))
             return self.redirect("domains?m=%s اضافه شد" % domain)
+
+        if rest in ("group-add", "group-save"):
+            # Multipart, for the icon, so the name comes out of the same body.
+            raw = getattr(self, "raw_body", None)
+            ctype = self.headers.get("Content-Type") if raw is not None else None
+
+            def field(name):
+                if raw is None:
+                    return one(name)
+                try:
+                    return parse_upload(raw, ctype, name).decode("utf-8", "replace").strip()
+                except ValueError:
+                    return ""
+
+            name = " ".join(field("name").split())
+            if not name:
+                return self.redirect("domains?m=!اسم گروه را بنویسید")
+            if len(name) > 40:
+                return self.redirect("domains?m=!اسم گروه حداکثر ۴۰ نویسه")
+            gid = int(field("id")) if field("id").isdigit() else None
+            if rest == "group-save" and not STORE.one(
+                    "SELECT 1 FROM custom_groups WHERE id = ?", (gid,)):
+                return self.redirect("domains?m=!گروه پیدا نشد")
+            if STORE.one("SELECT 1 FROM custom_groups WHERE name = ? COLLATE NOCASE"
+                         " AND id IS NOT ?", (name, gid)):
+                return self.redirect("domains?m=!گروهی با این اسم هست")
+            icon = None
+            blobs = parse_uploads(raw, ctype, "icon") if raw is not None else []
+            if blobs:
+                try:
+                    icon = check_group_icon(blobs[0])
+                except ValueError as e:
+                    return self.redirect("domains?m=!آیکون: %s" % e)
+            if rest == "group-add":
+                STORE.run("INSERT INTO custom_groups (name, icon, icon_type, created_at)"
+                          " VALUES (?, ?, ?, ?)",
+                          (name, icon[1] if icon else None, icon[0] if icon else None, now()))
+                return self.redirect("domains?m=گروه «%s» ساخته شد" % name)
+            STORE.run("UPDATE custom_groups SET name = ? WHERE id = ?", (name, gid))
+            if icon:
+                STORE.run("UPDATE custom_groups SET icon = ?, icon_type = ? WHERE id = ?",
+                          (icon[1], icon[0], gid))
+            elif field("drop") == "1":
+                STORE.run("UPDATE custom_groups SET icon = NULL, icon_type = NULL WHERE id = ?",
+                          (gid,))
+            return self.redirect("domains?m=ذخیره شد")
+
+        if rest == "group-del":
+            gid = int(one("id")) if (one("id") or "").isdigit() else 0
+            if not STORE.one("SELECT 1 FROM custom_groups WHERE id = ?", (gid,)):
+                return self.redirect("domains?m=!گروه پیدا نشد")
+            # The group and every domain in it, and what the templates kept
+            # of either.
+            n = STORE.one("SELECT COUNT(*) AS n FROM custom_domains WHERE group_id = ?",
+                          (gid,))["n"]
+            STORE.run("DELETE FROM template_domains_off WHERE domain IN"
+                      " (SELECT domain FROM custom_domains WHERE group_id = ?)", (gid,))
+            STORE.run("DELETE FROM custom_domains WHERE group_id = ?", (gid,))
+            STORE.run("DELETE FROM template_services WHERE service_key = ?", ("cg%d" % gid,))
+            STORE.run("DELETE FROM custom_groups WHERE id = ?", (gid,))
+            return self.redirect("domains?m=گروه و %d دامنه‌اش پاک شد" % n)
 
         if rest == "blocked-add":
             try:
@@ -9213,10 +9480,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # is, each un-ticked one switched off inside it - the same rows the
             # service list used to write. The default template routes them all.
             if not STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))["is_default"]:
-                custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains")]
+                custom = [r["domain"] for r in STORE.q(
+                    "SELECT domain FROM custom_domains WHERE group_id IS NULL")]
                 ticked = set(params.get("c") or []) & set(custom)
                 STORE.run("DELETE FROM template_domains_off WHERE template_id = ?"
-                          " AND domain IN (SELECT domain FROM custom_domains)", (tid,))
+                          " AND domain IN (SELECT domain FROM custom_domains"
+                          " WHERE group_id IS NULL)", (tid,))
                 if ticked:
                     STORE.run("INSERT OR IGNORE INTO template_services"
                               " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
@@ -9898,6 +10167,53 @@ def set_scope(table, domain, every, ids):
                   % RULE_TABLES[table], (domain, tid))
 
 
+def custom_groups_card(p, groups, rows):
+    """The domains page's groups: make one with a name and an icon, rename
+    it, change or drop its icon, delete it - with every domain in it."""
+    count = {}
+    for r in rows:
+        gid = r["group_id"] if "group_id" in r.keys() else None
+        count[gid] = count.get(gid, 0) + 1
+    out = ["<div class='card'><h2>گروه‌های من</h2>"
+           "<p class='muted'>دامنه‌های دلخواهتان را گروه کنید، مثلاً «سایت‌های دانشگاه». "
+           "هر گروه در صفحهٔ قالب‌ها یک ردیف جدا با آیکون خودش است و یک تیک دارد. "
+           "آیکون: SVG تا ۱۶ کیلوبایت یا PNG تا ۶۴ کیلوبایت و ۵۱۲×۵۱۲.</p>"
+           "<form method='post' action='/%s/group-add' enctype='multipart/form-data' "
+           "class='row' style='margin-bottom:14px'>"
+           "<input name='name' placeholder='اسم گروه' maxlength='40' required>"
+           "<input type='file' name='icon' accept='.svg,.png,image/svg+xml,image/png'>"
+           "<button>ساختن گروه</button></form>" % p]
+    if groups:
+        out.append("<table><tr><th>گروه</th><th>دامنه</th><th>اسم و آیکون تازه</th>"
+                   "<th></th></tr>")
+        for g in groups:
+            uri = group_icon_uri(g)
+            icon = ("<img class='logo' src='%s' alt=''>" % html.escape(uri) if uri
+                    else "<span class='logo letter'>%s</span>"
+                    % html.escape(g["name"].strip()[:1].upper() or "?"))
+            out.append(
+                "<tr><td>%s%s</td><td>%d</td>"
+                "<td><form method='post' action='/%s/group-save' "
+                "enctype='multipart/form-data' class='row'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<input name='name' value='%s' maxlength='40' required size='14'>"
+                "<input type='file' name='icon' accept='.svg,.png,image/svg+xml,image/png'>"
+                "%s<button class='ghost'>ذخیره</button></form></td>"
+                "<td><form method='post' action='/%s/group-del' "
+                "onsubmit=\"return confirm('این گروه و همهٔ %d دامنهٔ داخلش پاک شوند؟')\">"
+                "<input type='hidden' name='id' value='%d'>"
+                "<button class='danger'>حذف</button></form></td></tr>"
+                % (icon, html.escape(g["name"]), count.get(g["id"], 0), p, g["id"],
+                   html.escape(g["name"]),
+                   "<label style='display:inline'><input type='checkbox' name='drop' "
+                   "value='1'> بدون آیکون</label> " if uri else "",
+                   p, count.get(g["id"], 0), g["id"]))
+        out.append("</table>")
+        out.append("<p class='muted'>حذف گروه دامنه‌های داخلش را هم پاک می‌کند.</p>")
+    out.append("</div>")
+    return "".join(out)
+
+
 def template_rules_card(t, p):
     """A template's own page, at its foot: the operator's own domains it
     routes, and the blocks and forwards it has - everything the operator
@@ -9907,7 +10223,9 @@ def template_rules_card(t, p):
         forwards = STORE.q("SELECT domain, servers FROM dns_forwards ORDER BY domain")
     except sqlite3.OperationalError:
         blocked = forwards = []
-    custom = [r["domain"] for r in STORE.q("SELECT domain FROM custom_domains ORDER BY domain")]
+    # The ones in a group are that group's row, above.
+    custom = [r["domain"] for r in STORE.q(
+        "SELECT domain FROM custom_domains WHERE group_id IS NULL ORDER BY domain")]
     out = ["<div class='card'><h2>دامنه‌های دلخواه، مسدودها و DNS جداگانهٔ این قالب</h2>"]
     if not blocked and not forwards and not custom:
         out.append("<p class='muted'>هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از "
@@ -10285,6 +10603,7 @@ def main():
     global STORE, CFG, CATALOGUE
     CFG = load_config()
     CATALOGUE = load_catalogue()
+    ICONS.update(load_icons())
     GAMES[:] = load_games()
     SECTIONS[:] = load_sections()
     BLOCK_SECTIONS[:], BLOCKS[:] = load_blocks()

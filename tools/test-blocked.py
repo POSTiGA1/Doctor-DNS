@@ -231,7 +231,7 @@ psrc = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8")
 check("each profile carries its template's, and the default's are sent apart",
       "profiles[str(tid)].update(self.template_rules(tid))" in psrc
       and '"default_rules": self.store.template_rules(' in psrc)
-user = store.create_user(111, "ali", "علی")
+user = store.create_user(111, "ali")
 store.run("UPDATE users SET template_id = ? WHERE id = ?", (t_game, user["id"]))
 reason = panel.qlog_reasoner(store, store.one("SELECT * FROM users WHERE id = ?", (user["id"],)),
                              panel.CATALOGUE)

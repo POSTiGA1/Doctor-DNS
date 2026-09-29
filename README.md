@@ -110,7 +110,10 @@ days and sales, and their customers' usage:
 ![A seller's stats](docs/screenshots/admin-stats.png)
 
 A template decides which brands a customer's plan carries. Open a service and
-the domains inside it can be picked one at a time:
+the domains inside it can be picked one at a time. Each row carries its
+service's logo, and your own domains can be put in groups on the Domains page -
+a name and an icon of your own, SVG or PNG - each a row of its own in the
+templates with one tick; deleting a group deletes its domains too:
 
 ![The template editor](docs/screenshots/admin-template.png)
 
@@ -795,6 +798,9 @@ reach the service from.
   Vazirmatn project.
 - The operator shown for each customer in the admin panel comes from
   [RIPEstat](https://stat.ripe.net/), RIPE NCC's public routing data.
+- The services' logos on a template's page are from **[Simple Icons](https://simpleicons.org/)**
+  (CC0), and the plain icons for rows that are no brand from **[Lucide](https://lucide.dev/)**
+  (ISC). Each logo is its owner's trademark.
 - **[HyperDNS](https://github.com/IzumiRain/HyperDNS)**, by **Rain**
   ([@IzumiRain](https://github.com/IzumiRain)), a standalone smart DNS written in Go
   and released under the AGPL-3.0. Reading it showed us what doctor dns was
@@ -802,7 +808,8 @@ reach the service from.
   TLS, with the customer usage dashboard and the choice of public resolvers planned
   beside them (0.7.0); the sealed, encrypted receipts (0.7.2); the DNS report that
   says which rule each name met (0.7.3); an answer that says the resolver failed,
-  rather than silence (0.7.4); blocked domains and the single-server install (0.8.0).
+  rather than silence (0.7.4); blocked domains and the single-server install (0.8.0);
+  the services' logos, and groups of your own domains with an icon (0.9.10).
   doctor dns uses none of its code - each was written here, in Python, for this
   design - but the ideas were theirs first. Thank you, Rain.
 - The installer's check of whose name an exit's address is registered in asks the

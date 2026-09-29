@@ -55,7 +55,7 @@ check("each relay's DoH name is kept under its own address",
       'self.store.set_setting("doh_host:" + who, doh_host)' in src)
 check("  and the shared one is set once, not handed from relay to relay",
       'if doh_host and not self.store.setting("doh_host"):' in src)
-u = store.create_web_user("ali", "Ali", "ali-pass-1")
+u = store.create_web_user("ali", "ali-pass-1")
 store.set_setting("doh_host:198.51.100.1", "r1.example.com")
 store.set_setting("doh_host:198.51.100.3", "r3.example.com")
 store.set_setting("single:198.51.100.3", "1")

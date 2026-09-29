@@ -174,23 +174,21 @@ check("and no account is opened just for saying hello", not store.user_by_telegr
 store.set_setting("customer_panel_url", "https://user.example.com:8443/")
 message(CUSTOMER, botmod.B_ACCOUNT)
 check("the account is opened on first use", store.user_by_telegram(CUSTOMER) is not None)
-check("and the first thing asked is a name, with the Telegram one offered",
-      "اسمتان" in tg.last(CUSTOMER)["text"]
-      and tg.last(CUSTOMER)["reply_markup"]["keyboard"] == [["علی"]])
-message(CUSTOMER, "علی رضایی")
-check("then a username", "نام کاربری" in tg.last(CUSTOMER)["text"])
+check("and the first thing asked is a username - no name",
+      "نام کاربری" in tg.last(CUSTOMER)["text"] and "اسمتان" not in tg.last(CUSTOMER)["text"]
+      and bot.state[CUSTOMER][0] == "onb_user")
 message(CUSTOMER, "ع")
 check("a bad one is refused, and asked again", "⚠️" in tg.last(CUSTOMER)["text"]
       and bot.state[CUSTOMER][0] == "onb_user")
-store.create_web_user("taken_name", "x", "whatever-pass")
+store.create_web_user("taken_name", "whatever-pass")
 message(CUSTOMER, "Taken_Name")
 check("so is one somebody has", "گرفته شده" in tg.last(CUSTOMER)["text"])
 message(CUSTOMER, "Ali_Gamer")
 made = [p["text"] for m, p in tg.out if p.get("chat_id") == CUSTOMER and "حساب پنل شما" in
         (p.get("text") or "")]
 u = store.user_by_telegram(CUSTOMER)
-check("a web sign-in is made: the name, the username, a password",
-      u["username"] == "ali_gamer" and u["first_name"] == "علی رضایی" and u["password_hash"])
+check("a web sign-in is made: the username and a password, and no name",
+      u["username"] == "ali_gamer" and u["first_name"] is None and u["password_hash"])
 password = re.findall(r"رمز: ([a-z2-9-]{14})", made[0])[0] if made else ""
 check("and sent, with the address", made and "https://user.example.com:8443/" in made[0]
       and panel.check_password(u, password), str(made))
@@ -361,7 +359,7 @@ check("and sees the whole conversation", "درست شد ممنون" in tg.last(C
       and "پشتیبانی" in tg.last(CUSTOMER)["text"])
 
 print("linking a web account")
-web = store.create_web_user("sara", "سارا", "sara-password")
+web = store.create_web_user("sara", "sara-password")
 SARA = 222
 message(SARA, botmod.B_ACCOUNT, name="سارا")      # an empty bot account appears
 bot.state.pop(SARA, None)                          # and they do not finish the questions
@@ -384,8 +382,8 @@ message(GONE, botmod.B_ACCOUNT, name="رضا")
 again = store.user_by_telegram(GONE)
 check("the same Telegram id opens a new one, with no restart of the bot",
       again is not None, tg.last(GONE).get("text"))
-check("and is asked the questions again, not shown an error",
-      "اسمتان چیست" in tg.last(GONE)["text"], tg.last(GONE).get("text"))
+check("and is asked for a username again, not shown an error",
+      "نام کاربری" in tg.last(GONE)["text"], tg.last(GONE).get("text"))
 bot.state.pop(GONE, None)
 admin.STORE.delete_user(again["id"])
 store.set_setting("ref_on", "1")
@@ -456,7 +454,7 @@ tap_on(gated, NEW, "joined")
 check("after joining, the menu", ctg.last(NEW)["reply_markup"] == botmod.MENU)
 say_to(gated, NEW, botmod.B_ACCOUNT)
 check("and the bot serves them", store.user_by_telegram(NEW) is not None
-      and "اسمتان چیست" in ctg.last(NEW)["text"])
+      and "نام کاربری" in ctg.last(NEW)["text"])
 gated.state.pop(NEW, None)
 asked = sum(1 for m, _ in ctg.out if m == "getChatMember")
 say_to(gated, NEW, botmod.B_HELP)

@@ -47,9 +47,9 @@ tmp = tempfile.mkdtemp()
 db_path = os.path.join(tmp, "panel.db")
 store = panel.Store(db_path)
 
-store.create_web_user("owner", "صاحب حساب", "original-pass")
+store.create_web_user("owner", "original-pass")
 owner = store.user_by_username("owner")
-store.create_web_user("someone_else", "دیگری", "other-pass")
+store.create_web_user("someone_else", "other-pass")
 session = store.open_session(owner["id"])
 elsewhere = store.open_session(owner["id"])       # the same account, another device
 

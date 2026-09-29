@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.9"
+VERSION="0.9.10"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2110,6 +2110,9 @@ EOF
     # domain, for the admin to tick at the foot of a template's page.
     note_file /usr/local/share/smart-dns/blocks.json
     payload BLOCKS > /usr/local/share/smart-dns/blocks.json
+    # The logos drawn beside the services on a template's page.
+    note_file /usr/local/share/smart-dns/icons.json
+    payload ICONS > /usr/local/share/smart-dns/icons.json
     # Only the relays reach the sync API. The panel's service runs this before
     # every start, so a relay added to RELAY_IP by hand is let in the next time
     # the panel restarts - exactly when the panel itself would let it in.
