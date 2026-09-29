@@ -204,7 +204,9 @@ check("links are sent without a preview, so a preview cannot use one up",
 bot.state.pop(CUSTOMER, None)
 message(CUSTOMER, botmod.B_ACCOUNT)
 check("after that, the account as usual", "در انتظار خرید پلن" in tg.last(CUSTOMER)["text"])
-check("with the DNS address to use", "198.51.100.4" in tg.last(CUSTOMER)["text"])
+check("without the DNS address - that is the DNS button's",
+      "198.51.100.4" not in tg.last(CUSTOMER)["text"]
+      and "DNS" not in tg.last(CUSTOMER)["text"], tg.last(CUSTOMER).get("text"))
 
 print("the web panel, from the bot")
 message(CUSTOMER, botmod.B_WEB)

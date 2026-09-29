@@ -677,7 +677,7 @@ class Bot:
         self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 
     def help_text(self):
-        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
+        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
                 "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
                 "💰 کیف پول: موجودی و شارژ\n"
                 "🎁 دعوت از دوستان: لینک دعوت و پورسانت\n"
@@ -705,9 +705,6 @@ class Bot:
             if left:
                 lines.append("زمان باقی‌مانده: %s" % left)
         lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
-        if u["dns"]:
-            lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
-                         "بگذارید." % u["dns"][0])
         if (u.get("max_ips") or 1) > 1:
             lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
         if u["receipt_waiting"]:

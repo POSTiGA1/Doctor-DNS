@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.6"
+VERSION="0.9.7"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -31713,7 +31713,7 @@ exit 0
 #        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
 #
 #    def help_text(self):
-#        return ("📊 حساب من: وضعیت، حجم مانده و آدرس DNS\n"
+#        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
 #                "🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید\n"
 #                "💰 کیف پول: موجودی و شارژ\n"
 #                "🎁 دعوت از دوستان: لینک دعوت و پورسانت\n"
@@ -31741,9 +31741,6 @@ exit 0
 #            if left:
 #                lines.append("زمان باقی‌مانده: %s" % left)
 #        lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
-#        if u["dns"]:
-#            lines.append("\nDNS: %s\nاین آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، "
-#                         "بگذارید." % u["dns"][0])
 #        if (u.get("max_ips") or 1) > 1:
 #            lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
 #        if u["receipt_waiting"]:
@@ -37167,7 +37164,6 @@ exit 0
 #"اگر کانال بنویسید، هر مشتری اول باید عضو آن شود تا ربات برایش کار کند. ربات را در کانال": "With a channel here, every customer has to join it before the bot works for them. Make the bot an",
 #"ایج آو امپایرز": "Age of Empires",
 #"این Idempotency-Key قبلاً برای درخواست دیگری به کار رفته": "This Idempotency-Key was already used for another request",
-#"این آدرس را در کنسول یا مودم، هم برای DNS اول و هم دوم، بگذارید.": "Put this address in your console or router as both DNS 1 and DNS 2.",
 #"این آدرس معتبر نیست": "This address is not valid",
 #"این آی‌پی به حساب دیگری ثبت شده است": "This IP is registered to another account",
 #"این آی‌پی خود همین سرور است": "This IP is this server itself",
@@ -38936,7 +38932,7 @@ exit 0
 #"💰 کیف پول: موجودی و شارژ": "💰 Wallet: balance and top-up",
 #"💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):": "💻 iPhone, Windows, Chrome and Firefox — your personal address (DoH):",
 #"📊 حساب من": "📊 My account",
-#"📊 حساب من: وضعیت، حجم مانده و آدرس DNS": "📊 My account: status, quota left and DNS address",
+#"📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده": "📊 My account: status, what is left and the days left",
 #"📊 نمودار مصرف و سرعت": "📊 Usage and speed charts",
 #"📡 DNSها": "📡 DNS",
 #"📡 DNSها: آدرس DNS معمولی، DoH و DoT": "📡 DNS: the plain DNS address, DoH and DoT",
