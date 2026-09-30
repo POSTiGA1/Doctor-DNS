@@ -1468,11 +1468,19 @@ RESOLVERS = [
      "زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS "
      "رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند "
      "و جواب نمی‌دهند."),
-    ("OpenDNS", "208.67.222.222", "208.67.220.220", ""),
+    ("OpenDNS", "208.67.222.222", "208.67.220.220",
+     "مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent "
+     "مثل PUBG Mobile با آن باز نمی‌شوند."),
     ("AdGuard", "94.140.14.14", "94.140.15.15",
-     "تبلیغ و ردیاب را می‌بندد؛ بعضی بازی‌ها و فروشگاه‌ها که به همان دامنه‌ها "
-     "نیاز دارند ممکن است درست کار نکنند."),
+     "مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent "
+     "مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی "
+     "بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند."),
 ]
+# The ones that tell a service the asker's subnet - the relay's, which is
+# Iranian - so a service that turns Iran away in its DNS answers 0.0.0.1:
+# PUBG Mobile's downloads, anti-cheat and sign-in, tested from a relay.
+ECS_RESOLVERS = {"8.8.8.8", "8.8.4.4", "208.67.222.222", "208.67.220.220",
+                 "94.140.14.14", "94.140.15.15"}
 DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
 # What this machine's own nginx is, and where the pick is kept for the
 # installer, so an upgrade does not put the defaults back.
@@ -3236,7 +3244,11 @@ def upstream_card():
                 " value='%s' placeholder='یا آی‌پی دلخواه' dir='ltr' size='15'>"
                 % (name, "".join(opts), name, html.escape(custom)))
 
+    bad = [ip for ip in picks if ip in ECS_RESOLVERS]
     out = ["<div class='card'><h2>DNS بالادستی</h2>",
+           "<div class='msg err'>⚠️ %s زیرشبکهٔ ایرانی رله را به سرویس‌ها می‌گوید: PUBG "
+           "Mobile و بقیهٔ بازی‌های Tencent برای مشتری‌ها باز نمی‌شوند. Cloudflare یا "
+           "Quad9 را بگذارید.</div>" % html.escape("، ".join(bad)) if bad else "",
            "<p class='muted'>هر اسمی که رله‌ها مسیریابی نمی‌کنند از این‌ها پرسیده "
            "می‌شود، و nginx همین سرور هم برای پیدا کردن آدرس سرویس‌ها از آن‌ها "
            "می‌پرسد. پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از "
@@ -3707,6 +3719,8 @@ details.svc>summary label{flex:1}
  font-weight:600;vertical-align:-3px;line-height:1}
 td .logo{margin-inline-end:5px}
 .logo.plain{color:var(--muted)}
+.purge{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 14px}
+.purge form{margin:0}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
  vertical-align:1px}
 .dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
@@ -5404,6 +5418,7 @@ PAGE_SECTION = {"": ANYONE, "index": ANYONE, "me": ANYONE, "users": "users",
 ACTION_SECTION = {
     "user-save": "users", "user-status": "users", "user-template": "users",
     "user-plan": "users", "user-reset": "users", "user-delete": "users",
+    "users-purge": "users",
     "user-relays": "users", "user-exit": "users", "user-devices": "users",
     "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
     "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
@@ -5481,6 +5496,54 @@ def seller():
 def seller_id():
     s = seller()
     return s["id"] if s else None
+
+
+# The users page's buttons that delete many customers at once: which
+# statuses each takes, and what it says. Never someone with money in their
+# wallet or a receipt waiting - that is a customer, not a leftover.
+PURGE_KINDS = (
+    ("ended", ("expired", "over_quota"), "پاک کردن تمام‌شده‌ها",
+     "روز یا حجمشان تمام شده"),
+    ("unbought", ("pending",), "پاک کردن در انتظار پلن‌ها",
+     "ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند"),
+    ("inactive", None, "پاک کردن غیرفعال‌ها",
+     "هر کس که فعال نیست: تمام‌شده‌ها، در انتظار پلن‌ها و مسدودشده‌ها"),
+)
+
+
+def purge_ids(statuses):
+    """(the customers such a button would delete, the ones it keeps for
+    their wallet or a waiting receipt) - a seller's own only."""
+    extra, args = mine()
+    where = ("u.status IN (%s)" % ",".join("?" * len(statuses)) if statuses
+             else "u.status != 'active'")
+    rows = STORE.q("SELECT u.id, u.wallet, EXISTS (SELECT 1 FROM transactions t"
+                   " WHERE t.user_id = u.id AND t.status = 'pending') AS waiting"
+                   " FROM users u WHERE " + where + extra,
+                   tuple(statuses or ()) + tuple(args))
+    gone = [r["id"] for r in rows if (r["wallet"] or 0) <= 0 and not r["waiting"]]
+    return gone, len(rows) - len(gone)
+
+
+def purge_card(p):
+    """The three buttons, each with how many it would delete."""
+    out = ["<div class='purge'><span class='muted'>پاک کردن دسته‌جمعی:</span>"]
+    kept = 0
+    for key, statuses, label, what in PURGE_KINDS:
+        gone, keep = purge_ids(statuses)
+        kept = max(kept, keep)
+        out.append(
+            "<form method='post' action='/%s/users-purge' onsubmit='return confirm(%s)'>"
+            "<input type='hidden' name='kind' value='%s'>"
+            "<button class='danger' title='%s'%s>%s (%d)</button></form>"
+            % (p, html.escape(json.dumps(
+                "%d کاربر برای همیشه پاک شوند؟ آی‌پی‌ها، رسیدها و تیکت‌هایشان هم می‌رود و "
+                "برنمی‌گردد." % len(gone), ensure_ascii=False), quote=True),
+               key, html.escape(what), "" if gone else " disabled", label, len(gone)))
+    out.append("<span class='muted'>کسی که در کیف پولش پول دارد یا رسیدش منتظر تأیید است "
+               "پاک نمی‌شود%s.</span></div>"
+               % (" (%d نفر)" % kept if kept else ""))
+    return "".join(out)
 
 
 def mine(alias="u"):
@@ -7292,6 +7355,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
         out = ["<div class='card wide'><h2>کاربران (%d)</h2>" % len(rows)]
         if not rows:
             return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
+        out.append(purge_card(CFG["ADMIN_PATH"]))
         # Where a customer goes out is the owner's to choose, or a
         # reseller's when the owner let them.
         route = s is None or bool(s["can_route"])
@@ -9282,6 +9346,22 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       " status = CASE WHEN status = 'over_quota' THEN 'active'"
                       " ELSE status END WHERE id = ?", (uid,))
             return self.redirect("users?m=مصرف صفر شد")
+
+        if rest == "users-purge":
+            kind = {k: st for k, st, _, _ in PURGE_KINDS}
+            if one("kind") not in kind:
+                return self.redirect("users?m=!کدام کاربرها؟")
+            # Worked out again now, not taken from the page: someone may have
+            # paid since it was drawn.
+            gone, kept = purge_ids(kind[one("kind")])
+            n = 0
+            for uid in gone:
+                if STORE.delete_user(uid) is not None:
+                    n += 1
+            log(INFO, "deleted %d user(s) at once (%s); %d kept for a wallet or a receipt"
+                % (n, one("kind"), kept))
+            return self.redirect("users?m=%d کاربر پاک شد%s" % (
+                n, "؛ %d نفر به‌خاطر کیف پول یا رسید منتظر ماندند" % kept if kept else ""))
 
         if rest == "user-delete":
             uid = int(one("id") or 0)

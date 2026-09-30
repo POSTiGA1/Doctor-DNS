@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.12"
+VERSION="0.9.13"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -20077,11 +20077,19 @@ exit 0
 #     "زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS "
 #     "رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند "
 #     "و جواب نمی‌دهند."),
-#    ("OpenDNS", "208.67.222.222", "208.67.220.220", ""),
+#    ("OpenDNS", "208.67.222.222", "208.67.220.220",
+#     "مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent "
+#     "مثل PUBG Mobile با آن باز نمی‌شوند."),
 #    ("AdGuard", "94.140.14.14", "94.140.15.15",
-#     "تبلیغ و ردیاب را می‌بندد؛ بعضی بازی‌ها و فروشگاه‌ها که به همان دامنه‌ها "
-#     "نیاز دارند ممکن است درست کار نکنند."),
+#     "مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent "
+#     "مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی "
+#     "بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند."),
 #]
+## The ones that tell a service the asker's subnet - the relay's, which is
+## Iranian - so a service that turns Iran away in its DNS answers 0.0.0.1:
+## PUBG Mobile's downloads, anti-cheat and sign-in, tested from a relay.
+#ECS_RESOLVERS = {"8.8.8.8", "8.8.4.4", "208.67.222.222", "208.67.220.220",
+#                 "94.140.14.14", "94.140.15.15"}
 #DEFAULT_UPSTREAM = "1.1.1.1 9.9.9.9"
 ## What this machine's own nginx is, and where the pick is kept for the
 ## installer, so an upgrade does not put the defaults back.
@@ -21845,7 +21853,11 @@ exit 0
 #                " value='%s' placeholder='یا آی‌پی دلخواه' dir='ltr' size='15'>"
 #                % (name, "".join(opts), name, html.escape(custom)))
 #
+#    bad = [ip for ip in picks if ip in ECS_RESOLVERS]
 #    out = ["<div class='card'><h2>DNS بالادستی</h2>",
+#           "<div class='msg err'>⚠️ %s زیرشبکهٔ ایرانی رله را به سرویس‌ها می‌گوید: PUBG "
+#           "Mobile و بقیهٔ بازی‌های Tencent برای مشتری‌ها باز نمی‌شوند. Cloudflare یا "
+#           "Quad9 را بگذارید.</div>" % html.escape("، ".join(bad)) if bad else "",
 #           "<p class='muted'>هر اسمی که رله‌ها مسیریابی نمی‌کنند از این‌ها پرسیده "
 #           "می‌شود، و nginx همین سرور هم برای پیدا کردن آدرس سرویس‌ها از آن‌ها "
 #           "می‌پرسد. پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از "
@@ -22316,6 +22328,8 @@ exit 0
 # font-weight:600;vertical-align:-3px;line-height:1}
 #td .logo{margin-inline-end:5px}
 #.logo.plain{color:var(--muted)}
+#.purge{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 14px}
+#.purge form{margin:0}
 #.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
 # vertical-align:1px}
 #.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
@@ -24013,6 +24027,7 @@ exit 0
 #ACTION_SECTION = {
 #    "user-save": "users", "user-status": "users", "user-template": "users",
 #    "user-plan": "users", "user-reset": "users", "user-delete": "users",
+#    "users-purge": "users",
 #    "user-relays": "users", "user-exit": "users", "user-devices": "users",
 #    "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
 #    "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
@@ -24090,6 +24105,54 @@ exit 0
 #def seller_id():
 #    s = seller()
 #    return s["id"] if s else None
+#
+#
+## The users page's buttons that delete many customers at once: which
+## statuses each takes, and what it says. Never someone with money in their
+## wallet or a receipt waiting - that is a customer, not a leftover.
+#PURGE_KINDS = (
+#    ("ended", ("expired", "over_quota"), "پاک کردن تمام‌شده‌ها",
+#     "روز یا حجمشان تمام شده"),
+#    ("unbought", ("pending",), "پاک کردن در انتظار پلن‌ها",
+#     "ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند"),
+#    ("inactive", None, "پاک کردن غیرفعال‌ها",
+#     "هر کس که فعال نیست: تمام‌شده‌ها، در انتظار پلن‌ها و مسدودشده‌ها"),
+#)
+#
+#
+#def purge_ids(statuses):
+#    """(the customers such a button would delete, the ones it keeps for
+#    their wallet or a waiting receipt) - a seller's own only."""
+#    extra, args = mine()
+#    where = ("u.status IN (%s)" % ",".join("?" * len(statuses)) if statuses
+#             else "u.status != 'active'")
+#    rows = STORE.q("SELECT u.id, u.wallet, EXISTS (SELECT 1 FROM transactions t"
+#                   " WHERE t.user_id = u.id AND t.status = 'pending') AS waiting"
+#                   " FROM users u WHERE " + where + extra,
+#                   tuple(statuses or ()) + tuple(args))
+#    gone = [r["id"] for r in rows if (r["wallet"] or 0) <= 0 and not r["waiting"]]
+#    return gone, len(rows) - len(gone)
+#
+#
+#def purge_card(p):
+#    """The three buttons, each with how many it would delete."""
+#    out = ["<div class='purge'><span class='muted'>پاک کردن دسته‌جمعی:</span>"]
+#    kept = 0
+#    for key, statuses, label, what in PURGE_KINDS:
+#        gone, keep = purge_ids(statuses)
+#        kept = max(kept, keep)
+#        out.append(
+#            "<form method='post' action='/%s/users-purge' onsubmit='return confirm(%s)'>"
+#            "<input type='hidden' name='kind' value='%s'>"
+#            "<button class='danger' title='%s'%s>%s (%d)</button></form>"
+#            % (p, html.escape(json.dumps(
+#                "%d کاربر برای همیشه پاک شوند؟ آی‌پی‌ها، رسیدها و تیکت‌هایشان هم می‌رود و "
+#                "برنمی‌گردد." % len(gone), ensure_ascii=False), quote=True),
+#               key, html.escape(what), "" if gone else " disabled", label, len(gone)))
+#    out.append("<span class='muted'>کسی که در کیف پولش پول دارد یا رسیدش منتظر تأیید است "
+#               "پاک نمی‌شود%s.</span></div>"
+#               % (" (%d نفر)" % kept if kept else ""))
+#    return "".join(out)
 #
 #
 #def mine(alias="u"):
@@ -25901,6 +25964,7 @@ exit 0
 #        out = ["<div class='card wide'><h2>کاربران (%d)</h2>" % len(rows)]
 #        if not rows:
 #            return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
+#        out.append(purge_card(CFG["ADMIN_PATH"]))
 #        # Where a customer goes out is the owner's to choose, or a
 #        # reseller's when the owner let them.
 #        route = s is None or bool(s["can_route"])
@@ -27891,6 +27955,22 @@ exit 0
 #                      " status = CASE WHEN status = 'over_quota' THEN 'active'"
 #                      " ELSE status END WHERE id = ?", (uid,))
 #            return self.redirect("users?m=مصرف صفر شد")
+#
+#        if rest == "users-purge":
+#            kind = {k: st for k, st, _, _ in PURGE_KINDS}
+#            if one("kind") not in kind:
+#                return self.redirect("users?m=!کدام کاربرها؟")
+#            # Worked out again now, not taken from the page: someone may have
+#            # paid since it was drawn.
+#            gone, kept = purge_ids(kind[one("kind")])
+#            n = 0
+#            for uid in gone:
+#                if STORE.delete_user(uid) is not None:
+#                    n += 1
+#            log(INFO, "deleted %d user(s) at once (%s); %d kept for a wallet or a receipt"
+#                % (n, one("kind"), kept))
+#            return self.redirect("users?m=%d کاربر پاک شد%s" % (
+#                n, "؛ %d نفر به‌خاطر کیف پول یا رسید منتظر ماندند" % kept if kept else ""))
 #
 #        if rest == "user-delete":
 #            uid = int(one("id") or 0)
@@ -38458,7 +38538,6 @@ exit 0
 #"تاریخ": "Date",
 #"تازه کردن": "Refresh",
 #"تاور آو فانتزی": "Tower of Fantasy",
-#"تبلیغ و ردیاب را می‌بندد؛ بعضی بازی‌ها و فروشگاه‌ها که به همان دامنه‌ها نیاز دارند ممکن است درست کار نکنند.": "Blocks ads and trackers; some games and stores that need those same domains may not work properly.",
 #"تبلیغات آمازون": "Amazon ads",
 #"تبلیغات ایرانی — تپسل، عدیوری، یکتانت، صباویژن، مدیا‌اد": "Iranian ads — Tapsell, Adivery, Yektanet, Sabavision, MediaAd",
 #"تبلیغات بزرگسالان": "Adult ads",
@@ -38602,6 +38681,7 @@ exit 0
 #"ثبت‌نام": "Sign up",
 #"ثبت‌نام امروز:": "Sign-ups today:",
 #"ثبت‌نام تازه با وضعیت «در انتظار پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی نمی‌گیرد؛ اولین ذخیرهٔ همین سطر فعالش می‌کند. صفر در سهمیه یا سرعت یعنی بی‌حد. «زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود.": "A new sign-up arrives as “Waiting for a plan” and gets no traffic until you save a plan for it; the first save of its row activates it. Zero in quota or speed means no limit. An empty “Time” means no change; a number you write moves the end date that many days on from today, and the grey number inside it is the days left. Speed only limits downloads and is applied on the relays within 30 seconds.",
+#"ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند": "signed up but never took a plan",
 #"ثبت‌نام کنید": "sign up",
 #"ثرون اند لیبرتی": "Throne and Liberty",
 #"جدا کردن تلگرام": "Unlink Telegram",
@@ -38992,6 +39072,7 @@ exit 0
 #"روز و ساعت به وقت تهران. روی نام هر مشتری بزنید تا نمودار خودش را ببینید.": "Day and hour in Tehran time. Click a customer’s name to see their own chart.",
 #"روز و سقف استفاده را با عدد بنویسید": "Write the days and the use limit as numbers",
 #"روز پیش": "days ago",
+#"روز یا حجمشان تمام شده": "their days or allowance ran out",
 #"روز یک بار": "days",
 #"روز یک بار صفر می‌شود": "days",
 #"روز یک بار، برای ادمین‌های ربات بفرست": "days, send it to the bot’s admins",
@@ -39045,6 +39126,7 @@ exit 0
 #"زیر ده‌ها بازی است؛ روی ۴۴۳ کار می‌کند و از سرور رد می‌شود": "underlies dozens of games; it works on 443 and goes through the server",
 #"زیردامنه‌ها خودکار شامل می‌شوند. دامنه‌های بدون گروه در سرویس «دامنه‌های دلخواه» جمع می‌شوند و هر گروه در قالب‌ها یک ردیف جداست، پس در هر قالب می‌شود تیکشان را برداشت. دامنه‌ای را که هست دوباره با گروه دیگری اضافه کنید تا به آن گروه برود. به‌علاوهٔ": "Subdomains are included automatically. Domains in no group are gathered in the “your own domains” service, and each group is a row of its own in the templates, so in any template they can be unticked. Add a domain that is already here again with another group to move it there. On top of the",
 #"زیرساخت و شبکه": "Infrastructure and network",
+#"زیرشبکهٔ ایرانی رله را به سرویس‌ها می‌گوید: PUBG Mobile و بقیهٔ بازی‌های Tencent برای مشتری‌ها باز نمی‌شوند. Cloudflare یا Quad9 را بگذارید.": "tells services the relay's Iranian subnet: PUBG Mobile and the other Tencent games do not open for customers. Pick Cloudflare or Quad9.",
 #"زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید. سرویس‌هایی که ایران را در DNS رد می‌کنند — بازی‌های Tencent مثل PUBG Mobile — آی‌پی ایرانی رله را می‌بینند و جواب نمی‌دهند.": "passes the asker’s subnet (ECS) on to services. Services that refuse Iran in DNS — Tencent games like PUBG Mobile — see the relay’s Iranian IP and do not answer.",
 #"ساخت حساب": "Create account",
 #"ساختن": "Create",
@@ -39334,6 +39416,8 @@ exit 0
 #"متن پیام را بنویسید (یا «انصراف»).": "Write your message (or “Cancel”).",
 #"متن پیام را بنویسید یا عکس یا فیلم بگذارید": "Write a message, or add a photo or video",
 #"متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):": "Write your message (you can also send a photo with a caption):",
+#"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it.",
+#"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it. It also blocks ads and trackers, and some games and stores need those same domains.",
 #"مثلاً 203.0.113.7": "e.g. 203.0.113.7",
 #"مثلاً مخصوص ایرانسل": "e.g. for Irancell",
 #"مثلاً گیمینگ ماهانه": "e.g. Gaming monthly",
@@ -39475,10 +39559,12 @@ exit 0
 #"نصب‌کننده‌ای روی این سرور نگه داشته نشده": "No installer has been kept on this server",
 #"نفر": "people",
 #"نفر با لینک شما آمده‌اند و": "people have come with your link and",
+#"نفر به‌خاطر کیف پول یا رسید منتظر ماندند": "kept for a wallet or a waiting receipt",
 #"نفر تا ۳ روز دیگر تمام می‌شود": "people end within 3 days",
 #"نفر در صف فرستادن است": "people queued for sending",
 #"نفر دیگر تلگرام ندارند)": "more have no Telegram)",
 #"نفر دیگر.": "more.",
+#"نفر)": "people)",
 #"نمایش لاگ کامل": "Show the full log",
 #"نمودار مصرف": "Usage chart",
 #"نود": "Node",
@@ -39517,6 +39603,7 @@ exit 0
 #"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",
 #"هر کس با این لینک ثبت‌نام کند، مشتری شما می‌شود و پلن‌ها و اطلاعات پرداخت شما را می‌بیند.": "Whoever signs up with this link becomes your customer and sees your plans and payment details.",
 #"هر کس با لینک شما حساب بسازد و پلن بخرد،": "When someone makes an account with your link and buys a plan,",
+#"هر کس که فعال نیست: تمام‌شده‌ها، در انتظار پلن‌ها و مسدودشده‌ها": "everybody who is not active: the ended, those waiting for a plan and the blocked",
 #"هرگز": "Never",
 #"هست": "exists",
 #"هشدارها": "Alerts",
@@ -39648,6 +39735,10 @@ exit 0
 #"پابجی موبایل": "PUBG Mobile",
 #"پال‌ورلد": "Palworld",
 #"پاپ‌آپ‌ها (سایت‌های دانلود)": "Pop-ups (download sites)",
+#"پاک کردن تمام‌شده‌ها": "Delete the ended",
+#"پاک کردن در انتظار پلن‌ها": "Delete those waiting for a plan",
+#"پاک کردن دسته‌جمعی:": "Delete many at once:",
+#"پاک کردن غیرفعال‌ها": "Delete the inactive",
 #"پایان دوره": "Period ends",
 #"پایان دوره:": "Period ends:",
 #"پث آو اگزایل": "Path of Exile",
@@ -39750,10 +39841,12 @@ exit 0
 #"کار آپدیت متوقف شد": "The upgrade job stopped",
 #"کار آپدیت متوقف شد:": "The upgrade job stopped:",
 #"کاربر": "User",
+#"کاربر برای همیشه پاک شوند؟ آی‌پی‌ها، رسیدها و تیکت‌هایشان هم می‌رود و برنمی‌گردد.": "customers deleted for good? Their IPs, receipts and tickets go too, and cannot be brought back.",
 #"کاربر برگشت": "User restored",
 #"کاربر حذف شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود": "User deleted; cut off within 30 seconds",
 #"کاربر مسدود شد": "User blocked",
 #"کاربر مسدود شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود": "User blocked; cut off within 30 seconds",
+#"کاربر پاک شد": "customers deleted",
 #"کاربر یا پلن پیدا نشد": "User or plan not found",
 #"کاربران": "Users",
 #"کاربران (": "Users (",
@@ -39782,7 +39875,9 @@ exit 0
 #"کد ۳ تا ۳۲ حرف انگلیسی یا عدد است (و - _)": "A code is 3 to 32 English letters or digits (and - _)",
 #"کدام رله‌ها به هر مشتری به‌عنوان DNS اول و دوم نشان داده شوند، از ستون «DNS» صفحهٔ کاربران.": "Which relays each customer is shown as DNS 1 and DNS 2 is set in the “DNS” column of the users page.",
 #"کدام سر وصل شود:": "Which end connects:",
+#"کدام کاربرها؟": "Which customers?",
 #"کدی با این نام هست": "A code with this name exists",
+#"کسی که در کیف پولش پول دارد یا رسیدش منتظر تأیید است پاک نمی‌شود": "Nobody with money in their wallet or a receipt waiting for approval is deleted",
 #"کلاینت رایوت": "Riot Client",
 #"کلش آو کلنز": "Clash of Clans",
 #"کلش رویال": "Clash Royale",

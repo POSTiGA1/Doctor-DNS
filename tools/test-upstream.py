@@ -309,6 +309,14 @@ check("the settings page shows the pick selected, every provider, and the warnin
       and "AdGuard" in card and "ECS" in card and "149.112.112.112" in card)
 check("and each relay: what it uses, and why not the pick",
       "اعمال شد" in card and "جواب نداد" in card and "12ms" in card)
+check("Google, OpenDNS and AdGuard are each said to break PUBG Mobile",
+      all("PUBG" in w for n, a, b, w in admin.RESOLVERS if n in ("Google", "OpenDNS", "AdGuard"))
+      and admin.ECS_RESOLVERS == {ip for n, a, b, w in admin.RESOLVERS
+                                  if n in ("Google", "OpenDNS", "AdGuard") for ip in (a, b)})
+check("  and a pick of one is a red warning at the top of the card",
+      "<div class='msg err'>⚠️ 8.8.8.8 " in card)
+admin.STORE.run("UPDATE settings SET value = '1.1.1.1 9.9.9.9' WHERE key = 'dns_upstream'")
+check("  none for Cloudflare and Quad9", "msg err" not in admin.upstream_card())
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()
