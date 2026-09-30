@@ -179,6 +179,7 @@ check("a ticket reply, with the words", data.get("body") == "DNS رو چک کن�
       and "وصل نمی‌شه" in data.get("text", ""), str(data))
 act("user-plan", id="1", plan_id="1")
 check("a plan given by hand", len(events("plan.activated")) == 1)
+store.run("DELETE FROM reserved_plans")         # given over a running plan: reserved
 
 print("things a sync finds - each said once")
 store.run("DELETE FROM webhook_outbox")

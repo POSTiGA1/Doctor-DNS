@@ -380,10 +380,11 @@ admin.STORE.run("UPDATE users SET exit = NULL, relay_exits = ? WHERE id = ?",
 admin.STORE.apply_plan(nima, every["id"])
 check("a plan sold on all of them leaves the customer's exit as it was",
       urow()["exit"] is None and urow()["relay_exits"] is not None)
+admin.STORE.run("UPDATE users SET expires_at = NULL WHERE id = ?", (nima,))
 admin.STORE.apply_plan(nima, fr["id"])
 check("  one sold on an exit puts them on it, on every relay",
       urow()["exit"] == "93.184.216.20" and urow()["relay_exits"] is None)
-admin.STORE.run("UPDATE users SET exit = NULL WHERE id = ?", (nima,))
+admin.STORE.run("UPDATE users SET exit = NULL, expires_at = NULL WHERE id = ?", (nima,))
 panel.apply_plan(store, nima, fr["id"])
 check("  the same when the panel gives it - a receipt, a trial, the bot",
       store.one("SELECT exit FROM users WHERE id = ?", (nima,))["exit"] == "93.184.216.20")

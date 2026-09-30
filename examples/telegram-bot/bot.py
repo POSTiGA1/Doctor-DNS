@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -409,6 +409,48 @@ class Telegram:
             raise ValueError("فایل بزرگ‌تر از ۴ مگابایت است")
         with urllib.request.urlopen(self.files + info["file_path"], timeout=60) as r:
             return r.read(MAX_FILE + 1)
+
+
+# Dates as the admin picked them shown - the panel says which with every
+# account: Shamsi or Gregorian, in Tehran time.
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
+
+
+def to_jalali(gy, gm, gd):
+    """A Gregorian day as a Shamsi one: (year, month, day)."""
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+            + gd + g_d_m[gm - 1])
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+
+
+def show_date(value, cal="gregorian"):
+    """The day of a date or a moment, in `cal`: 1405/07/07 or 2026-09-29.
+    Anything else given back as it was."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        if len(text) == 10:
+            day = date.fromisoformat(text)
+        else:
+            t = datetime.fromisoformat(text)
+            day = (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(TEHRAN).date()
+    except ValueError:
+        return text
+    if cal == "jalali":
+        return "%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day)
+    return day.strftime("%Y-%m-%d")
 
 
 def ios_profile(url, address=""):
@@ -878,13 +920,16 @@ class Bot:
                                               else size_fa(u["remaining_bytes"])))
             lines.append("مصرف: %s" % size_fa(u["used_bytes"]))
         if u["expires_at"]:
-            lines.append("پایان دوره: %s" % u["expires_at"][:10])
+            lines.append("پایان دوره: %s" % show_date(u["expires_at"], u.get("calendar")))
             left = time_left_fa(u["expires_at"])
             if left:
                 lines.append("زمان باقی‌مانده: %s" % left)
         lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
         if (u.get("max_ips") or 1) > 1:
             lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
+        if u.get("reserved"):
+            lines.append("⏳ پلن رزرو: %s (بعد از تمام شدن پلن فعلی خودکار فعال می‌شود)"
+                         % "، ".join(u["reserved"]))
         if u["receipt_waiting"]:
             lines.append("\n⏳ یک رسید در انتظار بررسی دارید.")
         offer = u.get("device_offer")
@@ -969,11 +1014,10 @@ class Bot:
             return self.say(chat, "این پلن دیگر فروخته نمی‌شود.", MENU)
         u = self.account(sender)
         warn = ""
-        if u["plan"] and u["plan"]["id"] != plan_id and u["status"] in ("active", "over_quota"):
-            warn = ("\n\n⚠️ پلن فعلی شما «%s» است. پلن تازه از لحظهٔ تأیید از نو شروع می‌شود "
-                    "و باقی‌ماندهٔ پلن فعلی از بین می‌رود." % u["plan"]["name"])
-        elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
-            warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
+        if u["status"] == "active" and u.get("expires_at"):
+            warn = ("\n\n⏳ پلن فعلی شما%s هنوز تمام نشده؛ این پلن رزرو می‌شود و بعد از تمام "
+                    "شدن آن خودکار فعال می‌شود." % (" «%s»" % u["plan"]["name"]
+                                                    if u["plan"] else ""))
         self.state[chat] = ("receipt", (plan_id, code) if code else plan_id)
         price = ("%s تومان (به‌جای %s، با کد %s)" % (format(plan["price"], ","),
                                                   format(plan["list_price"], ","), code)
@@ -998,14 +1042,14 @@ class Bot:
             self.say(chat, "یا:", {"inline_keyboard": rows})
 
     def show_wallet(self, chat, sender):
-        self.account(sender)
+        cal = self.account(sender).get("calendar")
         w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
         lines = ["💰 کیف پول", "موجودی: %s تومان" % money(w["balance"])]
         if w.get("moves"):
             lines.append("")
             for m in w["moves"][:8]:
                 lines.append("%s %s%s تومان — %s%s" % (
-                    (m.get("at") or "")[:10], "+" if m["amount"] > 0 else "−",
+                    show_date(m.get("at"), cal), "+" if m["amount"] > 0 else "−",
                     money(abs(m["amount"])), m.get("what") or "",
                     " (%s)" % m["note"] if m.get("note") else ""))
         rows = []

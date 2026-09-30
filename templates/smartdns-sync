@@ -47,7 +47,7 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 CONFIG = "/etc/smart-dns/sync.env"
 ACL = "/usr/local/bin/smartdns-acl"
@@ -2960,6 +2960,7 @@ def sync_once():
     if target != PORTAL["url"]:
         log(INFO, "addresses not let in are sent to %s" % (target or "nowhere"))
         PORTAL["url"] = target
+    CALENDAR["v"] = "jalali" if answer.get("calendar") == "jalali" else "gregorian"
     # A panel from before says nothing, and meant open.
     opened = answer.get("portal_open") is not False
     if opened != PORTAL["open"]:
@@ -3787,6 +3788,11 @@ def account_notice(info):
                 "سرویس تا شارژ مجدد قطع است.</div>")
     if status != "active":
         return "<div class='msg err'>حساب شما غیرفعال است.</div>"
+    # The plan they bought ahead has just taken over: said for a few days.
+    done = info.get("reserve_done") or {}
+    if done.get("plan"):
+        return ("<div class='msg good'>✅ <b>پلن رزرو «%s» فعال شد.</b> پلن قبلی‌تان تمام "
+                "شده بود و این یکی خودکار جایش را گرفت.</div>" % html.escape(done["plan"]))
 
     quota, used = info.get("quota") or 0, info.get("used") or 0
     if quota:
@@ -3943,17 +3949,16 @@ def receipt_box(info):
                 "<label class='plan'><input type='radio' name='plan' value='%d'"
                 " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
                 % (p["id"], " checked" if mine else "", html.escape(p["name"]),
-                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
+                   " <span class='ok'>(پلن فعلی)</span>" if mine else "",
                    plan_line(p),
                    plan_games(p) +
                    ("<br><small>%s</small>" % html.escape(p["note"])
                     if p.get("note") else "")))
         out.append("</div>")
-        if held:
-            out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
-                       "باقی‌مانده‌تان اضافه می‌کند. <b>پلن دیگری</b> که انتخاب کنید "
-                       "از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین "
-                       "می‌رود.</p>")
+        if info.get("status") == "active":
+            out.append("<p class='note'>پلن فعلی‌تان هنوز تمام نشده: هر پلنی بخرید "
+                       "<b>رزرو</b> می‌شود و بعد از تمام شدن پلن فعلی (روز یا حجمش) خودکار "
+                       "فعال می‌شود؛ چیزی از پلن فعلی کم نمی‌شود.</p>")
         out.append("<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>")
     else:
         out.append("<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید "
@@ -4006,7 +4011,7 @@ def wallet_box(info):
         out.append("<details class='pw'><summary>گردش کیف پول</summary><table class='moves'>")
         for m in moves:
             out.append("<tr><td>%s</td><td>%s%s</td><td dir='ltr' class='%s'>%s%s</td></tr>"
-                       % (html.escape((m.get("at") or "")[:10]), html.escape(m.get("what") or ""),
+                       % (html.escape(show_date(m.get("at") or "")), html.escape(m.get("what") or ""),
                           " <small>%s</small>" % html.escape(m["note"]) if m.get("note") else "",
                           "ok" if m["amount"] > 0 else "bad",
                           "+" if m["amount"] > 0 else "−", money(abs(m["amount"]))))
@@ -4592,6 +4597,71 @@ def mobileconfig(info, server=None):
 # Tehran has kept +03:30 all year since 2022; the panel buckets by it too.
 TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
+# How dates are shown on the customer's pages: Shamsi or Gregorian, as the
+# admin picked - the panel says which at every sync.
+CALENDAR = {"v": "gregorian"}
+
+
+def to_jalali(gy, gm, gd):
+    """A Gregorian day as a Shamsi one: (year, month, day)."""
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+            + gd + g_d_m[gm - 1])
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+
+
+def _when(value):
+    if isinstance(value, datetime):
+        t = (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(TEHRAN)
+        return t.date(), t
+    if isinstance(value, date):
+        return value, None
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return date.fromisoformat(text), None
+        except ValueError:
+            return None
+    try:
+        t = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    t = (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(TEHRAN)
+    return t.date(), t
+
+
+def show_date(value, with_time=False):
+    """A day or a moment as the admin picked dates be shown, in Tehran;
+    anything else given back as it was."""
+    got = _when(value)
+    if not got:
+        return str(value or "")
+    day, moment = got
+    text = ("%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day)
+            if CALENDAR["v"] == "jalali" else day.strftime("%Y-%m-%d"))
+    return text + (moment.strftime(" %H:%M") if with_time and moment is not None else "")
+
+
+def month_day(value):
+    """The short day under a chart's bar."""
+    got = _when(value)
+    if not got:
+        return ""
+    day = got[0]
+    if CALENDAR["v"] == "jalali":
+        return "%02d/%02d" % to_jalali(day.year, day.month, day.day)[1:]
+    return day.strftime("%m/%d")
+
 
 # ---------------------------------------------------------------- usage page
 # Charts drawn here as SVG, so the page loads nothing from anywhere else.
@@ -4674,7 +4744,7 @@ def days_chart(days, n=30):
         x = L + i * slot + (slot - bw) / 2
         hd, hu = d * scale, u * scale
         base = H - B
-        tip = "%s — دانلود %s، آپلود %s" % (day.strftime("%m/%d"), human_fa(d), human_fa(u))
+        tip = "%s — دانلود %s، آپلود %s" % (month_day(day), human_fa(d), human_fa(u))
         out.append("<g><title>%s</title>" % html.escape(tip))
         if hu >= 1 and hd >= 1:
             # Download square on the base, a 2px gap of card, upload rounded on top.
@@ -4691,7 +4761,7 @@ def days_chart(days, n=30):
             last = i == n - 1
             out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
                        % (x + bw if last else x + bw / 2, H - 6,
-                          "end" if last else "middle", day.strftime("%m/%d")))
+                          "end" if last else "middle", month_day(day)))
     out.append("</svg>")
     return "".join(out), rows
 
@@ -4763,7 +4833,7 @@ def heat_chart(hours):
     for r, day in enumerate(days):
         y = T + r * 22
         out.append("<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
-                   % (L - 6, y + 14, day.strftime("%m/%d")))
+                   % (L - 6, y + 14, month_day(day)))
         for h in range(24):
             key = "%sT%02d:00" % (day.strftime("%Y-%m-%d"), h)
             v = by.get(key, 0)
@@ -4771,7 +4841,7 @@ def heat_chart(hours):
             out.append("<rect x='%.1f' y='%d' width='%.1f' height='18' rx='3' fill='%s'"
                        " fill-opacity='%.2f'><title>%s ساعت %02d — %s</title></rect>"
                        % (L + h * cw + 1, y, cw - 2, DOWN if v else "var(--line)",
-                          level if v else 1, day.strftime("%m/%d"), h, human_fa(v)))
+                          level if v else 1, month_day(day), h, human_fa(v)))
     for h in (0, 6, 12, 18, 23):
         out.append("<text x='%.1f' y='%d' class='axis' text-anchor='middle'>%02d</text>"
                    % (L + h * cw + cw / 2, H - 4, h))
@@ -4851,7 +4921,7 @@ def usage_page(view):
 
     out.append("<h2>روزانه</h2>" + legend() + days_svg)
     table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
-                    % (d.strftime("%m/%d"), human_fa(dn), human_fa(u))
+                    % (month_day(d), human_fa(dn), human_fa(u))
                     for d, u, dn in reversed(day_rows) if u or dn)
     if table:
         out.append("<details class='pw'><summary>جدول روزانه</summary>"
@@ -5438,7 +5508,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 body.append("<a class='tk' href='/ticket?id=%d'><span class='s'>%s</span>"
                             "<span class='%s'>%s</span><small>%s · %d پیام</small></a>"
                             % (t["id"], html.escape(t["subject"]), cls, label,
-                               html.escape(t["updated_at"][:16].replace("T", " ")),
+                               html.escape(show_date(t["updated_at"], True)),
                                t["messages"]))
             body.append("</div>")
         else:
@@ -5474,7 +5544,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                         "<div class='text'>%s</div>%s</div>"
                         % ("admin" if m["from"] == "admin" else "customer",
                            "پشتیبانی" if m["from"] == "admin" else "شما",
-                           html.escape(m["created_at"][:16].replace("T", " ")),
+                           html.escape(show_date(m["created_at"], True)),
                            html.escape(m["body"]), pic))
         body.append("</div>")
         body.append(
@@ -5630,6 +5700,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         rows = []
         if info.get("plan_name"):
             rows.append(("پلن", html.escape(info["plan_name"])))
+        if info.get("reserved"):
+            rows.append(("پلن رزرو", "%s <small>— بعد از تمام شدن پلن فعلی خودکار فعال "
+                         "می‌شود</small>" % html.escape("، ".join(info["reserved"]))))
         rows += [("قالب", html.escape(info.get("plan") or "-")),
                 ("آی‌پی ثبت‌شده", " ".join("<code>%s</code>" % html.escape(x)
                                            for x in (info.get("ips") or [info["ip"]])

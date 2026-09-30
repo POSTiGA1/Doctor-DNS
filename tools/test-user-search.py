@@ -127,6 +127,62 @@ html = page("علی", as_seller=True)
 check("a seller's search finds their own only",
       "shop_one" in html and "ali_gamer" not in html and "کاربران (1 از 1)" in html)
 
+print("the order")
+GB = 1024 ** 3
+store.run("UPDATE users SET used_bytes = ?, quota_bytes = ?, wallet = ?, status = ?,"
+          " expires_at = ?, last_seen = ?, created_at = ? WHERE id = ?",
+          (5 * GB, 10 * GB, 0, "active", "2026-12-01T00:00:00+00:00", None,
+           "2026-01-01T00:00:00+00:00", ali))
+store.run("UPDATE users SET used_bytes = ?, quota_bytes = ?, wallet = ?, status = ?,"
+          " expires_at = ?, last_seen = ?, created_at = ? WHERE id = ?",
+          (9 * GB, 10 * GB, 50000, "expired", "2026-10-05T00:00:00+00:00", panel.now(),
+           "2026-03-01T00:00:00+00:00", sara))
+store.run("UPDATE users SET used_bytes = ?, quota_bytes = 0, wallet = ?, status = ?,"
+          " expires_at = NULL, created_at = ? WHERE id = ?",
+          (1 * GB, 10000, "pending", "2026-02-01T00:00:00+00:00", yas))
+store.run("UPDATE users SET used_bytes = 0, quota_bytes = ?, created_at = ?,"
+          " expires_at = ? WHERE id = ?",
+          (20 * GB, "2026-04-01T00:00:00+00:00", "2026-11-01T00:00:00+00:00", shops))
+names = {ali: "ali_gamer", sara: "Sara.K", yas: "yas", shops: "shop_one"}
+
+
+def order(sort=None, cookie=None, q=None):
+    admin.REQ.admin = None
+    r = Rec("/p/users?" + "&".join(x for x in (
+        "sort=" + sort if sort else "", "q=" + __import__("urllib.parse").parse.quote(q)
+        if q else "") if x))
+    r.headers = {"Cookie": "usort=" + cookie} if cookie else {}
+    html = admin.Admin.users(r)
+    at = {uid: html.find("<code>%s</code>" % n) for uid, n in names.items()}
+    return [uid for uid, pos in sorted(at.items(), key=lambda x: x[1]) if pos >= 0], html
+
+
+check("newest sign-up first, as before", order()[0] == [shops, sara, yas, ali])
+check("oldest first", order("old")[0] == [ali, yas, sara, shops])
+check("by name", order("name")[0] == [sara, ali, shops, yas], str(order("name")[0]))
+check("by username, in any case", order("user")[0] == [ali, sara, shops, yas])
+check("most used first", order("used")[0][:3] == [sara, ali, yas])
+check("least allowance left first, the unlimited last",
+      order("left")[0] == [sara, ali, shops, yas], str(order("left")[0]))
+check("fewest days left first, those with no end last",
+      order("days")[0] == [sara, shops, ali, yas], str(order("days")[0]))
+check("most in the wallet first", order("wallet")[0][:2] == [sara, yas])
+check("by status: active, then waiting, then used up and ended",
+      order("status")[0][-2:] == [yas, sara], str(order("status")[0]))
+check("online and last seen first", order("seen")[0][0] == sara)
+ids, html = order("wallet")
+check("the menu shows the order in use", "<option value='wallet' selected>" in html
+      and "بیشترین کیف پول" in html)
+check("  and keeps it in a cookie when it is changed",
+      "document.cookie='usort='+this.value" in html)
+check("no order asked: the one the browser kept", order(cookie="used")[0][:3] == [sara, ali, yas]
+      and "<option value='used' selected>" in order(cookie="used")[1])
+check("  one asked beats the kept one", order("old", cookie="used")[0][0] == ali)
+check("an order that is not one is the newest first, never SQL",
+      order("u.id; DROP TABLE users")[0] == [shops, sara, yas, ali]
+      and store.one("SELECT count(*) c FROM users")["c"] == 4)
+check("search and order together", order("used", q="علی")[0] == [ali, shops])
+
 store.db.close()
 admin.STORE.db.close()
 shutil.rmtree(tmp, ignore_errors=True)

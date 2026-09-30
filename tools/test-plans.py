@@ -222,34 +222,50 @@ where = act("receipt-decide", id=str(t["id"]), to="approved")
 check("pressing approve again does nothing", "m=!" in where, where)
 check("the plan was not applied twice", user()["expires_at"] == u["expires_at"])
 
-print("renewing early loses nothing")
+print("buying while a plan runs: reserved")
 store.run("UPDATE users SET used_bytes = ? WHERE id = 1", (60 * GB,))
+reserved = lambda: [r["plan_id"] for r in store.q(
+    "SELECT plan_id FROM reserved_plans WHERE user_id = 1 ORDER BY id")]
+box = sync.receipt_box(api.do_user_info({"session": session}))
+check("the page says a plan bought now is reserved", "رزرو" in box and "از نو شروع" not in box)
+check("and marks the current plan", "پلن فعلی" in box)
 pay(game["id"])
 t = store.one("SELECT * FROM transactions WHERE status = 'pending'")
-check("the admin is told it is a renewal", "تمدید همان پلن" in Rec().receipts())
+check("the admin is told it will be reserved", "با تأیید رزرو می‌شود" in Rec().receipts())
 act("receipt-decide", id=str(t["id"]), to="approved")
 r = user()
-check("the allowance goes on top", r["quota_bytes"] == 200 * GB, str(r["quota_bytes"]))
-check("what was used stays used", r["used_bytes"] == 60 * GB)
-check("the days go on after the ones left",
-      abs(admin.parse_ts(r["expires_at"]) - ends - timedelta(days=30))
-      < timedelta(seconds=2))
-
-print("a different plan starts fresh")
-box = sync.receipt_box(api.do_user_info({"session": session}))
-check("the page warns before paying", "از نو شروع می‌شود" in box)
-check("and marks the current plan", "پلن فعلی" in box)
+check("the running plan is left as it was",
+      (r["plan_id"], r["quota_bytes"], r["used_bytes"], r["expires_at"])
+      == (game["id"], 100 * GB, 60 * GB, u["expires_at"]))
+check("  the same plan bought again waits its turn", reserved() == [game["id"]])
 pay(full["id"])
 t = store.one("SELECT * FROM transactions WHERE status = 'pending'")
 act("receipt-decide", id=str(t["id"]), to="approved")
+check("  and another behind it", reserved() == [game["id"], full["id"]])
+info = api.do_user_info({"session": session})
+check("the customer sees them waiting", info["reserved"] == ["گیمینگ ماهانه", "کامل ماهانه"])
+
+print("the running plan ends, and the next one starts")
+store.run("UPDATE users SET used_bytes = quota_bytes WHERE id = 1")
+panel.enforce_quotas(store)
 r = user()
-check("the new plan and template", (r["plan_id"], r["template_id"])
-      == (full["id"], FULL))
-check("unlimited", r["quota_bytes"] == 0)
-check("usage starts again", r["used_bytes"] == 0)
-check("thirty days from now, not on top",
-      abs(admin.parse_ts(r["expires_at"]) - datetime.now(timezone.utc)
-          - timedelta(days=30)) < timedelta(minutes=1))
+check("its allowance over, the first reserved one starts, fresh",
+      (r["plan_id"], r["status"], r["used_bytes"], r["quota_bytes"])
+      == (game["id"], "active", 0, 100 * GB)
+      and abs(admin.parse_ts(r["expires_at"]) - datetime.now(timezone.utc)
+              - timedelta(days=30)) < timedelta(minutes=1))
+check("  and leaves the queue", reserved() == [full["id"]])
+info = api.do_user_info({"session": session})
+check("the customer's page says it started",
+      "پلن رزرو «گیمینگ ماهانه» فعال شد" in sync.account_notice(info)
+      and info["reserved"] == ["کامل ماهانه"])
+store.run("UPDATE users SET expires_at = ? WHERE id = 1",
+          ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds"),))
+panel.enforce_quotas(store)
+r = user()
+check("its days over, the next one starts",
+      (r["plan_id"], r["template_id"], r["quota_bytes"], r["status"])
+      == (full["id"], FULL, 0, "active") and reserved() == [])
 
 print("a plan that ran out starts fresh too")
 store.run("UPDATE users SET expires_at = ?, status = 'expired' WHERE id = 1",
@@ -258,6 +274,21 @@ check("expired, held plan", admin.STORE.apply_plan(1, full["id"]))
 r = user()
 check("it is active again", r["status"] == "active")
 check("from now", admin.parse_ts(r["expires_at"]) > now + timedelta(days=29))
+
+print("given by hand while a plan runs")
+where = admin.STORE.apply_plan(1, game["id"])
+check("reserved too, and said so", "رزرو شد" in (where or "") and reserved() == [game["id"]])
+cell = admin.plan_cell(user(), admin.STORE.q("SELECT * FROM plans"))
+rid = store.one("SELECT id FROM reserved_plans WHERE user_id = 1")["id"]
+check("the users table shows it, with a way to take it back",
+      "رزرو: گیمینگ ماهانه" in cell and "/p/user-reserve-cancel" in cell
+      and "+1 رزرو" in cell)
+act("user-reserve-cancel", id=str(rid))
+check("taken back, it is gone", reserved() == [])
+store.run("UPDATE users SET expires_at = ?, status = 'active' WHERE id = 1",
+          ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds"),))
+panel.enforce_quotas(store)
+check("with nothing reserved, a plan ends as it always did", user()["status"] == "expired")
 
 print("a block stays a block")
 store.run("UPDATE users SET status = 'suspended' WHERE id = 1")

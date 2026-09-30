@@ -44,7 +44,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 CONFIG = "/etc/smart-dns/panel.env"
 DB = "/var/lib/smart-dns/panel.db"
@@ -392,6 +392,16 @@ CREATE TABLE IF NOT EXISTS custom_domains (
 -- Named groups of those domains, each a row of its own on a template's page
 -- (service "cg<id>", group "main"), with the icon the admin gave it. A
 -- domain's group is custom_domains.group_id; null for one in no group.
+-- A plan bought while another still runs, waiting its turn: the oldest
+-- starts, fresh, the moment the running one ends - its days or its
+-- allowance. Any plan, the same one included.
+CREATE TABLE IF NOT EXISTS reserved_plans (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id    INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS custom_groups (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -646,6 +656,10 @@ MIGRATIONS = [
     ("plans", "relay_exits", "TEXT"),
     # The group an operator's own domain is in (custom_groups); null for none.
     ("custom_domains", "group_id", "INTEGER"),
+    # The reserved plan that started last, and when: the customer's page says
+    # so for a few days.
+    ("users", "reserve_done_plan", "TEXT"),
+    ("users", "reserve_done_at", "TEXT"),
     # When this customer last moved more than a trickle through a relay, and
     # which one: what "online" is on the admin panel's home page.
     ("users", "last_seen", "TEXT"),
@@ -867,6 +881,69 @@ THROTTLE = Throttle()
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------ dates
+# Shamsi or Gregorian, as the admin picked in the admin panel's settings, in
+# Tehran time: for what the panel writes itself - "active until ..." - and
+# told to the relays and the bot, which show dates too.
+SHOWN_ZONE = timezone(timedelta(hours=3, minutes=30))
+
+
+def calendar_of(db):
+    """The admin's pick, "jalali" or "gregorian", from a connection or a
+    Store."""
+    db = getattr(db, "db", db)
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key = 'calendar'").fetchone()
+    except sqlite3.Error:
+        return "gregorian"
+    return "jalali" if row and row[0] == "jalali" else "gregorian"
+
+
+def to_jalali(gy, gm, gd):
+    """A Gregorian day as a Shamsi one: (year, month, day)."""
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+            + gd + g_d_m[gm - 1])
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+
+
+def show_date(value, cal, with_time=False):
+    """A day or a moment as the customer reads dates, in `cal`: 1405/07/07 or
+    2026-09-29. "" for nothing; anything else given back as it was."""
+    if isinstance(value, datetime):
+        t = (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(
+            SHOWN_ZONE)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            try:
+                t = date.fromisoformat(text)
+            except ValueError:
+                return text
+            with_time = False
+        else:
+            t = parse_ts(text)
+            if not t:
+                return text
+            t = t.astimezone(SHOWN_ZONE)
+    day = t.date() if isinstance(t, datetime) else t
+    out = ("%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day) if cal == "jalali"
+           else day.strftime("%Y-%m-%d"))
+    return out + (t.strftime(" %H:%M") if with_time and isinstance(t, datetime) else "")
 
 
 def parse_ts(s):
@@ -2347,26 +2424,36 @@ def buy_device_with_wallet(store, user):
                        % (total, format(price, ","), format(balance, ","))}
 
 
-def put_plan(db, uid, plan_id, stamp=None):
+def plan_running(user, stamp=None):
+    """Whether this account's plan still runs: active, with days left. A plan
+    bought then waits its turn, reserved."""
+    ends = parse_ts(user["expires_at"])
+    return bool(user["status"] == "active" and ends
+                and ends > (stamp or datetime.now(timezone.utc)))
+
+
+def put_plan(db, uid, plan_id, stamp=None, now_too=False):
     """apply_plan's work, inside a transaction somebody else commits - so a
-    plan paid from the wallet is the money and the plan together, or neither."""
+    plan paid from the wallet is the money and the plan together, or neither.
+
+    While a plan still runs, any plan given - the same one too - is reserved
+    and starts, fresh, when the running one ends (see start_reserved).
+    Otherwise, or with `now_too`, it starts fresh now."""
     stamp = stamp or datetime.now(timezone.utc)
     user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
     plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
     if not user or not plan:
         return None
-    ends = parse_ts(user["expires_at"])
-    renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
-                and user["status"] in ("active", "over_quota"))
-    if renewing:
-        until = ends + timedelta(days=plan["days"])
-        quota = (user["quota_bytes"] + plan["quota_bytes"]
-                 if plan["quota_bytes"] and user["quota_bytes"] else 0)
-        used = user["used_bytes"]
-    else:
-        until = stamp + timedelta(days=plan["days"])
-        quota = plan["quota_bytes"]
-        used = 0
+    if not now_too and plan_running(user, stamp):
+        db.execute("INSERT INTO reserved_plans (user_id, plan_id, created_at)"
+                   " VALUES (?, ?, ?)", (uid, plan["id"], stamp.isoformat(timespec="seconds")))
+        ahead = db.execute("SELECT count(*) FROM reserved_plans WHERE user_id = ?",
+                           (uid,)).fetchone()[0]
+        return ("پلن «%s» رزرو شد؛ بعد از تمام شدن پلن فعلی خودکار فعال می‌شود%s"
+                % (plan["name"], "" if ahead < 2 else " (نوبت %d)" % ahead))
+    until = stamp + timedelta(days=plan["days"])
+    quota = plan["quota_bytes"]
+    used = 0
     db.execute(
         "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
         " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
@@ -2375,9 +2462,10 @@ def put_plan(db, uid, plan_id, stamp=None):
         " ELSE 'active' END WHERE id = ?",
         (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
          until.isoformat(timespec="seconds"), uid))
-    # The plan's devices, and those bought on top - which a renewal keeps
-    # and another plan ends.
-    extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
+    # The plan's devices, and those bought on top - which the same plan
+    # again keeps, as it follows on, and another plan ends.
+    same = user["plan_id"] == plan["id"]
+    extra = (user["extra_devices"] or 0) if same and "extra_devices" in user.keys() else 0
     set_devices(db, uid, plan_devices(plan) + extra, extra)
     # A plan that names servers abroad puts the customer on them - one for
     # every relay, or relay by relay; one on automatic leaves theirs alone.
@@ -2385,8 +2473,57 @@ def put_plan(db, uid, plan_id, stamp=None):
     if exits:
         db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
                    exits + (uid,))
-    return ("پلن «%s» تمدید شد تا %s" if renewing
-            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+    return "پلن «%s» فعال شد تا %s" % (plan["name"], show_date(until, calendar_of(db)))
+
+
+def reserved_of(store, uid):
+    """This account's reserved plans, in the order they start."""
+    return [dict(r) for r in store.q(
+        "SELECT r.id, r.plan_id, r.created_at, p.name, p.days, p.quota_bytes"
+        " FROM reserved_plans r LEFT JOIN plans p ON p.id = r.plan_id"
+        " WHERE r.user_id = ? ORDER BY r.id", (uid,))]
+
+
+def start_reserved(store, user, stamp=None):
+    """The running plan has ended: start the next reserved one, fresh, and
+    tell the customer. Its sentence, or None when nothing was reserved - a
+    reserved plan deleted since is passed over."""
+    stamp = stamp or datetime.now(timezone.utc)
+    while True:
+        with store.lock:
+            row = store.db.execute("SELECT * FROM reserved_plans WHERE user_id = ?"
+                                   " ORDER BY id LIMIT 1", (user["id"],)).fetchone()
+            if not row:
+                return None
+            store.db.execute("DELETE FROM reserved_plans WHERE id = ?", (row["id"],))
+            done = put_plan(store.db, user["id"], row["plan_id"], stamp, now_too=True)
+            if done:
+                store.db.execute(
+                    "UPDATE users SET reserve_done_plan = (SELECT name FROM plans WHERE id = ?),"
+                    " reserve_done_at = ? WHERE id = ?",
+                    (row["plan_id"], stamp.isoformat(timespec="seconds"), user["id"]))
+            store.db.commit()
+        if done:
+            break
+    log(INFO, "user #%d: reserved plan #%d started" % (user["id"], row["plan_id"]))
+    emit(store, user, "plan.reserved_started",
+         dict(plan_event(store, user["id"]), text="✅ پلن رزرو شما فعال شد: %s" % done))
+    return done
+
+
+# How long the customer's page says a reserved plan has started.
+RESERVE_NOTICE_DAYS = 3
+
+
+def reserve_view(store, user):
+    """What the customer is told of reserved plans: those waiting, and the
+    one that started in the last few days."""
+    done = None
+    at = parse_ts(user["reserve_done_at"]) if "reserve_done_at" in user.keys() else None
+    if at and datetime.now(timezone.utc) - at < timedelta(days=RESERVE_NOTICE_DAYS):
+        done = {"plan": user["reserve_done_plan"] or "", "at": user["reserve_done_at"]}
+    return {"reserved": [r["name"] for r in reserved_of(store, user["id"]) if r["name"]],
+            "reserve_done": done}
 
 
 CODE_RE = re.compile(r"[A-Z0-9_-]{3,32}")
@@ -3261,7 +3398,7 @@ def usage_view(store, user, catalogue, with_services=True):
         "live": live, "week": week, "last_week": last_week,
         "month": month, "last_month": last_month,
         "runs_out_days": runs_out,
-        "expires": (user["expires_at"] or "")[:10],
+        "expires": show_date(user["expires_at"], calendar_of(store)),
         "quota": quota, "used": used,
     }
     if with_services:
@@ -3965,9 +4102,9 @@ DAILY_REPORT_UTC = (5, 30)
 
 
 def apply_plan(store, uid, plan_id, stamp=None):
-    """The admin panel's Store.apply_plan, word for word in effect: the same
-    plan while it runs is a renewal, anything else starts fresh, and a
-    suspended account stays suspended."""
+    """The admin panel's Store.apply_plan, word for word in effect: any plan
+    while one runs is reserved for when it ends, otherwise it starts fresh,
+    and a suspended account stays suspended."""
     with store.lock:
         done = put_plan(store.db, uid, plan_id, stamp)
         store.db.commit()
@@ -4878,6 +5015,9 @@ def enforce_quotas(store):
         # its quota does.
         due = parse_ts(u["expires_at"])
         if due and stamp >= due:
+            # Its days are over: a plan reserved for this starts instead.
+            if u["status"] in ("active", "over_quota") and start_reserved(store, u, stamp):
+                continue
             if u["status"] == "active":
                 store.run("UPDATE users SET status = 'expired' WHERE id = ?",
                           (u["id"],))
@@ -4890,8 +5030,11 @@ def enforce_quotas(store):
 
         # A few days' notice, once. The bit goes when the account is given
         # more time, so the next term is announced too.
+        # Not to somebody who has already bought the next one.
         if (due and u["status"] == "active" and not (u["warned"] & WARNED_EXPIRING)
-                and due - stamp <= timedelta(days=EXPIRING_DAYS)):
+                and due - stamp <= timedelta(days=EXPIRING_DAYS)
+                and not store.one("SELECT 1 FROM reserved_plans WHERE user_id = ?",
+                                  (u["id"],))):
             store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
                       (WARNED_EXPIRING, u["id"]))
             left = max(1, int((due - stamp).total_seconds() // 86400) + 1)
@@ -4919,6 +5062,9 @@ def enforce_quotas(store):
             continue
 
         if used >= quota and u["status"] == "active":
+            # Its allowance is over: a plan reserved for this starts instead.
+            if start_reserved(store, u, stamp):
+                continue
             store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
             print("over quota: user %d at %s of %s"
                   % (u["id"], human(used), human(quota)), flush=True)
@@ -5386,6 +5532,8 @@ class API(http.server.BaseHTTPRequestHandler):
                                     # Whether they are sent there by themselves,
                                     # whatever site they open; off, the page
                                     # opens only for somebody who goes to it.
+                                    # How dates are shown on its pages.
+                                    "calendar": calendar_of(self.store),
                                     "portal_open": self.store.setting("portal_open")
                                     != "0",
                                     # Its tunnels to the nodes, by node.
@@ -5804,8 +5952,8 @@ class API(http.server.BaseHTTPRequestHandler):
             "status": user["status"],
             "wallet": user["wallet"],
             "plan": tpl["name"] if tpl else "",
-            "renews": (user["quota_reset_at"] or "")[:10],
-            "expires": (user["expires_at"] or "")[:10],
+            "renews": show_date(user["quota_reset_at"], calendar_of(self.store)),
+            "expires": show_date(user["expires_at"], calendar_of(self.store)),
             # The moment itself, for the days left beside the date.
             "expires_at": user["expires_at"] or "",
             "speed_kbps": user["speed_kbps"] or 0,
@@ -5813,6 +5961,8 @@ class API(http.server.BaseHTTPRequestHandler):
             # page turns this into the banner the bot used to send.
             "warned": user["warned"] or 0,
             "seen_ip": body.get("ip", ""),
+            # Plans bought to start when this one ends, and the one that did.
+            **reserve_view(self.store, user),
             # The relays to type in as DNS 1 and DNS 2 - the same the bot gives.
             "dns": shown_relays(self.store, user, self.relays),
             "must_change": bool(user["must_change_password"]),
@@ -5845,7 +5995,8 @@ class API(http.server.BaseHTTPRequestHandler):
             "tickets_answered": self.store.one(
                 "SELECT count(*) c FROM tickets WHERE user_id = ?"
                 " AND status = 'answered'", (user["id"],))["c"],
-            "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
+            "receipt_waiting": ({"at": show_date(waiting["created_at"], calendar_of(self.store),
+                                                 True),
                                  "plan": waiting["name"] or ""}
                                 if waiting else None),
             # The personal DoH address. The relay builds the full address from
@@ -6052,6 +6203,10 @@ def user_view(store, user, relays):
         "remaining_bytes": None if not quota else max(0, quota - used),
         "speed_kbps": user["speed_kbps"] or 0,
         "expires_at": user["expires_at"],
+        # Plans bought to start when this one ends, and the one that did.
+        **reserve_view(store, user),
+        # How the bot shows dates.
+        "calendar": calendar_of(store),
         "ips": [r["ip"] for r in store.user_ips(user["id"])],
         "max_ips": user["max_ips"],
         "extra_devices": user["extra_devices"] or 0,

@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.20"
+VERSION="0.9.21"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -4503,7 +4503,7 @@ exit 0
 #import urllib.error
 #import urllib.parse
 #import urllib.request
-#from datetime import datetime, timedelta, timezone
+#from datetime import date, datetime, timedelta, timezone
 #
 #CONFIG = "/etc/smart-dns/panel.env"
 #DB = "/var/lib/smart-dns/panel.db"
@@ -4851,6 +4851,16 @@ exit 0
 #-- Named groups of those domains, each a row of its own on a template's page
 #-- (service "cg<id>", group "main"), with the icon the admin gave it. A
 #-- domain's group is custom_domains.group_id; null for one in no group.
+#-- A plan bought while another still runs, waiting its turn: the oldest
+#-- starts, fresh, the moment the running one ends - its days or its
+#-- allowance. Any plan, the same one included.
+#CREATE TABLE IF NOT EXISTS reserved_plans (
+#    id         INTEGER PRIMARY KEY,
+#    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    plan_id    INTEGER NOT NULL,
+#    created_at TEXT NOT NULL
+#);
+#
 #CREATE TABLE IF NOT EXISTS custom_groups (
 #    id         INTEGER PRIMARY KEY,
 #    name       TEXT NOT NULL,
@@ -5105,6 +5115,10 @@ exit 0
 #    ("plans", "relay_exits", "TEXT"),
 #    # The group an operator's own domain is in (custom_groups); null for none.
 #    ("custom_domains", "group_id", "INTEGER"),
+#    # The reserved plan that started last, and when: the customer's page says
+#    # so for a few days.
+#    ("users", "reserve_done_plan", "TEXT"),
+#    ("users", "reserve_done_at", "TEXT"),
 #    # When this customer last moved more than a trickle through a relay, and
 #    # which one: what "online" is on the admin panel's home page.
 #    ("users", "last_seen", "TEXT"),
@@ -5326,6 +5340,69 @@ exit 0
 #
 #def now():
 #    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+#
+#
+## ------------------------------------------------------------------ dates
+## Shamsi or Gregorian, as the admin picked in the admin panel's settings, in
+## Tehran time: for what the panel writes itself - "active until ..." - and
+## told to the relays and the bot, which show dates too.
+#SHOWN_ZONE = timezone(timedelta(hours=3, minutes=30))
+#
+#
+#def calendar_of(db):
+#    """The admin's pick, "jalali" or "gregorian", from a connection or a
+#    Store."""
+#    db = getattr(db, "db", db)
+#    try:
+#        row = db.execute("SELECT value FROM settings WHERE key = 'calendar'").fetchone()
+#    except sqlite3.Error:
+#        return "gregorian"
+#    return "jalali" if row and row[0] == "jalali" else "gregorian"
+#
+#
+#def to_jalali(gy, gm, gd):
+#    """A Gregorian day as a Shamsi one: (year, month, day)."""
+#    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+#    gy2 = gy + 1 if gm > 2 else gy
+#    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+#            + gd + g_d_m[gm - 1])
+#    jy = -1595 + 33 * (days // 12053)
+#    days %= 12053
+#    jy += 4 * (days // 1461)
+#    days %= 1461
+#    if days > 365:
+#        jy += (days - 1) // 365
+#        days = (days - 1) % 365
+#    if days < 186:
+#        return jy, 1 + days // 31, 1 + days % 31
+#    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+#
+#
+#def show_date(value, cal, with_time=False):
+#    """A day or a moment as the customer reads dates, in `cal`: 1405/07/07 or
+#    2026-09-29. "" for nothing; anything else given back as it was."""
+#    if isinstance(value, datetime):
+#        t = (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(
+#            SHOWN_ZONE)
+#    else:
+#        text = str(value or "").strip()
+#        if not text:
+#            return ""
+#        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+#            try:
+#                t = date.fromisoformat(text)
+#            except ValueError:
+#                return text
+#            with_time = False
+#        else:
+#            t = parse_ts(text)
+#            if not t:
+#                return text
+#            t = t.astimezone(SHOWN_ZONE)
+#    day = t.date() if isinstance(t, datetime) else t
+#    out = ("%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day) if cal == "jalali"
+#           else day.strftime("%Y-%m-%d"))
+#    return out + (t.strftime(" %H:%M") if with_time and isinstance(t, datetime) else "")
 #
 #
 #def parse_ts(s):
@@ -6806,26 +6883,36 @@ exit 0
 #                       % (total, format(price, ","), format(balance, ","))}
 #
 #
-#def put_plan(db, uid, plan_id, stamp=None):
+#def plan_running(user, stamp=None):
+#    """Whether this account's plan still runs: active, with days left. A plan
+#    bought then waits its turn, reserved."""
+#    ends = parse_ts(user["expires_at"])
+#    return bool(user["status"] == "active" and ends
+#                and ends > (stamp or datetime.now(timezone.utc)))
+#
+#
+#def put_plan(db, uid, plan_id, stamp=None, now_too=False):
 #    """apply_plan's work, inside a transaction somebody else commits - so a
-#    plan paid from the wallet is the money and the plan together, or neither."""
+#    plan paid from the wallet is the money and the plan together, or neither.
+#
+#    While a plan still runs, any plan given - the same one too - is reserved
+#    and starts, fresh, when the running one ends (see start_reserved).
+#    Otherwise, or with `now_too`, it starts fresh now."""
 #    stamp = stamp or datetime.now(timezone.utc)
 #    user = db.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
 #    plan = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
 #    if not user or not plan:
 #        return None
-#    ends = parse_ts(user["expires_at"])
-#    renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
-#                and user["status"] in ("active", "over_quota"))
-#    if renewing:
-#        until = ends + timedelta(days=plan["days"])
-#        quota = (user["quota_bytes"] + plan["quota_bytes"]
-#                 if plan["quota_bytes"] and user["quota_bytes"] else 0)
-#        used = user["used_bytes"]
-#    else:
-#        until = stamp + timedelta(days=plan["days"])
-#        quota = plan["quota_bytes"]
-#        used = 0
+#    if not now_too and plan_running(user, stamp):
+#        db.execute("INSERT INTO reserved_plans (user_id, plan_id, created_at)"
+#                   " VALUES (?, ?, ?)", (uid, plan["id"], stamp.isoformat(timespec="seconds")))
+#        ahead = db.execute("SELECT count(*) FROM reserved_plans WHERE user_id = ?",
+#                           (uid,)).fetchone()[0]
+#        return ("پلن «%s» رزرو شد؛ بعد از تمام شدن پلن فعلی خودکار فعال می‌شود%s"
+#                % (plan["name"], "" if ahead < 2 else " (نوبت %d)" % ahead))
+#    until = stamp + timedelta(days=plan["days"])
+#    quota = plan["quota_bytes"]
+#    used = 0
 #    db.execute(
 #        "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
 #        " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
@@ -6834,9 +6921,10 @@ exit 0
 #        " ELSE 'active' END WHERE id = ?",
 #        (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
 #         until.isoformat(timespec="seconds"), uid))
-#    # The plan's devices, and those bought on top - which a renewal keeps
-#    # and another plan ends.
-#    extra = (user["extra_devices"] or 0) if renewing and "extra_devices" in user.keys() else 0
+#    # The plan's devices, and those bought on top - which the same plan
+#    # again keeps, as it follows on, and another plan ends.
+#    same = user["plan_id"] == plan["id"]
+#    extra = (user["extra_devices"] or 0) if same and "extra_devices" in user.keys() else 0
 #    set_devices(db, uid, plan_devices(plan) + extra, extra)
 #    # A plan that names servers abroad puts the customer on them - one for
 #    # every relay, or relay by relay; one on automatic leaves theirs alone.
@@ -6844,8 +6932,57 @@ exit 0
 #    if exits:
 #        db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
 #                   exits + (uid,))
-#    return ("پلن «%s» تمدید شد تا %s" if renewing
-#            else "پلن «%s» فعال شد تا %s") % (plan["name"], until.strftime("%Y-%m-%d"))
+#    return "پلن «%s» فعال شد تا %s" % (plan["name"], show_date(until, calendar_of(db)))
+#
+#
+#def reserved_of(store, uid):
+#    """This account's reserved plans, in the order they start."""
+#    return [dict(r) for r in store.q(
+#        "SELECT r.id, r.plan_id, r.created_at, p.name, p.days, p.quota_bytes"
+#        " FROM reserved_plans r LEFT JOIN plans p ON p.id = r.plan_id"
+#        " WHERE r.user_id = ? ORDER BY r.id", (uid,))]
+#
+#
+#def start_reserved(store, user, stamp=None):
+#    """The running plan has ended: start the next reserved one, fresh, and
+#    tell the customer. Its sentence, or None when nothing was reserved - a
+#    reserved plan deleted since is passed over."""
+#    stamp = stamp or datetime.now(timezone.utc)
+#    while True:
+#        with store.lock:
+#            row = store.db.execute("SELECT * FROM reserved_plans WHERE user_id = ?"
+#                                   " ORDER BY id LIMIT 1", (user["id"],)).fetchone()
+#            if not row:
+#                return None
+#            store.db.execute("DELETE FROM reserved_plans WHERE id = ?", (row["id"],))
+#            done = put_plan(store.db, user["id"], row["plan_id"], stamp, now_too=True)
+#            if done:
+#                store.db.execute(
+#                    "UPDATE users SET reserve_done_plan = (SELECT name FROM plans WHERE id = ?),"
+#                    " reserve_done_at = ? WHERE id = ?",
+#                    (row["plan_id"], stamp.isoformat(timespec="seconds"), user["id"]))
+#            store.db.commit()
+#        if done:
+#            break
+#    log(INFO, "user #%d: reserved plan #%d started" % (user["id"], row["plan_id"]))
+#    emit(store, user, "plan.reserved_started",
+#         dict(plan_event(store, user["id"]), text="✅ پلن رزرو شما فعال شد: %s" % done))
+#    return done
+#
+#
+## How long the customer's page says a reserved plan has started.
+#RESERVE_NOTICE_DAYS = 3
+#
+#
+#def reserve_view(store, user):
+#    """What the customer is told of reserved plans: those waiting, and the
+#    one that started in the last few days."""
+#    done = None
+#    at = parse_ts(user["reserve_done_at"]) if "reserve_done_at" in user.keys() else None
+#    if at and datetime.now(timezone.utc) - at < timedelta(days=RESERVE_NOTICE_DAYS):
+#        done = {"plan": user["reserve_done_plan"] or "", "at": user["reserve_done_at"]}
+#    return {"reserved": [r["name"] for r in reserved_of(store, user["id"]) if r["name"]],
+#            "reserve_done": done}
 #
 #
 #CODE_RE = re.compile(r"[A-Z0-9_-]{3,32}")
@@ -7720,7 +7857,7 @@ exit 0
 #        "live": live, "week": week, "last_week": last_week,
 #        "month": month, "last_month": last_month,
 #        "runs_out_days": runs_out,
-#        "expires": (user["expires_at"] or "")[:10],
+#        "expires": show_date(user["expires_at"], calendar_of(store)),
 #        "quota": quota, "used": used,
 #    }
 #    if with_services:
@@ -8424,9 +8561,9 @@ exit 0
 #
 #
 #def apply_plan(store, uid, plan_id, stamp=None):
-#    """The admin panel's Store.apply_plan, word for word in effect: the same
-#    plan while it runs is a renewal, anything else starts fresh, and a
-#    suspended account stays suspended."""
+#    """The admin panel's Store.apply_plan, word for word in effect: any plan
+#    while one runs is reserved for when it ends, otherwise it starts fresh,
+#    and a suspended account stays suspended."""
 #    with store.lock:
 #        done = put_plan(store.db, uid, plan_id, stamp)
 #        store.db.commit()
@@ -9337,6 +9474,9 @@ exit 0
 #        # its quota does.
 #        due = parse_ts(u["expires_at"])
 #        if due and stamp >= due:
+#            # Its days are over: a plan reserved for this starts instead.
+#            if u["status"] in ("active", "over_quota") and start_reserved(store, u, stamp):
+#                continue
 #            if u["status"] == "active":
 #                store.run("UPDATE users SET status = 'expired' WHERE id = ?",
 #                          (u["id"],))
@@ -9349,8 +9489,11 @@ exit 0
 #
 #        # A few days' notice, once. The bit goes when the account is given
 #        # more time, so the next term is announced too.
+#        # Not to somebody who has already bought the next one.
 #        if (due and u["status"] == "active" and not (u["warned"] & WARNED_EXPIRING)
-#                and due - stamp <= timedelta(days=EXPIRING_DAYS)):
+#                and due - stamp <= timedelta(days=EXPIRING_DAYS)
+#                and not store.one("SELECT 1 FROM reserved_plans WHERE user_id = ?",
+#                                  (u["id"],))):
 #            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
 #                      (WARNED_EXPIRING, u["id"]))
 #            left = max(1, int((due - stamp).total_seconds() // 86400) + 1)
@@ -9378,6 +9521,9 @@ exit 0
 #            continue
 #
 #        if used >= quota and u["status"] == "active":
+#            # Its allowance is over: a plan reserved for this starts instead.
+#            if start_reserved(store, u, stamp):
+#                continue
 #            store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
 #            print("over quota: user %d at %s of %s"
 #                  % (u["id"], human(used), human(quota)), flush=True)
@@ -9845,6 +9991,8 @@ exit 0
 #                                    # Whether they are sent there by themselves,
 #                                    # whatever site they open; off, the page
 #                                    # opens only for somebody who goes to it.
+#                                    # How dates are shown on its pages.
+#                                    "calendar": calendar_of(self.store),
 #                                    "portal_open": self.store.setting("portal_open")
 #                                    != "0",
 #                                    # Its tunnels to the nodes, by node.
@@ -10263,8 +10411,8 @@ exit 0
 #            "status": user["status"],
 #            "wallet": user["wallet"],
 #            "plan": tpl["name"] if tpl else "",
-#            "renews": (user["quota_reset_at"] or "")[:10],
-#            "expires": (user["expires_at"] or "")[:10],
+#            "renews": show_date(user["quota_reset_at"], calendar_of(self.store)),
+#            "expires": show_date(user["expires_at"], calendar_of(self.store)),
 #            # The moment itself, for the days left beside the date.
 #            "expires_at": user["expires_at"] or "",
 #            "speed_kbps": user["speed_kbps"] or 0,
@@ -10272,6 +10420,8 @@ exit 0
 #            # page turns this into the banner the bot used to send.
 #            "warned": user["warned"] or 0,
 #            "seen_ip": body.get("ip", ""),
+#            # Plans bought to start when this one ends, and the one that did.
+#            **reserve_view(self.store, user),
 #            # The relays to type in as DNS 1 and DNS 2 - the same the bot gives.
 #            "dns": shown_relays(self.store, user, self.relays),
 #            "must_change": bool(user["must_change_password"]),
@@ -10304,7 +10454,8 @@ exit 0
 #            "tickets_answered": self.store.one(
 #                "SELECT count(*) c FROM tickets WHERE user_id = ?"
 #                " AND status = 'answered'", (user["id"],))["c"],
-#            "receipt_waiting": ({"at": waiting["created_at"][:16].replace("T", " "),
+#            "receipt_waiting": ({"at": show_date(waiting["created_at"], calendar_of(self.store),
+#                                                 True),
 #                                 "plan": waiting["name"] or ""}
 #                                if waiting else None),
 #            # The personal DoH address. The relay builds the full address from
@@ -10511,6 +10662,10 @@ exit 0
 #        "remaining_bytes": None if not quota else max(0, quota - used),
 #        "speed_kbps": user["speed_kbps"] or 0,
 #        "expires_at": user["expires_at"],
+#        # Plans bought to start when this one ends, and the one that did.
+#        **reserve_view(store, user),
+#        # How the bot shows dates.
+#        "calendar": calendar_of(store),
 #        "ips": [r["ip"] for r in store.user_ips(user["id"])],
 #        "max_ips": user["max_ips"],
 #        "extra_devices": user["extra_devices"] or 0,
@@ -11788,7 +11943,7 @@ exit 0
 #import traceback
 #import urllib.parse
 #import uuid
-#from datetime import datetime, timedelta, timezone
+#from datetime import date, datetime, timedelta, timezone
 #
 #CONFIG = "/etc/smart-dns/sync.env"
 #ACL = "/usr/local/bin/smartdns-acl"
@@ -14701,6 +14856,7 @@ exit 0
 #    if target != PORTAL["url"]:
 #        log(INFO, "addresses not let in are sent to %s" % (target or "nowhere"))
 #        PORTAL["url"] = target
+#    CALENDAR["v"] = "jalali" if answer.get("calendar") == "jalali" else "gregorian"
 #    # A panel from before says nothing, and meant open.
 #    opened = answer.get("portal_open") is not False
 #    if opened != PORTAL["open"]:
@@ -15528,6 +15684,11 @@ exit 0
 #                "سرویس تا شارژ مجدد قطع است.</div>")
 #    if status != "active":
 #        return "<div class='msg err'>حساب شما غیرفعال است.</div>"
+#    # The plan they bought ahead has just taken over: said for a few days.
+#    done = info.get("reserve_done") or {}
+#    if done.get("plan"):
+#        return ("<div class='msg good'>✅ <b>پلن رزرو «%s» فعال شد.</b> پلن قبلی‌تان تمام "
+#                "شده بود و این یکی خودکار جایش را گرفت.</div>" % html.escape(done["plan"]))
 #
 #    quota, used = info.get("quota") or 0, info.get("used") or 0
 #    if quota:
@@ -15684,17 +15845,16 @@ exit 0
 #                "<label class='plan'><input type='radio' name='plan' value='%d'"
 #                " required%s><span><span class='p'>%s%s</span><br>%s%s</span></label>"
 #                % (p["id"], " checked" if mine else "", html.escape(p["name"]),
-#                   " <span class='ok'>(پلن فعلی — تمدید)</span>" if mine else "",
+#                   " <span class='ok'>(پلن فعلی)</span>" if mine else "",
 #                   plan_line(p),
 #                   plan_games(p) +
 #                   ("<br><small>%s</small>" % html.escape(p["note"])
 #                    if p.get("note") else "")))
 #        out.append("</div>")
-#        if held:
-#            out.append("<p class='note'>تمدید همان پلن، روزها و حجم را روی "
-#                       "باقی‌مانده‌تان اضافه می‌کند. <b>پلن دیگری</b> که انتخاب کنید "
-#                       "از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین "
-#                       "می‌رود.</p>")
+#        if info.get("status") == "active":
+#            out.append("<p class='note'>پلن فعلی‌تان هنوز تمام نشده: هر پلنی بخرید "
+#                       "<b>رزرو</b> می‌شود و بعد از تمام شدن پلن فعلی (روز یا حجمش) خودکار "
+#                       "فعال می‌شود؛ چیزی از پلن فعلی کم نمی‌شود.</p>")
 #        out.append("<label>عکس رسید (عکس یا PDF، حداکثر ۴ مگابایت)</label>")
 #    else:
 #        out.append("<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید "
@@ -15747,7 +15907,7 @@ exit 0
 #        out.append("<details class='pw'><summary>گردش کیف پول</summary><table class='moves'>")
 #        for m in moves:
 #            out.append("<tr><td>%s</td><td>%s%s</td><td dir='ltr' class='%s'>%s%s</td></tr>"
-#                       % (html.escape((m.get("at") or "")[:10]), html.escape(m.get("what") or ""),
+#                       % (html.escape(show_date(m.get("at") or "")), html.escape(m.get("what") or ""),
 #                          " <small>%s</small>" % html.escape(m["note"]) if m.get("note") else "",
 #                          "ok" if m["amount"] > 0 else "bad",
 #                          "+" if m["amount"] > 0 else "−", money(abs(m["amount"]))))
@@ -16333,6 +16493,71 @@ exit 0
 ## Tehran has kept +03:30 all year since 2022; the panel buckets by it too.
 #TEHRAN = timezone(timedelta(hours=3, minutes=30))
 #
+## How dates are shown on the customer's pages: Shamsi or Gregorian, as the
+## admin picked - the panel says which at every sync.
+#CALENDAR = {"v": "gregorian"}
+#
+#
+#def to_jalali(gy, gm, gd):
+#    """A Gregorian day as a Shamsi one: (year, month, day)."""
+#    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+#    gy2 = gy + 1 if gm > 2 else gy
+#    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+#            + gd + g_d_m[gm - 1])
+#    jy = -1595 + 33 * (days // 12053)
+#    days %= 12053
+#    jy += 4 * (days // 1461)
+#    days %= 1461
+#    if days > 365:
+#        jy += (days - 1) // 365
+#        days = (days - 1) % 365
+#    if days < 186:
+#        return jy, 1 + days // 31, 1 + days % 31
+#    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+#
+#
+#def _when(value):
+#    if isinstance(value, datetime):
+#        t = (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(TEHRAN)
+#        return t.date(), t
+#    if isinstance(value, date):
+#        return value, None
+#    text = str(value or "").strip()
+#    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+#        try:
+#            return date.fromisoformat(text), None
+#        except ValueError:
+#            return None
+#    try:
+#        t = datetime.fromisoformat(text)
+#    except ValueError:
+#        return None
+#    t = (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(TEHRAN)
+#    return t.date(), t
+#
+#
+#def show_date(value, with_time=False):
+#    """A day or a moment as the admin picked dates be shown, in Tehran;
+#    anything else given back as it was."""
+#    got = _when(value)
+#    if not got:
+#        return str(value or "")
+#    day, moment = got
+#    text = ("%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day)
+#            if CALENDAR["v"] == "jalali" else day.strftime("%Y-%m-%d"))
+#    return text + (moment.strftime(" %H:%M") if with_time and moment is not None else "")
+#
+#
+#def month_day(value):
+#    """The short day under a chart's bar."""
+#    got = _when(value)
+#    if not got:
+#        return ""
+#    day = got[0]
+#    if CALENDAR["v"] == "jalali":
+#        return "%02d/%02d" % to_jalali(day.year, day.month, day.day)[1:]
+#    return day.strftime("%m/%d")
+#
 #
 ## ---------------------------------------------------------------- usage page
 ## Charts drawn here as SVG, so the page loads nothing from anywhere else.
@@ -16415,7 +16640,7 @@ exit 0
 #        x = L + i * slot + (slot - bw) / 2
 #        hd, hu = d * scale, u * scale
 #        base = H - B
-#        tip = "%s — دانلود %s، آپلود %s" % (day.strftime("%m/%d"), human_fa(d), human_fa(u))
+#        tip = "%s — دانلود %s، آپلود %s" % (month_day(day), human_fa(d), human_fa(u))
 #        out.append("<g><title>%s</title>" % html.escape(tip))
 #        if hu >= 1 and hd >= 1:
 #            # Download square on the base, a 2px gap of card, upload rounded on top.
@@ -16432,7 +16657,7 @@ exit 0
 #            last = i == n - 1
 #            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
 #                       % (x + bw if last else x + bw / 2, H - 6,
-#                          "end" if last else "middle", day.strftime("%m/%d")))
+#                          "end" if last else "middle", month_day(day)))
 #    out.append("</svg>")
 #    return "".join(out), rows
 #
@@ -16504,7 +16729,7 @@ exit 0
 #    for r, day in enumerate(days):
 #        y = T + r * 22
 #        out.append("<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
-#                   % (L - 6, y + 14, day.strftime("%m/%d")))
+#                   % (L - 6, y + 14, month_day(day)))
 #        for h in range(24):
 #            key = "%sT%02d:00" % (day.strftime("%Y-%m-%d"), h)
 #            v = by.get(key, 0)
@@ -16512,7 +16737,7 @@ exit 0
 #            out.append("<rect x='%.1f' y='%d' width='%.1f' height='18' rx='3' fill='%s'"
 #                       " fill-opacity='%.2f'><title>%s ساعت %02d — %s</title></rect>"
 #                       % (L + h * cw + 1, y, cw - 2, DOWN if v else "var(--line)",
-#                          level if v else 1, day.strftime("%m/%d"), h, human_fa(v)))
+#                          level if v else 1, month_day(day), h, human_fa(v)))
 #    for h in (0, 6, 12, 18, 23):
 #        out.append("<text x='%.1f' y='%d' class='axis' text-anchor='middle'>%02d</text>"
 #                   % (L + h * cw + cw / 2, H - 4, h))
@@ -16592,7 +16817,7 @@ exit 0
 #
 #    out.append("<h2>روزانه</h2>" + legend() + days_svg)
 #    table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
-#                    % (d.strftime("%m/%d"), human_fa(dn), human_fa(u))
+#                    % (month_day(d), human_fa(dn), human_fa(u))
 #                    for d, u, dn in reversed(day_rows) if u or dn)
 #    if table:
 #        out.append("<details class='pw'><summary>جدول روزانه</summary>"
@@ -17179,7 +17404,7 @@ exit 0
 #                body.append("<a class='tk' href='/ticket?id=%d'><span class='s'>%s</span>"
 #                            "<span class='%s'>%s</span><small>%s · %d پیام</small></a>"
 #                            % (t["id"], html.escape(t["subject"]), cls, label,
-#                               html.escape(t["updated_at"][:16].replace("T", " ")),
+#                               html.escape(show_date(t["updated_at"], True)),
 #                               t["messages"]))
 #            body.append("</div>")
 #        else:
@@ -17215,7 +17440,7 @@ exit 0
 #                        "<div class='text'>%s</div>%s</div>"
 #                        % ("admin" if m["from"] == "admin" else "customer",
 #                           "پشتیبانی" if m["from"] == "admin" else "شما",
-#                           html.escape(m["created_at"][:16].replace("T", " ")),
+#                           html.escape(show_date(m["created_at"], True)),
 #                           html.escape(m["body"]), pic))
 #        body.append("</div>")
 #        body.append(
@@ -17371,6 +17596,9 @@ exit 0
 #        rows = []
 #        if info.get("plan_name"):
 #            rows.append(("پلن", html.escape(info["plan_name"])))
+#        if info.get("reserved"):
+#            rows.append(("پلن رزرو", "%s <small>— بعد از تمام شدن پلن فعلی خودکار فعال "
+#                         "می‌شود</small>" % html.escape("، ".join(info["reserved"]))))
 #        rows += [("قالب", html.escape(info.get("plan") or "-")),
 #                ("آی‌پی ثبت‌شده", " ".join("<code>%s</code>" % html.escape(x)
 #                                           for x in (info.get("ips") or [info["ip"]])
@@ -18676,7 +18904,7 @@ exit 0
 #import urllib.error
 #import urllib.parse
 #import urllib.request
-#from datetime import datetime, timedelta, timezone
+#from datetime import date, datetime, timedelta, timezone
 #
 #CONFIG = "/etc/smart-dns/admin.env"
 #DB = "/var/lib/smart-dns/panel.db"
@@ -18744,6 +18972,92 @@ exit 0
 #    except ValueError:
 #        return None
 #    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+#
+#
+## ------------------------------------------------------------------ dates
+## How dates are shown, everywhere: Shamsi or Gregorian, as the admin picked
+## in the settings - Gregorian until then. Always in Tehran time.
+#CALENDAR = {"v": "gregorian", "at": 0.0}
+#
+#
+#def calendar():
+#    """The admin's pick, "jalali" or "gregorian" - read at most every few
+#    seconds, not once for every date on a page."""
+#    if time.time() - CALENDAR["at"] > 5:
+#        try:
+#            row = STORE.one("SELECT value FROM settings WHERE key = 'calendar'")
+#        except Exception:
+#            row = None
+#        CALENDAR["v"] = "jalali" if row and row["value"] == "jalali" else "gregorian"
+#        CALENDAR["at"] = time.time()
+#    return CALENDAR["v"]
+#
+#
+#def to_jalali(gy, gm, gd):
+#    """A Gregorian day as a Shamsi one: (year, month, day)."""
+#    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+#    gy2 = gy + 1 if gm > 2 else gy
+#    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+#            + gd + g_d_m[gm - 1])
+#    jy = -1595 + 33 * (days // 12053)
+#    days %= 12053
+#    jy += 4 * (days // 1461)
+#    days %= 1461
+#    if days > 365:
+#        jy += (days - 1) // 365
+#        days = (days - 1) % 365
+#    if days < 186:
+#        return jy, 1 + days // 31, 1 + days % 31
+#    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+#
+#
+#def _when(value):
+#    """(the day, the moment or None) of a date, a moment or a stored text;
+#    None for anything else. A moment is taken to Tehran."""
+#    if isinstance(value, datetime):
+#        t = (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(TEHRAN)
+#        return t.date(), t
+#    if isinstance(value, date):
+#        return value, None
+#    text = str(value or "").strip()
+#    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+#        try:
+#            return date.fromisoformat(text), None
+#        except ValueError:
+#            return None
+#    t = parse_ts(text)
+#    if not t:
+#        return None
+#    t = t.astimezone(TEHRAN)
+#    return t.date(), t
+#
+#
+#def show_date(value, with_time=False):
+#    """A day or a moment as the admin reads dates - 1405/07/07 or 2026-09-29,
+#    with the time after it when asked. Anything that is not one is given back
+#    as it was: "never", "not yet"."""
+#    got = _when(value)
+#    if not got:
+#        return str(value or "")
+#    day, moment = got
+#    if calendar() == "jalali":
+#        text = "%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day)
+#    else:
+#        text = day.strftime("%Y-%m-%d")
+#    if with_time and moment is not None:
+#        text += moment.strftime(" %H:%M")
+#    return text
+#
+#
+#def month_day(value):
+#    """The short day under a chart's bar: 07/07 or 09/29."""
+#    got = _when(value)
+#    if not got:
+#        return ""
+#    day = got[0]
+#    if calendar() == "jalali":
+#        return "%02d/%02d" % to_jalali(day.year, day.month, day.day)[1:]
+#    return day.strftime("%m/%d")
 #
 #
 #def panel_host():
@@ -18859,6 +19173,16 @@ exit 0
 #            self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
 #        if have and "relay_exits" not in have:
 #            self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
+#        # Plans bought to start when the running one ends - the panel's too.
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS reserved_plans ("
+#            " id INTEGER PRIMARY KEY,"
+#            " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+#            " plan_id INTEGER NOT NULL, created_at TEXT NOT NULL)")
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
+#        for col in ("reserve_done_plan", "reserve_done_at"):
+#            if have and col not in have:
+#                self.db.execute("ALTER TABLE users ADD COLUMN %s TEXT" % col)
 #        # When a customer was last online, and where - the panel's too.
 #        have = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
 #        for col in ("last_seen", "last_server"):
@@ -18929,13 +19253,11 @@ exit 0
 #        """Give an account a plan; a sentence saying what happened, or None
 #        when there is no such account or plan.
 #
-#        The same plan again, while it is still running, is a renewal: the
-#        days go on after the ones that are left and the allowance on top of
-#        what is left, so paying early loses nothing. Anything else starts
-#        fresh from now - a different plan, or one that has already run out -
-#        and what was left of the old one is gone, which the customer was told
-#        before they paid. A suspended account stays suspended: a receipt is
-#        not the operator changing their mind about a block.
+#        While a plan still runs - active, with days left - any plan given,
+#        the same one too, is reserved: the panel starts it, fresh, when the
+#        running one ends, its days or its allowance, and tells the customer.
+#        Otherwise it starts fresh now. A suspended account stays suspended: a
+#        receipt is not the operator changing their mind about a block.
 #        """
 #        stamp = stamp or datetime.now(timezone.utc)
 #        with self.lock:
@@ -18946,20 +19268,18 @@ exit 0
 #            if not user or not plan:
 #                return None
 #            ends = parse_ts(user["expires_at"])
-#            renewing = (user["plan_id"] == plan["id"] and ends and ends > stamp
-#                        and user["status"] in ("active", "over_quota"))
-#            if renewing:
-#                until = ends + timedelta(days=plan["days"])
-#                # Unlimited stays unlimited; otherwise the new allowance goes
-#                # on top of the old, and the usage already counted stays
-#                # counted against the total.
-#                quota = (user["quota_bytes"] + plan["quota_bytes"]
-#                         if plan["quota_bytes"] and user["quota_bytes"] else 0)
-#                used = user["used_bytes"]
-#            else:
-#                until = stamp + timedelta(days=plan["days"])
-#                quota = plan["quota_bytes"]
-#                used = 0
+#            if user["status"] == "active" and ends and ends > stamp:
+#                self.db.execute("INSERT INTO reserved_plans (user_id, plan_id, created_at)"
+#                                " VALUES (?, ?, ?)", (uid, plan["id"],
+#                                                      stamp.isoformat(timespec="seconds")))
+#                ahead = self.db.execute("SELECT count(*) FROM reserved_plans"
+#                                        " WHERE user_id = ?", (uid,)).fetchone()[0]
+#                self.db.commit()
+#                return ("پلن «%s» رزرو شد؛ بعد از تمام شدن پلن فعلی خودکار فعال می‌شود%s"
+#                        % (plan["name"], "" if ahead < 2 else " (نوبت %d)" % ahead))
+#            until = stamp + timedelta(days=plan["days"])
+#            quota = plan["quota_bytes"]
+#            used = 0
 #            self.db.execute(
 #                "UPDATE users SET plan_id = ?, template_id = ?, quota_bytes = ?,"
 #                " used_bytes = ?, speed_kbps = ?, expires_at = ?,"
@@ -18968,9 +19288,9 @@ exit 0
 #                " ELSE 'active' END WHERE id = ?",
 #                (plan["id"], plan["template_id"], quota, used, plan["speed_kbps"],
 #                 until.isoformat(timespec="seconds"), uid))
-#            # The plan's devices, and those bought on top, which a renewal
-#            # keeps and another plan ends.
-#            extra = (user["extra_devices"] or 0) if renewing and \
+#            # The plan's devices, and those bought on top, which the same
+#            # plan again keeps, as it follows on, and another plan ends.
+#            extra = (user["extra_devices"] or 0) if user["plan_id"] == plan["id"] and \
 #                "extra_devices" in user.keys() else 0
 #            set_devices(self.db, uid, plan_devices(plan) + extra, extra)
 #            # A plan that names servers abroad puts the customer on them - one
@@ -18981,9 +19301,7 @@ exit 0
 #                self.db.execute("UPDATE users SET exit = ?, relay_exits = ? WHERE id = ?",
 #                                exits + (uid,))
 #            self.db.commit()
-#        return ("پلن «%s» تمدید شد تا %s" if renewing
-#                else "پلن «%s» فعال شد تا %s") % (plan["name"],
-#                                                  until.strftime("%Y-%m-%d"))
+#        return "پلن «%s» فعال شد تا %s" % (plan["name"], show_date(until))
 #
 #    def delete_user(self, uid):
 #        """Delete an account and everything that is only its; the addresses
@@ -19486,7 +19804,7 @@ exit 0
 #        x = L + i * slot + (slot - bw) / 2
 #        hd, hu = d * scale, u * scale
 #        base = H - B
-#        tip = "%s — دانلود %s، آپلود %s" % (day.strftime("%m/%d"), human(d), human(u))
+#        tip = "%s — دانلود %s، آپلود %s" % (month_day(day), human(d), human(u))
 #        out.append("<g><title>%s</title>" % html.escape(tip))
 #        if hu >= 1 and hd >= 1:
 #            # Download square on the base, a 2px gap of card, upload rounded on top.
@@ -19503,7 +19821,7 @@ exit 0
 #            last = i == n - 1
 #            out.append("<text x='%.1f' y='%d' class='axis' text-anchor='%s'>%s</text>"
 #                       % (x + bw if last else x + bw / 2, H - 6,
-#                          "end" if last else "middle", day.strftime("%m/%d")))
+#                          "end" if last else "middle", month_day(day)))
 #    out.append("</svg>")
 #    return "".join(out), rows
 #
@@ -19575,7 +19893,7 @@ exit 0
 #    for r, day in enumerate(days):
 #        y = T + r * 22
 #        out.append("<text x='%d' y='%.1f' class='axis' text-anchor='end'>%s</text>"
-#                   % (L - 6, y + 14, day.strftime("%m/%d")))
+#                   % (L - 6, y + 14, month_day(day)))
 #        for h in range(24):
 #            key = "%sT%02d:00" % (day.strftime("%Y-%m-%d"), h)
 #            v = by.get(key, 0)
@@ -19583,7 +19901,7 @@ exit 0
 #            out.append("<rect x='%.1f' y='%d' width='%.1f' height='18' rx='3' fill='%s'"
 #                       " fill-opacity='%.2f'><title>%s ساعت %02d — %s</title></rect>"
 #                       % (L + h * cw + 1, y, cw - 2, DOWN if v else "var(--line)",
-#                          level if v else 1, day.strftime("%m/%d"), h, human(v)))
+#                          level if v else 1, month_day(day), h, human(v)))
 #    for h in (0, 6, 12, 18, 23):
 #        out.append("<text x='%.1f' y='%d' class='axis' text-anchor='middle'>%02d</text>"
 #                   % (L + h * cw + cw / 2, H - 4, h))
@@ -19621,7 +19939,7 @@ exit 0
 #                "می‌شود. زنده دیدن در همان لحظه: <code>smartdns-watch</code> روی رله."
 #                "</p></div>")
 #    out = ["<div class='card'><h2>گزارش DNS — %s</h2>" % (
-#        "روشن تا %s" % user["qlog_until"][:16].replace("T", " ") if on else "خاموش"),
+#        "روشن تا %s" % show_date(user["qlog_until"], True) if on else "خاموش"),
 #        "<p class='muted'>با اجازهٔ خود مشتری؛ هر اسم یک ساعت بعد از آخرین بار پاک "
 #        "می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا "
 #        "اسم در فهرست نیست.</p>",
@@ -21176,7 +21494,7 @@ exit 0
 #                      " (<a href='%s' target='_blank' rel='noopener'>یادداشت نسخه</a>)"
 #                      % html.escape(state["page"], quote=True) if state.get("page") else ""))
 #    out.append(" <span class='muted'>— بررسی: %s</span></p>"
-#               % html.escape((state.get("checked_at") or "هنوز نه")[:16].replace("T", " ")))
+#               % html.escape(show_date(state.get("checked_at") or "هنوز نه", True)))
 #    if state.get("error"):
 #        out.append("<p class='warn'>گیت‌هاب جواب درستی نداد: %s</p>" % html.escape(state["error"]))
 #    if waiting and rc is None:
@@ -21379,6 +21697,17 @@ exit 0
 #def is_online(row):
 #    seen = row["last_seen"] if "last_seen" in row.keys() else None
 #    return bool(seen) and seen >= online_since()
+#
+#
+#def joined_and_seen(row):
+#    """The line under a customer's name: when the account was made, in
+#    Tehran, and when they were last online - or that they are now."""
+#    made = parse_ts(row["created_at"])
+#    joined = show_date(made) if made else ""
+#    seen = row["last_seen"] if "last_seen" in row.keys() else None
+#    now_on = "آنلاین" if is_online(row) else (
+#        "آخرین آنلاین: %s" % ago(seen) if seen else "هنوز آنلاین نشده")
+#    return "ثبت‌نام: %s · %s" % (joined, now_on) if joined else now_on
 #
 #
 #def online_rows(extra="", args=()):
@@ -22318,10 +22647,11 @@ exit 0
 #.pill.bad{background:var(--err-bg);color:var(--bad)}
 #.card details>summary{cursor:pointer}
 #.who small{display:block;color:var(--muted);font-size:11px}
+#.who small.seen{font-size:10.5px;color:var(--faint);white-space:nowrap;line-height:1.5}
 #.card.wide{padding:16px 12px}
 #table.users td{padding:8px 5px}
 #table.users th{padding:9px 5px}
-#table.users td.who{max-width:118px;overflow:hidden;text-overflow:ellipsis}
+#table.users td.who{max-width:150px;overflow:hidden;text-overflow:ellipsis}
 #table.users td.who code{white-space:nowrap}
 #table.users input[name=quota_gb],table.users input[name=speed_mb]{width:52px}
 #table.users input[name=days]{width:66px}
@@ -22351,8 +22681,12 @@ exit 0
 #.logo.plain{color:var(--muted)}
 #.purge{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 14px}
 #.purge form{margin:0}
+#.reserved{color:var(--accent);font-size:11px}
+#form.reserve{display:flex;align-items:center;gap:6px;margin:6px 0;font-size:12px}
 #.usearch{margin:0 0 14px}
 #.usearch input[type=search]{min-width:280px;flex:1;max-width:460px}
+#.usort{display:inline-flex;align-items:center;gap:6px;margin:0;color:var(--muted);
+# font-size:13px;white-space:nowrap}
 #.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
 # vertical-align:1px}
 #.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
@@ -22703,7 +23037,7 @@ exit 0
 #                % ("" if r["active"] else " class='off'", html.escape(r["code"]),
 #                   "%d٪" % r["value"] if r["kind"] == "percent"
 #                   else "%s تومان" % format(r["value"], ","),
-#                   html.escape((r["expires_at"] or "")[:10]) or "بی‌مهلت",
+#                   html.escape(show_date(r["expires_at"] or "")) or "بی‌مهلت",
 #                   r["uses"], " از %d" % r["max_uses"] if r["max_uses"] else "",
 #                   "یک بار" if r["once"] else "بی‌حد",
 #                   "، ".join(html.escape(plans.get(i, "#%d" % i)) for i in only)
@@ -23033,7 +23367,7 @@ exit 0
 #                             (r["first_row"] or 0, r["last_row"] or -1))["c"]
 #            media = r["media"] if "media" in r.keys() else None
 #            out.append("<tr><td>%s</td><td>%s</td><td>%s%s</td><td>%s</td></tr>"
-#                       % (html.escape(r["created_at"][:16].replace("T", " ")),
+#                       % (html.escape(show_date(r["created_at"], True)),
 #                          html.escape(labels.get(r["target"], r["target"])),
 #                          broadcast_media_label(media),
 #                          html.escape(r["text"][:80] + ("…" if len(r["text"]) > 80 else "")),
@@ -23866,16 +24200,33 @@ exit 0
 #    opts = "".join("<option value='%d'>%s%s</option>"
 #                   % (x["id"], html.escape(x["name"]),
 #                      "" if x["active"] else " (خاموش)") for x in plans)
-#    return ("<details><summary>%s</summary>"
+#    try:
+#        waiting = STORE.q("SELECT r.id, p.name FROM reserved_plans r LEFT JOIN plans p"
+#                          " ON p.id = r.plan_id WHERE r.user_id = ? ORDER BY r.id",
+#                          (user["id"],))
+#    except sqlite3.OperationalError:
+#        waiting = []
+#    # The plans reserved to start when this one ends, each with a way to
+#    # take it back.
+#    reserved = "".join(
+#        "<form method='post' action='/%s/user-reserve-cancel' class='reserve'"
+#        " onsubmit='return confirm(%s)'><input type='hidden' name='id' value='%d'>"
+#        "<span>⏳ رزرو: %s</span> <button class='del' title='لغو رزرو'>لغو رزرو</button></form>"
+#        % (CFG["ADMIN_PATH"], html.escape(json.dumps(
+#            "رزرو پلن «%s» لغو شود؟ پولش خودکار برنمی‌گردد." % (w["name"] or "?"),
+#            ensure_ascii=False), quote=True), w["id"], html.escape(w["name"] or "?"))
+#        for w in waiting)
+#    return ("<details><summary>%s%s</summary>%s"
 #            "<form method='post' action='/%s/user-plan'"
-#            " onsubmit='return confirm(\"این پلن به این کاربر داده شود؟ همان پلن "
-#            "تمدید می‌شود و پلن دیگر از همین حالا از نو شروع می‌شود.\")'>"
+#            " onsubmit='return confirm(\"این پلن به این کاربر داده شود؟ اگر پلن فعلی‌اش "
+#            "هنوز تمام نشده، رزرو می‌شود و بعد از آن خودکار فعال می‌شود.\")'>"
 #            "<input type='hidden' name='id' value='%d'>"
 #            "<label>دادن پلن بدون رسید</label>"
 #            "<select name='plan_id' required><option value=''>انتخاب پلن…</option>"
 #            "%s</select> <button class='ghost'>اعمال</button></form></details>"
 #            % (html.escape(held) if held else "<span class='muted'>بدون پلن</span>",
-#               CFG["ADMIN_PATH"], user["id"], opts))
+#               " <small class='reserved'>+%d رزرو</small>" % len(waiting) if waiting else "",
+#               reserved, CFG["ADMIN_PATH"], user["id"], opts))
 #
 #
 ## What one template in use costs every relay: its own resolver, measured at
@@ -24050,7 +24401,7 @@ exit 0
 #ACTION_SECTION = {
 #    "user-save": "users", "user-status": "users", "user-template": "users",
 #    "user-plan": "users", "user-reset": "users", "user-delete": "users",
-#    "users-purge": "users",
+#    "users-purge": "users", "user-reserve-cancel": "users",
 #    "user-relays": "users", "user-exit": "users", "user-devices": "users",
 #    "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
 #    "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
@@ -24070,7 +24421,7 @@ exit 0
 #    "upgrade-start": "nodes", "upgrade-stop": "nodes", "update-check": "settings",
 #    "public-dns": "settings", "server-list-save": "nodes", "seller-server-notes": ANYONE,
 #    "dns-bench": "settings", "dns-upstream": "settings", "doh-name": "settings",
-#    "telegram-required": "settings", "portal-open": "settings", "watch-start": "logs", "diagnose-start": "logs",
+#    "telegram-required": "settings", "portal-open": "settings", "calendar-save": "settings", "watch-start": "logs", "diagnose-start": "logs",
 #    "me-password": ANYONE, "view-as-stop": ANYONE}
 ## Everything else - the owner's password, the panel's address, backups and
 ## restoring them, the standby, upgrading from GitHub, the admins - is the
@@ -24196,14 +24547,53 @@ exit 0
 #            (like, like, like, q.lstrip("#@"), q.lstrip("#"), like))
 #
 #
-#def user_search_box(p, q):
-#    """The users page's search, above the table."""
+## How the users page can be ordered: (key, what the menu says, ORDER BY).
+## Every one ends on the newest first, so equal rows keep a steady order.
+#USER_SORTS = (
+#    ("new", "جدیدترین ثبت‌نام", "u.created_at DESC"),
+#    ("old", "قدیمی‌ترین ثبت‌نام", "u.created_at ASC"),
+#    ("name", "اسم", "CASE WHEN COALESCE(u.first_name, '') = '' THEN 1 ELSE 0 END,"
+#                    " u.first_name COLLATE NOCASE"),
+#    ("user", "نام کاربری", "CASE WHEN COALESCE(u.username, '') = '' THEN 1 ELSE 0 END,"
+#                           " u.username COLLATE NOCASE"),
+#    ("used", "بیشترین مصرف", "u.used_bytes DESC"),
+#    ("left", "کمترین حجم مانده", "CASE WHEN u.quota_bytes > 0 THEN 0 ELSE 1 END,"
+#                                 " u.quota_bytes - u.used_bytes"),
+#    ("days", "کمترین روز مانده",
+#     "CASE WHEN COALESCE(u.expires_at, u.quota_reset_at) IS NULL THEN 1 ELSE 0 END,"
+#     " COALESCE(u.expires_at, u.quota_reset_at)"),
+#    ("wallet", "بیشترین کیف پول", "u.wallet DESC"),
+#    ("status", "وضعیت", "CASE u.status WHEN 'active' THEN 0 WHEN 'pending' THEN 1"
+#                        " WHEN 'over_quota' THEN 2 WHEN 'expired' THEN 3 ELSE 4 END"),
+#    ("seen", "آنلاین و آخرین فعالیت", "CASE WHEN u.last_seen IS NULL THEN 1 ELSE 0 END,"
+#                                      " u.last_seen DESC"),
+#)
+#
+#
+#def user_order(key):
+#    """(the key in use, its ORDER BY) - the newest first for anything else."""
+#    for k, _, order in USER_SORTS:
+#        if k == key:
+#            return k, order + ", u.id DESC"
+#    return "new", USER_SORTS[0][2] + ", u.id DESC"
+#
+#
+#def user_search_box(p, q, sort="new"):
+#    """The users page's search and order, above the table. The order is
+#    kept in a cookie too, so the page comes back in it after a row is
+#    saved."""
+#    opts = "".join("<option value='%s'%s>%s</option>"
+#                   % (k, " selected" if k == sort else "", label)
+#                   for k, label, _ in USER_SORTS)
 #    return ("<form method='get' action='/%s/users' class='row usearch'>"
 #            "<input type='search' name='q' value='%s' autocomplete='off' "
 #            "placeholder='جستجو: اسم، نام کاربری، شماره، آیدی تلگرام یا آی‌پی'>"
-#            "<button class='ghost'>جستجو</button>%s</form>"
+#            "<button class='ghost'>جستجو</button>%s"
+#            "<label class='usort'>مرتب‌سازی: <select name='sort' onchange=\"document.cookie="
+#            "'usort='+this.value+'; path=/; max-age=31536000; SameSite=Strict';"
+#            "this.form.submit()\">%s</select></label></form>"
 #            % (p, html.escape(q, quote=True),
-#               "<a href='/%s/users'>همه</a>" % p if q else ""))
+#               "<a href='/%s/users'>همه</a>" % p if q else "", opts))
 #
 #
 #def mine(alias="u"):
@@ -24477,7 +24867,7 @@ exit 0
 #           "value='%d'><button class='ghost'>دیدن به‌جای او</button></form></div></div>"
 #           % (html.escape(r["username"]),
 #              "<span class='pill warn'>فروشنده</span>" if seller else "", state,
-#              "ساخته شده %s" % html.escape((r["created_at"] or "")[:10]),
+#              "ساخته شده %s" % html.escape(show_date(r["created_at"] or "")),
 #              html.escape("، ".join(dict(ADMIN_SECTIONS)[k] for k in ADMIN_SECTIONS_ORDER
 #                                   if k in admin_perms(r)
 #                                   and (not seller or k in RESELLER_SECTIONS)) or "—"),
@@ -24536,7 +24926,7 @@ exit 0
 #                   "<th>مشتری</th><th>چه</th><th>مبلغ</th><th></th></tr>")
 #        for t in rows:
 #            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-#                       % (html.escape(t["created_at"][:16].replace("T", " ")),
+#                       % (html.escape(show_date(t["created_at"], True)),
 #                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
 #                          kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
 #                          states.get(t["status"], html.escape(t["status"]))))
@@ -24577,7 +24967,7 @@ exit 0
 #                   if r["own_only"] else "—",
 #                   ("%s از %s" % (human(r["used_bytes"]), human(r["cap_bytes"]))
 #                    if r["cap_bytes"] else "—") if r["own_only"] else "—",
-#                   html.escape((r["expires_at"] or "")[:10]) or "—",
+#                   html.escape(show_date(r["expires_at"] or "")) or "—",
 #                   admin_row_buttons(p, r, "list"),
 #                   p, r["id"], p, r["id"]))
 #        out.append("</table><p class='muted'>روی نام هر ادمین بزنید تا آمار و کارهایش را "
@@ -24592,7 +24982,7 @@ exit 0
 #def reset_days_form(p, user):
 #    """In a customer's menu: their usage back to zero every so many days."""
 #    days = user["reset_days"] if "reset_days" in user.keys() else None
-#    nxt = (user["reset_next"] or "")[:10] if days else ""
+#    nxt = show_date(user["reset_next"] or "") if days else ""
 #    return ("<form method='post' action='/%s/user-reset-days' class='resetdays'>"
 #            "<input type='hidden' name='id' value='%d'>"
 #            "<label>ریست خودکار مصرف هر</label>"
@@ -24681,7 +25071,7 @@ exit 0
 #           row.get("max_users") or "",
 #           ("%g" % (row["cap_bytes"] / GB)) if row.get("cap_bytes") else "", days,
 #           row.get("reset_days") or "",
-#           " <small class='muted'>بعدی: %s</small>" % row["reset_next"][:10]
+#           " <small class='muted'>بعدی: %s</small>" % show_date(row["reset_next"])
 #           if row.get("reset_days") and row.get("reset_next") else "",
 #           # Renewing: the usage so far back to nothing, by its own button.
 #           ("<p><span class='muted'>مصرف تا حالا: %s</span> <button class='ghost' "
@@ -25344,6 +25734,7 @@ exit 0
 #        rows = STORE.q(
 #            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
+#            " u.status AS ustatus, u.expires_at AS uends,"
 #            " p.name AS plan_name, p.days AS plan_days,"
 #            " p.quota_bytes AS plan_quota"
 #            " FROM transactions t JOIN users u ON u.id = t.user_id"
@@ -25373,7 +25764,10 @@ exit 0
 #                          % (html.escape(r["plan_name"]),
 #                             human(r["plan_quota"]) if r["plan_quota"] else "نامحدود",
 #                             r["plan_days"], format(r["amount"], ","),
-#                             "تمدید همان پلن" if r["holds"] == r["plan_id"]
+#                             "پلن فعلی‌اش هنوز تمام نشده: با تأیید رزرو می‌شود و بعد از آن "
+#                             "خودکار فعال می‌شود" if r["ustatus"] == "active" and r["uends"]
+#                             and (parse_ts(r["uends"]) or datetime.min.replace(
+#                                 tzinfo=timezone.utc)) > datetime.now(timezone.utc)
 #                             else "با تأیید، خودکار فعال می‌شود"))
 #                if r["code_id"]:
 #                    code = STORE.one("SELECT code FROM discount_codes WHERE id = ?",
@@ -25403,7 +25797,7 @@ exit 0
 #                "<button class='danger'>رد</button></form>"
 #                "<a class='muted' href='/%s/users'>ویرایش حساب این کاربر ←</a>"
 #                "</div></div>"
-#                % (html.escape(who), html.escape(r["created_at"][:16]),
+#                % (html.escape(who), html.escape(show_date(r["created_at"], True)),
 #                   human(r["size"] or 0), bought,
 #                   p, r["id"], p, r["id"], p, r["id"],
 #                   ("<input name='amount' value='%d' size='10' dir='ltr' title='مبلغی که "
@@ -25425,7 +25819,7 @@ exit 0
 #                           "<td class='%s'>%s</td><td>%s</td></tr>"
 #                           % (html.escape((r["first_name"] or "") + " · " +
 #                                          (r["username"] or r["phone"] or "")),
-#                              html.escape(r["created_at"][:16]),
+#                              html.escape(show_date(r["created_at"], True)),
 #                              html.escape(
 #                                  "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
 #                                  if r["kind"] == "topup" else
@@ -25435,7 +25829,7 @@ exit 0
 #                                  if r["kind"] == "wallet" else r["plan_name"] or "-"),
 #                              "ok" if r["status"] == "approved" else "bad",
 #                              "تأیید شد" if r["status"] == "approved" else "رد شد",
-#                              html.escape((r["decided_at"] or "")[:16])))
+#                              html.escape(show_date(r["decided_at"] or "", True))))
 #            out.append("</table></div>")
 #        return "".join(out)
 #
@@ -25996,7 +26390,7 @@ exit 0
 #        out.append(user_servers_card(uid))
 #        out.append(qlog_card(user))
 #        table = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
-#                        % (d.strftime("%Y-%m-%d"), human(dn), human(u))
+#                        % (show_date(d), human(dn), human(u))
 #                        for d, u, dn in reversed(rows) if u or dn)
 #        if table:
 #            out.append("<div class='card'><h2>جدول روزانه</h2><table><tr><th>روز</th>"
@@ -26015,9 +26409,20 @@ exit 0
 #        q = (urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("q")
 #             or [""])[0].strip()[:64]
 #        find, find_args = user_search(q)
+#        # The order asked for, else the one this browser picked last.
+#        asked = (urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("sort")
+#                 or [""])[0]
+#        if not asked:
+#            try:
+#                jar = http.cookies.SimpleCookie(
+#                    (getattr(self, "headers", None) or {}).get("Cookie", "") or "")
+#                asked = jar["usort"].value if "usort" in jar else ""
+#            except http.cookies.CookieError:
+#                asked = ""
+#        sort, order = user_order(asked)
 #        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
 #                       " ip FROM users u WHERE 1 = 1" + extra + find
-#                       + " ORDER BY u.created_at DESC", args + find_args)
+#                       + " ORDER BY " + order, args + find_args)
 #        total = STORE.one("SELECT count(*) c FROM users u WHERE 1 = 1" + extra, args)["c"] \
 #            if q else len(rows)
 #        out = ["<div class='card wide'><h2>کاربران (%s)</h2>"
@@ -26025,7 +26430,7 @@ exit 0
 #        if not total:
 #            return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
 #        out.append(purge_card(CFG["ADMIN_PATH"]))
-#        out.append(user_search_box(CFG["ADMIN_PATH"], q))
+#        out.append(user_search_box(CFG["ADMIN_PATH"], q, sort))
 #        if not rows:
 #            return "".join(out) + ("<p class='muted'>کسی با «%s» پیدا نشد.</p></div>"
 #                                   % html.escape(q))
@@ -26093,7 +26498,8 @@ exit 0
 #                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
 #                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
-#                "<tr><td class='who' title='%s'>%s<code>%s</code><small>%s</small></td>"
+#                "<tr><td class='who' title='%s'>%s<code>%s</code><small>%s</small>"
+#                "<small class='seen'>%s</small><small class='seen'>%s</small></td>"
 #                "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
 #                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
 #                "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -26132,6 +26538,8 @@ exit 0
 #                   "<span class='dot on' title='آنلاین'></span>" if is_online(r) else "",
 #                   html.escape(who),
 #                   html.escape(r["first_name"] or ""),
+#                   *[html.escape(x) for x in joined_and_seen(r).split(" · ", 1)
+#                     + ([""] if " · " not in joined_and_seen(r) else [])],
 #                   html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
 #                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
 #                   % (p, r["id"], human(r["used_bytes"])),
@@ -26304,7 +26712,7 @@ exit 0
 #                          html.escape(ticket_who(r)), p, r["id"], html.escape(r["subject"]),
 #                          r["n"], TICKET_STATES[r["status"]][1],
 #                          TICKET_STATES[r["status"]][0],
-#                          html.escape(r["updated_at"][:16].replace("T", " "))))
+#                          html.escape(show_date(r["updated_at"], True))))
 #        out.append("</table></div>")
 #        return "".join(out)
 #
@@ -26327,7 +26735,7 @@ exit 0
 #                       "<div class='text'>%s</div>%s</div>"
 #                       % ("admin" if m["from_admin"] else "customer",
 #                          "شما" if m["from_admin"] else "مشتری",
-#                          html.escape(m["created_at"][:16].replace("T", " ")),
+#                          html.escape(show_date(m["created_at"], True)),
 #                          html.escape(m["body"]), pic))
 #        out.append("</div>")
 #        out.append("<form method='post' action='/%s/ticket-reply'"
@@ -26528,7 +26936,7 @@ exit 0
 #            for m in moves:
 #                out.append("<tr><td>%s</td><td>%s</td><td class='%s' dir='ltr'>%s</td>"
 #                           "<td>%s</td><td>%s</td></tr>"
-#                           % (html.escape(m["at"][:16].replace("T", " ")),
+#                           % (html.escape(show_date(m["at"], True)),
 #                              WALLET_KINDS.get(m["kind"], html.escape(m["kind"])),
 #                              "ok" if m["amount"] > 0 else "bad",
 #                              ("+" if m["amount"] > 0 else "−") + format(abs(m["amount"]), ","),
@@ -26580,8 +26988,8 @@ exit 0
 #                    % ("" if live else " class='off'", html.escape(r["name"]),
 #                       "<span class='warn'>ادمین</span>" if r["scope"] == "admin"
 #                       else "مشتری",
-#                       html.escape(r["created_at"][:16].replace("T", " ")),
-#                       html.escape((r["last_used_at"] or "هرگز")[:16].replace("T", " ")),
+#                       html.escape(show_date(r["created_at"], True)),
+#                       html.escape(show_date(r["last_used_at"] or "هرگز", True)),
 #                       html.escape(r["allow_ips"] or "همه"),
 #                       "ok" if live else "bad", "فعال" if live else "باطل شده",
 #                       ("<form method='post' action='/%s/api-key-revoke'"
@@ -26652,7 +27060,7 @@ exit 0
 #                    out.append("<tr><td><code>%s</code></td><td>%s</td>"
 #                               "<td class='muted'>%s</td><td>%s</td></tr>"
 #                               % (html.escape(o["event"]), html.escape(o["name"] or "-"),
-#                                  html.escape(o["created_at"][:16].replace("T", " ")),
+#                                  html.escape(show_date(o["created_at"], True)),
 #                                  state))
 #                out.append("</table>")
 #            out.append("</div>")
@@ -26984,7 +27392,7 @@ exit 0
 #                           "<input type='hidden' name='domain' value='%s'>"
 #                           "<button class='danger'>حذف</button></form></td></tr>"
 #                           % (html.escape(r["domain"]), where, html.escape(r["note"] or ""),
-#                              (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
+#                              show_date(r["added_at"] or ""), p, html.escape(r["domain"])))
 #            out.append("</table>")
 #        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. دامنه‌های بدون گروه "
 #                   "در سرویس «دامنه‌های دلخواه» جمع می‌شوند و هر گروه در قالب‌ها یک ردیف "
@@ -27019,6 +27427,18 @@ exit 0
 #        if one_server():
 #            # No nodes page here: its one server's words for customers live here.
 #            out.append(customer_servers_card(p))
+#
+#        cal = calendar()
+#        out.append("<div class='card'><h2>تاریخ</h2>"
+#                   "<form method='post' action='/%s/calendar-save' class='row'>"
+#                   "<label style='display:inline'><input type='radio' name='cal' value='gregorian'%s>"
+#                   " میلادی (2026-09-29)</label> "
+#                   "<label style='display:inline'><input type='radio' name='cal' value='jalali'%s>"
+#                   " شمسی (1405/07/07)</label> <button class='ghost'>ذخیره</button></form>"
+#                   "<p class='muted'>همهٔ تاریخ‌ها این‌طور نشان داده می‌شوند، به وقت تهران: پنل "
+#                   "ادمین، پنل مشتری و پیام‌های ربات.</p></div>"
+#                   % (p, " checked" if cal != "jalali" else "",
+#                      " checked" if cal == "jalali" else ""))
 #
 #        opened = STORE.one("SELECT value FROM settings WHERE key = 'portal_open'")
 #        opened = not (opened and opened["value"] == "0")
@@ -28051,6 +28471,17 @@ exit 0
 #            return self.redirect("users?m=%d کاربر پاک شد%s" % (
 #                n, "؛ %d نفر به‌خاطر کیف پول یا رسید منتظر ماندند" % kept if kept else ""))
 #
+#        if rest == "user-reserve-cancel":
+#            rid = int(one("id")) if (one("id") or "").isdigit() else 0
+#            row = STORE.one("SELECT id, user_id FROM reserved_plans WHERE id = ?", (rid,))
+#            # A seller's own customers' only.
+#            if not row or not owns("SELECT 1 FROM reserved_plans r JOIN users u"
+#                                   " ON u.id = r.user_id WHERE r.id = ?", rid):
+#                return self.redirect("users?m=!این رزرو پیدا نشد")
+#            STORE.run("DELETE FROM reserved_plans WHERE id = ?", (rid,))
+#            log(INFO, "reserved plan #%d of user #%d taken back" % (rid, row["user_id"]))
+#            return self.redirect("users?m=رزرو لغو شد")
+#
 #        if rest == "user-delete":
 #            uid = int(one("id") or 0)
 #            ips = STORE.delete_user(uid)
@@ -28509,6 +28940,15 @@ exit 0
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (link,))
 #            return self.redirect("api?m=%s" % ("آدرس ربات ذخیره شد" if link
 #                                               else "آدرس ربات برداشته شد"))
+#
+#        if rest == "calendar-save":
+#            cal = "jalali" if one("cal") == "jalali" else "gregorian"
+#            STORE.run("INSERT INTO settings (key, value) VALUES ('calendar', ?)"
+#                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (cal,))
+#            CALENDAR["at"] = 0.0
+#            return self.redirect("settings?m=%s" % (
+#                "تاریخ‌ها از این به بعد شمسی نشان داده می‌شوند" if cal == "jalali"
+#                else "تاریخ‌ها از این به بعد میلادی نشان داده می‌شوند"))
 #
 #        if rest == "portal-open":
 #            on = one("on") == "1"
@@ -29227,7 +29667,7 @@ exit 0
 #    if meta.get("sha"):
 #        return ("<span class='pill ok'>%s دامنه</span> <span class='muted'>به‌روز %s</span>"
 #                % (format(meta.get("count") or 0, ","),
-#                   html.escape((meta.get("fetched_at") or "")[:10])))
+#                   html.escape(show_date(meta.get("fetched_at") or ""))))
 #    if meta.get("error"):
 #        return ("<span class='pill bad'>دریافت نشد</span> <span class='muted'>%s — یک ساعت "
 #                "دیگر دوباره</span>" % html.escape(meta["error"][:80]))
@@ -29359,7 +29799,7 @@ exit 0
 #                       % (html.escape(r["domain"]),
 #                          html.escape(scope_text("blocked_domains", r["domain"])),
 #                          html.escape(r["note"] or ""),
-#                          (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
+#                          show_date(r["added_at"] or ""), p, html.escape(r["domain"])))
 #        out.append("</table>")
 #    out.append("<p class='muted'>این‌ها برای مشتری‌های قالب‌های انتخاب‌شده بالا نمی‌آیند: DNS "
 #               "جواب «چنین اسمی نیست» می‌دهد، با همهٔ زیردامنه‌ها. دامنه‌ای که خود سرویس "
@@ -31904,7 +32344,7 @@ exit 0
 #import urllib.parse
 #import urllib.request
 #import uuid
-#from datetime import datetime, timezone
+#from datetime import date, datetime, timedelta, timezone
 #
 #try:
 #    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -32270,6 +32710,48 @@ exit 0
 #            raise ValueError("فایل بزرگ‌تر از ۴ مگابایت است")
 #        with urllib.request.urlopen(self.files + info["file_path"], timeout=60) as r:
 #            return r.read(MAX_FILE + 1)
+#
+#
+## Dates as the admin picked them shown - the panel says which with every
+## account: Shamsi or Gregorian, in Tehran time.
+#TEHRAN = timezone(timedelta(hours=3, minutes=30))
+#
+#
+#def to_jalali(gy, gm, gd):
+#    """A Gregorian day as a Shamsi one: (year, month, day)."""
+#    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+#    gy2 = gy + 1 if gm > 2 else gy
+#    days = (355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+#            + gd + g_d_m[gm - 1])
+#    jy = -1595 + 33 * (days // 12053)
+#    days %= 12053
+#    jy += 4 * (days // 1461)
+#    days %= 1461
+#    if days > 365:
+#        jy += (days - 1) // 365
+#        days = (days - 1) % 365
+#    if days < 186:
+#        return jy, 1 + days // 31, 1 + days % 31
+#    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+#
+#
+#def show_date(value, cal="gregorian"):
+#    """The day of a date or a moment, in `cal`: 1405/07/07 or 2026-09-29.
+#    Anything else given back as it was."""
+#    text = str(value or "").strip()
+#    if not text:
+#        return ""
+#    try:
+#        if len(text) == 10:
+#            day = date.fromisoformat(text)
+#        else:
+#            t = datetime.fromisoformat(text)
+#            day = (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(TEHRAN).date()
+#    except ValueError:
+#        return text
+#    if cal == "jalali":
+#        return "%04d/%02d/%02d" % to_jalali(day.year, day.month, day.day)
+#    return day.strftime("%Y-%m-%d")
 #
 #
 #def ios_profile(url, address=""):
@@ -32739,13 +33221,16 @@ exit 0
 #                                              else size_fa(u["remaining_bytes"])))
 #            lines.append("مصرف: %s" % size_fa(u["used_bytes"]))
 #        if u["expires_at"]:
-#            lines.append("پایان دوره: %s" % u["expires_at"][:10])
+#            lines.append("پایان دوره: %s" % show_date(u["expires_at"], u.get("calendar")))
 #            left = time_left_fa(u["expires_at"])
 #            if left:
 #                lines.append("زمان باقی‌مانده: %s" % left)
 #        lines.append("آی‌پی: %s" % (", ".join(u["ips"]) if u["ips"] else "ثبت نشده ⚠️"))
 #        if (u.get("max_ips") or 1) > 1:
 #            lines.append("دستگاه: %d از %d" % (len(u["ips"]), u["max_ips"]))
+#        if u.get("reserved"):
+#            lines.append("⏳ پلن رزرو: %s (بعد از تمام شدن پلن فعلی خودکار فعال می‌شود)"
+#                         % "، ".join(u["reserved"]))
 #        if u["receipt_waiting"]:
 #            lines.append("\n⏳ یک رسید در انتظار بررسی دارید.")
 #        offer = u.get("device_offer")
@@ -32830,11 +33315,10 @@ exit 0
 #            return self.say(chat, "این پلن دیگر فروخته نمی‌شود.", MENU)
 #        u = self.account(sender)
 #        warn = ""
-#        if u["plan"] and u["plan"]["id"] != plan_id and u["status"] in ("active", "over_quota"):
-#            warn = ("\n\n⚠️ پلن فعلی شما «%s» است. پلن تازه از لحظهٔ تأیید از نو شروع می‌شود "
-#                    "و باقی‌ماندهٔ پلن فعلی از بین می‌رود." % u["plan"]["name"])
-#        elif u["plan"] and u["plan"]["id"] == plan_id and u["status"] in ("active", "over_quota"):
-#            warn = "\n\n✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود."
+#        if u["status"] == "active" and u.get("expires_at"):
+#            warn = ("\n\n⏳ پلن فعلی شما%s هنوز تمام نشده؛ این پلن رزرو می‌شود و بعد از تمام "
+#                    "شدن آن خودکار فعال می‌شود." % (" «%s»" % u["plan"]["name"]
+#                                                    if u["plan"] else ""))
 #        self.state[chat] = ("receipt", (plan_id, code) if code else plan_id)
 #        price = ("%s تومان (به‌جای %s، با کد %s)" % (format(plan["price"], ","),
 #                                                  format(plan["list_price"], ","), code)
@@ -32859,14 +33343,14 @@ exit 0
 #            self.say(chat, "یا:", {"inline_keyboard": rows})
 #
 #    def show_wallet(self, chat, sender):
-#        self.account(sender)
+#        cal = self.account(sender).get("calendar")
 #        w = self.panel.call("GET", "/users/%d/wallet" % sender["id"])
 #        lines = ["💰 کیف پول", "موجودی: %s تومان" % money(w["balance"])]
 #        if w.get("moves"):
 #            lines.append("")
 #            for m in w["moves"][:8]:
 #                lines.append("%s %s%s تومان — %s%s" % (
-#                    (m.get("at") or "")[:10], "+" if m["amount"] > 0 else "−",
+#                    show_date(m.get("at"), cal), "+" if m["amount"] > 0 else "−",
 #                    money(abs(m["amount"])), m.get("what") or "",
 #                    " (%s)" % m["note"] if m.get("note") else ""))
 #        rows = []
@@ -38278,6 +38762,7 @@ exit 0
 #__BEGIN_I18N_EN__
 #{
 #"(با": "(with",
+#"(بعد از تمام شدن پلن فعلی خودکار فعال می‌شود)": "(starts by itself when the current plan ends)",
 #"(خالی = همین بماند)": "(empty = keep it)",
 #"(خاموش)": "(off)",
 #"(روشن)": "(on)",
@@ -38285,7 +38770,8 @@ exit 0
 #"(فایل رسید عکس نبود؛ در پنل ببینید)": "(The receipt file was not a picture; see it in the panel)",
 #"(فعال": "(active",
 #"(فعلی: ...": "(current: ...",
-#"(پلن فعلی — تمدید)": "(current plan — renewal)",
+#"(نوبت": "(turn",
+#"(پلن فعلی)": "(current plan)",
 #"(پیش‌فرض)": "(default)",
 #"(چیزی نیست)": "(nothing)",
 #"(۱۵ دقیقه بعد دوباره امتحان می‌شود)": "(tried again in 15 minutes)",
@@ -38370,19 +38856,20 @@ exit 0
 #"· دسترسی:": "· access:",
 #"» آی‌پی درستی نیست": "” is not a valid IP",
 #"» آی‌پی درستی نیست؛ مثل 1.1.1.1 یا 10.0.0.2#5353": "” is not a valid IP; like 1.1.1.1 or 10.0.0.2#5353",
-#"» است. پلن تازه از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین می‌رود.": "”. A new plan starts from the moment it is approved, and what is left of the current plan is lost.",
 #"» اعمال شد": "” applied",
 #"» باطل شود؟ رباتی که با آن کار می‌کند فوراً قطع می‌شود.": "” be revoked? A bot using it is cut off at once.",
 #"» برای همیشه حذف شود؟ آی‌پی‌ها و رسیدهایش هم پاک می‌شوند و برنمی‌گردند.": "” be deleted for good? Their IPs and receipts are deleted too and cannot be brought back.",
-#"» تمدید شد تا": "” renewed until",
 #"» جدا شود؟ بعد از آن بازیابی رمز با تلگرام کار نمی‌کند تا دوباره وصل کند.": "” be unlinked? After that, password recovery by Telegram will not work until they link again.",
 #"» جواب داد:": "” answered:",
 #"» حذف شود؟": "” be deleted?",
+#"» رزرو شد؛ بعد از تمام شدن پلن فعلی خودکار فعال می‌شود": "” is reserved; it starts by itself when the current plan ends",
 #"» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون می‌آید.": "” get a new password? They will be signed out of every device.",
 #"» روی خود رله است، نه یک DNS": "” is on the relay itself, not a DNS server",
 #"» ساخته شد": "” made",
 #"» شوید و بعد «✅ عضو شدم» را بزنید.": "”, then press “✅ I have joined”.",
 #"» فعال شد تا": "” active until",
+#"» فعال شد.": "” has started.",
+#"» لغو شود؟ پولش خودکار برنمی‌گردد.": "”? Its money does not come back by itself.",
 #"» پیدا نشد.": "”.",
 #"، آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را روشن می‌کند.": ", puts the bot’s address behind the customer panel’s “Connect Telegram” button, and turns the bot on.",
 #"، آپلود": ", upload",
@@ -38402,6 +38889,7 @@ exit 0
 #"؛ مشتری‌هایش سرویس ندارند": "; their customers have no service",
 #"؛ هر هفته به‌روز می‌شود و فقط یک‌جا روشن یا خاموش می‌شود": "; updated weekly, and turned on or off only as a whole",
 #"آخرین (UTC)": "Last (UTC)",
+#"آخرین آنلاین:": "Last online:",
 #"آخرین استفاده": "Last used",
 #"آخرین بار": "Last seen",
 #"آخرین ترافیک": "Last traffic",
@@ -38449,6 +38937,7 @@ exit 0
 #"آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر بیرون ماندید، از روی خود سرور:": "there, or it will not be reachable from outside. If you get locked out, from the server itself:",
 #"آنلاین": "Online",
 #"آنلاین الان:": "Online now:",
+#"آنلاین و آخرین فعالیت": "Online and last seen",
 #"آنلاین یعنی در ۳ دقیقهٔ اخیر از راه رله ترافیک داشته. فقط سرویس‌هایی که قالبش از رله می‌برد شمرده می‌شوند؛ کسی که فقط چیزهای دیگر را باز کرده این‌جا نمی‌آید.": "Online means traffic through a relay in the last 3 minutes. Only the services their template routes through the relay count; someone who has opened only other things does not show here.",
 #"آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود.": "What matters for customers is the relays column: that is where their questions are asked from.",
 #"آپدیت": "Upgrade",
@@ -38650,6 +39139,7 @@ exit 0
 #"این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم به‌عنوان": "Put this in the network settings of your console, phone or router as",
 #"این را نگه دارید؛ رمز را در پنل هر وقت خواستید عوض کنید.": "Keep this; you can change the password in the panel whenever you like.",
 #"این ربات برای حساب دیگری روی همین پنل کار می‌کند؛ یک ربات تازه از @BotFather بگیرید": "This bot already works for another account on this panel; get a new bot from @BotFather",
+#"این رزرو پیدا نشد": "Reservation not found",
 #"این رسید روی این سرور باز نمی‌شود": "This receipt cannot be opened on this server",
 #"این رسید قبلاً بررسی شده": "This receipt was already reviewed",
 #"این رسید مال مشتری‌های شما نیست": "This receipt is not from your customers",
@@ -38691,7 +39181,7 @@ exit 0
 #"این نام کاربری مال مالک است": "This username is the owner’s",
 #"این نام کاربری گرفته شده؛ یکی دیگر بنویسید": "This username is taken; write another one",
 #"این پلن با کیف پول خریدنی نیست": "This plan cannot be bought with the wallet",
-#"این پلن به این کاربر داده شود؟ همان پلن تمدید می‌شود و پلن دیگر از همین حالا از نو شروع می‌شود.": "Give this plan to this user? The same plan is renewed, and another plan starts over right now.",
+#"این پلن به این کاربر داده شود؟ اگر پلن فعلی‌اش هنوز تمام نشده، رزرو می‌شود و بعد از آن خودکار فعال می‌شود.": "Give this plan to this customer? If their current plan has not ended, it is reserved and starts by itself after it.",
 #"این پلن دیگر فروخته نمی‌شود.": "This plan is no longer sold.",
 #"این پلن دیگر فروخته نمی‌شود، یکی دیگر را انتخاب کنید": "This plan is no longer sold; choose another one",
 #"این پلن مال شما نیست": "This plan is not yours",
@@ -38850,6 +39340,8 @@ exit 0
 #"بیش از ۹۵٪ سهمیه‌تان مصرف شده —": "More than 95% of your quota is used —",
 #"بیشتر": "more",
 #"بیشتر از": "More than",
+#"بیشترین مصرف": "Most used",
+#"بیشترین کیف پول": "Most in wallet",
 #"بی‌حد": "Unlimited",
 #"بی‌خطا": "No errors",
 #"بی‌مهلت": "No end date",
@@ -38866,6 +39358,8 @@ exit 0
 #"تا یک دقیقه دیگر از": "Within a minute from",
 #"تا ۳ روز دیگر تمام می‌شود.": "run out within 3 days.",
 #"تاریخ": "Date",
+#"تاریخ‌ها از این به بعد شمسی نشان داده می‌شوند": "Dates are shown in the Solar Hijri calendar from now on",
+#"تاریخ‌ها از این به بعد میلادی نشان داده می‌شوند": "Dates are shown in the Gregorian calendar from now on",
 #"تازه کردن": "Refresh",
 #"تاور آو فانتزی": "Tower of Fantasy",
 #"تبلیغات آمازون": "Amazon ads",
@@ -38927,8 +39421,6 @@ exit 0
 #"تمام می‌شود. برای قطع نشدن، زودتر تمدید کنید.": "ends. To avoid being cut off, renew early.",
 #"تمدید": "Renewal",
 #"تمدید شد.": "renewed.",
-#"تمدید همان پلن": "Renewing the same plan",
-#"تمدید همان پلن، روزها و حجم را روی باقی‌مانده‌تان اضافه می‌کند.": "Renewing the same plan adds its days and quota to what you have left.",
 #"تمدید گواهی HTTPS": "HTTPS certificate renewal",
 #"تمدید گواهی HTTPS — سرور خارج": "HTTPS certificate renewal — exit server",
 #"تنظیم تونل از پنل خوانا نبود": "The tunnel setting from the panel could not be read",
@@ -39013,9 +39505,11 @@ exit 0
 #"ثبت‌نام تازه با وضعیت «در انتظار پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی نمی‌گیرد؛ اولین ذخیرهٔ همین سطر فعالش می‌کند. صفر در سهمیه یا سرعت یعنی بی‌حد. «زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود.": "A new sign-up arrives as “Waiting for a plan” and gets no traffic until you save a plan for it; the first save of its row activates it. Zero in quota or speed means no limit. An empty “Time” means no change; a number you write moves the end date that many days on from today, and the grey number inside it is the days left. Speed only limits downloads and is applied on the relays within 30 seconds.",
 #"ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند": "signed up but never took a plan",
 #"ثبت‌نام کنید": "sign up",
+#"ثبت‌نام:": "Joined:",
 #"ثرون اند لیبرتی": "Throne and Liberty",
 #"جدا کردن تلگرام": "Unlink Telegram",
 #"جدول روزانه": "Daily table",
+#"جدیدترین ثبت‌نام": "Newest sign-up",
 #"جستجو": "Search",
 #"جستجو: اسم، نام کاربری، شماره، آیدی تلگرام یا آی‌پی": "Search: name, username, phone, Telegram id or IP",
 #"جستجوی بازی یا دامنه…": "Search a game or domain…",
@@ -39313,6 +39807,9 @@ exit 0
 #"رد شد": "Rejected",
 #"رد شده": "Rejected",
 #"ردی اور نات": "Ready or Not",
+#"رزرو": "reserved",
+#"رزرو لغو شد": "Reservation cancelled",
+#"رزرو پلن «": "Cancel the reservation of “",
 #"رسانه و ارتباط": "Media and messaging",
 #"رسید": "Receipt",
 #"رسید #": "Receipt #",
@@ -39564,6 +40061,7 @@ exit 0
 #"شماره کارت را در صفحهٔ «پرداخت» بنویسید؛ ربات از همان‌جا می‌خواند. پنل برای ربات یک کلید با دسترسی ادمین می‌سازد": "Write the card number on the “Payment” page; the bot reads it from there. The panel makes the bot a key with admin rights",
 #"شماره کارت، اسم صاحب کارت، و اگر لازم است یک خط توضیح (مثلاً «کد پیگیری را هم بفرستید»). تا": "Card number, card holder’s name, and if needed a line of explanation (for example “also send the tracking code”). Up to",
 #"شمرده می‌شود:": "is counted:",
+#"شمسی (1405/07/07)": "Solar Hijri (1405/07/07)",
 #"صدای بازی روی Vivox است و مستقیم می‌ماند": "The game’s voice is on Vivox and stays direct",
 #"صفحه پیدا نشد": "Page not found",
 #"صفحهٔ دامنه‌ها": "domains page",
@@ -39704,6 +40202,7 @@ exit 0
 #"قالب‌ها": "Templates",
 #"قالب‌ها و دامنه‌ها": "Templates and domains",
 #"قبل": "Before",
+#"قدیمی‌ترین ثبت‌نام": "Oldest sign-up",
 #"قطع": "Down",
 #"قیمت (تومان)": "Price (Toman)",
 #"قیمت باید عدد درست باشد، به تومان": "The price must be a whole number, in Toman",
@@ -39715,6 +40214,7 @@ exit 0
 #"لاگ ربات —": "Bot log —",
 #"لاگ و عیب‌یابی": "Logs and diagnosis",
 #"لاگش در صفحهٔ «نود» است": "its log is on the Nodes page",
+#"لغو رزرو": "Cancel reservation",
 #"لغو شد.": "Cancelled.",
 #"لیست اپراتورها — سرور خارج": "Operators list — exit server",
 #"لینک ثبت‌نام در همین سایت": "Sign-up link on this site",
@@ -39758,6 +40258,7 @@ exit 0
 #"مثلاً گیمینگ ماهانه": "e.g. Gaming monthly",
 #"مجموع مصرف": "Total usage",
 #"مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰": "The length must be a whole number of days, from 1 to 3650",
+#"مرتب‌سازی:": "Sort:",
 #"مستقیم": "Direct",
 #"مستقیم کار می‌کند؛ فقط برای مشتری‌های اپراتوری روشن کنید که بازی رویش باز نمی‌شود — آپدیت‌های بازی هم از سرورها رد می‌شود": "works directly; only turn it on for customers of an operator the game does not open on — game updates go through the servers too",
 #"مستقیم — رله به سرور خارج وصل می‌شود": "Direct — the relay connects to the exit server",
@@ -39846,10 +40347,12 @@ exit 0
 #"میانهٔ سه سؤال واقعی DNS، به میلی‌ثانیه؛ ✓ سریع‌ترین هر ستون و ● آن‌هایی که الان انتخاب شده‌اند. آنچه برای مشتری‌ها مهم است ستون رله‌هاست: سؤال‌هایشان از آن‌جا پرسیده می‌شود. ستون هر نود زمانی است که nginx همان نود برای پیدا کردن آدرس سرویس‌ها منتظر می‌ماند. آخرین اندازه‌گیری:": "The median of three real DNS questions, in milliseconds; ✓ the fastest in each column and ● the ones chosen now. What matters to customers is the relays' columns: their questions are asked from there. A node's column is how long that node's nginx waits to find the services' addresses. Last measured:",
 #"میانگین هر ۵ دقیقه. رله هر نیم دقیقه گزارش می‌دهد، پس اوج لحظه‌ای کوتاه در این نمودار دیده نمی‌شود.": "Average of every 5 minutes. The relay reports every half minute, so a brief momentary peak does not show in this chart.",
 #"میانگین ۵ دقیقهٔ اخیر": "Average of the last 5 minutes",
+#"میلادی (2026-09-29)": "Gregorian (2026-09-29)",
 #"میلی‌ثانیه": "ms",
 #"می‌بیند.": "sees it.",
 #"می‌خواهند.": "want it.",
 #"می‌رود": "goes",
+#"می‌شود و بعد از تمام شدن پلن فعلی (روز یا حجمش) خودکار فعال می‌شود؛ چیزی از پلن فعلی کم نمی‌شود.": "and starts by itself when the current plan ends (its days or its allowance); nothing is taken from the current plan.",
 #"می‌فرستد.": "sends.",
 #"نام": "Name",
 #"نام (برای خودتان، مثلاً «ربات فروش»)": "Name (for yourself, e.g. “Sales bot”)",
@@ -39959,6 +40462,7 @@ exit 0
 #"همه (": "All (",
 #"همه، از جمله سرویس‌هایی که بعداً اضافه شوند": "All, including services added later",
 #"همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.": "All of these work only on the internet connection whose IP you registered.",
+#"همهٔ تاریخ‌ها این‌طور نشان داده می‌شوند، به وقت تهران: پنل ادمین، پنل مشتری و پیام‌های ربات.": "Every date is shown this way, in Tehran time: the admin panel, the customer panel and the bot’s messages.",
 #"همهٔ تیکت‌ها": "All tickets",
 #"همهٔ خریدها و تمدیدها": "Every purchase and renewal",
 #"همهٔ رله‌ها": "All relays",
@@ -39982,7 +40486,9 @@ exit 0
 #"هنوز آماده نیست:": "Not ready yet:",
 #"هنوز آماری نرسیده": "No stats yet",
 #"هنوز آماری نرسیده.": "No stats yet.",
+#"هنوز آنلاین نشده": "Not online yet",
 #"هنوز ادمینی نساخته‌اید.": "You have not made any admins yet.",
+#"هنوز تمام نشده؛ این پلن رزرو می‌شود و بعد از تمام شدن آن خودکار فعال می‌شود.": "has not ended; this plan is reserved and starts by itself when it ends.",
 #"هنوز تیکتی ندارید.": "You have no tickets yet.",
 #"هنوز تیکتی نفرستاده‌اید.": "You have not sent any tickets yet.",
 #"هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از": "You have not made any custom domains, blocks or separate DNS yet; from the",
@@ -40104,13 +40610,17 @@ exit 0
 #"پلن دست‌کم روی یک سرور باشد": "A plan has to be on at least one server",
 #"پلن دوباره فروخته می‌شود": "The plan is sold again",
 #"پلن دیگر فروخته نمی‌شود؛ کسانی که دارندش تا آخر دوره می‌مانند": "The plan is no longer sold; those who have it keep it until their period ends",
-#"پلن دیگری": "another plan",
 #"پلن ذخیره شد؛ برای خریدهای بعدی": "Plan saved; for later purchases",
 #"پلن ذخیره شد؛ سرورهایش همین حالا برای همهٔ دارندگانش اعمال شد، بقیه برای خریدهای بعدی": "Plan saved; its servers apply now to everyone on it, the rest from the next purchase",
 #"پلن را انتخاب کنید:": "Choose a plan:",
 #"پلن را انتخاب کنید، مبلغش را واریز کنید و عکس رسید را بفرستید. بعد از تأیید، پلن خودکار روی حسابتان فعال می‌شود.": "Choose a plan, pay its price and send a photo of the receipt. After it is approved, the plan is activated on your account automatically.",
+#"پلن رزرو": "Reserved plan",
+#"پلن رزرو «": "Reserved plan “",
 #"پلن ساخته شد و در پنل مشتری دیده می‌شود": "Plan created; it shows in the customer panel",
 #"پلن فعال": "Active plans",
+#"پلن فعلی‌اش هنوز تمام نشده: با تأیید رزرو می‌شود و بعد از آن خودکار فعال می‌شود": "their current plan has not ended: approved, it is reserved and starts by itself after it",
+#"پلن فعلی‌تان هنوز تمام نشده: هر پلنی بخرید": "Your current plan has not ended: whichever plan you buy is",
+#"پلن قبلی‌تان تمام شده بود و این یکی خودکار جایش را گرفت.": "Your previous plan had ended and this one took its place by itself.",
 #"پلن:": "Plan:",
 #"پلنی که انتخاب کرده بود حذف شده؛ بعد از تأیید، سهمیه و زمان را خودتان بگذارید": "The plan they chose was deleted; after approving, set the quota and time yourself",
 #"پلن‌ها": "Plans",
@@ -40234,9 +40744,10 @@ exit 0
 #"کم آمدن حافظه، پر شدن جدول اتصال‌ها": "Running out of memory, the connection table filling up",
 #"کم شد": "taken away",
 #"کمتر": "less",
+#"کمترین حجم مانده": "Least allowance left",
+#"کمترین روز مانده": "Fewest days left",
 #"کمی صبر کنید": "Wait a little",
 #"کنید؛ تلگرام فقط به ادمین می‌گوید چه کسی عضو است. کانال عمومی را با @ بنویسید؛ کانال خصوصی را با آیدی عددی‌اش (با -100 شروع می‌شود) و لینک دعوتش. خالی بگذارید تا خاموش شود.": "of the channel; Telegram tells only an admin who is in it. Write a public channel with @, a private one by its number (it starts with -100) and its invitation link. Leave it empty to turn this off.",
-#"که انتخاب کنید از لحظهٔ تأیید از نو شروع می‌شود و باقی‌ماندهٔ پلن فعلی از بین می‌رود.": "you choose starts over from the moment it is approved, and what is left of the current plan is lost.",
 #"که فقط مشتری‌ها، پلن‌ها و کارت شما را می‌بیند": "that sees only your customers, plans and card",
 #"کوئری DoH": "DoH query",
 #"کوئری DoT": "DoT query",
@@ -40324,6 +40835,7 @@ exit 0
 #"— این سرور": "— this server",
 #"— با تأیید، یک دستگاه به حسابش اضافه می‌شود": "— on approval, one device is added to their account",
 #"— بررسی:": "— checked:",
+#"— بعد از تمام شدن پلن فعلی خودکار فعال می‌شود": "— starts by itself when the current plan ends",
 #"— تا چند دقیقهٔ دیگر آماده می‌شود": "— ready within a few minutes",
 #"— خالی بگذارید تا همین بماند)": "— leave empty to keep it)",
 #"— خود سرور به آن سرویس می‌رسد یا نه — و": "— whether the server itself reaches that service — and",
@@ -40345,6 +40857,9 @@ exit 0
 #"‹ برگشت به نود": "‹ Back to nodes",
 #"‹ برگشت به کاربران": "‹ Back to users",
 #"↪ مستقیم": "↪ Direct",
+#"⏳ رزرو:": "⏳ Reserved:",
+#"⏳ پلن رزرو:": "⏳ Reserved plan:",
+#"⏳ پلن فعلی شما": "⏳ Your current plan",
 #"⏳ یک رسید در انتظار بررسی دارید.": "⏳ You have a receipt waiting for review.",
 #"⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.": "⚠️ The panel address is not known yet; try again in a few minutes.",
 #"⚠️ آپدیت": "⚠️ Upgrade",
@@ -40362,7 +40877,6 @@ exit 0
 #"⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.": "⚠️ You have not registered an IP yet; tap “Register IP” first.",
 #"⚠️ پردازندهٔ": "⚠️ Processor of",
 #"⚠️ پروفایل فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب بگیریدش.": "⚠️ The profile was not sent; press again in a little while, or get it from the web panel.",
-#"⚠️ پلن فعلی شما «": "⚠️ Your current plan is “",
 #"⚠️ گواهی HTTPS": "⚠️ HTTPS certificate",
 #"⛔ حجم فروشنده": "⛔ The traffic of seller",
 #"⛔ روزهای فروشنده": "⛔ The days of seller",
@@ -40370,7 +40884,6 @@ exit 0
 #"✅ از رله": "✅ Through the relay",
 #"✅ تأیید": "✅ Approve",
 #"✅ ترافیک": "✅ Traffic",
-#"✅ تمدید همان پلن: روزها و حجم روی باقی‌مانده‌تان اضافه می‌شود.": "✅ Renewing the same plan: the days and quota are added to what you have left.",
 #"✅ جدول اتصال‌های": "✅ Connection table of",
 #"✅ جواب تیکت #": "✅ Reply to ticket #",
 #"✅ حساب شما به تلگرام وصل است؛ اگر رمز را فراموش کنید، از صفحهٔ ورود با کد تلگرام بازیابی‌اش می‌کنید.": "✅ Your account is linked to Telegram; if you forget your password, you recover it from the sign-in page with a Telegram code.",
@@ -40383,6 +40896,7 @@ exit 0
 #"✅ ممنون! حالا از دکمه‌های پایین استفاده کنید.": "✅ Thank you! Now use the buttons below.",
 #"✅ همهٔ سرورها به نسخهٔ": "✅ All servers upgraded to version",
 #"✅ پردازندهٔ": "✅ Processor of",
+#"✅ پلن رزرو شما فعال شد:": "✅ Your reserved plan has started:",
 #"✅ گواهی HTTPS": "✅ HTTPS certificate",
 #"✅ یک دستگاه اضافه شد؛ حالا": "✅ A device was added; now you have",
 #"✍️ جواب": "✍️ Reply",

@@ -217,15 +217,20 @@ store.run("UPDATE users SET exit = ?, relay_exits = NULL WHERE id = ?", (NODE, t
 panel.apply_plan(store, tina, p_all["id"])
 check("a plan on automatic leaves the customer's own server abroad",
       row(tina)["exit"] == NODE)
+over = lambda uid: store.run("UPDATE users SET expires_at = NULL WHERE id = ?", (uid,))
+over(tina)
 panel.apply_plan(store, tina, plan("آلمان")["id"])
 check("one naming the same everywhere puts them on it, from every relay",
       row(tina)["exit"] == MAIN and row(tina)["relay_exits"] is None)
+over(tina)
 panel.apply_plan(store, tina, vip["id"])
 check("one naming them relay by relay, relay by relay",
       row(tina)["exit"] is None and json.loads(row(tina)["relay_exits"]) == {TR: NODE, DE: MAIN})
+over(tina)
 panel.apply_plan(store, tina, plan("نیمه")["id"])
 check("  automatic on a relay leaves it to that relay's own",
       json.loads(row(tina)["relay_exits"]) == {TR: NODE})
+over(tina)
 admin.STORE.apply_plan(tina, plan("آلمان")["id"])
 check("the same when the admin gives the plan by hand",
       admin.STORE.one("SELECT exit FROM users WHERE id = ?", (tina,))["exit"] == MAIN)

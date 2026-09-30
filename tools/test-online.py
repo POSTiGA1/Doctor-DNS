@@ -112,6 +112,19 @@ check("a dot beside the ones online", admin.is_online(row(ali)) and admin.is_onl
 users = src[src.index("    def users(self):"):]
 check("  drawn in the name's cell", "<span class='dot on' title='آنلاین'></span>" in users
       and "if is_online(r)" in users)
+store.run("UPDATE users SET created_at = '2026-09-28T22:00:00+00:00' WHERE id = ?", (ali,))
+check("under each name: when the account was made, in Tehran, and that it is online now",
+      admin.joined_and_seen(row(ali)) == "ثبت‌نام: 2026-09-29 · آنلاین",
+      admin.joined_and_seen(row(ali)))
+check("  or when it was last online", "آخرین آنلاین: 10 دقیقه پیش" in
+      admin.joined_and_seen(row(reza)), admin.joined_and_seen(row(reza)))
+store.run("INSERT INTO users (username, created_at, status) VALUES ('nobody', ?, 'pending')",
+          (panel.now(),))
+check("  or that it never was", "هنوز آنلاین نشده" in
+      admin.joined_and_seen(store.one("SELECT * FROM users WHERE username = 'nobody'")))
+check("  drawn in the users table, on two short lines", "joined_and_seen(r).split(" in users
+      and "<small class='seen'>%s</small><small class='seen'>%s</small>" in users)
+store.run("DELETE FROM users WHERE username = 'nobody'")
 
 print("the bot")
 s = panel.admin_stats(store)

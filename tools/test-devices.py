@@ -162,10 +162,13 @@ check("renewing the same plan keeps the extra devices", user(ali)["max_ips"] == 
       and user(ali)["extra_devices"] == 3)
 for ip in ("93.184.216.5", "93.184.216.6", "93.184.216.7"):
     panel.register_ip(store, ali, ip)
+store.run("UPDATE users SET expires_at = ?, status = 'expired' WHERE id = ?",
+          ("2020-01-01T00:00:00+00:00", ali))
 panel.apply_plan(store, ali, ONE)
 check("another plan ends them, and keeps the newest address only",
       user(ali)["max_ips"] == 1 and user(ali)["extra_devices"] == 0
       and ips(ali) == ["93.184.216.7"])
+store.run("UPDATE users SET expires_at = NULL WHERE id = ?", (ali,))
 admin.STORE.apply_plan(ali, THREE)
 check("a plan given in the admin panel sets them too", user(ali)["max_ips"] == 3)
 

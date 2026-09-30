@@ -106,6 +106,7 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
   "unlimited": false, "quota_bytes": 107374182400, "used_bytes": 5368709120,
   "remaining_bytes": 102005473280, "speed_kbps": 0,
   "expires_at": "2026-10-21T17:52:55+00:00",
+  "reserved": ["کامل ماهانه"], "reserve_done": null,
   "ips": ["5.120.1.2"], "max_ips": 1, "wallet": 0,
   "dns": ["203.0.113.4"],
   "doh": {"url": "https://user.example.com/dns-query/Xk3...", "dot_host": "user.example.com"},
@@ -114,6 +115,8 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
   "receipt_waiting": null
 }}
 ```
+
+`reserved` پلن‌هایی است که مشتری در حالی که پلن فعلی‌اش هنوز تمام نشده خریده: به ترتیب، هر کدام وقتی پلن قبلی (روز یا حجمش) تمام شد خودکار فعال می‌شود. `reserve_done` تا سه روز بعد از فعال شدن یکی از آن‌ها `{"plan": "...", "at": "..."}` است، وگرنه `null`.
 
 | `status` | یعنی |
 |---|---|
@@ -335,6 +338,7 @@ curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
 | `quota.exhausted` | حجم تمام شد و سرویس قطع است | `quota_bytes`، `used_bytes` |
 | `plan.expiring` | ۳ روز یا کمتر به پایان دوره مانده | `expires_at`، `days_left` |
 | `plan.expired` | دوره تمام شد | `expires_at` |
+| `plan.reserved_started` | پلن فعلی تمام شد و پلنی که مشتری از قبل خریده بود (رزرو) خودکار فعال شد | `plan`، `expires_at`، `quota_bytes` |
 | `password.reset_code` | مشتری در پنل وب «بازیابی رمز» زد | `code` (شش رقم)، `minutes` |
 | `wallet.referral` | کسی که با لینک این مشتری آمده بود خرید کرد و پورسانتش به کیف پول رفت | `amount`، `balance` |
 | `wallet.changed` | ادمین دستی موجودی را عوض کرد | `amount` (منفی یعنی کم شد)، `balance` |
