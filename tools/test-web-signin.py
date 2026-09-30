@@ -50,9 +50,9 @@ panel.print = lambda *a, **k: None
 
 tmp = tempfile.mkdtemp()
 store = panel.Store(os.path.join(tmp, "panel.db"))
-store.run("INSERT INTO users (telegram_id, created_at, status)"
-          " VALUES (111, ?, 'pending')", (panel.now(),))
-store.create_web_user("taken", "some-password")
+store.run("INSERT INTO users (telegram_id, first_name, created_at, status)"
+          " VALUES (111, 'از تلگرام', ?, 'pending')", (panel.now(),))
+store.create_web_user("taken", "x", "some-password")
 
 
 def bot_user():
@@ -61,18 +61,18 @@ def bot_user():
 
 print("a username and a password")
 check("a bad username is refused",
-      panel.give_credentials(store, bot_user(), "a b")["error"] == "bad_username")
+      panel.give_credentials(store, bot_user(), "a b", "علی")["error"] == "bad_username")
 check("one somebody has is refused",
-      panel.give_credentials(store, bot_user(), "TAKEN")["error"] == "username_taken")
-res = panel.give_credentials(store, bot_user(), "Ali.G")
+      panel.give_credentials(store, bot_user(), "TAKEN", "علی")["error"] == "username_taken")
+res = panel.give_credentials(store, bot_user(), "Ali.G", "علی رضایی")
 u = bot_user()
 check("a good one is taken, as the web signup would write it",
       res["ok"] and u["username"] == "ali.g" and res["username"] == "ali.g")
-check("and no name kept beside it", u["first_name"] is None)
+check("with the name chosen", u["first_name"] == "علی رضایی")
 check("and a password that works", panel.check_password(u, res["password"]))
 check("the account can sign in on the web now", store.user_by_username("ali.g")["id"] == u["id"])
 check("a second time is refused, not overwritten",
-      panel.give_credentials(store, bot_user(), "other")["error"] == "has_username"
+      panel.give_credentials(store, bot_user(), "other", "x")["error"] == "has_username"
       and bot_user()["username"] == "ali.g")
 store.open_session(u["id"])
 fresh = panel.fresh_password(store, bot_user())

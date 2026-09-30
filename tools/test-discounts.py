@@ -120,7 +120,7 @@ check("the same code twice is refused", "!" in act("discount-save", code="NOROOZ
 check("the plans page lists them", "NOROOZ30" in Rec().plans() and "discount-save" in Rec().plans())
 
 print("using one")
-ali = store.create_web_user("ali", "ali-password")
+ali = store.create_web_user("ali", "علی", "ali-password")
 plans, msg, ok = panel.discount_view(store, ali, "norooz30")
 month = next(p for p in plans if p["id"] == MONTH)
 check("the customer sees the price after it before paying", ok and month["price"] == 140000
@@ -149,7 +149,7 @@ store.run("UPDATE users SET wallet = 200000 WHERE id = ?", (ali["id"],))
 res = panel.buy_with_wallet(store, user(ali["id"]), MONTH, "MINUS50")
 check("from the wallet, the price after the code", res["ok"]
       and user(ali["id"])["wallet"] == 50000, str(res))
-bob = store.create_web_user("bob", "bob-password")
+bob = store.create_web_user("bob", "", "bob-password")
 store.run("UPDATE users SET wallet = 500000 WHERE id = ?", (bob["id"],))
 res = panel.buy_with_wallet(store, user(bob["id"]), MONTH, "MINUS50")
 check("a code used up is refused, and nothing is spent", not res["ok"]
@@ -165,7 +165,7 @@ check("a code switched off is refused", not panel.discount_view(store, bob, "NOR
 print("the inviter's share is of what was paid")
 act("ref-settings", on="1", percent="10", mode="every")
 code = panel.ref_code(store, user(bob["id"]))
-cara = store.create_web_user("cara", "cara-password")
+cara = store.create_web_user("cara", "", "cara-password")
 panel.set_referrer(store, cara["id"], code)
 act("discount-save", code="HALF", value="50", kind="percent", days="", max_uses="")
 store.run("UPDATE users SET wallet = 200000 WHERE id = ?", (cara["id"],))

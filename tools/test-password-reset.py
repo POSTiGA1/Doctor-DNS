@@ -55,7 +55,7 @@ store = panel.Store(db)
 cat = json.load(open(os.path.join(ROOT, "domains", "services.json"),
                      encoding="utf-8"))["services"]
 store.ensure_default_template(cat)
-store.create_web_user("forgetful", "the-old-password")
+store.create_web_user("forgetful", "علی", "the-old-password")
 ali = store.user_by_username("forgetful")
 store.run("INSERT INTO ips (user_id, ip, added_at) VALUES (?, '203.0.113.20', ?)",
           (ali["id"], panel.now()))

@@ -66,8 +66,8 @@ admin.STORE = admin.Store(db_path)
 
 store.run("INSERT INTO templates (name, is_default, created_at) VALUES ('کامل', 1, ?)",
           (panel.now(),))
-ali = store.create_web_user("ali", "old-password-1")
-sara = store.create_web_user("sara", "sara-password")
+ali = store.create_web_user("ali", "علی", "old-password-1")
+sara = store.create_web_user("sara", "سارا", "sara-password")
 store.run("INSERT INTO users (telegram_id, first_name, created_at) VALUES (555, 'از ربات', ?)",
           (panel.now(),))
 ali_session = store.open_session(ali["id"])
@@ -250,7 +250,7 @@ PNG64 = _b64.b64encode(_b64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmM"
     "IQAAAABJRU5ErkJggg==")).decode()
 slip = {"content_type": "image/png", "data": PNG64}
-nolink = store.create_web_user("nolink", "nolink-password")
+nolink = store.create_web_user("nolink", "بی‌تلگرام", "nolink-password")
 nolink = user(nolink["id"])
 check("while it is off, anybody may pay", panel.create_receipt(store, nolink, slip)["ok"])
 store.set_setting("require_telegram", "1")

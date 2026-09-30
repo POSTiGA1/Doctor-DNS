@@ -213,7 +213,7 @@ check("  and on a single machine says there are none", "تک‌سرور" in admi
 
 print("which relays a customer is shown")
 store = panel.Store(admin.DB)
-user = store.create_user(111, "ali")
+user = store.create_user(111, "ali", "علی")
 row = lambda: store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
 relays = ("198.51.100.1", "198.51.100.2", "198.51.100.3")
 check("with nothing chosen, all of them", panel.shown_relays(store, row(), relays) == list(relays))

@@ -173,10 +173,7 @@ check("the same id again is the same customer, not a second",
 code, res, _ = call("GET", "/api/v1/users/999", key=key)
 check("an unknown customer: 404", code == 404 and res["error"] == "user_not_found")
 code, res, _ = call("GET", "/api/v1/users/111", key=key)
-check("a known one", code == 200 and res["user"]["id"] == u["id"])
-check("  with no name: the one an older bot sent is not kept",
-      "name" not in res["user"]
-      and store.one("SELECT first_name FROM users WHERE telegram_id = 111")["first_name"] is None)
+check("a known one", code == 200 and res["user"]["name"] == "علی")
 
 print("addresses")
 code, res, _ = call("POST", "/api/v1/users/111/ips", {"ip": "192.168.1.5"}, key=key)

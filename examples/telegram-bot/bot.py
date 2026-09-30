@@ -26,12 +26,14 @@ Settings come from the environment (see bot.env.example):
 import base64
 import hashlib
 import hmac
+import http.client
 import http.server
 import json
 import os
 import queue
 import re
 import secrets
+import select
 import sys
 import threading
 import time
@@ -238,45 +240,119 @@ class ApiError(Exception):
 
 
 # ------------------------------------------------------------ the two APIs
+class Wire:
+    """A connection to one server, kept open between calls - one for each
+    thread that asks.
+
+    Every button a customer presses is three or four calls, and opening a
+    new TLS connection to Telegram for each was most of the wait. A
+    connection the other end has closed since is noticed before it is used,
+    and one that turns out dead as the call goes out is opened again, once.
+    Through a proxy from the environment it stands aside for urllib, which
+    knows how to use one.
+    """
+
+    def __init__(self, base):
+        u = urllib.parse.urlsplit(base)
+        self.base = base
+        self.https = u.scheme == "https"
+        self.host, self.port, self.prefix = u.hostname, u.port, u.path
+        self.local = threading.local()
+        self.proxied = bool(urllib.request.getproxies().get(u.scheme)) and not \
+            urllib.request.proxy_bypass(u.hostname or "")
+
+    @staticmethod
+    def dropped(conn):
+        sock = conn.sock
+        if sock is None:
+            return True
+        try:
+            # Nothing was asked, so anything to read is the other end's goodbye.
+            return bool(select.select([sock], [], [], 0)[0])
+        except (OSError, ValueError):
+            return True
+
+    def request(self, method, path, body=None, headers=None, timeout=30):
+        """(status, the body's bytes)."""
+        if self.proxied:
+            req = urllib.request.Request(self.base + path, method=method, data=body,
+                                         headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        conn = getattr(self.local, "conn", None)
+        if conn is not None and self.dropped(conn):
+            conn.close()
+            conn = None
+        reused = conn is not None
+        while True:
+            if conn is None:
+                kind = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+                conn = kind(self.host, self.port, timeout=timeout)
+            try:
+                conn.timeout = timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                conn.request(method, self.prefix + path, body=body, headers=headers or {})
+                r = conn.getresponse()
+                data = r.read()
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                    BrokenPipeError, ConnectionResetError):
+                conn.close()
+                self.local.conn = conn = None
+                if not reused:
+                    raise
+                reused = False              # closed while idle: once more, on a new one
+                continue
+            except BaseException:
+                conn.close()
+                self.local.conn = None
+                raise
+            if r.will_close:
+                conn.close()
+                conn = None
+            self.local.conn = conn
+            return r.status, data
+
+
 class Panel:
     """The panel's bot API."""
 
     def __init__(self, cfg):
         self.base, self.key = cfg["api"], cfg["key"]
+        self.wire = Wire(self.base)
 
     def call(self, method, path, body=None, idem=None):
-        req = urllib.request.Request(self.base + path, method=method,
-                                     data=json.dumps(body).encode() if body is not None
-                                     else None)
-        req.add_header("Authorization", "Bearer " + self.key)
-        req.add_header("Content-Type", "application/json")
+        headers = {"Authorization": "Bearer " + self.key, "Content-Type": "application/json"}
         if idem:
-            req.add_header("Idempotency-Key", idem)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
+            headers["Idempotency-Key"] = idem
+        status, raw = self.wire.request(
+            method, path, json.dumps(body).encode() if body is not None else None, headers)
+        if status >= 400:
             try:
-                body = json.loads(e.read())
+                body = json.loads(raw)
             except ValueError:
-                body = {"message": "پنل جواب درستی نداد (HTTP %d)" % e.code}
-            raise ApiError(e.code, body)
+                body = {"message": "پنل جواب درستی نداد (HTTP %d)" % status}
+            raise ApiError(status, body)
+        return json.loads(raw)
 
 
 class Telegram:
     def __init__(self, cfg):
         self.base = "%s/bot%s/" % (cfg["telegram"], cfg["token"])
         self.files = "%s/file/bot%s/" % (cfg["telegram"], cfg["token"])
+        self.wire = Wire(self.base)
 
     def call(self, method, http_timeout=30, **params):
         data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
-        req = urllib.request.Request(self.base + method, data=data,
-                                     headers={"Content-Type": "application/json"})
+        _, raw = self.wire.request("POST", method, data,
+                                   {"Content-Type": "application/json"}, http_timeout)
         try:
-            with urllib.request.urlopen(req, timeout=http_timeout) as r:
-                res = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            res = json.loads(e.read() or b"{}")
+            res = json.loads(raw or b"{}")
+        except ValueError:
+            res = {"description": raw[:200].decode("utf-8", "replace")}
         if not res.get("ok"):
             raise RuntimeError("telegram %s: %s" % (method, res.get("description")))
         return res.get("result")
@@ -388,7 +464,8 @@ class Bot:
                 if e.body.get("error") != "user_not_found":
                     raise
                 self.known.discard(uid)
-        self.panel.call("POST", "/users", {"telegram_id": uid})
+        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+        self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
         self.known.add(uid)
         return self.panel.call("GET", "/users/%d" % uid)["user"]
 
@@ -423,8 +500,10 @@ class Bot:
             return self.admin_command(chat, text)
 
         waiting, extra = self.state.get(chat, (None, None))
+        if waiting == "onb_name":
+            return self.got_name(chat, sender, text)
         if waiting == "onb_user":
-            return self.got_username(chat, sender, text)
+            return self.got_username(chat, sender, text, extra)
         if text in ("/doh", "/dns"):
             text = B_DNS
         if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
@@ -492,9 +571,10 @@ class Bot:
             # Asked even for a Telegram id the bot knows, which may since have
             # been deleted in the admin panel; for one that is still there the
             # panel only answers that it exists.
+            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
             try:
                 self.panel.call("POST", "/users", {"telegram_id": sender["id"],
-                                                   "ref": arg[4:20]})
+                                                   "name": name[:60], "ref": arg[4:20]})
                 self.known.add(sender["id"])
             except ApiError as e:
                 log("invitation start failed: %s" % e)
@@ -540,20 +620,30 @@ class Bot:
 
     # -- a web sign-in for everybody who comes through the bot ----------------
     def ready(self, chat, sender):
-        """True when the account has its web sign-in. Otherwise the question
-        for a username comes first, and whatever was pressed waits for it."""
+        """True when the account has its web sign-in. Otherwise the two
+        questions start, and whatever was pressed waits until they are done."""
         u = self.account(sender)
         if u.get("username"):
             return True
-        self.state[chat] = ("onb_user", None)
-        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nیک نام کاربری انگلیسی برای ورود به "
-                 "پنل وب انتخاب کنید (حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
+        tg_name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+        self.state[chat] = ("onb_name", None)
+        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nاسمتان چیست؟",
+                 {"keyboard": [[tg_name[:60]]] if tg_name else [[B_CANCEL]],
+                  "resize_keyboard": True, "one_time_keyboard": True})
         return False
 
-    def got_username(self, chat, sender, text):
+    def got_name(self, chat, sender, text):
+        if not text or text == B_CANCEL:
+            self.state.pop(chat, None)
+            return self.say(chat, "هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.", MENU)
+        self.state[chat] = ("onb_user", text[:60])
+        self.say(chat, "یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید "
+                 "(حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
+
+    def got_username(self, chat, sender, text, name):
         try:
             res = self.panel.call("POST", "/users/%d/credentials" % sender["id"],
-                                  {"username": text})
+                                  {"username": text, "name": name})
         except ApiError as e:
             if e.body.get("error") == "has_username":
                 self.state.pop(chat, None)
@@ -677,7 +767,7 @@ class Bot:
     # -- the customer's screens ---------------------------------------------
     def show_account(self, chat, sender):
         u = self.account(sender)
-        lines = ["👤 %s" % (u.get("username") or "حساب شما"),
+        lines = ["👤 %s" % (u["name"] or "حساب شما"),
                  "وضعیت: %s" % STATUS.get(u["status"], u["status"])]
         if u["plan"]:
             lines.append("پلن: %s" % u["plan"]["name"])
@@ -1232,6 +1322,41 @@ def webhook_server(bot, work):
     return http.server.ThreadingHTTPServer((host or "127.0.0.1", int(port)), Hook)
 
 
+# How many customers are answered at once.
+LANES = 8
+
+
+def lane_of(update, lanes=LANES):
+    """Which lane an update goes down: its chat's, always the same one."""
+    msg = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+    chat = (msg.get("chat") or {}).get("id") or \
+        ((update.get("callback_query") or {}).get("from") or {}).get("id") or 0
+    try:
+        return abs(int(chat)) % lanes
+    except (TypeError, ValueError):
+        return 0
+
+
+def start_lanes(handle, lanes=LANES):
+    """Several customers at once, each in their own order: a chat's updates
+    always go down the same lane, so a customer's photo and the text after it
+    do not race, and one slow answer - a receipt being fetched - holds up
+    nobody else's. Returns what an update is handed to."""
+    queues = [queue.Queue() for _ in range(lanes)]
+
+    def lane(q):
+        while True:
+            update = q.get()
+            try:
+                handle(update)
+            except Exception:
+                log("update failed:\n" + traceback.format_exc())
+
+    for q in queues:
+        threading.Thread(target=lane, args=(q,), daemon=True).start()
+    return lambda update: queues[lane_of(update, lanes)].put(update)
+
+
 def main():
     cfg = settings()
     if not cfg["secret"]:
@@ -1254,20 +1379,25 @@ def main():
     server = webhook_server(bot, work)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
+    hand = start_lanes(bot.handle)
+
     offset = None
     while True:
         try:
-            # Long polling: Telegram holds the request up to 50 seconds.
-            updates = bot.tg.call("getUpdates", http_timeout=70, timeout=50, offset=offset,
+            # Long polling: Telegram holds the request up to 25 seconds. Short
+            # enough that a connection that went dead on the way is noticed
+            # and opened again in well under a minute.
+            updates = bot.tg.call("getUpdates", http_timeout=40, timeout=25, offset=offset,
                                   allowed_updates=["message", "callback_query"])
         except Exception as e:
             log("getUpdates: %s" % e)
-            time.sleep(5)
+            # A dead connection is simply tried again; anything else - a
+            # refusal, no network - is given a moment.
+            time.sleep(1 if "timed out" in str(e) else 5)
             continue
-        # In order: a customer's photo and the text after it must not race.
         for u in updates or []:
             offset = u["update_id"] + 1
-            bot.handle(u)
+            hand(u)
 
 
 if __name__ == "__main__":

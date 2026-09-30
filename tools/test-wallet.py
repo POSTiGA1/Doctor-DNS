@@ -132,7 +132,7 @@ store.run("INSERT INTO api_tokens (name, token_hash, scope, webhook_url, webhook
           (panel.token_hash("dd_key"), panel.now()))
 
 print("topping the wallet up")
-ali = store.create_web_user("ali", "ali-password")
+ali = store.create_web_user("ali", "علی", "ali-password")
 store.run("UPDATE users SET telegram_id = 501 WHERE id = ?", (ali["id"],))
 res = panel.create_receipt(store, user(ali["id"]), dict(SLIP, kind="topup", amount="300000"))
 check("closed until the operator opens it", not res["ok"] and res["error"] == "wallet_off")
@@ -201,7 +201,7 @@ check("a plan no longer on sale cannot be bought", not res["ok"]
 store.run("UPDATE plans SET active = 1 WHERE id = ?", (SEASON,))
 store.set_setting("require_telegram", "1")
 store.set_setting("bot_link", "https://t.me/doctor_bot")
-nat = store.create_web_user("nat", "nat-password")
+nat = store.create_web_user("nat", "", "nat-password")
 store.run("UPDATE users SET wallet = 999999 WHERE id = ?", (nat["id"],))
 store.run("INSERT INTO api_tokens (name, token_hash, scope, webhook_url, webhook_secret,"
           " created_at) VALUES ('c', ?, 'customer', 'https://c.example/h', 'w', ?)",
@@ -289,7 +289,7 @@ res = panel.create_receipt(store, user(bahar["id"]), dict(SLIP, plan_id=MONTH))
 panel.decide_receipt(store, res["receipt_id"], "approved")
 check("set to the first purchase only, a later one pays nothing",
       user(ali["id"])["wallet"] == 240000)
-omid = store.create_web_user("omid", "omid-password")
+omid = store.create_web_user("omid", "", "omid-password")
 panel.set_referrer(store, omid["id"], code)
 res = panel.create_receipt(store, user(omid["id"]), dict(SLIP, plan_id=SEASON))
 act("receipt-decide", id=str(res["receipt_id"]), to="approved")

@@ -122,7 +122,7 @@ store.run("INSERT INTO dns_forwards (domain, servers, added_at) VALUES"
 check("it keeps them", store.dns_forwards() == {"example.com": ["1.1.1.1", "8.8.8.8"]})
 psrc = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8").read()
 check("keeps each relay's check", 'self.store.set_setting("forward_check:" + who, text)' in psrc)
-user = store.create_user(111, "ali")
+user = store.create_user(111, "ali", "علی")
 reason = panel.qlog_reasoner(store, store.one("SELECT * FROM users WHERE id = ?", (user["id"],)),
                              panel.CATALOGUE)
 check("the DNS report says which resolver answered",

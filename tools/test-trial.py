@@ -104,7 +104,7 @@ def user(uid):
 
 
 print("making the trial")
-ali = store.create_web_user("ali", "ali-password")
+ali = store.create_web_user("ali", "علی", "ali-password")
 check("with none made, nobody is offered one", panel.trial_view(store, user(ali["id"])) is None)
 act("plan-save", name="تست یک‌روزه", template_id="1", days="1", quota_gb="1", price="5000",
     trial="1")
@@ -149,7 +149,7 @@ check("the same account cannot take it again",
       panel.take_trial(store, user(ali["id"]))["error"] == "trial_used")
 check("and is no longer offered it", panel.trial_view(store, user(ali["id"])) is None)
 store.run("UPDATE users SET telegram_id = NULL WHERE id = ?", (ali["id"],))
-second = store.create_web_user("ali2", "ali-password")
+second = store.create_web_user("ali2", "علی", "ali-password")
 store.run("UPDATE users SET telegram_id = 1001 WHERE id = ?", (second["id"],))
 check("nor can a new account with the same Telegram",
       panel.take_trial(store, user(second["id"]))["error"] == "trial_used")
@@ -161,7 +161,7 @@ check("another Telegram account is another person",
       panel.take_trial(store, user(second["id"]))["ok"])
 
 print("never over a plan somebody is running")
-sara = store.create_web_user("sara", "sara-password")
+sara = store.create_web_user("sara", "سارا", "sara-password")
 store.run("UPDATE users SET telegram_id = 2001 WHERE id = ?", (sara["id"],))
 admin.STORE.apply_plan(sara["id"], 1)
 view = panel.trial_view(store, user(sara["id"]))

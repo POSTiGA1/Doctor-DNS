@@ -57,9 +57,9 @@ card = admin.total_usage_card("p")
 check("it says so rather than drawing empty charts", "هنوز مصرفی ثبت نشده" in card and "<svg" not in card)
 
 print("with three customers")
-a = store.create_user(111, "ali")
-b = store.create_user(222, "sara")
-c = store.create_user(333, "reza")
+a = store.create_user(111, "ali", "علی")
+b = store.create_user(222, "sara", "سارا")
+c = store.create_user(333, "reza", "رضا")
 T = admin.TEHRAN
 today = datetime.now(T)
 

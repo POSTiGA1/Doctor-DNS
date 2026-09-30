@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.15"
+VERSION="0.9.16"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -4528,8 +4528,6 @@ exit 0
 #    password_hash  TEXT,
 #    password_salt  TEXT,
 #    username       TEXT,
-#    -- No longer written or shown: a customer is their username. Kept so a
-#    -- database from before still opens.
 #    first_name     TEXT,
 #    created_at     TEXT NOT NULL,
 #    status         TEXT NOT NULL DEFAULT 'active',
@@ -5801,13 +5799,13 @@ exit 0
 #    # Not quota_bytes = 0 on an active account, which is the trap here: zero
 #    # means unlimited everywhere in this file, so the account that was meant
 #    # to get nothing would get everything. The status is what decides.
-#    def create_user(self, tg_id, username):
+#    def create_user(self, tg_id, username, first_name):
 #        self.run(
 #            "INSERT OR IGNORE INTO users"
-#            " (telegram_id, username, created_at, status,"
+#            " (telegram_id, username, first_name, created_at, status,"
 #            "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
-#            " VALUES (?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-#            (tg_id, username, now()),
+#            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (tg_id, username, first_name, now()),
 #        )
 #        return self.user_by_telegram(tg_id)
 #
@@ -5817,7 +5815,7 @@ exit 0
 #    def user_by_username(self, username):
 #        return self.one("SELECT * FROM users WHERE username = ?", (username,))
 #
-#    def create_web_user(self, username, password):
+#    def create_web_user(self, username, first_name, password):
 #        """Open an account from the web panel, with no Telegram behind it.
 #
 #        It starts with nothing, the same as one opened any other way - the way
@@ -5828,11 +5826,11 @@ exit 0
 #        salt = secrets.token_hex(16)
 #        self.run(
 #            "INSERT INTO users"
-#            " (telegram_id, username, password_hash, password_salt,"
+#            " (telegram_id, username, password_hash, password_salt, first_name,"
 #            "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
 #            "  expires_at)"
-#            " VALUES (NULL, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-#            (username, hash_password(password, salt), salt, now()),
+#            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (username, hash_password(password, salt), salt, first_name, now()),
 #        )
 #        return self.user_by_username(username)
 #
@@ -8103,9 +8101,9 @@ exit 0
 #                    for _ in range(3))
 #
 #
-#def give_credentials(store, user, username):
-#    """A web sign-in for an account that came through the bot: the username
-#    the customer chose, and a password made here."""
+#def give_credentials(store, user, username, name):
+#    """A web sign-in for an account that came through the bot: the name and
+#    username the customer chose, and a password made here."""
 #    if user["username"]:
 #        return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
 #    wanted = normal_username(username)
@@ -8114,12 +8112,13 @@ exit 0
 #                                       "یا زیرخط باشد")
 #    if store.user_by_username(wanted):
 #        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+#    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
 #    password = new_password()
 #    salt = secrets.token_hex(16)
 #    try:
-#        store.run("UPDATE users SET username = ?, password_hash = ?,"
+#        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
 #                  " password_salt = ?, must_change_password = 0 WHERE id = ?",
-#                  (wanted, hash_password(password, salt), salt, user["id"]))
+#                  (wanted, name, hash_password(password, salt), salt, user["id"]))
 #    except sqlite3.IntegrityError:
 #        return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
 #    log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
@@ -8555,7 +8554,7 @@ exit 0
 #
 #
 #def who_label(user):
-#    return (user["username"] or user["phone"]
+#    return (user["first_name"] or user["username"] or user["phone"]
 #            or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
 #                else "#%d" % user["id"]))
 #
@@ -10062,6 +10061,8 @@ exit 0
 #        password = body.get("password") or ""
 #        if len(password) < 8:
 #            return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
+#        name = (body.get("name") or "").strip()[:60]
+#
 #        if self.store.user_by_username(username):
 #            return {"ok": False,
 #                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
@@ -10074,7 +10075,7 @@ exit 0
 #            return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
 #                                            "بگیرید"}
 #        try:
-#            user = self.store.create_web_user(username, password)
+#            user = self.store.create_web_user(username, name, password)
 #        except sqlite3.IntegrityError:
 #            # Two signups claiming the same name in the same instant. The
 #            # unique index is what actually decides between them; this only
@@ -10090,7 +10091,7 @@ exit 0
 #        print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
 #        emit_admin(self.store, "user.created", {
 #            "user_id": user["id"], "via": "web",
-#            "text": "مشتری تازه از پنل وب: %s" % username})
+#            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
 #        return {"ok": True, "session": self.store.open_session(user["id"]),
 #                "message": "حساب ساخته شد"}
 #
@@ -10249,10 +10250,7 @@ exit 0
 #        plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
 #        return {
 #            "ok": True,
-#            # What the customer page puts at the top. Under "name" still, for
-#            # a relay not yet upgraded; it is the username now.
-#            "name": user["username"] or "",
-#            "username": user["username"] or "",
+#            "name": user["first_name"] or user["username"] or "",
 #            "telegram_id": user["telegram_id"],
 #            "ip": ips[0]["ip"] if ips else None,
 #            "used": user["used_bytes"],
@@ -10496,6 +10494,7 @@ exit 0
 #    return {
 #        "id": user["id"],
 #        "telegram_id": user["telegram_id"],
+#        "name": user["first_name"] or "",
 #        "username": user["username"],
 #        "panel_url": store.setting("customer_panel_url") or None,
 #        "status": user["status"],
@@ -10556,7 +10555,7 @@ exit 0
 #RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
 #                " t.plan_id,"
 #                " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
-#                " u.id AS uid, u.username, u.phone, u.telegram_id"
+#                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
 #                " FROM transactions t JOIN users u ON u.id = t.user_id"
 #                " LEFT JOIN plans p ON p.id = t.plan_id")
 #
@@ -10636,10 +10635,10 @@ exit 0
 #            like = "%" + q.replace("%", "").replace("_", "") + "%"
 #            rows = self.store.q(
 #                "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-#                " WHERE (u.username LIKE ? OR u.phone LIKE ?"
+#                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
 #                " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
 #                " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
-#                (like, like, q, q, q) + more)
+#                (like, like, like, q, q, q) + more)
 #        return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
 #                                           for r in rows]}
 #
@@ -10726,7 +10725,7 @@ exit 0
 #            return 400, refused("bad_status", "status یکی از open، answered، closed "
 #                                              "یا all است")
 #        rows = self.store.q(
-#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
 #            " FROM tickets t JOIN users u ON u.id = t.user_id"
 #            + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
@@ -11037,11 +11036,10 @@ exit 0
 #                return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
 #        created = not user
 #        if created:
+#            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
 #            # No username: that column is what a customer signs in to the web
 #            # panel with, and a Telegram handle there could collide with one.
-#            # The bot asks for one next. A "name" sent by an older bot is not
-#            # kept.
-#            user = self.store.create_user(tg, None)
+#            user = self.store.create_user(tg, None, name or None)
 #            print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
 #                  flush=True)
 #            # A reseller's link makes them the reseller's; somebody else's
@@ -11120,7 +11118,7 @@ exit 0
 #        user, err = self.customer(tg)
 #        if err:
 #            return err
-#        res = give_credentials(self.store, user, body.get("username"))
+#        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
 #        if not res["ok"]:
 #            return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
 #        return 200, res
@@ -15286,6 +15284,8 @@ exit 0
 #             if ref else "") +
 #            "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
 #            "<form method='post' action='/signup'>%s"
+#            "<label>نام</label>"
+#            "<input name='name' maxlength='60' autocomplete='name'>"
 #            "<label>نام کاربری</label>"
 #            "<input name='username' required minlength='3' maxlength='32' "
 #            "pattern='[A-Za-z0-9._-]{3,32}' placeholder='ali_reza' "
@@ -16868,6 +16868,7 @@ exit 0
 #                       "password": form.get("password", ""),
 #                       "ip": self.client_ip()}
 #            if path == "/signup":
+#                payload["name"] = form.get("name", "")
 #                # Whose invitation this came by; the panel decides if it counts.
 #                payload["ref"] = form.get("ref", "")[:16]
 #                back = ("/signup?ref=" + urllib.parse.quote(payload["ref"])
@@ -17389,10 +17390,7 @@ exit 0
 #            gauge = ("<div class='bar'><i class='%s' style='width:%d%%'></i></div>"
 #                     % (cls, pct))
 #
-#        # The username - "name" from a panel not yet upgraded, which sent
-#        # the customer's name there.
-#        body = ["<h1>%s</h1>" % html.escape(info.get("username") or info.get("name")
-#                                             or "حساب شما"),
+#        body = ["<h1>%s</h1>" % html.escape(info.get("name") or "حساب شما"),
 #                "<div class='sub'>%s</div>" % html.escape(brand()),
 #                banner, account_notice(info)]
 #        for k, v in rows:
@@ -19814,7 +19812,7 @@ exit 0
 #    since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
 #    mine_only = (" AND u.owner_admin IS NULL" if owner == "own" else
 #                 " AND u.owner_admin = ?" if owner else "")
-#    top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
+#    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
 #                  " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
 #                  " WHERE g.grain = '1d' AND g.bucket >= ?" + mine_only + " GROUP BY u.id"
 #                  " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10",
@@ -19871,9 +19869,9 @@ exit 0
 #                   "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
 #        for r in top:
 #            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
-#            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a>"
+#            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
 #                       "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
-#                       % (p, r["id"], html.escape(who),
+#                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
 #                          human(r["down"]), human(r["up"]),
 #                          round(100.0 * (r["down"] + r["up"]) / total)))
 #        out.append("</table>")
@@ -21367,8 +21365,9 @@ exit 0
 #    """The customers online now - a seller's own, with `extra` - busiest
 #    first: each with what they moved in the last ten minutes or so."""
 #    try:
-#        rows = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id, u.last_seen,"
-#                       " u.last_server, u.owner_admin FROM users u WHERE u.last_seen >= ?"
+#        rows = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+#                       " u.last_seen, u.last_server, u.owner_admin FROM users u"
+#                       " WHERE u.last_seen >= ?"
 #                       + extra, (online_since(),) + tuple(args))
 #    except sqlite3.OperationalError:
 #        return []                   # a panel that has not added the column yet
@@ -21406,10 +21405,11 @@ exit 0
 #            who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
 #            server = r["last_server"] or ""
 #            out.append(
-#                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a></td>"
+#                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a>"
+#                " <span class='muted'>%s</span></td>"
 #                "<td>%s</td>%s<td class='muted'><span dir='ltr'>↓%s/s ↑%s/s</span></td>"
 #                "<td class='muted'>%s</td></tr>"
-#                % (p, r["id"], html.escape(who),
+#                % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
 #                   html.escape(server_label(server)) if server else "—",
 #                   "<td>%s</td>" % html.escape(sellers.get(r["owner_admin"], "—"))
 #                   if show_seller else "",
@@ -22297,6 +22297,7 @@ exit 0
 #.pill.warn{background:var(--warn-bg);color:var(--warn)}
 #.pill.bad{background:var(--err-bg);color:var(--bad)}
 #.card details>summary{cursor:pointer}
+#.who small{display:block;color:var(--muted);font-size:11px}
 #.card.wide{padding:16px 12px}
 #table.users td{padding:8px 5px}
 #table.users th{padding:9px 5px}
@@ -23035,9 +23036,9 @@ exit 0
 #
 #
 #def ticket_who(row):
-#    return (row["username"] or row["phone"]
-#            or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
-#                else "#%d" % row["user_id"]))
+#    return "%s · %s" % (row["first_name"] or "", row["username"] or row["phone"]
+#                        or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
+#                            else "#%d" % row["user_id"]))
 #
 #
 #def image_kind(blob):
@@ -24473,7 +24474,7 @@ exit 0
 #    out.append("</div>")
 #    out.append(total_usage_card(p, sid, "مصرف مشتری‌های %s" % r["username"]))
 #    rows = STORE.q("SELECT t.id, t.amount, t.kind, t.status, t.created_at, u.username,"
-#                   " u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
+#                   " u.first_name, u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
 #                   " WHERE u.owner_admin = ? ORDER BY t.id DESC LIMIT 10", (sid,))
 #    if rows:
 #        kinds = {"topup": "شارژ کیف پول", "device": "دستگاه اضافه", "wallet": "از کیف پول"}
@@ -24485,7 +24486,7 @@ exit 0
 #        for t in rows:
 #            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
 #                       % (html.escape(t["created_at"][:16].replace("T", " ")),
-#                          html.escape(t["username"] or "#%d" % t["uid"]),
+#                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
 #                          kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
 #                          states.get(t["status"], html.escape(t["status"]))))
 #        out.append("</table></div>")
@@ -25290,7 +25291,7 @@ exit 0
 #    def receipts(self):
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
-#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
 #            " p.name AS plan_name, p.days AS plan_days,"
 #            " p.quota_bytes AS plan_quota"
@@ -25303,8 +25304,9 @@ exit 0
 #        if not pending:
 #            out.append("<p class='muted'>رسیدی نرسیده.</p>")
 #        for r in pending:
-#            who = (r["username"] or r["phone"]
-#                   or str(r["telegram_id"] or "#%d" % r["user_id"]))
+#            who = (r["first_name"] or "") + " · " + (
+#                r["username"] or r["phone"]
+#                or str(r["telegram_id"] or "#%d" % r["user_id"]))
 #            topup = r["kind"] == "topup"
 #            if r["kind"] == "device":
 #                bought = ("<div class='bought'>📱 دستگاه اضافه · %s تومان<span class='muted'>"
@@ -25370,7 +25372,8 @@ exit 0
 #            for r in decided[:40]:
 #                out.append("<tr><td>%s</td><td>%s</td><td>%s</td>"
 #                           "<td class='%s'>%s</td><td>%s</td></tr>"
-#                           % (html.escape(r["username"] or r["phone"] or ""),
+#                           % (html.escape((r["first_name"] or "") + " · " +
+#                                          (r["username"] or r["phone"] or "")),
 #                              html.escape(r["created_at"][:16]),
 #                              html.escape(
 #                                  "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
@@ -25897,7 +25900,7 @@ exit 0
 #                  health_cells("exit" if kind == "exit" and ip == here else ip))]
 #        view = server_view(kind, ip)
 #        since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
-#        top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
+#        top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
 #                      " SUM(g.down) down, SUM(g.up) up FROM user_server_usage g"
 #                      " JOIN users u ON u.id = g.user_id WHERE g.kind = ? AND g.server = ?"
 #                      " AND g.day >= ? GROUP BY u.id ORDER BY SUM(g.down) + SUM(g.up) DESC"
@@ -26028,7 +26031,7 @@ exit 0
 #                        "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
 #                        "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
 #            out.append(
-#                "<tr><td class='who' title='%s'>%s<code>%s</code></td>"
+#                "<tr><td class='who' title='%s'>%s<code>%s</code><small>%s</small></td>"
 #                "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
 #                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
 #                "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -26066,6 +26069,7 @@ exit 0
 #                % (html.escape(who, quote=True),
 #                   "<span class='dot on' title='آنلاین'></span>" if is_online(r) else "",
 #                   html.escape(who),
+#                   html.escape(r["first_name"] or ""),
 #                   html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
 #                   "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
 #                   % (p, r["id"], human(r["used_bytes"])),
@@ -26210,14 +26214,14 @@ exit 0
 #    def tickets(self):
 #        wanted = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t")
 #        if wanted and wanted[0].isdigit():
-#            row = STORE.one("SELECT t.*, u.username, u.phone,"
+#            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
 #                            " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
 #                            " WHERE t.id = ?" + mine()[0], (int(wanted[0]),) + mine()[1])
 #            if row:
 #                return self.ticket_page(row)
 #        p = CFG["ADMIN_PATH"]
 #        rows = STORE.q(
-#            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+#            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
 #            " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
 #            " FROM tickets t JOIN users u ON u.id = t.user_id WHERE 1 = 1" + mine()[0] +
 #            " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
@@ -26427,7 +26431,7 @@ exit 0
 #               "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a></p>" % p,
 #               "<div class='grid'><div class='stat'><div class='n'>%s</div>"
 #               "<div class='l'>موجودی (تومان)</div></div>" % format(user["wallet"] or 0, ",")]
-#        invited = STORE.q("SELECT id, username, phone, telegram_id, status"
+#        invited = STORE.q("SELECT id, username, phone, telegram_id, first_name, status"
 #                          " FROM users WHERE referred_by = ? ORDER BY id DESC", (uid,))
 #        earned = STORE.one("SELECT COALESCE(sum(amount), 0) s FROM wallet_moves"
 #                           " WHERE user_id = ? AND kind = 'referral'", (uid,))["s"]
@@ -26473,10 +26477,11 @@ exit 0
 #            out.append("<div class='card'><h2>دعوت‌شده‌ها (%d)</h2><table><tr><th>کاربر</th>"
 #                       "<th>وضعیت</th></tr>" % len(invited))
 #            for r in invited:
-#                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a></td><td>%s</td></tr>"
+#                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a> <span class='muted'>%s"
+#                           "</span></td><td>%s</td></tr>"
 #                           % (p, r["id"], html.escape(str(r["username"] or r["phone"]
 #                                                          or r["telegram_id"] or "#%d" % r["id"])),
-#                              html.escape(r["status"])))
+#                              html.escape(r["first_name"] or ""), html.escape(r["status"])))
 #            out.append("</table></div>")
 #        return "".join(out)
 #
@@ -31796,12 +31801,14 @@ exit 0
 #import base64
 #import hashlib
 #import hmac
+#import http.client
 #import http.server
 #import json
 #import os
 #import queue
 #import re
 #import secrets
+#import select
 #import sys
 #import threading
 #import time
@@ -32008,45 +32015,119 @@ exit 0
 #
 #
 ## ------------------------------------------------------------ the two APIs
+#class Wire:
+#    """A connection to one server, kept open between calls - one for each
+#    thread that asks.
+#
+#    Every button a customer presses is three or four calls, and opening a
+#    new TLS connection to Telegram for each was most of the wait. A
+#    connection the other end has closed since is noticed before it is used,
+#    and one that turns out dead as the call goes out is opened again, once.
+#    Through a proxy from the environment it stands aside for urllib, which
+#    knows how to use one.
+#    """
+#
+#    def __init__(self, base):
+#        u = urllib.parse.urlsplit(base)
+#        self.base = base
+#        self.https = u.scheme == "https"
+#        self.host, self.port, self.prefix = u.hostname, u.port, u.path
+#        self.local = threading.local()
+#        self.proxied = bool(urllib.request.getproxies().get(u.scheme)) and not \
+#            urllib.request.proxy_bypass(u.hostname or "")
+#
+#    @staticmethod
+#    def dropped(conn):
+#        sock = conn.sock
+#        if sock is None:
+#            return True
+#        try:
+#            # Nothing was asked, so anything to read is the other end's goodbye.
+#            return bool(select.select([sock], [], [], 0)[0])
+#        except (OSError, ValueError):
+#            return True
+#
+#    def request(self, method, path, body=None, headers=None, timeout=30):
+#        """(status, the body's bytes)."""
+#        if self.proxied:
+#            req = urllib.request.Request(self.base + path, method=method, data=body,
+#                                         headers=headers or {})
+#            try:
+#                with urllib.request.urlopen(req, timeout=timeout) as r:
+#                    return r.status, r.read()
+#            except urllib.error.HTTPError as e:
+#                return e.code, e.read()
+#        conn = getattr(self.local, "conn", None)
+#        if conn is not None and self.dropped(conn):
+#            conn.close()
+#            conn = None
+#        reused = conn is not None
+#        while True:
+#            if conn is None:
+#                kind = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+#                conn = kind(self.host, self.port, timeout=timeout)
+#            try:
+#                conn.timeout = timeout
+#                if conn.sock is not None:
+#                    conn.sock.settimeout(timeout)
+#                conn.request(method, self.prefix + path, body=body, headers=headers or {})
+#                r = conn.getresponse()
+#                data = r.read()
+#            except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+#                    BrokenPipeError, ConnectionResetError):
+#                conn.close()
+#                self.local.conn = conn = None
+#                if not reused:
+#                    raise
+#                reused = False              # closed while idle: once more, on a new one
+#                continue
+#            except BaseException:
+#                conn.close()
+#                self.local.conn = None
+#                raise
+#            if r.will_close:
+#                conn.close()
+#                conn = None
+#            self.local.conn = conn
+#            return r.status, data
+#
+#
 #class Panel:
 #    """The panel's bot API."""
 #
 #    def __init__(self, cfg):
 #        self.base, self.key = cfg["api"], cfg["key"]
+#        self.wire = Wire(self.base)
 #
 #    def call(self, method, path, body=None, idem=None):
-#        req = urllib.request.Request(self.base + path, method=method,
-#                                     data=json.dumps(body).encode() if body is not None
-#                                     else None)
-#        req.add_header("Authorization", "Bearer " + self.key)
-#        req.add_header("Content-Type", "application/json")
+#        headers = {"Authorization": "Bearer " + self.key, "Content-Type": "application/json"}
 #        if idem:
-#            req.add_header("Idempotency-Key", idem)
-#        try:
-#            with urllib.request.urlopen(req, timeout=30) as r:
-#                return json.loads(r.read())
-#        except urllib.error.HTTPError as e:
+#            headers["Idempotency-Key"] = idem
+#        status, raw = self.wire.request(
+#            method, path, json.dumps(body).encode() if body is not None else None, headers)
+#        if status >= 400:
 #            try:
-#                body = json.loads(e.read())
+#                body = json.loads(raw)
 #            except ValueError:
-#                body = {"message": "پنل جواب درستی نداد (HTTP %d)" % e.code}
-#            raise ApiError(e.code, body)
+#                body = {"message": "پنل جواب درستی نداد (HTTP %d)" % status}
+#            raise ApiError(status, body)
+#        return json.loads(raw)
 #
 #
 #class Telegram:
 #    def __init__(self, cfg):
 #        self.base = "%s/bot%s/" % (cfg["telegram"], cfg["token"])
 #        self.files = "%s/file/bot%s/" % (cfg["telegram"], cfg["token"])
+#        self.wire = Wire(self.base)
 #
 #    def call(self, method, http_timeout=30, **params):
 #        data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
-#        req = urllib.request.Request(self.base + method, data=data,
-#                                     headers={"Content-Type": "application/json"})
+#        _, raw = self.wire.request("POST", method, data,
+#                                   {"Content-Type": "application/json"}, http_timeout)
 #        try:
-#            with urllib.request.urlopen(req, timeout=http_timeout) as r:
-#                res = json.loads(r.read())
-#        except urllib.error.HTTPError as e:
-#            res = json.loads(e.read() or b"{}")
+#            res = json.loads(raw or b"{}")
+#        except ValueError:
+#            res = {"description": raw[:200].decode("utf-8", "replace")}
 #        if not res.get("ok"):
 #            raise RuntimeError("telegram %s: %s" % (method, res.get("description")))
 #        return res.get("result")
@@ -32158,7 +32239,8 @@ exit 0
 #                if e.body.get("error") != "user_not_found":
 #                    raise
 #                self.known.discard(uid)
-#        self.panel.call("POST", "/users", {"telegram_id": uid})
+#        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#        self.panel.call("POST", "/users", {"telegram_id": uid, "name": name[:60]})
 #        self.known.add(uid)
 #        return self.panel.call("GET", "/users/%d" % uid)["user"]
 #
@@ -32193,8 +32275,10 @@ exit 0
 #            return self.admin_command(chat, text)
 #
 #        waiting, extra = self.state.get(chat, (None, None))
+#        if waiting == "onb_name":
+#            return self.got_name(chat, sender, text)
 #        if waiting == "onb_user":
-#            return self.got_username(chat, sender, text)
+#            return self.got_username(chat, sender, text, extra)
 #        if text in ("/doh", "/dns"):
 #            text = B_DNS
 #        if text in (B_ACCOUNT, B_BUY, B_WALLET, B_INVITE, B_IP, B_DNS, B_SUPPORT, B_WEB) \
@@ -32262,9 +32346,10 @@ exit 0
 #            # Asked even for a Telegram id the bot knows, which may since have
 #            # been deleted in the admin panel; for one that is still there the
 #            # panel only answers that it exists.
+#            name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
 #            try:
 #                self.panel.call("POST", "/users", {"telegram_id": sender["id"],
-#                                                   "ref": arg[4:20]})
+#                                                   "name": name[:60], "ref": arg[4:20]})
 #                self.known.add(sender["id"])
 #            except ApiError as e:
 #                log("invitation start failed: %s" % e)
@@ -32310,20 +32395,30 @@ exit 0
 #
 #    # -- a web sign-in for everybody who comes through the bot ----------------
 #    def ready(self, chat, sender):
-#        """True when the account has its web sign-in. Otherwise the question
-#        for a username comes first, and whatever was pressed waits for it."""
+#        """True when the account has its web sign-in. Otherwise the two
+#        questions start, and whatever was pressed waits until they are done."""
 #        u = self.account(sender)
 #        if u.get("username"):
 #            return True
-#        self.state[chat] = ("onb_user", None)
-#        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nیک نام کاربری انگلیسی برای ورود به "
-#                 "پنل وب انتخاب کنید (حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
+#        tg_name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+#        self.state[chat] = ("onb_name", None)
+#        self.say(chat, "اول حسابتان را کامل کنیم 🙂\n\nاسمتان چیست؟",
+#                 {"keyboard": [[tg_name[:60]]] if tg_name else [[B_CANCEL]],
+#                  "resize_keyboard": True, "one_time_keyboard": True})
 #        return False
 #
-#    def got_username(self, chat, sender, text):
+#    def got_name(self, chat, sender, text):
+#        if not text or text == B_CANCEL:
+#            self.state.pop(chat, None)
+#            return self.say(chat, "هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.", MENU)
+#        self.state[chat] = ("onb_user", text[:60])
+#        self.say(chat, "یک نام کاربری انگلیسی برای ورود به پنل وب انتخاب کنید "
+#                 "(حروف انگلیسی و عدد، مثلاً ali_gamer):", CANCEL)
+#
+#    def got_username(self, chat, sender, text, name):
 #        try:
 #            res = self.panel.call("POST", "/users/%d/credentials" % sender["id"],
-#                                  {"username": text})
+#                                  {"username": text, "name": name})
 #        except ApiError as e:
 #            if e.body.get("error") == "has_username":
 #                self.state.pop(chat, None)
@@ -32447,7 +32542,7 @@ exit 0
 #    # -- the customer's screens ---------------------------------------------
 #    def show_account(self, chat, sender):
 #        u = self.account(sender)
-#        lines = ["👤 %s" % (u.get("username") or "حساب شما"),
+#        lines = ["👤 %s" % (u["name"] or "حساب شما"),
 #                 "وضعیت: %s" % STATUS.get(u["status"], u["status"])]
 #        if u["plan"]:
 #            lines.append("پلن: %s" % u["plan"]["name"])
@@ -33002,6 +33097,41 @@ exit 0
 #    return http.server.ThreadingHTTPServer((host or "127.0.0.1", int(port)), Hook)
 #
 #
+## How many customers are answered at once.
+#LANES = 8
+#
+#
+#def lane_of(update, lanes=LANES):
+#    """Which lane an update goes down: its chat's, always the same one."""
+#    msg = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+#    chat = (msg.get("chat") or {}).get("id") or \
+#        ((update.get("callback_query") or {}).get("from") or {}).get("id") or 0
+#    try:
+#        return abs(int(chat)) % lanes
+#    except (TypeError, ValueError):
+#        return 0
+#
+#
+#def start_lanes(handle, lanes=LANES):
+#    """Several customers at once, each in their own order: a chat's updates
+#    always go down the same lane, so a customer's photo and the text after it
+#    do not race, and one slow answer - a receipt being fetched - holds up
+#    nobody else's. Returns what an update is handed to."""
+#    queues = [queue.Queue() for _ in range(lanes)]
+#
+#    def lane(q):
+#        while True:
+#            update = q.get()
+#            try:
+#                handle(update)
+#            except Exception:
+#                log("update failed:\n" + traceback.format_exc())
+#
+#    for q in queues:
+#        threading.Thread(target=lane, args=(q,), daemon=True).start()
+#    return lambda update: queues[lane_of(update, lanes)].put(update)
+#
+#
 #def main():
 #    cfg = settings()
 #    if not cfg["secret"]:
@@ -33024,20 +33154,25 @@ exit 0
 #    server = webhook_server(bot, work)
 #    threading.Thread(target=server.serve_forever, daemon=True).start()
 #
+#    hand = start_lanes(bot.handle)
+#
 #    offset = None
 #    while True:
 #        try:
-#            # Long polling: Telegram holds the request up to 50 seconds.
-#            updates = bot.tg.call("getUpdates", http_timeout=70, timeout=50, offset=offset,
+#            # Long polling: Telegram holds the request up to 25 seconds. Short
+#            # enough that a connection that went dead on the way is noticed
+#            # and opened again in well under a minute.
+#            updates = bot.tg.call("getUpdates", http_timeout=40, timeout=25, offset=offset,
 #                                  allowed_updates=["message", "callback_query"])
 #        except Exception as e:
 #            log("getUpdates: %s" % e)
-#            time.sleep(5)
+#            # A dead connection is simply tried again; anything else - a
+#            # refusal, no network - is given a moment.
+#            time.sleep(1 if "timed out" in str(e) else 5)
 #            continue
-#        # In order: a customer's photo and the text after it must not race.
 #        for u in updates or []:
 #            offset = u["update_id"] + 1
-#            bot.handle(u)
+#            hand(u)
 #
 #
 #if __name__ == "__main__":
@@ -38231,6 +38366,7 @@ exit 0
 #"اسم گروه": "Group name",
 #"اسم گروه حداکثر ۴۰ نویسه": "A group’s name is at most 40 characters",
 #"اسم گروه را بنویسید": "Write the group’s name",
+#"اسمتان چیست؟": "What is your name?",
 #"اسکواد": "Squad",
 #"اسکواد باسترز": "Squad Busters",
 #"اسکیپ فرام تارکوف": "Escape from Tarkov",
@@ -39598,6 +39734,7 @@ exit 0
 #"هر مشتری": "Per customer",
 #"هر مشتری فقط یک بار": "Each customer only once",
 #"هر مشتری لینک دعوت خودش را بگیرد": "Every customer gets their own invitation link",
+#"هر وقت خواستید دوباره یکی از دکمه‌ها را بزنید.": "Press one of the buttons again whenever you like.",
 #"هر پلن تعداد دستگاه خودش را دارد (ستون «دستگاه»)، یعنی چند آی‌پی هم‌زمان می‌توانند وصل باشند. اگر آی‌پی تازه‌ای بیاید و جا نباشد، قدیمی‌ترین آی‌پی حذف می‌شود. مشتری روی پلن فعالش می‌تواند از پنل یا ربات دستگاه اضافه بخرد، با رسید یا از کیف پول. دستگاه اضافه تا وقتی همان پلن را تمدید کند می‌ماند و با خرید پلن دیگر از بین می‌رود. حداکثر": "Each plan has its own number of devices (the “Devices” column): how many IPs can be connected at once. When a new IP comes and there is no room, the oldest one is removed. On an active plan, a customer can buy extra devices from the panel or the bot, by receipt or from the wallet. An extra device lasts while the same plan is renewed and ends when another plan is bought. At most",
 #"هر پلن یعنی یک قالب، برای چند روز، با یک حجم و یک قیمت. مشتری در پنل خودش پلن را انتخاب می‌کند و رسید می‌فرستد؛ با تأیید رسید همه‌چیز خودکار روی حسابش می‌نشیند. خرید دوبارهٔ همان پلن پیش از تمام شدنش تمدید است: روزها و حجم روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ حجم پذیرفته نمی‌شود.": "Each plan is a template, for a number of days, with a quota and a price. The customer picks a plan in their own panel and sends a receipt; on approval everything is put on their account automatically. Buying the same plan again before it ends is a renewal: the days and quota are added to what is left. Buying another plan starts over from that moment and what was left is lost; the customer is told this before buying. “Unlimited” only by its own tick; an empty quota box is not accepted.",
 #"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",

@@ -116,7 +116,7 @@ check("  and the customer reads them", "3 دستگاه" in sync.plan_line(sale["
       and "دستگاه" not in sync.plan_line(sale["یک دستگاه"]))
 
 print("buying")
-ali = store.create_web_user("ali", "ali-password")["id"]
+ali = store.create_web_user("ali", "علی", "ali-password")["id"]
 panel.apply_plan(store, ali, THREE)
 check("a plan gives its devices", user(ali)["max_ips"] == 3)
 for ip in ("93.184.216.1", "93.184.216.2", "93.184.216.3"):
@@ -132,7 +132,7 @@ act("devices-settings", price="50,000", limit="")
 offer = panel.device_offer(store, user(ali))
 check("priced, it is offered to a customer on a plan", offer and offer["available"]
       and offer["price"] == 50000)
-bob = store.create_web_user("bob", "bob-password")["id"]
+bob = store.create_web_user("bob", "", "bob-password")["id"]
 check("  not to one without a plan", not panel.device_offer(store, user(bob))["available"])
 res = panel.buy_device_with_wallet(store, user(ali))
 check("not without the money", not res["ok"] and res["error"] == "wallet_short")
@@ -178,7 +178,7 @@ check("the users page shows the devices on the address",
 
 print("new addresses a day")
 act("devices-settings", price="50000", limit="2")
-cara = store.create_web_user("cara", "cara-password")["id"]
+cara = store.create_web_user("cara", "", "cara-password")["id"]
 panel.apply_plan(store, cara, ONE)
 r1 = panel.register_ip(store, cara, "93.184.217.1", limited=True)
 r2 = panel.register_ip(store, cara, "93.184.217.2", limited=True)

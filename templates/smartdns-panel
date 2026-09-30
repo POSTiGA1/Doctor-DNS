@@ -69,8 +69,6 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash  TEXT,
     password_salt  TEXT,
     username       TEXT,
-    -- No longer written or shown: a customer is their username. Kept so a
-    -- database from before still opens.
     first_name     TEXT,
     created_at     TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'active',
@@ -1342,13 +1340,13 @@ class Store:
     # Not quota_bytes = 0 on an active account, which is the trap here: zero
     # means unlimited everywhere in this file, so the account that was meant
     # to get nothing would get everything. The status is what decides.
-    def create_user(self, tg_id, username):
+    def create_user(self, tg_id, username, first_name):
         self.run(
             "INSERT OR IGNORE INTO users"
-            " (telegram_id, username, created_at, status,"
+            " (telegram_id, username, first_name, created_at, status,"
             "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
-            " VALUES (?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-            (tg_id, username, now()),
+            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (tg_id, username, first_name, now()),
         )
         return self.user_by_telegram(tg_id)
 
@@ -1358,7 +1356,7 @@ class Store:
     def user_by_username(self, username):
         return self.one("SELECT * FROM users WHERE username = ?", (username,))
 
-    def create_web_user(self, username, password):
+    def create_web_user(self, username, first_name, password):
         """Open an account from the web panel, with no Telegram behind it.
 
         It starts with nothing, the same as one opened any other way - the way
@@ -1369,11 +1367,11 @@ class Store:
         salt = secrets.token_hex(16)
         self.run(
             "INSERT INTO users"
-            " (telegram_id, username, password_hash, password_salt,"
+            " (telegram_id, username, password_hash, password_salt, first_name,"
             "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
             "  expires_at)"
-            " VALUES (NULL, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-            (username, hash_password(password, salt), salt, now()),
+            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (username, hash_password(password, salt), salt, first_name, now()),
         )
         return self.user_by_username(username)
 
@@ -3644,9 +3642,9 @@ def new_password():
                     for _ in range(3))
 
 
-def give_credentials(store, user, username):
-    """A web sign-in for an account that came through the bot: the username
-    the customer chose, and a password made here."""
+def give_credentials(store, user, username, name):
+    """A web sign-in for an account that came through the bot: the name and
+    username the customer chose, and a password made here."""
     if user["username"]:
         return refused("has_username", "این حساب نام کاربری دارد: %s" % user["username"])
     wanted = normal_username(username)
@@ -3655,12 +3653,13 @@ def give_credentials(store, user, username):
                                        "یا زیرخط باشد")
     if store.user_by_username(wanted):
         return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
+    name = unicodedata.normalize("NFC", str(name or "")).strip()[:60] or user["first_name"]
     password = new_password()
     salt = secrets.token_hex(16)
     try:
-        store.run("UPDATE users SET username = ?, password_hash = ?,"
+        store.run("UPDATE users SET username = ?, first_name = ?, password_hash = ?,"
                   " password_salt = ?, must_change_password = 0 WHERE id = ?",
-                  (wanted, hash_password(password, salt), salt, user["id"]))
+                  (wanted, name, hash_password(password, salt), salt, user["id"]))
     except sqlite3.IntegrityError:
         return refused("username_taken", "این نام کاربری گرفته شده؛ یکی دیگر بنویسید")
     log(INFO, "user #%d chose web sign-in %r through the bot" % (user["id"], wanted))
@@ -4096,7 +4095,7 @@ def admin_ticket_reply(store, tid, body):
 
 
 def who_label(user):
-    return (user["username"] or user["phone"]
+    return (user["first_name"] or user["username"] or user["phone"]
             or ("تلگرام %s" % user["telegram_id"] if user["telegram_id"]
                 else "#%d" % user["id"]))
 
@@ -5603,6 +5602,8 @@ class API(http.server.BaseHTTPRequestHandler):
         password = body.get("password") or ""
         if len(password) < 8:
             return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
+        name = (body.get("name") or "").strip()[:60]
+
         if self.store.user_by_username(username):
             return {"ok": False,
                     "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
@@ -5615,7 +5616,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "message": "ظرفیت ثبت‌نام این فروشنده پر است؛ با خودش تماس "
                                             "بگیرید"}
         try:
-            user = self.store.create_web_user(username, password)
+            user = self.store.create_web_user(username, name, password)
         except sqlite3.IntegrityError:
             # Two signups claiming the same name in the same instant. The
             # unique index is what actually decides between them; this only
@@ -5631,7 +5632,7 @@ class API(http.server.BaseHTTPRequestHandler):
         print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
         emit_admin(self.store, "user.created", {
             "user_id": user["id"], "via": "web",
-            "text": "مشتری تازه از پنل وب: %s" % username})
+            "text": "مشتری تازه از پنل وب: %s (%s)" % (name or username, username)})
         return {"ok": True, "session": self.store.open_session(user["id"]),
                 "message": "حساب ساخته شد"}
 
@@ -5790,10 +5791,7 @@ class API(http.server.BaseHTTPRequestHandler):
         plans, code_message, code_ok = discount_view(self.store, user, body.get("code"))
         return {
             "ok": True,
-            # What the customer page puts at the top. Under "name" still, for
-            # a relay not yet upgraded; it is the username now.
-            "name": user["username"] or "",
-            "username": user["username"] or "",
+            "name": user["first_name"] or user["username"] or "",
             "telegram_id": user["telegram_id"],
             "ip": ips[0]["ip"] if ips else None,
             "used": user["used_bytes"],
@@ -6037,6 +6035,7 @@ def user_view(store, user, relays):
     return {
         "id": user["id"],
         "telegram_id": user["telegram_id"],
+        "name": user["first_name"] or "",
         "username": user["username"],
         "panel_url": store.setting("customer_panel_url") or None,
         "status": user["status"],
@@ -6097,7 +6096,7 @@ def admin_receipt(store, row):
 RECEIPT_ROWS = ("SELECT t.id, t.status, t.amount, t.kind, t.created_at, t.decided_at,"
                 " t.plan_id,"
                 " t.user_id, t.receipt_blob IS NOT NULL AS has_image, p.name AS plan_name,"
-                " u.id AS uid, u.username, u.phone, u.telegram_id"
+                " u.id AS uid, u.first_name, u.username, u.phone, u.telegram_id"
                 " FROM transactions t JOIN users u ON u.id = t.user_id"
                 " LEFT JOIN plans p ON p.id = t.plan_id")
 
@@ -6177,10 +6176,10 @@ class AdminAPI:
             like = "%" + q.replace("%", "").replace("_", "") + "%"
             rows = self.store.q(
                 "SELECT DISTINCT u.* FROM users u LEFT JOIN ips i ON i.user_id = u.id"
-                " WHERE (u.username LIKE ? OR u.phone LIKE ?"
+                " WHERE (u.username LIKE ? OR u.first_name LIKE ? OR u.phone LIKE ?"
                 " OR CAST(u.telegram_id AS TEXT) = ? OR CAST(u.id AS TEXT) = ?"
                 " OR i.ip = ?)" + extra + " ORDER BY u.id DESC LIMIT 20",
-                (like, like, q, q, q) + more)
+                (like, like, like, q, q, q) + more)
         return 200, {"ok": True, "users": [admin_user_view(self.store, r, self.relays)
                                            for r in rows]}
 
@@ -6267,7 +6266,7 @@ class AdminAPI:
             return 400, refused("bad_status", "status یکی از open، answered، closed "
                                               "یا all است")
         rows = self.store.q(
-            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
             " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
             " FROM tickets t JOIN users u ON u.id = t.user_id"
             + (" WHERE 1 = 1" if which == "all" else " WHERE t.status = ?") + self.mine()[0]
@@ -6578,11 +6577,10 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
                 return 403, refused("seller_full", "ظرفیت ثبت‌نام این فروشنده پر است")
         created = not user
         if created:
+            name = unicodedata.normalize("NFC", str(body.get("name") or "")).strip()[:60]
             # No username: that column is what a customer signs in to the web
             # panel with, and a Telegram handle there could collide with one.
-            # The bot asks for one next. A "name" sent by an older bot is not
-            # kept.
-            user = self.store.create_user(tg, None)
+            user = self.store.create_user(tg, None, name or None)
             print("bot-api: account #%d opened for telegram %d" % (user["id"], tg),
                   flush=True)
             # A reseller's link makes them the reseller's; somebody else's
@@ -6661,7 +6659,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         user, err = self.customer(tg)
         if err:
             return err
-        res = give_credentials(self.store, user, body.get("username"))
+        res = give_credentials(self.store, user, body.get("username"), body.get("name"))
         if not res["ok"]:
             return {"username_taken": 409, "has_username": 409}.get(res["error"], 400), res
         return 200, res

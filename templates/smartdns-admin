@@ -1205,7 +1205,7 @@ def total_usage_card(p, owner=None, title="مصرف کل — همهٔ مشتری
     since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
     mine_only = (" AND u.owner_admin IS NULL" if owner == "own" else
                  " AND u.owner_admin = ?" if owner else "")
-    top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
+    top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
                   " SUM(g.down) down, SUM(g.up) up FROM usage g JOIN users u ON u.id = g.user_id"
                   " WHERE g.grain = '1d' AND g.bucket >= ?" + mine_only + " GROUP BY u.id"
                   " ORDER BY SUM(g.down) + SUM(g.up) DESC LIMIT 10",
@@ -1262,9 +1262,9 @@ def usage_card(p, title, view, top):
                    "<th>دانلود</th><th>آپلود</th><th>سهم</th></tr>")
         for r in top:
             who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
-            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a>"
+            out.append("<tr><td><a href='/%s/usage?u=%d'>%s</a> <span class='muted'>%s</span>"
                        "</td><td>%s</td><td>%s</td><td>%d٪</td></tr>"
-                       % (p, r["id"], html.escape(who),
+                       % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
                           human(r["down"]), human(r["up"]),
                           round(100.0 * (r["down"] + r["up"]) / total)))
         out.append("</table>")
@@ -2758,8 +2758,9 @@ def online_rows(extra="", args=()):
     """The customers online now - a seller's own, with `extra` - busiest
     first: each with what they moved in the last ten minutes or so."""
     try:
-        rows = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id, u.last_seen,"
-                       " u.last_server, u.owner_admin FROM users u WHERE u.last_seen >= ?"
+        rows = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
+                       " u.last_seen, u.last_server, u.owner_admin FROM users u"
+                       " WHERE u.last_seen >= ?"
                        + extra, (online_since(),) + tuple(args))
     except sqlite3.OperationalError:
         return []                   # a panel that has not added the column yet
@@ -2797,10 +2798,11 @@ def online_card(p, rows, show_seller=False, most=100):
             who = str(r["username"] or r["phone"] or r["telegram_id"] or "#%d" % r["id"])
             server = r["last_server"] or ""
             out.append(
-                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a></td>"
+                "<tr><td><span class='dot on'></span><a href='/%s/usage?u=%d'>%s</a>"
+                " <span class='muted'>%s</span></td>"
                 "<td>%s</td>%s<td class='muted'><span dir='ltr'>↓%s/s ↑%s/s</span></td>"
                 "<td class='muted'>%s</td></tr>"
-                % (p, r["id"], html.escape(who),
+                % (p, r["id"], html.escape(who), html.escape(r["first_name"] or ""),
                    html.escape(server_label(server)) if server else "—",
                    "<td>%s</td>" % html.escape(sellers.get(r["owner_admin"], "—"))
                    if show_seller else "",
@@ -3688,6 +3690,7 @@ table.users td.acts .menu form.resetdays small{flex-basis:100%}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.bad{background:var(--err-bg);color:var(--bad)}
 .card details>summary{cursor:pointer}
+.who small{display:block;color:var(--muted);font-size:11px}
 .card.wide{padding:16px 12px}
 table.users td{padding:8px 5px}
 table.users th{padding:9px 5px}
@@ -4426,9 +4429,9 @@ def webhook_url_ok(url):
 
 
 def ticket_who(row):
-    return (row["username"] or row["phone"]
-            or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
-                else "#%d" % row["user_id"]))
+    return "%s · %s" % (row["first_name"] or "", row["username"] or row["phone"]
+                        or ("تلگرام %s" % row["telegram_id"] if row["telegram_id"]
+                            else "#%d" % row["user_id"]))
 
 
 def image_kind(blob):
@@ -5864,7 +5867,7 @@ def admin_stats_page(p, r):
     out.append("</div>")
     out.append(total_usage_card(p, sid, "مصرف مشتری‌های %s" % r["username"]))
     rows = STORE.q("SELECT t.id, t.amount, t.kind, t.status, t.created_at, u.username,"
-                   " u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
+                   " u.first_name, u.id uid FROM transactions t JOIN users u ON u.id = t.user_id"
                    " WHERE u.owner_admin = ? ORDER BY t.id DESC LIMIT 10", (sid,))
     if rows:
         kinds = {"topup": "شارژ کیف پول", "device": "دستگاه اضافه", "wallet": "از کیف پول"}
@@ -5876,7 +5879,7 @@ def admin_stats_page(p, r):
         for t in rows:
             out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
                        % (html.escape(t["created_at"][:16].replace("T", " ")),
-                          html.escape(t["username"] or "#%d" % t["uid"]),
+                          html.escape(t["first_name"] or t["username"] or "#%d" % t["uid"]),
                           kinds.get(t["kind"], "پلن"), format(t["amount"] or 0, ","),
                           states.get(t["status"], html.escape(t["status"]))))
         out.append("</table></div>")
@@ -6681,7 +6684,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def receipts(self):
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
-            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
             " u.plan_id AS holds, u.wallet, length(t.receipt_blob) AS size,"
             " p.name AS plan_name, p.days AS plan_days,"
             " p.quota_bytes AS plan_quota"
@@ -6694,8 +6697,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
         if not pending:
             out.append("<p class='muted'>رسیدی نرسیده.</p>")
         for r in pending:
-            who = (r["username"] or r["phone"]
-                   or str(r["telegram_id"] or "#%d" % r["user_id"]))
+            who = (r["first_name"] or "") + " · " + (
+                r["username"] or r["phone"]
+                or str(r["telegram_id"] or "#%d" % r["user_id"]))
             topup = r["kind"] == "topup"
             if r["kind"] == "device":
                 bought = ("<div class='bought'>📱 دستگاه اضافه · %s تومان<span class='muted'>"
@@ -6761,7 +6765,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
             for r in decided[:40]:
                 out.append("<tr><td>%s</td><td>%s</td><td>%s</td>"
                            "<td class='%s'>%s</td><td>%s</td></tr>"
-                           % (html.escape(r["username"] or r["phone"] or ""),
+                           % (html.escape((r["first_name"] or "") + " · " +
+                                          (r["username"] or r["phone"] or "")),
                               html.escape(r["created_at"][:16]),
                               html.escape(
                                   "شارژ کیف پول · %s تومان" % format(r["amount"], ",")
@@ -7288,7 +7293,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                   health_cells("exit" if kind == "exit" and ip == here else ip))]
         view = server_view(kind, ip)
         since = (datetime.now(TEHRAN) - timedelta(days=6)).strftime("%Y-%m-%d")
-        top = STORE.q("SELECT u.id, u.username, u.phone, u.telegram_id,"
+        top = STORE.q("SELECT u.id, u.username, u.first_name, u.phone, u.telegram_id,"
                       " SUM(g.down) down, SUM(g.up) up FROM user_server_usage g"
                       " JOIN users u ON u.id = g.user_id WHERE g.kind = ? AND g.server = ?"
                       " AND g.day >= ? GROUP BY u.id ORDER BY SUM(g.down) + SUM(g.up) DESC"
@@ -7419,7 +7424,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                         "برای «%s» رمز تازه ساخته شود؟ از همهٔ دستگاه‌ها بیرون "
                         "می‌آید." % who, ensure_ascii=False), quote=True), r["id"]))
             out.append(
-                "<tr><td class='who' title='%s'>%s<code>%s</code></td>"
+                "<tr><td class='who' title='%s'>%s<code>%s</code><small>%s</small></td>"
                 "<td><code>%s</code>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
                 "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
                 "<input form='u%d' type='hidden' name='id' value='%d'>"
@@ -7457,6 +7462,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 % (html.escape(who, quote=True),
                    "<span class='dot on' title='آنلاین'></span>" if is_online(r) else "",
                    html.escape(who),
+                   html.escape(r["first_name"] or ""),
                    html.escape(r["ip"] or "-"), operator_label(r["ip"]) + devices_cell(p, r),
                    "<a href='/%s/usage?u=%d' title='نمودار مصرف'>%s</a>"
                    % (p, r["id"], human(r["used_bytes"])),
@@ -7601,14 +7607,14 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def tickets(self):
         wanted = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t")
         if wanted and wanted[0].isdigit():
-            row = STORE.one("SELECT t.*, u.username, u.phone,"
+            row = STORE.one("SELECT t.*, u.first_name, u.username, u.phone,"
                             " u.telegram_id FROM tickets t JOIN users u ON u.id = t.user_id"
                             " WHERE t.id = ?" + mine()[0], (int(wanted[0]),) + mine()[1])
             if row:
                 return self.ticket_page(row)
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
-            "SELECT t.*, u.username, u.phone, u.telegram_id,"
+            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
             " (SELECT count(*) FROM ticket_messages m WHERE m.ticket_id = t.id) AS n"
             " FROM tickets t JOIN users u ON u.id = t.user_id WHERE 1 = 1" + mine()[0] +
             " ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'answered' THEN 1 ELSE 2 END,"
@@ -7818,7 +7824,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a></p>" % p,
                "<div class='grid'><div class='stat'><div class='n'>%s</div>"
                "<div class='l'>موجودی (تومان)</div></div>" % format(user["wallet"] or 0, ",")]
-        invited = STORE.q("SELECT id, username, phone, telegram_id, status"
+        invited = STORE.q("SELECT id, username, phone, telegram_id, first_name, status"
                           " FROM users WHERE referred_by = ? ORDER BY id DESC", (uid,))
         earned = STORE.one("SELECT COALESCE(sum(amount), 0) s FROM wallet_moves"
                            " WHERE user_id = ? AND kind = 'referral'", (uid,))["s"]
@@ -7864,10 +7870,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
             out.append("<div class='card'><h2>دعوت‌شده‌ها (%d)</h2><table><tr><th>کاربر</th>"
                        "<th>وضعیت</th></tr>" % len(invited))
             for r in invited:
-                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a></td><td>%s</td></tr>"
+                out.append("<tr><td><a href='/%s/wallet?u=%d'>%s</a> <span class='muted'>%s"
+                           "</span></td><td>%s</td></tr>"
                            % (p, r["id"], html.escape(str(r["username"] or r["phone"]
                                                           or r["telegram_id"] or "#%d" % r["id"])),
-                              html.escape(r["status"])))
+                              html.escape(r["first_name"] or ""), html.escape(r["status"])))
             out.append("</table></div>")
         return "".join(out)
 

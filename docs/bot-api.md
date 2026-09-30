@@ -79,10 +79,10 @@ curl -s -H "Authorization: Bearer $KEY" $API/plans
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-     -d '{"telegram_id": 123456789}' $API/users
+     -d '{"telegram_id": 123456789, "name": "علی"}' $API/users
 ```
 
-مشتری تازه `201` می‌گیرد، و اگر با این آیدی از قبل هست `200` — همان حساب، نه یک حساب دوم. پس لازم نیست ربات اول بپرسد هست یا نه؛ در `/start` همین را صدا بزنید. مشتری اسم ندارد؛ نام کاربری‌اش را با `POST /users/{telegram_id}/credentials` می‌گذارد (یک `"name"` که ربات‌های قدیمی می‌فرستند نادیده گرفته می‌شود).
+مشتری تازه `201` می‌گیرد، و اگر با این آیدی از قبل هست `200` — همان حساب، نه یک حساب دوم. پس لازم نیست ربات اول بپرسد هست یا نه؛ در `/start` همین را صدا بزنید.
 
 اگر مشتری با لینک دعوت کسی آمده (`/start ref_<code>`)، کد را در `"ref": "<code>"` بفرستید. معرف فقط برای حسابی ثبت می‌شود که همین درخواست می‌سازد، و فقط وقتی ادمین «دعوت از دوستان» را روشن کرده باشد.
 
@@ -99,7 +99,7 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789
 ```
 ```json
 {"ok": true, "user": {
-  "id": 7, "telegram_id": 123456789, "username": "ali_gamer",
+  "id": 7, "telegram_id": 123456789, "name": "علی", "username": "ali_gamer",
   "panel_url": "https://user.example.com:8443/",
   "status": "active",
   "plan": {"id": 1, "name": "گیمینگ ماهانه"}, "template": "بازی",
@@ -218,7 +218,7 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789/receipts
 
 | | |
 |---|---|
-| `POST /users/{telegram_id}/credentials` | `{"username": "ali_gamer"}` — نام کاربری را می‌گذارد و یک رمز تصادفی می‌سازد: `{"username", "password", "panel_url"}`. نام کاربری همان قاعدهٔ ثبت‌نام وب را دارد (۳ تا ۳۲ حرف انگلیسی، عدد، `.`، `-`، `_`)؛ بد: `400` با `bad_username`، تکراری: `409` با `username_taken`، حسابی که از قبل نام کاربری دارد: `409` با `has_username` |
+| `POST /users/{telegram_id}/credentials` | `{"username": "ali_gamer", "name": "علی"}` — نام کاربری و اسم را می‌گذارد و یک رمز تصادفی می‌سازد: `{"username", "password", "panel_url"}`. نام کاربری همان قاعدهٔ ثبت‌نام وب را دارد (۳ تا ۳۲ حرف انگلیسی، عدد، `.`، `-`، `_`)؛ بد: `400` با `bad_username`، تکراری: `409` با `username_taken`، حسابی که از قبل نام کاربری دارد: `409` با `has_username` |
 | `POST /users/{telegram_id}/password` | رمز تصادفی تازه؛ هر جا با رمز قبلی وارد بود خارج می‌شود |
 | `POST /users/{telegram_id}/login-link` | لینک یک‌بارمصرف ورود: `{"url", "minutes": 10}`. مشتری بازش می‌کند و بدون رمز وارد حسابش می‌شود — برای ثبت آی‌پی، لینک را با همان اینترنتی باز کند که سرویس را رویش می‌خواهد |
 

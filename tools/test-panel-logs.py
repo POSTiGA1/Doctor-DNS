@@ -259,7 +259,7 @@ out = since(at)
 check("a sync that works is the heartbeat, and says nothing",
       status == 200 and "/sync" not in out, out)
 
-pstore.create_web_user("sara", "good-secret")
+pstore.create_web_user("sara", "Sara", "good-secret")
 at = mark()
 api("/user-password-login", {"username": "sara", "password": "bad-secret", "ip": "5.6.7.8"})
 out = since(at)

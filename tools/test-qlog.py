@@ -173,8 +173,8 @@ catalogue = [{"key": "steam", "label": "Steam", "groups": [{"key": "main", "doma
 store.run("INSERT INTO custom_domains (domain, added_at) VALUES ('mygame.example', ?)", (panel.now(),)) \
     if "added_at" in [r[1] for r in store.db.execute("PRAGMA table_info(custom_domains)")] else \
     store.run("INSERT INTO custom_domains (domain) VALUES ('mygame.example')")
-u = store.create_user(111, "ali")
-v = store.create_user(222, "sara")
+u = store.create_user(111, "ali", "علی")
+v = store.create_user(222, "sara", "سارا")
 panel.register_ip(store, u["id"], "203.0.113.5")
 panel.register_ip(store, v["id"], "203.0.113.6")
 import time
