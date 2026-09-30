@@ -88,7 +88,11 @@ class FakeTelegram:
 
     def __init__(self):
         self.out = []
+        self.docs = []
         self.files = {"PHOTO1": PNG, "TEXTFILE": b"not a picture"}
+
+    def document(self, chat, filename, blob, caption=""):
+        self.docs.append({"chat_id": chat, "name": filename, "bytes": blob, "caption": caption})
 
     def call(self, method, http_timeout=30, **params):
         self.out.append((method, params))
@@ -308,6 +312,7 @@ message(CUSTOMER, "/dns")
 first = tg.last(CUSTOMER)["text"]
 check("every server of the customer's with its DNS, and before one has DoH, no DoH",
       "198.51.100.4" in first and "198.51.100.5" in first and "DoH" not in first, first)
+check("  and no iPhone profile yet", tg.docs == [])
 store.set_setting("doh_host:198.51.100.4", "r1.example.com")
 store.set_setting("doh_host:198.51.100.5", "r2.example.com")
 message(CUSTOMER, botmod.B_DNS)
@@ -317,15 +322,42 @@ check("then each server's own DoT name and the customer's DoH address on it",
       "https://r1.example.com/dns-query/%s" % token in doh_text
       and "https://r2.example.com/dns-query/%s" % token in doh_text
       and "r1.example.com" in doh_text and "آی‌پی ثبت نکرده" not in doh_text, doh_text)
+import plistlib
+profiles = [plistlib.loads(d["bytes"]) for d in tg.docs]
+check("the iPhone profile comes with it, as a file for each server",
+      [d["name"] for d in tg.docs] == ["dns-1.mobileconfig", "dns-2.mobileconfig"]
+      and all(d["chat_id"] == CUSTOMER for d in tg.docs), str([d["name"] for d in tg.docs]))
+check("  each turning on the customer's own DoH address there, by that server's IP",
+      [p["PayloadContent"][0]["DNSSettings"] for p in profiles] == [
+          {"DNSProtocol": "HTTPS", "ServerURL": "https://r1.example.com/dns-query/%s" % token,
+           "ServerAddresses": ["198.51.100.4"]},
+          {"DNSProtocol": "HTTPS", "ServerURL": "https://r2.example.com/dns-query/%s" % token,
+           "ServerAddresses": ["198.51.100.5"]}])
+check("  named for its server, and saying how to install it",
+      "1" in tg.docs[0]["caption"] and "Save to Files" in tg.docs[0]["caption"]
+      and "Profile Downloaded" in tg.docs[0]["caption"])
+check("  the same file again replaces the profile, a new address makes a new one",
+      plistlib.loads(botmod.ios_profile("https://r1.example.com/dns-query/%s" % token,
+                                        "198.51.100.4"))["PayloadUUID"]
+      == profiles[0]["PayloadUUID"] != profiles[1]["PayloadUUID"]
+      and plistlib.loads(botmod.ios_profile("https://r1.example.com/dns-query/other"))[
+          "PayloadUUID"] != profiles[0]["PayloadUUID"])
+check("  and the message says it is below, not on the web page",
+      "زیر همین پیام" in doh_text and "در پنل وب، بخش" not in doh_text)
+tg.docs.clear()
 cust = store.one("SELECT id FROM users WHERE telegram_id = ?", (CUSTOMER,))["id"]
 store.run("UPDATE users SET relays = '198.51.100.5' WHERE id = ?", (cust,))
 message(CUSTOMER, botmod.B_DNS)
 picked = tg.last(CUSTOMER)["text"]
+check("only the profiles of the servers the customer is given",
+      [d["name"] for d in tg.docs] == ["dns.mobileconfig"]
+      and "r2.example.com" in plistlib.loads(tg.docs[0]["bytes"])[
+          "PayloadContent"][0]["DNSSettings"]["ServerURL"])
 check("the ticks that pick a customer's DNS pick their DoT and DoH too",
       "r2.example.com" in picked and "r1.example.com" not in picked
       and "198.51.100.4" not in picked, picked)
 store.run("UPDATE users SET relays = NULL WHERE id = ?", (cust,))
-check("with a way into the web page, for the iPhone profile",
+check("with a way into the web page too",
       tg.buttons(CUSTOMER)[0]["callback_data"] == "login")
 check("and the button is on the menu, in place of the old one",
       botmod.B_DNS in sum(botmod.MENU["keyboard"], [])

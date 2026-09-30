@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.16"
+VERSION="0.9.17"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -31801,6 +31801,7 @@ exit 0
 #import base64
 #import hashlib
 #import hmac
+#import html
 #import http.client
 #import http.server
 #import json
@@ -31816,6 +31817,7 @@ exit 0
 #import urllib.error
 #import urllib.parse
 #import urllib.request
+#import uuid
 #from datetime import datetime, timezone
 #
 #try:
@@ -32151,15 +32153,22 @@ exit 0
 #            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
 #                          % (boundary, key, value)).encode())
 #        for name, blob in files.items():
+#            # (file name, bytes) where the name matters - a document's does.
+#            filename, blob = blob if isinstance(blob, tuple) else (name, blob)
 #            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; '
 #                          'filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
-#                          % (boundary, name, name)).encode() + blob + b"\r\n")
+#                          % (boundary, name, filename)).encode() + blob + b"\r\n")
 #        parts.append(("--%s--\r\n" % boundary).encode())
 #        req = urllib.request.Request(self.base + method, data=b"".join(parts),
 #                                     headers={"Content-Type": "multipart/form-data; boundary="
 #                                              + boundary})
 #        with urllib.request.urlopen(req, timeout=300) as r:
 #            return json.loads(r.read()).get("result")
+#
+#    def document(self, chat, filename, blob, caption=""):
+#        """A file sent as it is, under its own name."""
+#        return self.upload("sendDocument", {"document": (filename, blob)}, chat_id=chat,
+#                           caption=caption[:1000] or None)
 #
 #    def photo(self, chat, blob, caption, markup=None):
 #        try:
@@ -32175,6 +32184,65 @@ exit 0
 #            raise ValueError("فایل بزرگ‌تر از ۴ مگابایت است")
 #        with urllib.request.urlopen(self.files + info["file_path"], timeout=60) as r:
 #            return r.read(MAX_FILE + 1)
+#
+#
+#def ios_profile(url, address=""):
+#    """An iOS/macOS profile that turns a personal DoH address on for the
+#    whole device - the same one the customer's web page gives. Its ids come
+#    from the address, so the file sent again replaces the profile instead of
+#    adding a second one, and a new address makes a new profile."""
+#    host = urllib.parse.urlsplit(url).hostname or "dns"
+#    one = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-payload:" + url)).upper()
+#    two = str(uuid.uuid5(uuid.NAMESPACE_URL, "doctor-dns-profile:" + url)).upper()
+#    name = html.escape("DNS %s" % host)
+#    addresses = ("\n        <key>ServerAddresses</key>\n        <array><string>%s</string>"
+#                 "</array>" % html.escape(address)) if address else ""
+#    return ("""<?xml version="1.0" encoding="UTF-8"?>
+#<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+#<plist version="1.0">
+#<dict>
+#  <key>PayloadContent</key>
+#  <array>
+#    <dict>
+#      <key>DNSSettings</key>
+#      <dict>
+#        <key>DNSProtocol</key>
+#        <string>HTTPS</string>
+#        <key>ServerURL</key>
+#        <string>%s</string>%s
+#      </dict>
+#      <key>PayloadDisplayName</key>
+#      <string>%s</string>
+#      <key>PayloadIdentifier</key>
+#      <string>com.doctordns.dns.%s</string>
+#      <key>PayloadType</key>
+#      <string>com.apple.dnsSettings.managed</string>
+#      <key>PayloadUUID</key>
+#      <string>%s</string>
+#      <key>PayloadVersion</key>
+#      <integer>1</integer>
+#    </dict>
+#  </array>
+#  <key>PayloadDisplayName</key>
+#  <string>%s</string>
+#  <key>PayloadIdentifier</key>
+#  <string>com.doctordns.profile.%s</string>
+#  <key>PayloadRemovalDisallowed</key>
+#  <false/>
+#  <key>PayloadType</key>
+#  <string>Configuration</string>
+#  <key>PayloadUUID</key>
+#  <string>%s</string>
+#  <key>PayloadVersion</key>
+#  <integer>1</integer>
+#</dict>
+#</plist>
+#""" % (html.escape(url), addresses, name, one, one, name, two, two)).encode("utf-8")
+#
+#
+#IOS_PROFILE_HELP = ("📲 پروفایل آیفون%s\n\nفایل را باز کنید ← دکمهٔ اشتراک‌گذاری ← "
+#                    "«Save to Files». بعد در برنامهٔ Files روی فایل بزنید، و در تنظیمات ← "
+#                    "«Profile Downloaded» ← Install را بزنید.")
 #
 #
 ## ------------------------------------------------------------------ the bot
@@ -32462,11 +32530,23 @@ exit 0
 #                 {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
 #                                       {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 #
+#    def send_profiles(self, chat, servers):
+#        """The iPhone profile as a file, under the DNS message: one for each
+#        server that has a DoH address - [(label, DoH address, its IP)]. A
+#        file that would not go is only logged; the addresses above still
+#        stand."""
+#        for i, (label, url, address) in enumerate(servers, 1):
+#            name = "dns.mobileconfig" if len(servers) == 1 else "dns-%d.mobileconfig" % i
+#            try:
+#                self.tg.document(chat, name, ios_profile(url, address),
+#                                 self.t(IOS_PROFILE_HELP % (" — " + label if label else "")))
+#            except Exception as e:
+#                log("iPhone profile not sent to %s: %s" % (chat, e))
+#
 #    def show_dns(self, chat, sender):
 #        """Every way to use the service, in one message: the plain DNS
-#        addresses, and the personal DoH and DoT ones once a relay has them.
-#        The iPhone profile is on the web page, which is what the login button
-#        is for."""
+#        addresses, and the personal DoH and DoT ones once a relay has them -
+#        and, with a DoH address, the iPhone profile as a file under it."""
 #        u = self.account(sender)
 #        lines = ["📡 DNSهای شما", ""]
 #        servers = u.get("servers") or []
@@ -32489,7 +32569,7 @@ exit 0
 #                      "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):",
 #                      doh["url"],
 #                      "",
-#                      "پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+#                      "پروفایل آمادهٔ آیفون زیر همین پیام فرستاده می‌شود. "
 #                      "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
 #        lines.append("")
@@ -32497,6 +32577,8 @@ exit 0
 #        if not u["ips"]:
 #            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
 #        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
+#        if doh:
+#            self.send_profiles(chat, [("", doh["url"], (u["dns"] or [""])[0])])
 #
 #    def show_servers(self, chat, u, servers):
 #        """One block per server the customer is given: its plain DNS, and
@@ -32517,7 +32599,7 @@ exit 0
 #                          "DoH (آیفون، ویندوز، مرورگر): %s" % s["doh"]]
 #        lines.append("")
 #        if with_doh:
-#            lines.append("پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. "
+#            lines.append("پروفایل آمادهٔ آیفون هر سرور زیر همین پیام فرستاده می‌شود. "
 #                         "آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.")
 #        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
 #        if not u["ips"]:
@@ -32526,6 +32608,9 @@ exit 0
 #        if with_doh:
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
 #        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
+#        self.send_profiles(chat, [
+#            ("%s %d" % (self.t("تک‌سرور") if x.get("single") else self.t("سرور"), x["n"]),
+#             x["doh"], x["ip"]) for x in servers if x.get("doh")])
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -39424,6 +39509,7 @@ exit 0
 #"فایل خراب بود، دوباره بفرستید": "The file was broken, send it again",
 #"فایل خیلی بزرگ است": "The file is too large",
 #"فایل ذخیره نشد:": "The file was not saved:",
+#"فایل را باز کنید ← دکمهٔ اشتراک‌گذاری ← «Save to Files». بعد در برنامهٔ Files روی فایل بزنید، و در تنظیمات ← «Profile Downloaded» ← Install را بزنید.": "Open the file → the share button → “Save to Files”. Then tap the file in the Files app, and in Settings → “Profile Downloaded” → tap Install.",
 #"فایل ربات روی این سرور نیست. نصب‌کننده را یک بار دیگر روی همین سرور اجرا کنید تا اضافه شود.": "The bot file is not on this server. Run the installer on this server once more to add it.",
 #"فایل ربات روی این سرور نیست؛ نصب‌کننده را دوباره اجرا کنید": "The bot file is not on this server; run the installer again",
 #"فایل، روی هم تا ۵۰ مگابایت؛ چند فایل با هم به شکل یک آلبوم می‌رسند. متن زیر عکس یا فیلم می‌آید؛ اگر بیشتر از": "files, 50 MB together; several files arrive together as one album. The text goes under the photo or video; if it is longer than",
@@ -39885,8 +39971,8 @@ exit 0
 #"پرش به:": "Jump to:",
 #"پرفکت ورلد": "Perfect World",
 #"پرمصرف‌ترین‌ها — ۷ روز اخیر": "Top users — last 7 days",
-#"پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید.": "A ready iPhone profile is in the web panel, under “Encrypted DNS”. The DoH address is your account’s own; do not give it to anyone.",
-#"پروفایل آمادهٔ آیفون در پنل وب، بخش «DNS رمزگذاری‌شده» است. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "A ready iPhone profile is in the web panel, under “Encrypted DNS”. The DoH addresses are your account’s own; do not give them to anyone.",
+#"پروفایل آمادهٔ آیفون زیر همین پیام فرستاده می‌شود. آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید.": "The ready-made iPhone profile is sent under this message. The DoH address is your account’s own; do not give it to anyone.",
+#"پروفایل آمادهٔ آیفون هر سرور زیر همین پیام فرستاده می‌شود. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "Each server’s ready-made iPhone profile is sent under this message. The DoH addresses are your account’s own; do not give them to anyone.",
 #"پروفایل آیفون این سرور": "iPhone profile for this server",
 #"پشتیبان": "Standby",
 #"پشتیبان باید یکی از نودها باشد": "The standby must be one of the nodes",
@@ -40240,6 +40326,7 @@ exit 0
 #"📱 دستگاه اضافه ·": "📱 Extra device ·",
 #"📱 دستگاه اضافه —": "📱 Extra device —",
 #"📱 دستگاه‌ها و تغییر آی‌پی": "📱 Devices and IP changes",
+#"📲 پروفایل آیفون": "📲 iPhone profile",
 #"🔄 آدرس DoH تازه": "🔄 New DoH address",
 #"🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ این را روی دستگاه‌هایتان بگذارید:": "🔄 A new address has been made. The old one stops working within a minute; put this one on your devices:",
 #"🔄 رمز تازه": "🔄 New password",

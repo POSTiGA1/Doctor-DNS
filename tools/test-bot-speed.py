@@ -143,6 +143,17 @@ except RuntimeError as e:
 check("Telegram's is raised with its reason", "bad chat" in said, said)
 srv.shutdown()
 
+print("a file under its own name")
+srv, seen, base = server("HTTP/1.1")
+botmod.Telegram({"telegram": base, "token": "T"}).document(7, "dns.mobileconfig", b"<plist/>",
+                                                           "how to install")
+method, path, body, _ = seen["requests"][-1]
+check("a document goes to sendDocument, named as given - an iPhone knows a profile by it",
+      path == "/botT/sendDocument" and b'name="document"; filename="dns.mobileconfig"' in body
+      and b"<plist/>" in body and b'name="chat_id"\r\n\r\n7' in body
+      and b"how to install" in body, body[:300].decode("utf-8", "replace"))
+srv.shutdown()
+
 print("a proxy in the environment")
 os.environ["HTTPS_PROXY"] = "http://127.0.0.1:9"
 check("the wire stands aside for urllib", botmod.Wire("https://api.telegram.org/botT/").proxied)
