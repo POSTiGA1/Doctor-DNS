@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.17"
+VERSION="0.9.18"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -32240,6 +32240,7 @@ exit 0
 #""" % (html.escape(url), addresses, name, one, one, name, two, two)).encode("utf-8")
 #
 #
+#B_IOS_PROFILE = "دریافت پروفایل آیفون📱"
 #IOS_PROFILE_HELP = ("📲 پروفایل آیفون%s\n\nفایل را باز کنید ← دکمهٔ اشتراک‌گذاری ← "
 #                    "«Save to Files». بعد در برنامهٔ Files روی فایل بزنید، و در تنظیمات ← "
 #                    "«Profile Downloaded» ← Install را بزنید.")
@@ -32530,11 +32531,22 @@ exit 0
 #                 {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
 #                                       {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 #
+#    def profiles_of(self, u):
+#        """The customer's servers that have a DoH address, for the iPhone
+#        profile: [(label, DoH address, the server's IP)]."""
+#        servers = u.get("servers") or []
+#        if servers:
+#            return [("%s %d" % (self.t("تک‌سرور") if x.get("single") else self.t("سرور"),
+#                                x["n"]), x["doh"], x["ip"]) for x in servers if x.get("doh")]
+#        doh = u.get("doh")
+#        return [("", doh["url"], (u["dns"] or [""])[0])] if doh else []
+#
 #    def send_profiles(self, chat, servers):
-#        """The iPhone profile as a file, under the DNS message: one for each
-#        server that has a DoH address - [(label, DoH address, its IP)]. A
-#        file that would not go is only logged; the addresses above still
-#        stand."""
+#        """The iPhone profile as a file, when its button is pressed: one for
+#        each server that has a DoH address. A file that would not go is said,
+#        not left as silence."""
+#        if not servers:
+#            return self.say(chat, "هنوز آدرس DoH ندارید؛ پروفایل آیفون با آن ساخته می‌شود.")
 #        for i, (label, url, address) in enumerate(servers, 1):
 #            name = "dns.mobileconfig" if len(servers) == 1 else "dns-%d.mobileconfig" % i
 #            try:
@@ -32542,11 +32554,13 @@ exit 0
 #                                 self.t(IOS_PROFILE_HELP % (" — " + label if label else "")))
 #            except Exception as e:
 #                log("iPhone profile not sent to %s: %s" % (chat, e))
+#                self.say(chat, "⚠️ پروفایل فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
+#                         "بگیریدش.")
 #
 #    def show_dns(self, chat, sender):
 #        """Every way to use the service, in one message: the plain DNS
 #        addresses, and the personal DoH and DoT ones once a relay has them -
-#        and, with a DoH address, the iPhone profile as a file under it."""
+#        with a button, then, that sends the iPhone profile as a file."""
 #        u = self.account(sender)
 #        lines = ["📡 DNSهای شما", ""]
 #        servers = u.get("servers") or []
@@ -32569,16 +32583,15 @@ exit 0
 #                      "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):",
 #                      doh["url"],
 #                      "",
-#                      "پروفایل آمادهٔ آیفون زیر همین پیام فرستاده می‌شود. "
+#                      "برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. "
 #                      "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+#            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
 #        lines.append("")
 #        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
 #        if not u["ips"]:
 #            lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
-#        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
-#        if doh:
-#            self.send_profiles(chat, [("", doh["url"], (u["dns"] or [""])[0])])
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
 #
 #    def show_servers(self, chat, u, servers):
 #        """One block per server the customer is given: its plain DNS, and
@@ -32599,7 +32612,7 @@ exit 0
 #                          "DoH (آیفون، ویندوز، مرورگر): %s" % s["doh"]]
 #        lines.append("")
 #        if with_doh:
-#            lines.append("پروفایل آمادهٔ آیفون هر سرور زیر همین پیام فرستاده می‌شود. "
+#            lines.append("برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. "
 #                         "آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.")
 #        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
 #        if not u["ips"]:
@@ -32607,10 +32620,14 @@ exit 0
 #        buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
 #        if with_doh:
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
-#        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
-#        self.send_profiles(chat, [
-#            ("%s %d" % (self.t("تک‌سرور") if x.get("single") else self.t("سرور"), x["n"]),
-#             x["doh"], x["ip"]) for x in servers if x.get("doh")])
+#            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+#        self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
+#
+#    @staticmethod
+#    def dns_rows(buttons):
+#        """The DNS message's buttons: the first two side by side, the iPhone
+#        profile's on a row of its own - three do not fit one row on a phone."""
+#        return [buttons[:2]] + ([buttons[2:]] if buttons[2:] else [])
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -32957,6 +32974,8 @@ exit 0
 #            return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
 #                                   % (link["url"], link["minutes"])) if link
 #                            else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
+#        if kind == "iosprofile":
+#            return self.send_profiles(chat, self.profiles_of(self.account(sender)))
 #        if kind == "dohnew":
 #            self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
 #            self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
@@ -38665,6 +38684,8 @@ exit 0
 #"برای": "for",
 #"برای «": "for “",
 #"برای آماده کردن پشتیبان، اول در «تنظیمات» رمز بکاپ بگذارید؛ بکاپی که پشتیبان نگه می‌دارد با همان رمز باز می‌شود.": "To get a standby ready, first set a backup password in “Settings”; the backup the standby keeps opens with that password.",
+#"برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید.": "For an iPhone, press “Get iPhone profile📱”. The DoH address is your account’s own; do not give it to anyone.",
+#"برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "For an iPhone, press “Get iPhone profile📱”. The DoH addresses are your account’s own; do not give them to anyone.",
 #"برای استفاده از ربات، اول عضو کانال «": "To use the bot, first join the channel “",
 #"برای استفاده از سرویس، وارد پنل مشتری شوید:": "To use the service, open your customer panel:",
 #"برای بکاپ یک رمز بگذارید": "Set a password for the backup",
@@ -39077,6 +39098,7 @@ exit 0
 #"دریافت تست رایگان": "Get the free trial",
 #"دریافت نشد": "Not fetched",
 #"دریافت پروفایل": "Get the profile",
+#"دریافت پروفایل آیفون📱": "Get iPhone profile📱",
 #"دسترسی": "Access",
 #"دسترسی ادمین": "Admin access",
 #"دسترسی ندارید": "No access",
@@ -39864,6 +39886,7 @@ exit 0
 #"همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید. این آدرس مخصوص حساب شماست و به رله می‌گوید قالب شما کدام است.": "The same service, encrypted. Like plain DNS, it works only on the internet connection whose IP you registered. This address is your account’s own and tells the relay which template is yours.",
 #"همین سرویس، ولی رمزگذاری‌شده. مثل DNS معمولی، فقط روی اینترنتی کار می‌کند که آی‌پی‌اش را ثبت کرده‌اید. هر سرور آدرس‌های خودش را دارد؛ اگر یکی فیلتر شد، سراغ دیگری بروید. آدرس‌های DoH مخصوص حساب شماست.": "The same service, encrypted. Like plain DNS, it works only on the internet connection whose IP you registered. Each server has its own addresses; if one is filtered, use another. The DoH addresses are your account’s own.",
 #"همین مبلغ را واریز کنید و رسیدش را بفرستید؛ بعد از تأیید، به کیف پولتان اضافه می‌شود. حداقل": "Pay exactly this amount and send its receipt; after it is approved, it is added to your wallet. At least",
+#"هنوز آدرس DoH ندارید؛ پروفایل آیفون با آن ساخته می‌شود.": "You do not have a DoH address yet; the iPhone profile is made with it.",
 #"هنوز آماده نیست:": "Not ready yet:",
 #"هنوز آماری نرسیده": "No stats yet",
 #"هنوز آماری نرسیده.": "No stats yet.",
@@ -39971,8 +39994,6 @@ exit 0
 #"پرش به:": "Jump to:",
 #"پرفکت ورلد": "Perfect World",
 #"پرمصرف‌ترین‌ها — ۷ روز اخیر": "Top users — last 7 days",
-#"پروفایل آمادهٔ آیفون زیر همین پیام فرستاده می‌شود. آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید.": "The ready-made iPhone profile is sent under this message. The DoH address is your account’s own; do not give it to anyone.",
-#"پروفایل آمادهٔ آیفون هر سرور زیر همین پیام فرستاده می‌شود. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "Each server’s ready-made iPhone profile is sent under this message. The DoH addresses are your account’s own; do not give them to anyone.",
 #"پروفایل آیفون این سرور": "iPhone profile for this server",
 #"پشتیبان": "Standby",
 #"پشتیبان باید یکی از نودها باشد": "The standby must be one of the nodes",
@@ -40244,6 +40265,7 @@ exit 0
 #"⚠️ هر قالبی که مشتری دارد، روی هر رله و تک‌سرور یک DNS جدا اجرا می‌کند که حدود": "⚠️ Every template that has customers runs its own DNS on each relay and single server, taking about",
 #"⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.": "⚠️ You have not registered an IP yet; tap “Register IP” first.",
 #"⚠️ پردازندهٔ": "⚠️ Processor of",
+#"⚠️ پروفایل فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب بگیریدش.": "⚠️ The profile was not sent; press again in a little while, or get it from the web panel.",
 #"⚠️ پلن فعلی شما «": "⚠️ Your current plan is “",
 #"⚠️ گواهی HTTPS": "⚠️ HTTPS certificate",
 #"⛔ حجم فروشنده": "⛔ The traffic of seller",

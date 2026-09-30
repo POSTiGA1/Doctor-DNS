@@ -323,8 +323,14 @@ check("then each server's own DoT name and the customer's DoH address on it",
       and "https://r2.example.com/dns-query/%s" % token in doh_text
       and "r1.example.com" in doh_text and "آی‌پی ثبت نکرده" not in doh_text, doh_text)
 import plistlib
+check("with a button for the iPhone profile, beside the other two, on a row of its own",
+      [b["callback_data"] for b in tg.buttons(CUSTOMER)] == ["login", "dohnew", "iosprofile"]
+      and tg.buttons(CUSTOMER)[2]["text"] == "دریافت پروفایل آیفون📱"
+      and len(tg.last(CUSTOMER)["reply_markup"]["inline_keyboard"]) == 2)
+check("  nothing is sent until it is pressed", tg.docs == [])
+tap(CUSTOMER, "iosprofile")
 profiles = [plistlib.loads(d["bytes"]) for d in tg.docs]
-check("the iPhone profile comes with it, as a file for each server",
+check("pressed, the profile comes as a file for each server",
       [d["name"] for d in tg.docs] == ["dns-1.mobileconfig", "dns-2.mobileconfig"]
       and all(d["chat_id"] == CUSTOMER for d in tg.docs), str([d["name"] for d in tg.docs]))
 check("  each turning on the customer's own DoH address there, by that server's IP",
@@ -342,13 +348,14 @@ check("  the same file again replaces the profile, a new address makes a new one
       == profiles[0]["PayloadUUID"] != profiles[1]["PayloadUUID"]
       and plistlib.loads(botmod.ios_profile("https://r1.example.com/dns-query/other"))[
           "PayloadUUID"] != profiles[0]["PayloadUUID"])
-check("  and the message says it is below, not on the web page",
-      "زیر همین پیام" in doh_text and "در پنل وب، بخش" not in doh_text)
+check("  and the message points to the button, not to the web page",
+      "دریافت پروفایل آیفون" in doh_text and "در پنل وب، بخش" not in doh_text)
 tg.docs.clear()
 cust = store.one("SELECT id FROM users WHERE telegram_id = ?", (CUSTOMER,))["id"]
 store.run("UPDATE users SET relays = '198.51.100.5' WHERE id = ?", (cust,))
 message(CUSTOMER, botmod.B_DNS)
 picked = tg.last(CUSTOMER)["text"]
+tap(CUSTOMER, "iosprofile")
 check("only the profiles of the servers the customer is given",
       [d["name"] for d in tg.docs] == ["dns.mobileconfig"]
       and "r2.example.com" in plistlib.loads(tg.docs[0]["bytes"])[

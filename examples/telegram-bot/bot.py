@@ -465,6 +465,7 @@ def ios_profile(url, address=""):
 """ % (html.escape(url), addresses, name, one, one, name, two, two)).encode("utf-8")
 
 
+B_IOS_PROFILE = "دریافت پروفایل آیفون📱"
 IOS_PROFILE_HELP = ("📲 پروفایل آیفون%s\n\nفایل را باز کنید ← دکمهٔ اشتراک‌گذاری ← "
                     "«Save to Files». بعد در برنامهٔ Files روی فایل بزنید، و در تنظیمات ← "
                     "«Profile Downloaded» ← Install را بزنید.")
@@ -755,11 +756,22 @@ class Bot:
                  {"inline_keyboard": [[{"text": "🔗 ورود با یک کلیک", "callback_data": "login"},
                                        {"text": "🔄 رمز تازه", "callback_data": "newpw"}]]})
 
+    def profiles_of(self, u):
+        """The customer's servers that have a DoH address, for the iPhone
+        profile: [(label, DoH address, the server's IP)]."""
+        servers = u.get("servers") or []
+        if servers:
+            return [("%s %d" % (self.t("تک‌سرور") if x.get("single") else self.t("سرور"),
+                                x["n"]), x["doh"], x["ip"]) for x in servers if x.get("doh")]
+        doh = u.get("doh")
+        return [("", doh["url"], (u["dns"] or [""])[0])] if doh else []
+
     def send_profiles(self, chat, servers):
-        """The iPhone profile as a file, under the DNS message: one for each
-        server that has a DoH address - [(label, DoH address, its IP)]. A
-        file that would not go is only logged; the addresses above still
-        stand."""
+        """The iPhone profile as a file, when its button is pressed: one for
+        each server that has a DoH address. A file that would not go is said,
+        not left as silence."""
+        if not servers:
+            return self.say(chat, "هنوز آدرس DoH ندارید؛ پروفایل آیفون با آن ساخته می‌شود.")
         for i, (label, url, address) in enumerate(servers, 1):
             name = "dns.mobileconfig" if len(servers) == 1 else "dns-%d.mobileconfig" % i
             try:
@@ -767,11 +779,13 @@ class Bot:
                                  self.t(IOS_PROFILE_HELP % (" — " + label if label else "")))
             except Exception as e:
                 log("iPhone profile not sent to %s: %s" % (chat, e))
+                self.say(chat, "⚠️ پروفایل فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
+                         "بگیریدش.")
 
     def show_dns(self, chat, sender):
         """Every way to use the service, in one message: the plain DNS
         addresses, and the personal DoH and DoT ones once a relay has them -
-        and, with a DoH address, the iPhone profile as a file under it."""
+        with a button, then, that sends the iPhone profile as a file."""
         u = self.account(sender)
         lines = ["📡 DNSهای شما", ""]
         servers = u.get("servers") or []
@@ -794,16 +808,15 @@ class Bot:
                       "💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):",
                       doh["url"],
                       "",
-                      "پروفایل آمادهٔ آیفون زیر همین پیام فرستاده می‌شود. "
+                      "برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. "
                       "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
             buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
+            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
         lines.append("")
         lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
         if not u["ips"]:
             lines.append("⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.")
-        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
-        if doh:
-            self.send_profiles(chat, [("", doh["url"], (u["dns"] or [""])[0])])
+        self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
 
     def show_servers(self, chat, u, servers):
         """One block per server the customer is given: its plain DNS, and
@@ -824,7 +837,7 @@ class Bot:
                           "DoH (آیفون، ویندوز، مرورگر): %s" % s["doh"]]
         lines.append("")
         if with_doh:
-            lines.append("پروفایل آمادهٔ آیفون هر سرور زیر همین پیام فرستاده می‌شود. "
+            lines.append("برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. "
                          "آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.")
         lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
         if not u["ips"]:
@@ -832,10 +845,14 @@ class Bot:
         buttons = [{"text": "🔗 ورود به پنل وب", "callback_data": "login"}]
         if with_doh:
             buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
-        self.say(chat, "\n".join(lines), {"inline_keyboard": [buttons]})
-        self.send_profiles(chat, [
-            ("%s %d" % (self.t("تک‌سرور") if x.get("single") else self.t("سرور"), x["n"]),
-             x["doh"], x["ip"]) for x in servers if x.get("doh")])
+            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+        self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
+
+    @staticmethod
+    def dns_rows(buttons):
+        """The DNS message's buttons: the first two side by side, the iPhone
+        profile's on a row of its own - three do not fit one row on a phone."""
+        return [buttons[:2]] + ([buttons[2:]] if buttons[2:] else [])
 
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -1182,6 +1199,8 @@ class Bot:
             return self.say(chat, ("🔗 %s\n\n(%d دقیقه اعتبار دارد و یک بار کار می‌کند)"
                                    % (link["url"], link["minutes"])) if link
                             else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
+        if kind == "iosprofile":
+            return self.send_profiles(chat, self.profiles_of(self.account(sender)))
         if kind == "dohnew":
             self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
             self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
