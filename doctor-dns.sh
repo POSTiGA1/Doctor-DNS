@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.18"
+VERSION="0.9.19"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -22331,6 +22331,8 @@ exit 0
 #.logo.plain{color:var(--muted)}
 #.purge{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 14px}
 #.purge form{margin:0}
+#.usearch{margin:0 0 14px}
+#.usearch input[type=search]{min-width:280px;flex:1;max-width:460px}
 #.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;
 # vertical-align:1px}
 #.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--good-bg)}
@@ -24155,6 +24157,35 @@ exit 0
 #    return "".join(out)
 #
 #
+#def user_search(q):
+#    """The SQL, and its arguments, that keep the users matching a search:
+#    their name or username - any part of it, any case - their phone, their
+#    Telegram id, their number, or one of their IPs. Nothing for no search."""
+#    if not q:
+#        return "", ()
+#    # Arabic yeh and kaf, as an Arabic keyboard types them, are the Persian
+#    # ones: a name is found however it was typed, here or at signup.
+#    q = q.replace("\u064a", "\u06cc").replace("\u0643", "\u06a9")
+#    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+#    name = ("REPLACE(REPLACE(COALESCE(u.first_name, ''), '\u064a', '\u06cc'),"
+#            " '\u0643', '\u06a9')")
+#    return (" AND (u.username LIKE ? ESCAPE '\\' OR " + name + " LIKE ? ESCAPE '\\'"
+#            " OR u.phone LIKE ? ESCAPE '\\' OR CAST(u.telegram_id AS TEXT) = ?"
+#            " OR CAST(u.id AS TEXT) = ? OR u.id IN (SELECT user_id FROM ips"
+#            " WHERE ip LIKE ? ESCAPE '\\'))",
+#            (like, like, like, q.lstrip("#@"), q.lstrip("#"), like))
+#
+#
+#def user_search_box(p, q):
+#    """The users page's search, above the table."""
+#    return ("<form method='get' action='/%s/users' class='row usearch'>"
+#            "<input type='search' name='q' value='%s' autocomplete='off' "
+#            "placeholder='جستجو: اسم، نام کاربری، شماره، آیدی تلگرام یا آی‌پی'>"
+#            "<button class='ghost'>جستجو</button>%s</form>"
+#            % (p, html.escape(q, quote=True),
+#               "<a href='/%s/users'>همه</a>" % p if q else ""))
+#
+#
 #def mine(alias="u"):
 #    """A reseller's own customers only: the SQL to add, and its argument."""
 #    s = seller()
@@ -25960,13 +25991,24 @@ exit 0
 #        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
 #        did = default["id"] if default else 0
 #        extra, args = mine()
+#        path = getattr(self, "path", "") or ""
+#        q = (urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("q")
+#             or [""])[0].strip()[:64]
+#        find, find_args = user_search(q)
 #        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
-#                       " ip FROM users u WHERE 1 = 1" + extra + " ORDER BY u.created_at DESC",
-#                       args)
-#        out = ["<div class='card wide'><h2>کاربران (%d)</h2>" % len(rows)]
-#        if not rows:
+#                       " ip FROM users u WHERE 1 = 1" + extra + find
+#                       + " ORDER BY u.created_at DESC", args + find_args)
+#        total = STORE.one("SELECT count(*) c FROM users u WHERE 1 = 1" + extra, args)["c"] \
+#            if q else len(rows)
+#        out = ["<div class='card wide'><h2>کاربران (%s)</h2>"
+#               % ("%d از %d" % (len(rows), total) if q else len(rows))]
+#        if not total:
 #            return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
 #        out.append(purge_card(CFG["ADMIN_PATH"]))
+#        out.append(user_search_box(CFG["ADMIN_PATH"], q))
+#        if not rows:
+#            return "".join(out) + ("<p class='muted'>کسی با «%s» پیدا نشد.</p></div>"
+#                                   % html.escape(q))
 #        # Where a customer goes out is the owner's to choose, or a
 #        # reseller's when the owner let them.
 #        route = s is None or bool(s["can_route"])
@@ -38297,6 +38339,7 @@ exit 0
 #"» ساخته شد": "” made",
 #"» شوید و بعد «✅ عضو شدم» را بزنید.": "”, then press “✅ I have joined”.",
 #"» فعال شد تا": "” active until",
+#"» پیدا نشد.": "”.",
 #"، آدرس ربات را برای دکمهٔ «اتصال به تلگرام» پنل مشتری می‌گذارد، و ربات را روشن می‌کند.": ", puts the bot’s address behind the customer panel’s “Connect Telegram” button, and turns the bot on.",
 #"، آپلود": ", upload",
 #"، آپلود تا": ", upload up to",
@@ -38927,6 +38970,8 @@ exit 0
 #"ثرون اند لیبرتی": "Throne and Liberty",
 #"جدا کردن تلگرام": "Unlink Telegram",
 #"جدول روزانه": "Daily table",
+#"جستجو": "Search",
+#"جستجو: اسم، نام کاربری، شماره، آیدی تلگرام یا آی‌پی": "Search: name, username, phone, Telegram id or IP",
 #"جستجوی بازی یا دامنه…": "Search a game or domain…",
 #"جهت تونل را انتخاب کنید": "Choose the tunnel direction",
 #"جواب": "Reply",
@@ -40120,6 +40165,7 @@ exit 0
 #"کدام سر وصل شود:": "Which end connects:",
 #"کدام کاربرها؟": "Which customers?",
 #"کدی با این نام هست": "A code with this name exists",
+#"کسی با «": "Nobody found for “",
 #"کسی که در کیف پولش پول دارد یا رسیدش منتظر تأیید است پاک نمی‌شود": "Nobody with money in their wallet or a receipt waiting for approval is deleted",
 #"کلاینت رایوت": "Riot Client",
 #"کلش آو کلنز": "Clash of Clans",
