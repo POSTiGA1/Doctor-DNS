@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.13"
+VERSION="0.9.14"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -24115,8 +24115,7 @@ exit 0
 #     "روز یا حجمشان تمام شده"),
 #    ("unbought", ("pending",), "پاک کردن در انتظار پلن‌ها",
 #     "ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند"),
-#    ("inactive", None, "پاک کردن غیرفعال‌ها",
-#     "هر کس که فعال نیست: تمام‌شده‌ها، در انتظار پلن‌ها و مسدودشده‌ها"),
+#    ("inactive", ("suspended",), "پاک کردن غیرفعال‌ها", "مسدودشده‌ها"),
 #)
 #
 #
@@ -39431,6 +39430,7 @@ exit 0
 #"مسدود کردن": "Block",
 #"مسدود کن": "Block",
 #"مسدود ⛔": "Blocked ⛔",
+#"مسدودشده‌ها": "the blocked",
 #"مسدودی‌های دستی (": "Manual blocks (",
 #"مسیر باید ۸ تا ۶۴ نویسه از حروف، رقم، - و _ باشد": "The path must be 8 to 64 characters of letters, digits, - and _",
 #"مسیر تصادفی": "Random path",
@@ -39603,7 +39603,6 @@ exit 0
 #"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",
 #"هر کس با این لینک ثبت‌نام کند، مشتری شما می‌شود و پلن‌ها و اطلاعات پرداخت شما را می‌بیند.": "Whoever signs up with this link becomes your customer and sees your plans and payment details.",
 #"هر کس با لینک شما حساب بسازد و پلن بخرد،": "When someone makes an account with your link and buys a plan,",
-#"هر کس که فعال نیست: تمام‌شده‌ها، در انتظار پلن‌ها و مسدودشده‌ها": "everybody who is not active: the ended, those waiting for a plan and the blocked",
 #"هرگز": "Never",
 #"هست": "exists",
 #"هشدارها": "Alerts",

@@ -3,7 +3,7 @@
 
 What has to hold: three buttons, red, each saying how many it would delete
 and asking first - the ended ones (days or allowance run out), the ones who
-never took a plan, or everybody who is not active, the blocked too.
+never took a plan, or the blocked - none of them the others'.
 None of them ever deletes an active customer, one with money in their wallet
 or one whose receipt is waiting; the page says how many were kept for that.
 What is deleted is worked out again when the button is pressed, and a
@@ -113,7 +113,7 @@ check("three, red, each asking first", card.count("class='danger'") == 3
 check("  each with how many it deletes",
       "پاک کردن تمام‌شده‌ها (3)" in card
       and "پاک کردن در انتظار پلن‌ها (1)" in card
-      and "پاک کردن غیرفعال‌ها (5)" in card, card)
+      and "پاک کردن غیرفعال‌ها (1)" in card, card)
 check("  and how many are kept for a wallet or a receipt", "(2 نفر)" in card)
 check("on the users page", "out.append(purge_card(CFG[\"ADMIN_PATH\"]))" in open(
     os.path.join(HERE, "..", "templates", "smartdns-admin"), encoding="utf-8").read())
@@ -138,18 +138,21 @@ check("only the pending go",
       u["pending"] not in alive()
       and {u["active"], u["suspended"], u["expired"], u["over"]} <= alive())
 
-print("everybody not active")
+print("the blocked")
 u = build()
 press("inactive")
-check("the blocked go too", u["suspended"] not in alive())
+check("only the blocked go", u["suspended"] not in alive()
+      and {u["expired"], u["over"], u["pending"], u["sellers"]} <= alive())
+for kind in ("ended", "unbought"):
+    press(kind)
 check("  never an active one, one with money or a waiting receipt",
       alive() == {u["active"], u["rich"], u["waiting"]})
 
 print("a seller")
 u = build()
-press("inactive", as_seller=True)
+press("ended", as_seller=True)
 check("reaches their own customers only",
-      u["sellers"] not in alive() and u["expired"] in alive() and u["suspended"] in alive())
+      u["sellers"] not in alive() and u["expired"] in alive() and u["over"] in alive())
 
 print("worked out when pressed")
 u = build()
