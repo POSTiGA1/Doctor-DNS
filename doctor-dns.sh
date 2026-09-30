@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.14"
+VERSION="0.9.15"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -24111,11 +24111,11 @@ exit 0
 ## statuses each takes, and what it says. Never someone with money in their
 ## wallet or a receipt waiting - that is a customer, not a leftover.
 #PURGE_KINDS = (
-#    ("ended", ("expired", "over_quota"), "پاک کردن تمام‌شده‌ها",
-#     "روز یا حجمشان تمام شده"),
+#    ("ended", ("expired", "over_quota"), "پاک کردن منقضی‌ها و تمام‌شده‌ها",
+#     "روزشان تمام شده (منقضی) یا حجمشان (سهمیه تمام شده)"),
 #    ("unbought", ("pending",), "پاک کردن در انتظار پلن‌ها",
 #     "ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند"),
-#    ("inactive", ("suspended",), "پاک کردن غیرفعال‌ها", "مسدودشده‌ها"),
+#    ("inactive", ("suspended",), "پاک کردن مسدودها", "مسدودشده‌ها"),
 #)
 #
 #
@@ -39071,11 +39071,11 @@ exit 0
 #"روز و ساعت به وقت تهران. روی نام هر مشتری بزنید تا نمودار خودش را ببینید.": "Day and hour in Tehran time. Click a customer’s name to see their own chart.",
 #"روز و سقف استفاده را با عدد بنویسید": "Write the days and the use limit as numbers",
 #"روز پیش": "days ago",
-#"روز یا حجمشان تمام شده": "their days or allowance ran out",
 #"روز یک بار": "days",
 #"روز یک بار صفر می‌شود": "days",
 #"روز یک بار، برای ادمین‌های ربات بفرست": "days, send it to the bot’s admins",
 #"روزانه": "Daily",
+#"روزشان تمام شده (منقضی) یا حجمشان (سهمیه تمام شده)": "their days ran out (expired) or their allowance (used up)",
 #"روزی که این سرور از دست رفت": "The day this server is lost",
 #"روشن": "On",
 #"روشن / تیره": "Light / dark",
@@ -39734,10 +39734,10 @@ exit 0
 #"پابجی موبایل": "PUBG Mobile",
 #"پال‌ورلد": "Palworld",
 #"پاپ‌آپ‌ها (سایت‌های دانلود)": "Pop-ups (download sites)",
-#"پاک کردن تمام‌شده‌ها": "Delete the ended",
 #"پاک کردن در انتظار پلن‌ها": "Delete those waiting for a plan",
 #"پاک کردن دسته‌جمعی:": "Delete many at once:",
-#"پاک کردن غیرفعال‌ها": "Delete the inactive",
+#"پاک کردن مسدودها": "Delete the blocked",
+#"پاک کردن منقضی‌ها و تمام‌شده‌ها": "Delete the expired and the used up",
 #"پایان دوره": "Period ends",
 #"پایان دوره:": "Period ends:",
 #"پث آو اگزایل": "Path of Exile",

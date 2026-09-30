@@ -111,9 +111,9 @@ card = admin.purge_card("p")
 check("three, red, each asking first", card.count("class='danger'") == 3
       and card.count("return confirm(") == 3)
 check("  each with how many it deletes",
-      "پاک کردن تمام‌شده‌ها (3)" in card
+      "پاک کردن منقضی‌ها و تمام‌شده‌ها (3)" in card
       and "پاک کردن در انتظار پلن‌ها (1)" in card
-      and "پاک کردن غیرفعال‌ها (1)" in card, card)
+      and "پاک کردن مسدودها (1)" in card, card)
 check("  and how many are kept for a wallet or a receipt", "(2 نفر)" in card)
 check("on the users page", "out.append(purge_card(CFG[\"ADMIN_PATH\"]))" in open(
     os.path.join(HERE, "..", "templates", "smartdns-admin"), encoding="utf-8").read())

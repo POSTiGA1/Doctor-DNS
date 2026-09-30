@@ -5502,11 +5502,11 @@ def seller_id():
 # statuses each takes, and what it says. Never someone with money in their
 # wallet or a receipt waiting - that is a customer, not a leftover.
 PURGE_KINDS = (
-    ("ended", ("expired", "over_quota"), "پاک کردن تمام‌شده‌ها",
-     "روز یا حجمشان تمام شده"),
+    ("ended", ("expired", "over_quota"), "پاک کردن منقضی‌ها و تمام‌شده‌ها",
+     "روزشان تمام شده (منقضی) یا حجمشان (سهمیه تمام شده)"),
     ("unbought", ("pending",), "پاک کردن در انتظار پلن‌ها",
      "ثبت‌نام کرده‌اند ولی هیچ‌وقت پلن نگرفته‌اند"),
-    ("inactive", ("suspended",), "پاک کردن غیرفعال‌ها", "مسدودشده‌ها"),
+    ("inactive", ("suspended",), "پاک کردن مسدودها", "مسدودشده‌ها"),
 )
 
 
