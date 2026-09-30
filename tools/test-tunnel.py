@@ -320,6 +320,35 @@ check("and checks the hash before installing anything",
       0 < inst.index("sha256sum") < inst.index("install -m 755"))
 check("a download that fails leaves the run on the direct path",
       "! install_backpack" in LOGIC and 'TUNNEL=off; TUNNEL_SPEC=""' in LOGIC)
+block = LOGIC[LOGIC.index('if [ "$TUNNEL" = backpack ] && ! install_backpack; then'):]
+block = block[:block.index("\nfi\n") + 4]
+
+
+def after_failed_download(have_old):
+    d = tempfile.mkdtemp()
+    try:
+        binary = os.path.join(d, "backpack").replace("\\", "/")
+        if have_old:
+            with open(binary, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(binary, 0o755)
+            with open(binary + ".version", "w") as f:
+                f.write("v1.8.0 abc\n")
+        script = os.path.join(d, "t.sh")
+        with open(script, "w", newline="\n") as f:
+            f.write('warn() { echo "warn: $*"; }\ninstall_backpack() { return 1; }\n'
+                    'BACKPACK_BIN="%s"; TUNNEL=backpack; TUNNEL_SPEC=bp-stealth-8444-r; ROLE=relay\n'
+                    '%s\necho "TUNNEL=$TUNNEL SPEC=$TUNNEL_SPEC"\n' % (binary, block))
+        return subprocess.run(["bash", script], capture_output=True, text=True).stdout
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+out = after_failed_download(True)
+check("an update BackPack cannot download keeps the one already here, and the tunnel",
+      "TUNNEL=backpack SPEC=bp-stealth-8444-r" in out and "keeping BackPack v1.8.0" in out, out)
+out = after_failed_download(False)
+check("  with none here, the direct path", "TUNNEL=off SPEC=" in out, out)
 check("that happens before nginx is written",
       LOGIC.index("! install_backpack")
       < LOGIC.index("install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1"))

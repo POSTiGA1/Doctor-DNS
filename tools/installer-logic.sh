@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.21"
+VERSION="0.9.22"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -349,9 +349,9 @@ enable_service() {
 # fetched from his own releases when asked for and checked against the hashes
 # pinned here - never copied into this project, and never a version nobody here
 # has tried.
-BACKPACK_VERSION="v1.8.0"
-BACKPACK_SHA_amd64="0fca707e413c0ca051fac1bf47a8f5bc870bc54a67866415b75fd93fbd91f9b8"
-BACKPACK_SHA_arm64="b93d4b1c76d44e2168a66f7e3e27173b07682d012b3cdf3917f768ea7064a764"
+BACKPACK_VERSION="v1.8.5"
+BACKPACK_SHA_amd64="e80c4da9bdcece9e7a82305e572fdfde9a395a68a985fdd835c1af8ff248b395"
+BACKPACK_SHA_arm64="9d9eaa951f8bd3f7b786be94916517c4ec900af0eeaac893b89d03d9867643f4"
 BACKPACK_BIN=/usr/local/lib/smart-dns/backpack
 TUNNEL_DIR=/etc/smart-dns/tunnel
 TUNNEL_NFT=/etc/nftables.d/40-smartdns-tunnel.conf
@@ -1695,8 +1695,15 @@ fi
 # leaves this run on the direct path rather than with nginx pointed at a
 # tunnel that will never be there.
 if [ "$TUNNEL" = backpack ] && ! install_backpack; then
-    warn "no tunnel this run - the relay reaches the exit directly"
-    TUNNEL=off; TUNNEL_SPEC=""; TUNNEL_OUT="none - BackPack could not be installed"
+    # A relay that cannot reach GitHub to update BackPack keeps the one it has:
+    # older and newer ends speak the same protocol, and a tunnel dropped for
+    # want of a download would leave it on a direct path that may be filtered.
+    if [ -x "$BACKPACK_BIN" ]; then
+        warn "keeping BackPack $(cut -d' ' -f1 "$BACKPACK_BIN.version" 2>/dev/null) that is already here"
+    else
+        warn "no tunnel this run - the relay reaches the exit directly"
+        TUNNEL=off; TUNNEL_SPEC=""; TUNNEL_OUT="none - BackPack could not be installed"
+    fi
 elif [ "$TUNNEL" != backpack ] && [ "$ROLE" != single ]; then
     # Here all the same, on a relay or an exit with no tunnel now: the admin
     # panel can give any relay one later, without this installer. Not being
