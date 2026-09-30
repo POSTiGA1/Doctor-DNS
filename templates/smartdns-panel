@@ -5383,6 +5383,11 @@ class API(http.server.BaseHTTPRequestHandler):
                                     # Where a relay with no panel of its own
                                     # sends the addresses it does not let in.
                                     "portal": panel_on_url(self.store) or "",
+                                    # Whether they are sent there by themselves,
+                                    # whatever site they open; off, the page
+                                    # opens only for somebody who goes to it.
+                                    "portal_open": self.store.setting("portal_open")
+                                    != "0",
                                     # Its tunnels to the nodes, by node.
                                     "node_tunnels": {
                                         n: dict(spec, on=True)

@@ -5443,7 +5443,7 @@ ACTION_SECTION = {
     "upgrade-start": "nodes", "upgrade-stop": "nodes", "update-check": "settings",
     "public-dns": "settings", "server-list-save": "nodes", "seller-server-notes": ANYONE,
     "dns-bench": "settings", "dns-upstream": "settings", "doh-name": "settings",
-    "telegram-required": "settings", "watch-start": "logs", "diagnose-start": "logs",
+    "telegram-required": "settings", "portal-open": "settings", "watch-start": "logs", "diagnose-start": "logs",
     "me-password": ANYONE, "view-as-stop": ANYONE}
 # Everything else - the owner's password, the panel's address, backups and
 # restoring them, the standby, upgrading from GitHub, the admins - is the
@@ -8393,6 +8393,19 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # No nodes page here: its one server's words for customers live here.
             out.append(customer_servers_card(p))
 
+        opened = STORE.one("SELECT value FROM settings WHERE key = 'portal_open'")
+        opened = not (opened and opened["value"] == "0")
+        out.append("<div class='card'><h2>پنل مشتری برای کسی که سرویس ندارد</h2>"
+                   "<form method='post' action='/%s/portal-open'>"
+                   "<label style='display:inline'><input type='checkbox' name='on' value='1'%s>"
+                   " باز کردن خودکار پنل مشتری برای کسی که سرویس ندارد</label> "
+                   "<button class='ghost'>ذخیره</button></form>"
+                   "<p class='muted'>روشن: کسی که پلنش تمام شده، آی‌پی‌اش ثبت نیست یا عوض "
+                   "شده، هر سایتی باز کند پنل مشتری برایش باز می‌شود. خاموش: اینترنتش از راه "
+                   "رله فقط کار نمی‌کند و صفحه‌ای خودش باز نمی‌شود؛ اگر خودش آدرس پنل مشتری "
+                   "را باز کند، هنوز وارد می‌شود. برای همهٔ سرورها، تا یک دقیقه دیگر.</p></div>"
+                   % (p, " checked" if opened else ""))
+
         need = STORE.one("SELECT value FROM settings WHERE key = 'require_telegram'")
         bot = STORE.one("SELECT 1 FROM api_tokens WHERE revoked_at IS NULL"
                         " AND COALESCE(webhook_url, '') != ''")
@@ -9869,6 +9882,17 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (link,))
             return self.redirect("api?m=%s" % ("آدرس ربات ذخیره شد" if link
                                                else "آدرس ربات برداشته شد"))
+
+        if rest == "portal-open":
+            on = one("on") == "1"
+            STORE.run("INSERT INTO settings (key, value) VALUES ('portal_open', ?)"
+                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                      ("1" if on else "0",))
+            log(INFO, "the customer panel %s for addresses not let in"
+                % ("opens by itself" if on else "does not open by itself"))
+            return self.redirect("settings?m=%s" % (
+                "پنل مشتری برای کسی که سرویس ندارد خودش باز می‌شود" if on
+                else "پنل مشتری دیگر خودش باز نمی‌شود") + "؛ تا یک دقیقه دیگر روی همهٔ سرورها")
 
         if rest == "telegram-required":
             on = one("on") == "1"

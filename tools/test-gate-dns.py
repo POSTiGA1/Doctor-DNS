@@ -134,6 +134,44 @@ sync.apply_gate_dns()
 check("a relay upgraded from before the page is given it",
       any(":5298" in r for r in chain["rules"]) and len(chain["rules"]) == 6)
 
+print("the admin turns the page off")
+sync.PANEL_TO["url"] = ""
+answer = {"portal": "", "portal_open": False}
+sync.PORTAL["open"] = answer.get("portal_open") is not False
+active.discard("smartdns-dns-gate")
+sync.apply_gate_dns()
+conf = open(sync.GATE_CONF).read()
+check("the panel's own name still answers, so a customer who goes to it gets in",
+      "server=/users.example.com/1.1.1.1" in conf)
+check("  but no other name does: nothing sends them there by itself",
+      "address=/#/" not in conf and "smartdns-dns-gate" in active)
+check("  and port 80 no longer goes to the page",
+      not any(":5298" in r for r in chain["rules"]) and len(chain["rules"]) == 5)
+check("  DoT and DoH still reach the gate - its answers, the panel's name only",
+      any(":8853" in r for r in chain["rules"]) and any(":5297" in r for r in chain["rules"]))
+calls.clear()
+sync.apply_gate_dns()
+check("  and the next sync leaves it so", not any(c[:2] in (("nft", "flush"), ("nft", "add"))
+                                                  or c[:2] == ("systemctl", "restart")
+                                                  for c in calls), str(calls))
+sync.PORTAL["open"] = True
+sync.apply_gate_dns()
+check("turned on again, it all comes back",
+      "address=/#/198.51.100.7" in open(sync.GATE_CONF).read()
+      and any(":5298" in r for r in chain["rules"]) and len(chain["rules"]) == 6)
+src = open(os.path.join(HERE, "..", "templates", "smartdns-sync"), encoding="utf-8").read()
+check("the relay takes it from the panel's answer, a panel from before meaning open",
+      'opened = answer.get("portal_open") is not False' in src
+      and 'PORTAL["open"] = opened' in src)
+psrc = open(os.path.join(HERE, "..", "templates", "smartdns-panel"), encoding="utf-8").read()
+check("the panel says it to every relay, open unless the admin said no",
+      '"portal_open": self.store.setting("portal_open")' in psrc and '!= "0"' in psrc)
+asrc = open(os.path.join(HERE, "..", "templates", "smartdns-admin"), encoding="utf-8").read()
+check("the admin's settings have the tick, on until turned off",
+      "action='/%s/portal-open'" in asrc and "باز کردن خودکار پنل مشتری برای کسی که سرویس ندارد"
+      in asrc and 'if rest == "portal-open":' in asrc
+      and '"portal-open": "settings"' in asrc)
+
 print("a relay with no panel of its own")
 sync.CFG = {"PANEL_DOMAIN": "", "SELF_IP": "198.51.100.8"}
 sync.PANEL_TO["url"] = ""
