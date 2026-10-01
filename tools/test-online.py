@@ -109,7 +109,7 @@ check("  for an admin who may see the customers", 'if may("users") else None' in
 print("the users table")
 check("a dot beside the ones online", admin.is_online(row(ali)) and admin.is_online(row(sara))
       and not admin.is_online(row(reza)))
-users = src[src.index("    def users(self):"):]
+users = src[src.index("    def users(self, rows_only=False):"):]
 check("  drawn in the name's cell", "<span class='dot on' title='آنلاین'></span>" in users
       and "if is_online(r)" in users)
 store.run("UPDATE users SET created_at = '2026-09-28T22:00:00+00:00' WHERE id = ?", (ali,))
