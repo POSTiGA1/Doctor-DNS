@@ -1281,7 +1281,9 @@ class Bot:
         if not receipts:
             return self.say(chat, "رسیدی در انتظار نیست.")
         for r in receipts[:10]:
-            self.post_receipt(chat, r["id"], "رسید از %s%s — %s تومان" % (
+            # The whole receipt from the panel; a panel too old to say it,
+            # the short line it used to be.
+            self.post_receipt(chat, r["id"], r.get("text") or "رسید از %s%s — %s تومان" % (
                 r["user"]["label"], " برای شارژ کیف پول" if r.get("kind") == "topup"
                 else " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
                 format(r["amount"], ",")))
@@ -1345,7 +1347,8 @@ class Bot:
         if ev.get("audience") == "admin" or kind == "ping":
             for admin in self.cfg["admins"]:
                 if kind == "receipt.submitted":
-                    self.post_receipt(admin, data["receipt_id"], "🧾 " + text)
+                    self.post_receipt(admin, data["receipt_id"],
+                                      text if text.startswith("🧾") else "🧾 " + text)
                 elif kind in ("ticket.opened", "ticket.message"):
                     tid = data["ticket_id"]
                     self.say(admin, "🎫 #%d %s" % (tid, text), {"inline_keyboard": [[

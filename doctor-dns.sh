@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.23"
+VERSION="0.9.24"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -7209,11 +7209,7 @@ exit 0
 #        "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
 #        "kind": "topup" if topup else "device" if device else "card",
 #        "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
-#        "text": "رسید تازه از %s%s — %s تومان"
-#                % (who_label(user), " برای شارژ کیف پول" if topup
-#                   else " برای دستگاه اضافه" if device
-#                   else " برای «%s»" % plan["name"] if plan else "",
-#                   format(amount, ","))})
+#        "text": receipt_text(store, cur.lastrowid)})
 #    return {"ok": True, "receipt_id": cur.lastrowid,
 #            "message": "رسید فرستاده شد. پس از بررسی، %s تومان به کیف پولتان اضافه "
 #                       "می‌شود" % format(amount, ",") if topup
@@ -8695,6 +8691,72 @@ exit 0
 #        "has_image": bool(blob),
 #        "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
 #    return {"ok": True, "message": "جواب فرستاده شد"}
+#
+#
+#def receipt_text(store, tid):
+#    """Everything the operator needs to decide a receipt, under its photo:
+#    who sent it, what for - the plan's days, allowance, speed, devices and
+#    template - its price, any discount, the amount, the customer's note, and
+#    what the customer has now, so a plan bought while one runs is seen to be
+#    reserved. Plain lines, well under Telegram's 1024 for a caption."""
+#    t = store.one("SELECT * FROM transactions WHERE id = ?", (tid,))
+#    if not t:
+#        return ""
+#    user = store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+#    if not user:
+#        return ""
+#    cal = calendar_of(store)
+#    kind = t["kind"]
+#    what = ("شارژ کیف پول" if kind == "topup" else "دستگاه اضافه" if kind == "device"
+#            else "خرید پلن")
+#    who = who_label(user)
+#    handles = []
+#    if user["username"] and user["username"] != who:
+#        handles.append(user["username"])
+#    if user["telegram_id"]:
+#        handles.append("تلگرام %s" % user["telegram_id"])
+#    lines = ["🧾 رسید #%d — %s" % (t["id"], what),
+#             "👤 مشتری: %s%s" % (who, " (%s)" % "، ".join(handles) if handles else "")]
+#    plan = store.one("SELECT * FROM plans WHERE id = ?", (t["plan_id"],)) \
+#        if t["plan_id"] else None
+#    if plan:
+#        tpl = store.one("SELECT name FROM templates WHERE id = ?", (plan["template_id"],))
+#        lines += [
+#            "📦 پلن: %s" % plan["name"],
+#            "⏳ مدت: %d روز" % plan["days"],
+#            "💾 حجم: %s" % ("%g گیگابایت" % round(plan["quota_bytes"] / 2.0 ** 30, 1)
+#                           if plan["quota_bytes"] else "نامحدود"),
+#            "🚀 سرعت: %s" % ("%g مگابیت" % (plan["speed_kbps"] / 1000.0)
+#                            if plan["speed_kbps"] else "بی‌حد"),
+#            "📱 دستگاه: %d" % plan_devices(plan)]
+#        if tpl:
+#            lines.append("🗂 قالب: %s" % tpl["name"])
+#        lines.append("🏷 قیمت پلن: %s تومان" % format(plan["price"], ","))
+#    if t["code_id"]:
+#        code = store.one("SELECT code FROM discount_codes WHERE id = ?", (t["code_id"],))
+#        if code:
+#            lines.append("🎟 کد تخفیف: %s" % code["code"])
+#    lines.append("💳 مبلغ واریزی: %s تومان" % format(t["amount"], ","))
+#    if (t["note"] or "").strip():
+#        lines.append("📝 یادداشت مشتری: %s" % t["note"].strip())
+#    # What the customer has now.
+#    if kind == "topup":
+#        lines.append("👛 کیف پول الان: %s تومان" % format(user["wallet"] or 0, ","))
+#    elif kind == "device":
+#        lines.append("📱 دستگاه‌های الان: %d" % (user["max_ips"] or 1))
+#    now_plan = store.one("SELECT name FROM plans WHERE id = ?", (user["plan_id"],)) \
+#        if user["plan_id"] else None
+#    if plan_running(user):
+#        lines.append("📌 پلن فعلی: %s تا %s%s" % (
+#            now_plan["name"] if now_plan else "—", show_date(user["expires_at"], cal),
+#            " — این پلن رزرو می‌شود" if plan and kind == "card" else ""))
+#    else:
+#        lines.append("📌 پلن فعلی: ندارد")
+#    waiting = len(reserved_of(store, user["id"]))
+#    if waiting:
+#        lines.append("🔖 پلن رزرو در صف: %d" % waiting)
+#    lines.append("🕒 زمان: %s" % show_date(t["created_at"], cal, True))
+#    return "\n".join(lines)
 #
 #
 #def who_label(user):
@@ -10710,6 +10772,7 @@ exit 0
 #
 #def admin_receipt(store, row):
 #    return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+#            "text": receipt_text(store, row["id"]),
 #            "kind": row["kind"],
 #            "created_at": row["created_at"], "decided_at": row["decided_at"],
 #            "has_image": bool(row["has_image"]),
@@ -33689,7 +33752,9 @@ exit 0
 #        if not receipts:
 #            return self.say(chat, "رسیدی در انتظار نیست.")
 #        for r in receipts[:10]:
-#            self.post_receipt(chat, r["id"], "رسید از %s%s — %s تومان" % (
+#            # The whole receipt from the panel; a panel too old to say it,
+#            # the short line it used to be.
+#            self.post_receipt(chat, r["id"], r.get("text") or "رسید از %s%s — %s تومان" % (
 #                r["user"]["label"], " برای شارژ کیف پول" if r.get("kind") == "topup"
 #                else " برای «%s»" % r["plan"]["name"] if r["plan"] else "",
 #                format(r["amount"], ",")))
@@ -33753,7 +33818,8 @@ exit 0
 #        if ev.get("audience") == "admin" or kind == "ping":
 #            for admin in self.cfg["admins"]:
 #                if kind == "receipt.submitted":
-#                    self.post_receipt(admin, data["receipt_id"], "🧾 " + text)
+#                    self.post_receipt(admin, data["receipt_id"],
+#                                      text if text.startswith("🧾") else "🧾 " + text)
 #                elif kind in ("ticket.opened", "ticket.message"):
 #                    tid = data["ticket_id"]
 #                    self.say(admin, "🎫 #%d %s" % (tid, text), {"inline_keyboard": [[
@@ -39378,7 +39444,6 @@ exit 0
 #"برای تست رایگان، اول حسابتان را به تلگرام وصل کنید": "For the free trial, first link your account to Telegram",
 #"برای خرید یا تمدید، اول حسابتان را به تلگرام وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.": "To buy or renew, first link your account to Telegram. Each Telegram links to only one account.",
 #"برای خرید، اول حسابتان را به تلگرام وصل کنید": "To buy, first link your account to Telegram",
-#"برای دستگاه اضافه": "for an extra device",
 #"برای دیدن حساب و ثبت آی‌پی وارد شوید.": "Sign in to see your account and register your IP.",
 #"برای روزی که نام فعلی در ایران فیلتر شود. اول یک رکورد A برای نام تازه بسازید که به آی‌پی رله اشاره کند؛ بعد اینجا ذخیره کنید. رله برای نام تازه گواهی می‌گیرد (حدود بیست ثانیه پورت ۸۰ به Let": "For the day the current name is filtered in Iran. First make an A record for the new name pointing at the relay’s IP; then save it here. The relay gets a certificate for the new name (for about twenty seconds port 80 is given to Let’",
 #"برای روش پرداخت با پشتیبانی تماس بگیرید.": "Contact support for how to pay.",
@@ -39927,7 +39992,6 @@ exit 0
 #"رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید": "Receipt approved; now set its quota and time",
 #"رسید تأیید شد؛ سهمیه و زمان را خودتان بگذارید": "Receipt approved; set the quota and time yourself",
 #"رسید تأیید شد؛ یک دستگاه اضافه شد (": "Receipt approved; a device was added (",
-#"رسید تازه از": "New receipt from",
 #"رسید در انتظار": "Receipts waiting",
 #"رسید در انتظار:": "Receipts waiting:",
 #"رسید رد شد": "Receipt rejected",
@@ -40942,6 +41006,7 @@ exit 0
 #"— از نصب‌کننده؛ با": "— from the installer; with",
 #"— اندروید ← DNS خصوصی": "— Android → Private DNS",
 #"— این سرور": "— this server",
+#"— این پلن رزرو می‌شود": "— this plan will be reserved",
 #"— با تأیید، یک دستگاه به حسابش اضافه می‌شود": "— on approval, one device is added to their account",
 #"— بررسی:": "— checked:",
 #"— بعد از تمام شدن پلن فعلی خودکار فعال می‌شود": "— starts by itself when the current plan ends",
@@ -40967,6 +41032,7 @@ exit 0
 #"‹ برگشت به کاربران": "‹ Back to users",
 #"↪ مستقیم": "↪ Direct",
 #"⏳ رزرو:": "⏳ Reserved:",
+#"⏳ مدت:": "⏳ Length:",
 #"⏳ پلن رزرو:": "⏳ Reserved plan:",
 #"⏳ پلن فعلی شما": "⏳ Your current plan",
 #"⏳ یک رسید در انتظار بررسی دارید.": "⏳ You have a receipt waiting for review.",
@@ -41036,13 +41102,17 @@ exit 0
 #"🎁 دعوت از دوستان فعلاً فعال نیست.": "🎁 Inviting friends is not on right now.",
 #"🎁 دعوت از دوستان: لینک دعوت و پورسانت": "🎁 Invite friends: your invitation link and commission",
 #"🎉 یکی از کسانی که با لینک دعوت شما آمده بود خرید کرد؛": "🎉 Someone who came with your invitation link made a purchase;",
+#"🎟 کد تخفیف:": "🎟 Discount code:",
 #"🎫 پشتیبانی": "🎫 Support",
 #"🎫 پشتیبانی: تیکت و گفتگو با پشتیبانی": "🎫 Support: tickets and chat with support",
 #"🎮 شامل:": "🎮 Includes:",
 #"🏷 با کد تخفیف": "🏷 With discount code",
+#"🏷 قیمت پلن:": "🏷 Plan price:",
 #"🏷 کد تخفیف دارم": "🏷 I have a discount code",
 #"🏷 کدهای تخفیف (": "🏷 Discount codes (",
 #"👁 پنل را همان‌طور می‌بینید که": "👁 You are seeing the panel as",
+#"👛 کیف پول الان:": "👛 Wallet now:",
+#"👤 مشتری:": "👤 Customer:",
 #"💰 خرید از کیف پول (موجودی": "💰 Buy from wallet (balance",
 #"💰 خرید از کیف پول:": "💰 Bought from the wallet:",
 #"💰 دستگاه اضافه از کیف پول:": "💰 Extra device from the wallet:",
@@ -41052,21 +41122,29 @@ exit 0
 #"💰 پرداخت از کیف پول (موجودی": "💰 Pay from wallet (balance",
 #"💰 کیف پول": "💰 Wallet",
 #"💰 کیف پول: موجودی و شارژ": "💰 Wallet: balance and top-up",
+#"💳 مبلغ واریزی:": "💳 Amount paid:",
 #"💻 آیفون، ویندوز، کروم و فایرفاکس — آدرس شخصی شما (DoH):": "💻 iPhone, Windows, Chrome and Firefox — your personal address (DoH):",
+#"💾 حجم:": "💾 Allowance:",
 #"📊 حساب من": "📊 My account",
 #"📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده": "📊 My account: status, what is left and the days left",
 #"📊 نمودار مصرف و سرعت": "📊 Usage and speed charts",
+#"📌 پلن فعلی:": "📌 Current plan:",
+#"📌 پلن فعلی: ندارد": "📌 Current plan: none",
+#"📝 یادداشت مشتری:": "📝 Customer's note:",
 #"📡 DNSها": "📡 DNS",
 #"📡 DNSها: آدرس DNS معمولی، DoH و DoT": "📡 DNS: the plain DNS address, DoH and DoT",
 #"📡 DNSهای شما": "📡 Your DNS",
 #"📢 تبلیغات": "📢 Ads",
 #"📢 عضویت در کانال": "📢 Join the channel",
 #"📣 پیام همگانی": "📣 Broadcast message",
+#"📦 پلن:": "📦 Plan:",
 #"📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):": "📱 Android — Settings → Network → Private DNS → hostname (DoT):",
 #"📱 دستگاه اضافه": "📱 Extra device",
 #"📱 دستگاه اضافه ·": "📱 Extra device ·",
 #"📱 دستگاه اضافه —": "📱 Extra device —",
+#"📱 دستگاه:": "📱 Devices:",
 #"📱 دستگاه‌ها و تغییر آی‌پی": "📱 Devices and IP changes",
+#"📱 دستگاه‌های الان:": "📱 Devices now:",
 #"📲 پروفایل آیفون": "📲 iPhone profile",
 #"🔄 آدرس DoH تازه": "🔄 New DoH address",
 #"🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ این را روی دستگاه‌هایتان بگذارید:": "🔄 A new address has been made. The old one stops working within a minute; put this one on your devices:",
@@ -41078,10 +41156,14 @@ exit 0
 #"🔒 DNS امن": "🔒 Secure DNS",
 #"🔒 DNS امن (رمزگذاری‌شده)": "🔒 Secure DNS (encrypted)",
 #"🔒 DNS رمزگذاری‌شده": "🔒 Encrypted DNS",
+#"🔖 پلن رزرو در صف:": "🔖 Reserved plans waiting:",
 #"🔗 ورود با یک کلیک": "🔗 One-click sign-in",
 #"🔗 ورود به پنل وب": "🔗 Sign in to the web panel",
 #"🔞 پورن": "🔞 Porn",
+#"🕒 زمان:": "🕒 Sent:",
+#"🗂 قالب:": "🗂 Template:",
 #"🗄 بکاپ پنل —": "🗄 Panel backup —",
+#"🚀 سرعت:": "🚀 Speed:",
 #"🚫 مسدودی‌ها": "🚫 Blocks",
 #"🛒 تمدید": "🛒 Renew",
 #"🛒 خرید / تمدید": "🛒 Buy / Renew",
@@ -41089,6 +41171,7 @@ exit 0
 #"🛒 خرید پلن": "🛒 Buy a plan",
 #"🟢 آنلاین الان (": "🟢 Online now (",
 #"🤖 لینک ربات:": "🤖 Bot link:",
+#"🧾 رسید #": "🧾 Receipt #",
 #"🧾 پرداخت با رسید": "🧾 Pay with a receipt"
 #}
 #__END_I18N_EN__

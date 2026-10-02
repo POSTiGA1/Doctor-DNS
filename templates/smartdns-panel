@@ -2743,11 +2743,7 @@ def create_receipt(store, user, body):
         "receipt_id": cur.lastrowid, "user_id": user["id"], "amount": amount,
         "kind": "topup" if topup else "device" if device else "card",
         "plan": {"id": plan["id"], "name": plan["name"]} if plan else None,
-        "text": "رسید تازه از %s%s — %s تومان"
-                % (who_label(user), " برای شارژ کیف پول" if topup
-                   else " برای دستگاه اضافه" if device
-                   else " برای «%s»" % plan["name"] if plan else "",
-                   format(amount, ","))})
+        "text": receipt_text(store, cur.lastrowid)})
     return {"ok": True, "receipt_id": cur.lastrowid,
             "message": "رسید فرستاده شد. پس از بررسی، %s تومان به کیف پولتان اضافه "
                        "می‌شود" % format(amount, ",") if topup
@@ -4229,6 +4225,72 @@ def admin_ticket_reply(store, tid, body):
         "has_image": bool(blob),
         "text": "پشتیبانی به تیکت «%s» جواب داد:\n\n%s" % (ticket["subject"], text)})
     return {"ok": True, "message": "جواب فرستاده شد"}
+
+
+def receipt_text(store, tid):
+    """Everything the operator needs to decide a receipt, under its photo:
+    who sent it, what for - the plan's days, allowance, speed, devices and
+    template - its price, any discount, the amount, the customer's note, and
+    what the customer has now, so a plan bought while one runs is seen to be
+    reserved. Plain lines, well under Telegram's 1024 for a caption."""
+    t = store.one("SELECT * FROM transactions WHERE id = ?", (tid,))
+    if not t:
+        return ""
+    user = store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+    if not user:
+        return ""
+    cal = calendar_of(store)
+    kind = t["kind"]
+    what = ("شارژ کیف پول" if kind == "topup" else "دستگاه اضافه" if kind == "device"
+            else "خرید پلن")
+    who = who_label(user)
+    handles = []
+    if user["username"] and user["username"] != who:
+        handles.append(user["username"])
+    if user["telegram_id"]:
+        handles.append("تلگرام %s" % user["telegram_id"])
+    lines = ["🧾 رسید #%d — %s" % (t["id"], what),
+             "👤 مشتری: %s%s" % (who, " (%s)" % "، ".join(handles) if handles else "")]
+    plan = store.one("SELECT * FROM plans WHERE id = ?", (t["plan_id"],)) \
+        if t["plan_id"] else None
+    if plan:
+        tpl = store.one("SELECT name FROM templates WHERE id = ?", (plan["template_id"],))
+        lines += [
+            "📦 پلن: %s" % plan["name"],
+            "⏳ مدت: %d روز" % plan["days"],
+            "💾 حجم: %s" % ("%g گیگابایت" % round(plan["quota_bytes"] / 2.0 ** 30, 1)
+                           if plan["quota_bytes"] else "نامحدود"),
+            "🚀 سرعت: %s" % ("%g مگابیت" % (plan["speed_kbps"] / 1000.0)
+                            if plan["speed_kbps"] else "بی‌حد"),
+            "📱 دستگاه: %d" % plan_devices(plan)]
+        if tpl:
+            lines.append("🗂 قالب: %s" % tpl["name"])
+        lines.append("🏷 قیمت پلن: %s تومان" % format(plan["price"], ","))
+    if t["code_id"]:
+        code = store.one("SELECT code FROM discount_codes WHERE id = ?", (t["code_id"],))
+        if code:
+            lines.append("🎟 کد تخفیف: %s" % code["code"])
+    lines.append("💳 مبلغ واریزی: %s تومان" % format(t["amount"], ","))
+    if (t["note"] or "").strip():
+        lines.append("📝 یادداشت مشتری: %s" % t["note"].strip())
+    # What the customer has now.
+    if kind == "topup":
+        lines.append("👛 کیف پول الان: %s تومان" % format(user["wallet"] or 0, ","))
+    elif kind == "device":
+        lines.append("📱 دستگاه‌های الان: %d" % (user["max_ips"] or 1))
+    now_plan = store.one("SELECT name FROM plans WHERE id = ?", (user["plan_id"],)) \
+        if user["plan_id"] else None
+    if plan_running(user):
+        lines.append("📌 پلن فعلی: %s تا %s%s" % (
+            now_plan["name"] if now_plan else "—", show_date(user["expires_at"], cal),
+            " — این پلن رزرو می‌شود" if plan and kind == "card" else ""))
+    else:
+        lines.append("📌 پلن فعلی: ندارد")
+    waiting = len(reserved_of(store, user["id"]))
+    if waiting:
+        lines.append("🔖 پلن رزرو در صف: %d" % waiting)
+    lines.append("🕒 زمان: %s" % show_date(t["created_at"], cal, True))
+    return "\n".join(lines)
 
 
 def who_label(user):
@@ -6244,6 +6306,7 @@ def admin_user_view(store, user, relays):
 
 def admin_receipt(store, row):
     return {"id": row["id"], "status": row["status"], "amount": row["amount"],
+            "text": receipt_text(store, row["id"]),
             "kind": row["kind"],
             "created_at": row["created_at"], "decided_at": row["decided_at"],
             "has_image": bool(row["has_image"]),

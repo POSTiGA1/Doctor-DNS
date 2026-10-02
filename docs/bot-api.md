@@ -373,7 +373,7 @@ def from_panel(secret, header, body):      # body: bytes، همان‌طور ک�
 | | |
 |---|---|
 | `GET /admin/stats` | آمار: کاربرها به تفکیک وضعیت، ثبت‌نام امروز، رسید در انتظار، تأیید و درآمد امروز، درآمد ۷ روز، تیکت منتظر، دوره‌های نزدیک به پایان — و `text` آماده |
-| `GET /admin/receipts?status=pending` | رسیدها؛ `status` یکی از `pending` (پیش‌فرض، قدیمی اول)، `approved`، `rejected`، `all` |
+| `GET /admin/receipts?status=pending` | رسیدها؛ `status` یکی از `pending` (پیش‌فرض، قدیمی اول)، `approved`، `rejected`، `all`. هر رسید یک `text` هم دارد: همهٔ جزئیاتش در چند خط (مشتری، پلن، مدت، حجم، سرعت، دستگاه، قالب، قیمت، کد تخفیف، مبلغ، یادداشت، پلن فعلی مشتری) برای زیر عکس |
 | `GET /admin/receipts/{id}/image` | عکس رسید: `{"content_type", "data"}` (بعد از تصمیم پاک می‌شود) |
 | `POST /admin/receipts/{id}/approve` | تأیید — پلن رسید خودکار روی حساب می‌نشیند، دقیقاً مثل پنل. رسید شارژ کیف پول (`"kind": "topup"`) مبلغش به کیف پول می‌رود؛ با `{"amount": 450000}` مبلغ درست را بدهید اگر رسید چیز دیگری می‌گوید |
 | `POST /admin/receipts/{id}/reject` | رد |
@@ -401,7 +401,7 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" $API/admin/receipts/31/app
 
 | `event` | کی | در `data` |
 |---|---|---|
-| `receipt.submitted` | رسید تازه رسید | `receipt_id`، `user_id`، `amount`، `kind` (`card` یا `topup`)، `plan` |
+| `receipt.submitted` | رسید تازه رسید | `receipt_id`، `user_id`، `amount`، `kind` (`card`، `topup` یا `device`)، `plan`؛ `text` همان جزئیات کامل `GET /admin/receipts` است |
 | `wallet.bought` | مشتری پلن را از کیف پول خرید | `user_id`، `amount`، `plan` |
 | `ticket.opened` | تیکت تازه | `ticket_id`، `user_id`، `subject`، `body` |
 | `ticket.message` | مشتری در تیکتی نوشت | `ticket_id`، `user_id`، `subject`، `body` |
