@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.24"
+VERSION="0.9.25"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -539,6 +539,14 @@ install_backpack() {
     printf '%s %s\n' "$BACKPACK_VERSION" "$sha" > "$BACKPACK_BIN.version"
     rm -rf "$tmp"
     info "BackPack $BACKPACK_VERSION installed, its hash checked"
+    # A tunnel already running goes on running the old binary - the file
+    # replaced under it - until it is restarted: a relay upgraded to v1.8.5
+    # was still on v1.8.0 four days later, stuck the way v1.8.1 had fixed.
+    local unit
+    for unit in $(systemctl list-units --plain --no-legend --state=active 'smartdns-tunnel*' \
+                  2>/dev/null | awk '{print $1}'); do
+        systemctl restart "$unit" && info "$unit restarted on the new BackPack"
+    done
     info "BackPack is the work of Amin Mohammadi - github.com/AminMGMT/BackPack (AGPL-3.0)"
 }
 
@@ -12169,10 +12177,19 @@ exit 0
 #            seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
 #            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
 #                raise RuntimeError("certificate fingerprint mismatch")
-#            conn.request("POST", path, "{}", {"Content-Type": "application/json",
-#                                              "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
-#            res = conn.getresponse()
-#            body = res.read()
+#            # Asking for these bytes changes nothing, so a way that took the
+#            # request and then went quiet - a tunnel that connects and carries
+#            # nothing - is left for the next, not the end of it: a relay
+#            # whose tunnel had stalled timed out on every upgrade, while the
+#            # direct path brought the installer in under a second.
+#            try:
+#                conn.request("POST", path, "{}", {"Content-Type": "application/json",
+#                                                  "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
+#                res = conn.getresponse()
+#                body = res.read()
+#            except (OSError, http.client.HTTPException) as e:
+#                last = e
+#                continue
 #            if res.status != 200:
 #                raise RuntimeError("panel returned %d" % res.status)
 #            return body, dict(res.getheaders())
@@ -25750,7 +25767,11 @@ exit 0
 #        # one - which it reports as corrupted content rather than as an error.
 #        self._headers_buffer = []
 #        self.send_response(code)
-#        self.send_header("Content-Type", "text/html; charset=utf-8")
+#        # A file's own type in place of a page's, never beside it: with two,
+#        # a phone's browser took the first - a page - and nosniff held it to
+#        # that, so a receipt, a backup or a WireGuard config would not save.
+#        headers = dict(headers or {})
+#        self.send_header("Content-Type", headers.pop("Content-Type", "text/html; charset=utf-8"))
 #        self.send_header("Content-Length", str(len(blob)))
 #        # This panel is only ever reached over TLS, and none of it should sit
 #        # in a cache or be framed by anything.
@@ -25758,7 +25779,7 @@ exit 0
 #        self.send_header("X-Frame-Options", "DENY")
 #        self.send_header("X-Content-Type-Options", "nosniff")
 #        self.send_header("Referrer-Policy", "no-referrer")
-#        for k, v in (headers or {}).items():
+#        for k, v in headers.items():
 #            self.send_header(k, v)
 #        self.end_headers()
 #        self.wfile.write(blob)

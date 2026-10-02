@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.24"
+VERSION="0.9.25"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -539,6 +539,14 @@ install_backpack() {
     printf '%s %s\n' "$BACKPACK_VERSION" "$sha" > "$BACKPACK_BIN.version"
     rm -rf "$tmp"
     info "BackPack $BACKPACK_VERSION installed, its hash checked"
+    # A tunnel already running goes on running the old binary - the file
+    # replaced under it - until it is restarted: a relay upgraded to v1.8.5
+    # was still on v1.8.0 four days later, stuck the way v1.8.1 had fixed.
+    local unit
+    for unit in $(systemctl list-units --plain --no-legend --state=active 'smartdns-tunnel*' \
+                  2>/dev/null | awk '{print $1}'); do
+        systemctl restart "$unit" && info "$unit restarted on the new BackPack"
+    done
     info "BackPack is the work of Amin Mohammadi - github.com/AminMGMT/BackPack (AGPL-3.0)"
 }
 

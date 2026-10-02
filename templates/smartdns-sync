@@ -203,10 +203,19 @@ def fetch(path):
             seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
             if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
                 raise RuntimeError("certificate fingerprint mismatch")
-            conn.request("POST", path, "{}", {"Content-Type": "application/json",
-                                              "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
-            res = conn.getresponse()
-            body = res.read()
+            # Asking for these bytes changes nothing, so a way that took the
+            # request and then went quiet - a tunnel that connects and carries
+            # nothing - is left for the next, not the end of it: a relay
+            # whose tunnel had stalled timed out on every upgrade, while the
+            # direct path brought the installer in under a second.
+            try:
+                conn.request("POST", path, "{}", {"Content-Type": "application/json",
+                                                  "Authorization": "Bearer " + CFG["SYNC_SECRET"]})
+                res = conn.getresponse()
+                body = res.read()
+            except (OSError, http.client.HTTPException) as e:
+                last = e
+                continue
             if res.status != 200:
                 raise RuntimeError("panel returned %d" % res.status)
             return body, dict(res.getheaders())
