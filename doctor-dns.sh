@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.1"
+VERSION="0.10.2"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -33996,6 +33996,7 @@ exit 0
 #import re
 #import secrets
 #import select
+#import socket
 #import sys
 #import threading
 #import time
@@ -34203,6 +34204,50 @@ exit 0
 #
 #
 ## ------------------------------------------------------------ the two APIs
+## How long one of a server's addresses may take to take a new connection
+## before the next is tried. Python waits the whole call's timeout on each -
+## up to five minutes for an upload - and a machine whose IPv6 route to
+## Telegram comes and goes sat that long on every QR and file it sent.
+#CONNECT_WAIT = 6
+## Address families that failed to connect lately, tried last until then:
+## {family: until}.
+#FAMILY_DOWN = {}
+#
+#
+#def open_socket(host, port, timeout):
+#    """A connection to host:port - each address given CONNECT_WAIT seconds,
+#    a family that has just failed tried after the others."""
+#    stamp = time.time()
+#    infos = sorted(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM),
+#                   key=lambda i: FAMILY_DOWN.get(i[0], 0) > stamp)
+#    err = None
+#    for family, kind, proto, _, addr in infos:
+#        sock = socket.socket(family, kind, proto)
+#        try:
+#            sock.settimeout(min(CONNECT_WAIT, timeout or CONNECT_WAIT))
+#            sock.connect(addr)
+#        except OSError as e:
+#            sock.close()
+#            err = e
+#            FAMILY_DOWN[family] = stamp + 600
+#            continue
+#        sock.settimeout(timeout)
+#        FAMILY_DOWN.pop(family, None)
+#        return sock
+#    raise err or OSError("no address for %s" % host)
+#
+#
+#class QuickHTTP(http.client.HTTPConnection):
+#    def connect(self):
+#        self.sock = open_socket(self.host, self.port, self.timeout)
+#
+#
+#class QuickHTTPS(http.client.HTTPSConnection):
+#    def connect(self):
+#        sock = open_socket(self.host, self.port, self.timeout)
+#        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+#
+#
 #class Wire:
 #    """A connection to one server, kept open between calls - one for each
 #    thread that asks.
@@ -34252,7 +34297,7 @@ exit 0
 #        reused = conn is not None
 #        while True:
 #            if conn is None:
-#                kind = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+#                kind = QuickHTTPS if self.https else QuickHTTP
 #                conn = kind(self.host, self.port, timeout=timeout)
 #            try:
 #                conn.timeout = timeout
@@ -34307,6 +34352,7 @@ exit 0
 #        self.base = "%s/bot%s/" % (cfg["telegram"], cfg["token"])
 #        self.files = "%s/file/bot%s/" % (cfg["telegram"], cfg["token"])
 #        self.wire = Wire(self.base)
+#        self.file_wire = Wire(self.files)
 #
 #    def call(self, method, http_timeout=30, **params):
 #        data = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
@@ -34345,11 +34391,13 @@ exit 0
 #                          'filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
 #                          % (boundary, name, filename)).encode() + blob + b"\r\n")
 #        parts.append(("--%s--\r\n" % boundary).encode())
-#        req = urllib.request.Request(self.base + method, data=b"".join(parts),
-#                                     headers={"Content-Type": "multipart/form-data; boundary="
-#                                              + boundary})
-#        with urllib.request.urlopen(req, timeout=300) as r:
-#            return json.loads(r.read()).get("result")
+#        status, raw = self.wire.request(
+#            "POST", method, b"".join(parts),
+#            {"Content-Type": "multipart/form-data; boundary=" + boundary}, 300)
+#        if status >= 400:
+#            raise urllib.error.HTTPError(method, status, raw[:200].decode("utf-8", "replace"),
+#                                         None, None)
+#        return json.loads(raw).get("result")
 #
 #    def document(self, chat, filename, blob, caption=""):
 #        """A file sent as it is, under its own name."""
@@ -34368,8 +34416,10 @@ exit 0
 #        info = self.call("getFile", file_id=file_id)
 #        if (info.get("file_size") or 0) > MAX_FILE:
 #            raise ValueError("فایل بزرگ‌تر از ۴ مگابایت است")
-#        with urllib.request.urlopen(self.files + info["file_path"], timeout=60) as r:
-#            return r.read(MAX_FILE + 1)
+#        status, raw = self.file_wire.request("GET", info["file_path"], timeout=60)
+#        if status >= 400:
+#            raise urllib.error.HTTPError("getFile", status, "file not fetched", None, None)
+#        return raw[:MAX_FILE + 1]
 #
 #
 ## Dates as the admin picked them shown - the panel says which with every
