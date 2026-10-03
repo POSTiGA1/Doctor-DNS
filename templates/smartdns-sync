@@ -4754,16 +4754,23 @@ WG_HELP = ("<h3>نصب</h3>"
            "DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.</p>")
 
 
+def wg_state(d):
+    """How a config is doing, in a few words."""
+    return ("<span class='ok'>آنلاین</span>" if d.get("online") else
+            "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
+            if d.get("blocked") else
+            "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
+            else "هنوز وصل نشده")
+
+
 def wg_box(info):
-    """WireGuard on the account page, when it is offered: the customer's
-    configs, each to show as a QR and download, and a new one while devices
-    are free - when the operator lets customers make them."""
+    """WireGuard on the account page, when it is offered: how each config
+    is doing, and one button - configs for every server made at once, all
+    shown together on one page."""
     wg = info.get("wg") or {}
     if not wg.get("on"):
         return ""
     devices = wg.get("devices") or []
-    servers = wg.get("relays") or []
-    many = len(servers) > 1 or len({d.get("relay") for d in devices}) > 1
     out = ["<details class='pw' id='wg' open><summary>🛡 وایرگارد</summary>",
            "<p class='note'>یک راه دیگر برای استفاده از سرویس، کنار DNS: برنامهٔ "
            "وایرگارد را روی گوشی نصب می‌کنید و کانفیگ را به آن می‌دهید. جایی که DNS "
@@ -4771,55 +4778,66 @@ def wg_box(info):
            % ("روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
               "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند.")]
     for d in devices:
-        state = ("<span class='ok'>آنلاین</span>" if d.get("online") else
-                 "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
-                 if d.get("blocked") else
-                 "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
-                 else "هنوز وصل نشده")
-        out.append(
-            "<div class='dns'><div class='k'>%s%s</div><p class='note' style='margin-top:0'>%s</p>"
-            "<a class='btn' href='/wg/%d'>QR کد و فایل کانفیگ</a>%s</div>"
-            % (html.escape(d.get("name") or d.get("file") or d["address"]),
-               " — %s" % html.escape(d["server"]) if many and d.get("server") else "",
-               state, d["id"],
-               ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
-                "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
-                "name='id' value='%d'><button class='ghost small'>حذف</button></form>"
-                % d["id"]) if wg.get("self") else ""))
+        out.append("<p class='note' style='margin:2px 16px'><b>%s</b>%s: %s</p>"
+                   % (html.escape(d.get("server") or d["address"]),
+                      " — %s" % html.escape(d["note"]) if d.get("note") else "", wg_state(d)))
     if wg.get("self") and wg.get("room"):
-        # More than one server: the customer picks - one filtered in their
-        # city, another may not be.
-        pick = ("<label>برای کدام سرور؟</label><select name='relay'>%s</select>"
-                % "".join("<option value='%s'>%s</option>"
-                          % (html.escape(x["ip"], quote=True), html.escape(x["label"]))
-                          for x in servers)) if len(servers) > 1 else "".join(
-            "<input type='hidden' name='relay' value='%s'>" % html.escape(x["ip"], quote=True)
-            for x in servers)
-        out.append("<form method='post' action='/wg-new'>%s<button>%s</button></form>"
-                   % (pick, "دریافت کانفیگ وایرگارد" if not devices else
-                      "+ کانفیگ برای سرور دیگر"))
-    elif wg.get("self") and devices:
-        out.append("<p class='note'>برای همهٔ سرورها کانفیگ دارید.</p>")
-    elif not wg.get("self") and not devices:
+        # Every server still without one gets its config in the same go.
+        out.append("<form method='post' action='/wg-new'><button>%s</button></form>"
+                   % "📥 دریافت کانفیگ وایرگارد")
+    elif devices:
+        out.append("<a class='btn' href='/wg'>📥 کانفیگ‌ها و QR کدها</a>")
+    elif not wg.get("self"):
         out.append("<p class='note'>برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.</p>")
     out.append(WG_HELP + "</details>")
     return "".join(out)
 
 
-def wg_config_page(res):
-    """One config, to import: its QR, its file, its text to copy."""
+def wg_one(res, deletable=False):
+    """One server's config: its name and the admin's words about it, its QR,
+    its file, its text to copy."""
     qr = res.get("qr") or ""
-    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>"
+    return ("<div class='dns'><h3 style='margin:0 0 4px'>🛡 %s</h3>%s"
+            % (html.escape(res.get("server") or "کانفیگ وایرگارد"),
+               "<p class='note' style='margin-top:0'>%s</p>" % html.escape(res["note"])
+               if res.get("note") else "")
             + ("<p style='text-align:center'><img alt='QR' style='width:100%%;max-width:300px;"
                "image-rendering:pixelated;border-radius:8px' "
-               "src='data:image/png;base64,%s'></p>"
-               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
-               "QR code</p>" % html.escape(qr) if qr else "")
+               "src='data:image/png;base64,%s'></p>" % html.escape(qr) if qr else "")
             + "<a class='btn' href='/wg/%d.conf'>دانلود فایل کانفیگ</a>" % res["id"]
             + "<details class='pw'><summary>متن کانفیگ</summary>"
             "<textarea readonly dir='ltr' rows='11' style='width:100%%;font-family:monospace;"
             "font-size:12px' onclick='this.select()'>%s</textarea></details>"
             % html.escape(res.get("config") or "")
+            + ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
+               "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
+               "name='id' value='%d'><button class='ghost small'>حذف این کانفیگ</button></form>"
+               % res["id"] if deletable else "")
+            + "</div>")
+
+
+def wg_config_page(res):
+    """One config, to import."""
+    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>" + wg_one(res)
+            + "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+            "QR code</p>" + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
+
+
+def wg_all_page(res):
+    """Every config of the customer's on one page, one under another, each
+    under its server's name and the admin's words about it."""
+    configs = res.get("configs") or []
+    return ("<div class='icon'>🛡</div><h1>کانفیگ‌های وایرگارد</h1>"
+            + ("<p class='note' style='text-align:center'>برای هر سرور یک کانفیگ. در برنامهٔ "
+               "WireGuard هر کدام را جدا اضافه کنید: + ← Scan from QR code، یا فایلش را "
+               "باز کنید. اگر یکی کار نکرد، دیگری را روشن کنید.</p>" if len(configs) > 1 else
+               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+               "QR code، یا فایل را باز کنید.</p>" if configs else
+               "<p class='note' style='text-align:center'>هنوز کانفیگی ندارید.</p>")
+            + "".join(wg_one(c, res.get("self")) for c in configs)
+            + ("<form method='post' action='/wg-new'><button>%s</button></form>"
+               % ("📥 کانفیگ سرورهای تازه" if configs else "📥 دریافت کانفیگ وایرگارد")
+               if res.get("self") and res.get("room") else "")
             + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
 
 
@@ -5485,6 +5503,16 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if path == "/doh.mobileconfig":
             return self.send_profile()
 
+        if path == "/wg":
+            if not self.session():
+                return self.redirect("/login")
+            res = self.ask_panel("/user-wg-all", {})
+            if res is None:
+                return self.send_html(NOT_NOW, 502)
+            if not res.get("ok"):
+                return self.redirect("/", res.get("message", ""), bad=True)
+            return self.send_html(self.banner() + wg_all_page(res))
+
         m = re.fullmatch(r"/wg/(\d{1,12})(\.conf)?", path)
         if m:
             if not self.session():
@@ -5677,8 +5705,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                                                        "relay": form.get("relay") or ""})
             if res is None:
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
-            if path == "/wg-new" and res.get("ok") and res.get("device_id"):
-                return self.redirect("/wg/%d" % res["device_id"], res.get("message", ""))
+            if res.get("ok"):
+                # Made or deleted: every config left, together.
+                return self.redirect("/wg", res.get("message", ""))
             return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
         if path == "/doh-reset":

@@ -143,7 +143,7 @@ check("with qrencode: the QR of exactly that config, a PNG",
 psrc = open(os.path.join(ROOT, "templates", "smartdns-panel"), encoding="utf-8").read()
 check("the customer's page gets it with everything else, and its three calls",
       '"wg": wg_view(self.store, user, self.relays),' in psrc
-      and '("/user-wg-new", "/user-wg-del", "/user-wg-config")' in psrc)
+      and '("/user-wg-new", "/user-wg-del", "/user-wg-config", "/user-wg-all")' in psrc)
 check("the bot's API: list, make, fetch, delete",
       all(x in psrc for x in ('"wg_list"', '"wg_new"', '"wg_get"', '"wg_delete"')))
 
@@ -174,9 +174,8 @@ print("the customer's page")
 check("off: nothing", sync.wg_box({"wg": {"on": False}}) == "")
 info = {"wg": panel.wg_view(store, ali(), relays)}
 box = sync.wg_box(info)
-check("each config: to show as QR and file, to delete",
-      "href='/wg/%d'" % dev in box and "action='/wg-del'" in box
-      and "value='%d'" % dev in box and "WireGuard" in box)
+check("its configs: how each is doing, and one link to them all",
+      "href='/wg'" in box and "هنوز وصل نشده" in box and "WireGuard" in box)
 info["wg"]["room"] = 1
 check("  a free device: a button for another", "action='/wg-new'" in sync.wg_box(info))
 info["wg"]["self"] = False
@@ -188,8 +187,8 @@ check("no config yet: one button to get it",
       "دریافت کانفیگ وایرگارد" in sync.wg_box({"wg": fresh}))
 full = dict(fresh, room=0, relays=[], devices=[{"id": 9, "address": "10.66.0.9",
                                                 "relay": "198.51.100.1", "server": "سرور 1"}])
-check("  a config for every server: said so, no button",
-      "برای همهٔ سرورها کانفیگ دارید" in sync.wg_box({"wg": full})
+check("  a config for every server: no button to make more, the link to them",
+      "href='/wg'" in sync.wg_box({"wg": full})
       and "action='/wg-new'" not in sync.wg_box({"wg": full}))
 check("  bound: the page says it works where the address is registered",
       "آی‌پی‌شان را ثبت کرده‌اید" in sync.wg_box({"wg": dict(fresh, bind=True)})
@@ -236,8 +235,8 @@ b.say = lambda chat, text, markup=None: said.append((text, markup))
 bot.Bot.show_wg(b, 5, {"id": 111})
 text, markup = said[-1]
 flat = [x for row in markup["inline_keyboard"] for x in row]
-check("its list: each config to fetch and delete, and the way to install",
-      any(x["callback_data"] == "wgget:%d" % dev for x in flat)
+check("its list: all configs in one button, each to delete, and the way to install",
+      any(x["callback_data"] == "wgall" for x in flat)
       and any(x["callback_data"] == "wgdel:%d" % dev for x in flat) and "WireGuard" in text)
 bot.Bot.send_wg(b, 5, panel.wg_handout(store, 1, dev))
 check("a config sent: its QR as a photo, its text as a file under its name",
@@ -250,7 +249,7 @@ check("the button beside the iPhone profile's, when offered, in both DNS screens
       bsrc.count('if u.get("wg_on"):\n            buttons.append({"text": B_WG, "callback_data": "wg"})')
       == 2 or bsrc.count('buttons.append({"text": B_WG, "callback_data": "wg"})') == 2)
 check("  and its answers: list, fetch, make, delete",
-      all(x in bsrc for x in ('if kind == "wg":', 'if kind in ("wgget", "wgnew"):',
+      all(x in bsrc for x in ('if kind == "wg":', 'if kind in ("wgget", "wgnew", "wgall"):',
                               'if kind == "wgdel":')))
 
 print("the admin and the installer")

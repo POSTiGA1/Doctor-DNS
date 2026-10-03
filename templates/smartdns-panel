@@ -2966,9 +2966,10 @@ def wg_day(when=None):
 
 
 def wg_relays_for(store, user, relays):
-    """The relays this customer may have a config on: WireGuard ready there,
-    the admin left it on, and it serves them - in the panel's order."""
-    return [r for r in relays
+    """The relays this customer may have a config on: those they are given
+    as DNS addresses, in the same order, where WireGuard is ready and the
+    admin left it on."""
+    return [r for r in shown_relays(store, user, relays)
             if store.setting("wg_pub:" + r) and wg_relay_enabled(store, r)
             and user["id"] not in kept_off(store, r, relays)]
 
@@ -2979,10 +2980,11 @@ def wg_relay_for(store, user, relays):
     return ready[0] if ready else None
 
 
-def wg_server_label(store, relay, relays):
-    """How a customer is shown a relay: Server 1, 2 - its place among the
-    panel's relays, which they also see beside their DNS addresses."""
-    n = relays.index(relay) + 1 if relay in relays else 0
+def wg_server_label(store, relay, relays, shown=None):
+    """How a customer is shown a relay: Server 1, 2 - the number its DNS
+    address has on their page and in the bot."""
+    order = shown if shown is not None else relays
+    n = order.index(relay) + 1 if relay in order else 0
     return "سرور %d" % n if n else relay
 
 
@@ -3106,16 +3108,24 @@ def wg_view(store, user, relays):
     devices = wg_devices_of(store, user["id"])
     recent = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec="seconds")
     day, name, cal = wg_day(), wg_name(store), calendar_of(store)
+    shown = shown_relays(store, user, relays)
+    # In the order of their DNS addresses, so Server 1 is the same server
+    # in both places.
+    devices = sorted(devices, key=lambda d: (shown.index(d["relay"]) if d["relay"] in shown
+                                             else len(shown), d["id"]))
     view = {
         "on": wg_offered(store, user, relays) or bool(devices and wg_on(store)),
         "self": wg_self(store),
         # The servers without a config of theirs yet, one config each.
-        "relays": [{"ip": r, "label": wg_server_label(store, r, relays)}
+        "relays": [{"ip": r, "label": wg_server_label(store, r, relays, shown),
+                    "note": server_note(store, user, r)}
                    for r in wg_relays_for(store, user, relays)
                    if r not in {d["relay"] for d in devices}],
         "bind": wg_bind(store),
         "devices": [{"id": d["id"], "address": d["address"], "name": d["name"] or "",
-                     "relay": d["relay"], "server": wg_server_label(store, d["relay"], relays),
+                     "relay": d["relay"],
+                     "server": wg_server_label(store, d["relay"], relays, shown),
+                     "note": server_note(store, user, d["relay"]),
                      "file": wg_file_name(name, d["id"]),
                      "last": show_date(d["last_handshake"], cal, True)
                      if d["last_handshake"] else "",
@@ -3159,18 +3169,39 @@ def wg_handout(store, uid, device_id):
 
 
 def wg_customer_new(store, user, relays, relay=None):
-    """A config the customer makes themselves - when the admin lets them -
-    on the server they chose, or the first."""
+    """Configs the customer makes themselves - when the admin lets them: on
+    the server they chose, or else on every server they have none on yet,
+    all at once. `device_ids` are the new ones; `device_id` the first."""
     if not wg_self(store):
         return refused("wg_admin_only", "کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ "
                                         "تیکت بزنید")
     relay = str(relay or "").strip() or None
     res = create_wg_device(store, user["id"], relays, relay=relay)
-    if res.get("ok"):
-        res.pop("config", None)
-        res["message"] = ("کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
-                          "می‌شود")
-    return res
+    if not res.get("ok"):
+        return res
+    made = [res["device_id"]]
+    while not relay:
+        more = create_wg_device(store, user["id"], relays)
+        if not more.get("ok"):
+            break
+        made.append(more["device_id"])
+    return {"ok": True, "device_id": made[0], "device_ids": made,
+            "message": "کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود"
+            if len(made) == 1 else
+            "کانفیگ وایرگارد برای همهٔ سرورها ساخته شد؛ تا یک دقیقهٔ دیگر فعال می‌شوند"}
+
+
+def wg_handout_all(store, user, relays):
+    """Every config of the customer's, to import in one go: each with its
+    server, the words the admin wrote about that server, and its QR."""
+    view = wg_view(store, user, relays)
+    configs = []
+    for d in view["devices"]:
+        res = wg_handout(store, user["id"], d["id"])
+        if res.get("ok"):
+            configs.append(dict(res, server=d["server"], note=d["note"], relay=d["relay"]))
+    return {"ok": True, "configs": configs, "self": view["self"], "bind": view["bind"],
+            "room": view["room"]}
 
 
 def wg_customer_delete(store, user, device_id):
@@ -6165,7 +6196,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"ok": True, "message": (
                 "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
                 "گزارش DNS خاموش و پاک شد")})
-        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config"):
+        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config", "/user-wg-all"):
             user = self._session_user(body.get("session"))
             if not user:
                 return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
@@ -6177,6 +6208,8 @@ class API(http.server.BaseHTTPRequestHandler):
                 res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
             elif self.path == "/user-wg-del":
                 res = wg_customer_delete(self.store, user, dev)
+            elif self.path == "/user-wg-all":
+                res = wg_handout_all(self.store, user, self.relays)
             else:
                 res = wg_handout(self.store, user["id"], dev)
             res.pop("error", None)
@@ -7106,6 +7139,7 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_list"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_new"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/all$"), "wg_all"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_get"),
         ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_delete"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
@@ -7473,7 +7507,16 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
         if not res.get("ok"):
             return {"wg_have": 409, "wg_admin_only": 403}.get(res["error"], 400), res
-        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]))
+        made = set(res["device_ids"])
+        every = wg_handout_all(self.store, user, self.relays)["configs"]
+        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]),
+                         configs=[c for c in every if c["id"] in made])
+
+    def api_wg_all(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return 200, wg_handout_all(self.store, user, self.relays)
 
     def api_wg_get(self, body, tg, dev):
         user, err = self.customer(tg)

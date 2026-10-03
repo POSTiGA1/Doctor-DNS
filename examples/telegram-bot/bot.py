@@ -915,8 +915,8 @@ class Bot:
         return [buttons[:2]] + [[b] for b in buttons[2:]]
 
     def show_wg(self, chat, sender, said=""):
-        """The customer's WireGuard: their configs, each to fetch or delete,
-        and a new one while devices are free and the operator lets them."""
+        """The customer's WireGuard: how each server's config is doing, one
+        button for every config at once, and each to delete."""
         try:
             wg = self.panel.call("GET", "/users/%d/wg" % sender["id"])["wg"]
         except ApiError as e:
@@ -925,37 +925,35 @@ class Bot:
         lines = ([said, ""] if said else []) + [WG_HELP, "", (
             "روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
             "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند."), ""]
-        servers = wg.get("relays") or []
-        many = len(servers) > 1 or len({d.get("relay") for d in wg.get("devices") or []}) > 1
-        for d in wg.get("devices") or []:
-            label = (d.get("name") or d.get("file") or d["address"]) + (
-                " — %s" % d["server"] if many and d.get("server") else "")
-            lines.append("• %s — %s" % (label, "🟢 آنلاین" if d.get("online") else
-                                        "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
-                                        "آخرین اتصال: %s" % d["last"] if d.get("last")
-                                        else "هنوز وصل نشده"))
-            row = [{"text": "📥 " + label, "callback_data": "wgget:%d" % d["id"]}]
-            if wg.get("self"):
-                row.append({"text": "🗑 حذف", "callback_data": "wgdel:%d" % d["id"]})
-            rows.append(row)
-        if wg.get("self") and wg.get("room") and len(servers) > 1:
-            # One button per server: one filtered in their city, another may not be.
-            lines.append("برای کانفیگ تازه، سرور را انتخاب کنید:")
-            rows.append([{"text": "➕ " + x["label"], "callback_data": "wgnew:" + x["ip"]}
-                         for x in servers][:3])
-        elif wg.get("self") and wg.get("room"):
-            rows.append([{"text": "➕ کانفیگ تازه" if wg.get("devices")
+        devices = wg.get("devices") or []
+        for d in devices:
+            lines.append("• %s%s — %s" % (d.get("server") or d["address"],
+                                          " (%s)" % d["note"] if d.get("note") else "",
+                                          "🟢 آنلاین" if d.get("online") else
+                                          "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
+                                          "آخرین اتصال: %s" % d["last"] if d.get("last")
+                                          else "هنوز وصل نشده"))
+        if wg.get("self") and wg.get("room"):
+            # Every server still without one gets its config in the same go.
+            rows.append([{"text": "📥 کانفیگ سرورهای تازه" if devices
                           else "📥 دریافت کانفیگ وایرگارد", "callback_data": "wgnew"}])
-        elif wg.get("self") and wg.get("devices"):
-            lines.append("برای همهٔ سرورها کانفیگ دارید.")
-        elif not wg.get("self") and not wg.get("devices"):
+        if devices:
+            rows.append([{"text": "📲 همهٔ کانفیگ‌ها و QR کدها", "callback_data": "wgall"}])
+        if wg.get("self") and devices:
+            dels = [{"text": "🗑 حذف " + (d.get("server") or d["address"]),
+                     "callback_data": "wgdel:%d" % d["id"]} for d in devices]
+            rows += [dels[i:i + 2] for i in range(0, len(dels), 2)]
+        if not wg.get("self") and not devices:
             lines.append("برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.")
         return self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else None)
 
     def send_wg(self, chat, res):
-        """One config: its QR to scan, and its file to open."""
-        caption = self.t("🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا "
-                         "فایل را باز کنید.")
+        """One config: its server and the admin's words about it, its QR to
+        scan, and its file to open."""
+        head = "🛡 %s" % (res.get("server") or "کانفیگ وایرگارد") + (
+            "\n%s" % res["note"] if res.get("note") else "")
+        caption = head + "\n" + self.t("در برنامهٔ WireGuard: + ← اسکن QR، یا فایل را باز "
+                                        "کنید.")
         try:
             if res.get("qr"):
                 self.tg.photo(chat, base64.b64decode(res["qr"]), caption)
@@ -965,6 +963,14 @@ class Bot:
             log("WireGuard config not sent to %s: %s" % (chat, e))
             self.say(chat, "⚠️ کانفیگ فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
                      "بگیریدش.")
+
+    def send_wg_all(self, chat, configs):
+        """Every config, one after another, each under its server's name."""
+        if len(configs) > 1:
+            self.say(chat, "برای هر سرور یک کانفیگ؛ هر کدام را جدا در برنامهٔ WireGuard اضافه "
+                     "کنید. اگر یکی کار نکرد، دیگری را روشن کنید.")
+        for c in configs:
+            self.send_wg(chat, c)
 
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -1317,17 +1323,20 @@ class Bot:
             return self.send_profiles(chat, self.profiles_of(self.account(sender)))
         if kind == "wg":
             return self.show_wg(chat, sender)
-        if kind in ("wgget", "wgnew"):
+        if kind in ("wgget", "wgnew", "wgall"):
             try:
                 res = (self.panel.call("POST", "/users/%d/wg" % sender["id"],
                                        {"relay": arg} if arg else None) if kind == "wgnew"
+                       else self.panel.call("GET", "/users/%d/wg/all" % sender["id"])
+                       if kind == "wgall"
                        else self.panel.call("GET", "/users/%d/wg/%d" % (sender["id"], int(arg))))
             except ApiError as e:
                 return self.say(chat, "⚠️ " + str(e))
             if kind == "wgnew":
-                self.say(chat, "✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
-                         "می‌شود.")
-            return self.send_wg(chat, res)
+                self.say(chat, "✅ " + res.get("message", ""))
+            if kind == "wgget":
+                return self.send_wg(chat, res)
+            return self.send_wg_all(chat, res.get("configs") or [res])
         if kind == "wgdel":
             try:
                 res = self.panel.call("DELETE", "/users/%d/wg/%d" % (sender["id"], int(arg)))

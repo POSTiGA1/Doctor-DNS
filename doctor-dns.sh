@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.0"
+VERSION="0.10.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -7450,9 +7450,10 @@ exit 0
 #
 #
 #def wg_relays_for(store, user, relays):
-#    """The relays this customer may have a config on: WireGuard ready there,
-#    the admin left it on, and it serves them - in the panel's order."""
-#    return [r for r in relays
+#    """The relays this customer may have a config on: those they are given
+#    as DNS addresses, in the same order, where WireGuard is ready and the
+#    admin left it on."""
+#    return [r for r in shown_relays(store, user, relays)
 #            if store.setting("wg_pub:" + r) and wg_relay_enabled(store, r)
 #            and user["id"] not in kept_off(store, r, relays)]
 #
@@ -7463,10 +7464,11 @@ exit 0
 #    return ready[0] if ready else None
 #
 #
-#def wg_server_label(store, relay, relays):
-#    """How a customer is shown a relay: Server 1, 2 - its place among the
-#    panel's relays, which they also see beside their DNS addresses."""
-#    n = relays.index(relay) + 1 if relay in relays else 0
+#def wg_server_label(store, relay, relays, shown=None):
+#    """How a customer is shown a relay: Server 1, 2 - the number its DNS
+#    address has on their page and in the bot."""
+#    order = shown if shown is not None else relays
+#    n = order.index(relay) + 1 if relay in order else 0
 #    return "سرور %d" % n if n else relay
 #
 #
@@ -7590,16 +7592,24 @@ exit 0
 #    devices = wg_devices_of(store, user["id"])
 #    recent = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec="seconds")
 #    day, name, cal = wg_day(), wg_name(store), calendar_of(store)
+#    shown = shown_relays(store, user, relays)
+#    # In the order of their DNS addresses, so Server 1 is the same server
+#    # in both places.
+#    devices = sorted(devices, key=lambda d: (shown.index(d["relay"]) if d["relay"] in shown
+#                                             else len(shown), d["id"]))
 #    view = {
 #        "on": wg_offered(store, user, relays) or bool(devices and wg_on(store)),
 #        "self": wg_self(store),
 #        # The servers without a config of theirs yet, one config each.
-#        "relays": [{"ip": r, "label": wg_server_label(store, r, relays)}
+#        "relays": [{"ip": r, "label": wg_server_label(store, r, relays, shown),
+#                    "note": server_note(store, user, r)}
 #                   for r in wg_relays_for(store, user, relays)
 #                   if r not in {d["relay"] for d in devices}],
 #        "bind": wg_bind(store),
 #        "devices": [{"id": d["id"], "address": d["address"], "name": d["name"] or "",
-#                     "relay": d["relay"], "server": wg_server_label(store, d["relay"], relays),
+#                     "relay": d["relay"],
+#                     "server": wg_server_label(store, d["relay"], relays, shown),
+#                     "note": server_note(store, user, d["relay"]),
 #                     "file": wg_file_name(name, d["id"]),
 #                     "last": show_date(d["last_handshake"], cal, True)
 #                     if d["last_handshake"] else "",
@@ -7643,18 +7653,39 @@ exit 0
 #
 #
 #def wg_customer_new(store, user, relays, relay=None):
-#    """A config the customer makes themselves - when the admin lets them -
-#    on the server they chose, or the first."""
+#    """Configs the customer makes themselves - when the admin lets them: on
+#    the server they chose, or else on every server they have none on yet,
+#    all at once. `device_ids` are the new ones; `device_id` the first."""
 #    if not wg_self(store):
 #        return refused("wg_admin_only", "کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ "
 #                                        "تیکت بزنید")
 #    relay = str(relay or "").strip() or None
 #    res = create_wg_device(store, user["id"], relays, relay=relay)
-#    if res.get("ok"):
-#        res.pop("config", None)
-#        res["message"] = ("کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
-#                          "می‌شود")
-#    return res
+#    if not res.get("ok"):
+#        return res
+#    made = [res["device_id"]]
+#    while not relay:
+#        more = create_wg_device(store, user["id"], relays)
+#        if not more.get("ok"):
+#            break
+#        made.append(more["device_id"])
+#    return {"ok": True, "device_id": made[0], "device_ids": made,
+#            "message": "کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود"
+#            if len(made) == 1 else
+#            "کانفیگ وایرگارد برای همهٔ سرورها ساخته شد؛ تا یک دقیقهٔ دیگر فعال می‌شوند"}
+#
+#
+#def wg_handout_all(store, user, relays):
+#    """Every config of the customer's, to import in one go: each with its
+#    server, the words the admin wrote about that server, and its QR."""
+#    view = wg_view(store, user, relays)
+#    configs = []
+#    for d in view["devices"]:
+#        res = wg_handout(store, user["id"], d["id"])
+#        if res.get("ok"):
+#            configs.append(dict(res, server=d["server"], note=d["note"], relay=d["relay"]))
+#    return {"ok": True, "configs": configs, "self": view["self"], "bind": view["bind"],
+#            "room": view["room"]}
 #
 #
 #def wg_customer_delete(store, user, device_id):
@@ -10649,7 +10680,7 @@ exit 0
 #            return self.reply(200, {"ok": True, "message": (
 #                "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
 #                "گزارش DNS خاموش و پاک شد")})
-#        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config"):
+#        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config", "/user-wg-all"):
 #            user = self._session_user(body.get("session"))
 #            if not user:
 #                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
@@ -10661,6 +10692,8 @@ exit 0
 #                res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
 #            elif self.path == "/user-wg-del":
 #                res = wg_customer_delete(self.store, user, dev)
+#            elif self.path == "/user-wg-all":
+#                res = wg_handout_all(self.store, user, self.relays)
 #            else:
 #                res = wg_handout(self.store, user["id"], dev)
 #            res.pop("error", None)
@@ -11590,6 +11623,7 @@ exit 0
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_list"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_new"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/all$"), "wg_all"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_get"),
 #        ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_delete"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
@@ -11957,7 +11991,16 @@ exit 0
 #        res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
 #        if not res.get("ok"):
 #            return {"wg_have": 409, "wg_admin_only": 403}.get(res["error"], 400), res
-#        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]))
+#        made = set(res["device_ids"])
+#        every = wg_handout_all(self.store, user, self.relays)["configs"]
+#        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]),
+#                         configs=[c for c in every if c["id"] in made])
+#
+#    def api_wg_all(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return 200, wg_handout_all(self.store, user, self.relays)
 #
 #    def api_wg_get(self, body, tg, dev):
 #        user, err = self.customer(tg)
@@ -17311,16 +17354,23 @@ exit 0
 #           "DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.</p>")
 #
 #
+#def wg_state(d):
+#    """How a config is doing, in a few words."""
+#    return ("<span class='ok'>آنلاین</span>" if d.get("online") else
+#            "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
+#            if d.get("blocked") else
+#            "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
+#            else "هنوز وصل نشده")
+#
+#
 #def wg_box(info):
-#    """WireGuard on the account page, when it is offered: the customer's
-#    configs, each to show as a QR and download, and a new one while devices
-#    are free - when the operator lets customers make them."""
+#    """WireGuard on the account page, when it is offered: how each config
+#    is doing, and one button - configs for every server made at once, all
+#    shown together on one page."""
 #    wg = info.get("wg") or {}
 #    if not wg.get("on"):
 #        return ""
 #    devices = wg.get("devices") or []
-#    servers = wg.get("relays") or []
-#    many = len(servers) > 1 or len({d.get("relay") for d in devices}) > 1
 #    out = ["<details class='pw' id='wg' open><summary>🛡 وایرگارد</summary>",
 #           "<p class='note'>یک راه دیگر برای استفاده از سرویس، کنار DNS: برنامهٔ "
 #           "وایرگارد را روی گوشی نصب می‌کنید و کانفیگ را به آن می‌دهید. جایی که DNS "
@@ -17328,55 +17378,66 @@ exit 0
 #           % ("روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
 #              "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند.")]
 #    for d in devices:
-#        state = ("<span class='ok'>آنلاین</span>" if d.get("online") else
-#                 "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
-#                 if d.get("blocked") else
-#                 "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
-#                 else "هنوز وصل نشده")
-#        out.append(
-#            "<div class='dns'><div class='k'>%s%s</div><p class='note' style='margin-top:0'>%s</p>"
-#            "<a class='btn' href='/wg/%d'>QR کد و فایل کانفیگ</a>%s</div>"
-#            % (html.escape(d.get("name") or d.get("file") or d["address"]),
-#               " — %s" % html.escape(d["server"]) if many and d.get("server") else "",
-#               state, d["id"],
-#               ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
-#                "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
-#                "name='id' value='%d'><button class='ghost small'>حذف</button></form>"
-#                % d["id"]) if wg.get("self") else ""))
+#        out.append("<p class='note' style='margin:2px 16px'><b>%s</b>%s: %s</p>"
+#                   % (html.escape(d.get("server") or d["address"]),
+#                      " — %s" % html.escape(d["note"]) if d.get("note") else "", wg_state(d)))
 #    if wg.get("self") and wg.get("room"):
-#        # More than one server: the customer picks - one filtered in their
-#        # city, another may not be.
-#        pick = ("<label>برای کدام سرور؟</label><select name='relay'>%s</select>"
-#                % "".join("<option value='%s'>%s</option>"
-#                          % (html.escape(x["ip"], quote=True), html.escape(x["label"]))
-#                          for x in servers)) if len(servers) > 1 else "".join(
-#            "<input type='hidden' name='relay' value='%s'>" % html.escape(x["ip"], quote=True)
-#            for x in servers)
-#        out.append("<form method='post' action='/wg-new'>%s<button>%s</button></form>"
-#                   % (pick, "دریافت کانفیگ وایرگارد" if not devices else
-#                      "+ کانفیگ برای سرور دیگر"))
-#    elif wg.get("self") and devices:
-#        out.append("<p class='note'>برای همهٔ سرورها کانفیگ دارید.</p>")
-#    elif not wg.get("self") and not devices:
+#        # Every server still without one gets its config in the same go.
+#        out.append("<form method='post' action='/wg-new'><button>%s</button></form>"
+#                   % "📥 دریافت کانفیگ وایرگارد")
+#    elif devices:
+#        out.append("<a class='btn' href='/wg'>📥 کانفیگ‌ها و QR کدها</a>")
+#    elif not wg.get("self"):
 #        out.append("<p class='note'>برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.</p>")
 #    out.append(WG_HELP + "</details>")
 #    return "".join(out)
 #
 #
-#def wg_config_page(res):
-#    """One config, to import: its QR, its file, its text to copy."""
+#def wg_one(res, deletable=False):
+#    """One server's config: its name and the admin's words about it, its QR,
+#    its file, its text to copy."""
 #    qr = res.get("qr") or ""
-#    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>"
+#    return ("<div class='dns'><h3 style='margin:0 0 4px'>🛡 %s</h3>%s"
+#            % (html.escape(res.get("server") or "کانفیگ وایرگارد"),
+#               "<p class='note' style='margin-top:0'>%s</p>" % html.escape(res["note"])
+#               if res.get("note") else "")
 #            + ("<p style='text-align:center'><img alt='QR' style='width:100%%;max-width:300px;"
 #               "image-rendering:pixelated;border-radius:8px' "
-#               "src='data:image/png;base64,%s'></p>"
-#               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
-#               "QR code</p>" % html.escape(qr) if qr else "")
+#               "src='data:image/png;base64,%s'></p>" % html.escape(qr) if qr else "")
 #            + "<a class='btn' href='/wg/%d.conf'>دانلود فایل کانفیگ</a>" % res["id"]
 #            + "<details class='pw'><summary>متن کانفیگ</summary>"
 #            "<textarea readonly dir='ltr' rows='11' style='width:100%%;font-family:monospace;"
 #            "font-size:12px' onclick='this.select()'>%s</textarea></details>"
 #            % html.escape(res.get("config") or "")
+#            + ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
+#               "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
+#               "name='id' value='%d'><button class='ghost small'>حذف این کانفیگ</button></form>"
+#               % res["id"] if deletable else "")
+#            + "</div>")
+#
+#
+#def wg_config_page(res):
+#    """One config, to import."""
+#    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>" + wg_one(res)
+#            + "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+#            "QR code</p>" + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
+#
+#
+#def wg_all_page(res):
+#    """Every config of the customer's on one page, one under another, each
+#    under its server's name and the admin's words about it."""
+#    configs = res.get("configs") or []
+#    return ("<div class='icon'>🛡</div><h1>کانفیگ‌های وایرگارد</h1>"
+#            + ("<p class='note' style='text-align:center'>برای هر سرور یک کانفیگ. در برنامهٔ "
+#               "WireGuard هر کدام را جدا اضافه کنید: + ← Scan from QR code، یا فایلش را "
+#               "باز کنید. اگر یکی کار نکرد، دیگری را روشن کنید.</p>" if len(configs) > 1 else
+#               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+#               "QR code، یا فایل را باز کنید.</p>" if configs else
+#               "<p class='note' style='text-align:center'>هنوز کانفیگی ندارید.</p>")
+#            + "".join(wg_one(c, res.get("self")) for c in configs)
+#            + ("<form method='post' action='/wg-new'><button>%s</button></form>"
+#               % ("📥 کانفیگ سرورهای تازه" if configs else "📥 دریافت کانفیگ وایرگارد")
+#               if res.get("self") and res.get("room") else "")
 #            + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
 #
 #
@@ -18042,6 +18103,16 @@ exit 0
 #        if path == "/doh.mobileconfig":
 #            return self.send_profile()
 #
+#        if path == "/wg":
+#            if not self.session():
+#                return self.redirect("/login")
+#            res = self.ask_panel("/user-wg-all", {})
+#            if res is None:
+#                return self.send_html(NOT_NOW, 502)
+#            if not res.get("ok"):
+#                return self.redirect("/", res.get("message", ""), bad=True)
+#            return self.send_html(self.banner() + wg_all_page(res))
+#
 #        m = re.fullmatch(r"/wg/(\d{1,12})(\.conf)?", path)
 #        if m:
 #            if not self.session():
@@ -18234,8 +18305,9 @@ exit 0
 #                                                       "relay": form.get("relay") or ""})
 #            if res is None:
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
-#            if path == "/wg-new" and res.get("ok") and res.get("device_id"):
-#                return self.redirect("/wg/%d" % res["device_id"], res.get("message", ""))
+#            if res.get("ok"):
+#                # Made or deleted: every config left, together.
+#                return self.redirect("/wg", res.get("message", ""))
 #            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
 #        if path == "/doh-reset":
@@ -34804,8 +34876,8 @@ exit 0
 #        return [buttons[:2]] + [[b] for b in buttons[2:]]
 #
 #    def show_wg(self, chat, sender, said=""):
-#        """The customer's WireGuard: their configs, each to fetch or delete,
-#        and a new one while devices are free and the operator lets them."""
+#        """The customer's WireGuard: how each server's config is doing, one
+#        button for every config at once, and each to delete."""
 #        try:
 #            wg = self.panel.call("GET", "/users/%d/wg" % sender["id"])["wg"]
 #        except ApiError as e:
@@ -34814,37 +34886,35 @@ exit 0
 #        lines = ([said, ""] if said else []) + [WG_HELP, "", (
 #            "روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
 #            "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند."), ""]
-#        servers = wg.get("relays") or []
-#        many = len(servers) > 1 or len({d.get("relay") for d in wg.get("devices") or []}) > 1
-#        for d in wg.get("devices") or []:
-#            label = (d.get("name") or d.get("file") or d["address"]) + (
-#                " — %s" % d["server"] if many and d.get("server") else "")
-#            lines.append("• %s — %s" % (label, "🟢 آنلاین" if d.get("online") else
-#                                        "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
-#                                        "آخرین اتصال: %s" % d["last"] if d.get("last")
-#                                        else "هنوز وصل نشده"))
-#            row = [{"text": "📥 " + label, "callback_data": "wgget:%d" % d["id"]}]
-#            if wg.get("self"):
-#                row.append({"text": "🗑 حذف", "callback_data": "wgdel:%d" % d["id"]})
-#            rows.append(row)
-#        if wg.get("self") and wg.get("room") and len(servers) > 1:
-#            # One button per server: one filtered in their city, another may not be.
-#            lines.append("برای کانفیگ تازه، سرور را انتخاب کنید:")
-#            rows.append([{"text": "➕ " + x["label"], "callback_data": "wgnew:" + x["ip"]}
-#                         for x in servers][:3])
-#        elif wg.get("self") and wg.get("room"):
-#            rows.append([{"text": "➕ کانفیگ تازه" if wg.get("devices")
+#        devices = wg.get("devices") or []
+#        for d in devices:
+#            lines.append("• %s%s — %s" % (d.get("server") or d["address"],
+#                                          " (%s)" % d["note"] if d.get("note") else "",
+#                                          "🟢 آنلاین" if d.get("online") else
+#                                          "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
+#                                          "آخرین اتصال: %s" % d["last"] if d.get("last")
+#                                          else "هنوز وصل نشده"))
+#        if wg.get("self") and wg.get("room"):
+#            # Every server still without one gets its config in the same go.
+#            rows.append([{"text": "📥 کانفیگ سرورهای تازه" if devices
 #                          else "📥 دریافت کانفیگ وایرگارد", "callback_data": "wgnew"}])
-#        elif wg.get("self") and wg.get("devices"):
-#            lines.append("برای همهٔ سرورها کانفیگ دارید.")
-#        elif not wg.get("self") and not wg.get("devices"):
+#        if devices:
+#            rows.append([{"text": "📲 همهٔ کانفیگ‌ها و QR کدها", "callback_data": "wgall"}])
+#        if wg.get("self") and devices:
+#            dels = [{"text": "🗑 حذف " + (d.get("server") or d["address"]),
+#                     "callback_data": "wgdel:%d" % d["id"]} for d in devices]
+#            rows += [dels[i:i + 2] for i in range(0, len(dels), 2)]
+#        if not wg.get("self") and not devices:
 #            lines.append("برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.")
 #        return self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else None)
 #
 #    def send_wg(self, chat, res):
-#        """One config: its QR to scan, and its file to open."""
-#        caption = self.t("🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا "
-#                         "فایل را باز کنید.")
+#        """One config: its server and the admin's words about it, its QR to
+#        scan, and its file to open."""
+#        head = "🛡 %s" % (res.get("server") or "کانفیگ وایرگارد") + (
+#            "\n%s" % res["note"] if res.get("note") else "")
+#        caption = head + "\n" + self.t("در برنامهٔ WireGuard: + ← اسکن QR، یا فایل را باز "
+#                                        "کنید.")
 #        try:
 #            if res.get("qr"):
 #                self.tg.photo(chat, base64.b64decode(res["qr"]), caption)
@@ -34854,6 +34924,14 @@ exit 0
 #            log("WireGuard config not sent to %s: %s" % (chat, e))
 #            self.say(chat, "⚠️ کانفیگ فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
 #                     "بگیریدش.")
+#
+#    def send_wg_all(self, chat, configs):
+#        """Every config, one after another, each under its server's name."""
+#        if len(configs) > 1:
+#            self.say(chat, "برای هر سرور یک کانفیگ؛ هر کدام را جدا در برنامهٔ WireGuard اضافه "
+#                     "کنید. اگر یکی کار نکرد، دیگری را روشن کنید.")
+#        for c in configs:
+#            self.send_wg(chat, c)
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -35206,17 +35284,20 @@ exit 0
 #            return self.send_profiles(chat, self.profiles_of(self.account(sender)))
 #        if kind == "wg":
 #            return self.show_wg(chat, sender)
-#        if kind in ("wgget", "wgnew"):
+#        if kind in ("wgget", "wgnew", "wgall"):
 #            try:
 #                res = (self.panel.call("POST", "/users/%d/wg" % sender["id"],
 #                                       {"relay": arg} if arg else None) if kind == "wgnew"
+#                       else self.panel.call("GET", "/users/%d/wg/all" % sender["id"])
+#                       if kind == "wgall"
 #                       else self.panel.call("GET", "/users/%d/wg/%d" % (sender["id"], int(arg))))
 #            except ApiError as e:
 #                return self.say(chat, "⚠️ " + str(e))
 #            if kind == "wgnew":
-#                self.say(chat, "✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
-#                         "می‌شود.")
-#            return self.send_wg(chat, res)
+#                self.say(chat, "✅ " + res.get("message", ""))
+#            if kind == "wgget":
+#                return self.send_wg(chat, res)
+#            return self.send_wg_all(chat, res.get("configs") or [res])
 #        if kind == "wgdel":
 #            try:
 #                res = self.panel.call("DELETE", "/users/%d/wg/%d" % (sender["id"], int(arg)))
@@ -40459,7 +40540,6 @@ exit 0
 #") با رمز بکاپش باز می‌شود.": ") opens with its backup password.",
 #") روی این سرور نیست، ولی": ") is not on this server, but",
 #"). با رمز بکاپ باز می‌شود؛ برای بازگردانی در صفحهٔ «تنظیمات» بفرستیدش.": "). It opens with the backup password; to restore, upload it on the “Settings” page.",
-#"+ کانفیگ برای سرور دیگر": "+ A config for another server",
 #"+ کانفیگ تازه": "+ New config",
 #". با موجودی کیف پول، پلن را از بخش «خرید یا تمدید» بدون رسید و فوری بخرید.": ". With your wallet balance, buy a plan instantly and with no receipt from “Buy or renew”.",
 #". جدول هر بار که صفحه را باز کنید تازه می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.": ". The table refreshes every time you open the page; a new name takes up to a minute to arrive.",
@@ -40514,7 +40594,6 @@ exit 0
 #"Pangle (تبلیغات تیک‌تاک)": "Pangle (TikTok’s ads)",
 #"PlayStation — STUN و API": "PlayStation — STUN and API",
 #"PowerShell را با Run as administrator باز کنید و این را بزنید:": "Open PowerShell with Run as administrator and enter this:",
-#"QR کد و فایل کانفیگ": "QR code and config file",
 #"RedTube، YouPorn و Tube8": "RedTube, YouPorn and Tube8",
 #"SVG اسکریپت یا چیز فعال دارد؛ یک SVG ساده بدهید": "the SVG has a script or something active in it; give a plain SVG",
 #"SVG بیشتر از ۱۶ کیلوبایت است": "the SVG is over 16 KB",
@@ -40986,16 +41065,15 @@ exit 0
 #"برای شارژ کیف پول": "to top up the wallet",
 #"برای فعال شدن سرویس، رسید پرداختتان را از پایین همین صفحه بفرستید — بعد از تأیید، پلن برایتان ثبت می‌شود.": "To activate the service, send your payment receipt from the bottom of this page — after it is approved, your plan is set.",
 #"برای مسیری که TCP وصل می‌شود و بعد می‌میرد": "For a path where TCP connects and then dies",
+#"برای هر سرور یک کانفیگ. در برنامهٔ WireGuard هر کدام را جدا اضافه کنید: + ← Scan from QR code، یا فایلش را باز کنید. اگر یکی کار نکرد، دیگری را روشن کنید.": "One config for each server. Add each to the WireGuard app on its own: + → Scan from QR code, or open its file. If one does not work, turn the other on.",
+#"برای هر سرور یک کانفیگ؛ هر کدام را جدا در برنامهٔ WireGuard اضافه کنید. اگر یکی کار نکرد، دیگری را روشن کنید.": "One config for each server; add each to the WireGuard app on its own. If one does not work, turn the other on.",
 #"برای هر سرویسی که از سرور می‌رود، چند دامنه‌اش امتحان می‌شود: یک اتصال امن روی ۴۴۳ با گواهی خود سرویس. دو جا:": "For every service that goes through the server, a few of its domains are tested: a secure connection on 443 with the service’s own certificate. In two places:",
 #"برای همهٔ سرورها کانفیگ دارید": "You have a config for every server",
-#"برای همهٔ سرورها کانفیگ دارید.": "You have a config for every server.",
 #"برای همهٔ قالب‌ها مسدود است (": "is blocked for every template (",
 #"برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت (اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت (DOH) یا (DOT) جلویشان.": "To find which domain a service needs: pick the customer, press the button and ask them to open the service that does not work during that time. “via relay” means it went through the server, “direct” means it went directly (if the service does not accept Iran, add those domains on the domains page), “filtered” means Iran’s own filter. DoH and DoT queries show too, marked (DOH) or (DOT).",
 #"برای کار کردن، این‌ها هم باید روشن باشند:": "For it to work, these must be on too:",
 #"برای کانال خصوصی، لینک دعوت کانال را هم بنویسید (مثل https://t.me/+AbCd...)": "For a private channel, write its invitation link too (like https://t.me/+AbCd...)",
-#"برای کانفیگ تازه، سرور را انتخاب کنید:": "For a new config, choose the server:",
 #"برای کدام خریدها": "For which purchases",
-#"برای کدام سرور؟": "For which server?",
 #"برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.": "Message support for a WireGuard config.",
 #"برداشتن": "Remove",
 #"برداشته شد": "Removed",
@@ -41364,6 +41442,8 @@ exit 0
 #"در انتظار همگام‌سازی": "Waiting for sync",
 #"در انتظار پلن": "Waiting for a plan",
 #"در برنامهٔ WireGuard: + ← Scan from QR code": "In the WireGuard app: + → Scan from QR code",
+#"در برنامهٔ WireGuard: + ← Scan from QR code، یا فایل را باز کنید.": "In the WireGuard app: + → Scan from QR code, or open the file.",
+#"در برنامهٔ WireGuard: + ← اسکن QR، یا فایل را باز کنید.": "In the WireGuard app: + → scan the QR, or open the file.",
 #"در تلگرام به": "in Telegram to",
 #"در تیکت «": "in ticket “",
 #"در حال آوردن کاربرهای بعدی…": "Loading more users…",
@@ -41407,7 +41487,6 @@ exit 0
 #"دریافت نشد": "Not fetched",
 #"دریافت پروفایل": "Get the profile",
 #"دریافت پروفایل آیفون📱": "Get iPhone profile📱",
-#"دریافت کانفیگ وایرگارد": "Get a WireGuard config",
 #"دسترسی": "Access",
 #"دسترسی ادمین": "Admin access",
 #"دسترسی ندارید": "No access",
@@ -42257,6 +42336,7 @@ exit 0
 #"هنوز چیزی نیامده و نرفته.": "Nothing has come in or gone out yet.",
 #"هنوز چیزی نیست": "Nothing yet",
 #"هنوز چیزی نیست. چند دقیقه بعد از اولین استفاده این‌جا پر می‌شود.": "Nothing yet. This fills up a few minutes after first use.",
+#"هنوز کانفیگی ندارید.": "You have no config yet.",
 #"هنوز کسی ثبت‌نام نکرده.": "Nobody has signed up yet.",
 #"هنوز کلیدی نساخته‌اید.": "You have not made any keys yet.",
 #"هنوز گزارشی نداده": "Has not reported yet",
@@ -42474,6 +42554,7 @@ exit 0
 #"کانفیگ فقط روی آی‌پی‌های ثبت‌شدهٔ مشتری کار کند": "Configs work only from the customer's registered addresses",
 #"کانفیگ هنوز آماده نیست؛ یک دقیقهٔ دیگر دوباره امتحان کنید": "The config is not ready yet; try again in a minute",
 #"کانفیگ وایرگارد": "WireGuard config",
+#"کانفیگ وایرگارد برای همهٔ سرورها ساخته شد؛ تا یک دقیقهٔ دیگر فعال می‌شوند": "WireGuard configs made for every server; they work within a minute",
 #"کانفیگ وایرگارد حذف شد": "WireGuard config deleted",
 #"کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ تیکت بزنید": "Support makes WireGuard configs for you; open a ticket",
 #"کانفیگ وایرگارد ساخته شد": "WireGuard config made",
@@ -42481,6 +42562,7 @@ exit 0
 #"کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود": "WireGuard config made; it works on the server within a minute",
 #"کانفیگ،": "configs,",
 #"کانفیگ‌ها (": "Configs (",
+#"کانفیگ‌های وایرگارد": "WireGuard configs",
 #"کجا رفت": "Where it went",
 #"کد": "Code",
 #"کد اتصال درست نیست": "The link code is not correct",
@@ -42689,7 +42771,6 @@ exit 0
 #"✅ همهٔ سرورها به نسخهٔ": "✅ All servers upgraded to version",
 #"✅ پردازندهٔ": "✅ Processor of",
 #"✅ پلن رزرو شما فعال شد:": "✅ Your reserved plan has started:",
-#"✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود.": "✅ WireGuard config made; it works on the server within a minute.",
 #"✅ گواهی HTTPS": "✅ HTTPS certificate",
 #"✅ یک دستگاه اضافه شد؛ حالا": "✅ A device was added; now you have",
 #"✍️ جواب": "✍️ Reply",
@@ -42703,7 +42784,6 @@ exit 0
 #"❓ راهنما": "❓ Help",
 #"➕ تیکت تازه": "➕ New ticket",
 #"➕ شارژ کیف پول": "➕ Top up wallet",
-#"➕ کانفیگ تازه": "➕ New config",
 #"🆕 نسخهٔ تازه از گیت‌هاب": "🆕 New version from GitHub",
 #"🌍 DNS عمومی روشن است: هر کسی آدرس رله را بگذارد، بدون ثبت‌نام و ثبت آی‌پی سرویس می‌گیرد.": "🌍 Public DNS is on: anyone who sets the relay’s address gets the service, with no sign-up and no registered IP.",
 #"🌐 DNS معمولی — در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی یکی از این‌ها بگذارید:": "🌐 Plain DNS — on a console, modem or phone, set both the first and the second DNS to one of these:",
@@ -42757,6 +42837,8 @@ exit 0
 #"📢 عضویت در کانال": "📢 Join the channel",
 #"📣 پیام همگانی": "📣 Broadcast message",
 #"📥 دریافت کانفیگ وایرگارد": "📥 Get a WireGuard config",
+#"📥 کانفیگ سرورهای تازه": "📥 Configs for the new servers",
+#"📥 کانفیگ‌ها و QR کدها": "📥 Configs and QR codes",
 #"📦 پلن:": "📦 Plan:",
 #"📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):": "📱 Android — Settings → Network → Private DNS → hostname (DoT):",
 #"📱 دستگاه اضافه": "📱 Extra device",
@@ -42765,6 +42847,7 @@ exit 0
 #"📱 دستگاه:": "📱 Devices:",
 #"📱 دستگاه‌ها و تغییر آی‌پی": "📱 Devices and IP changes",
 #"📱 دستگاه‌های الان:": "📱 Devices now:",
+#"📲 همهٔ کانفیگ‌ها و QR کدها": "📲 All configs and QR codes",
 #"📲 پروفایل آیفون": "📲 iPhone profile",
 #"🔄 آدرس DoH تازه": "🔄 New DoH address",
 #"🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ این را روی دستگاه‌هایتان بگذارید:": "🔄 A new address has been made. The old one stops working within a minute; put this one on your devices:",
@@ -42794,7 +42877,6 @@ exit 0
 #"🛡 وایرگارد": "🛡 WireGuard",
 #"🛡 وایرگارد آنلاین": "🛡 WireGuard online",
 #"🛡 کانفیگ وایرگارد": "🛡 WireGuard config",
-#"🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا فایل را باز کنید.": "🛡 WireGuard config — in the WireGuard app: + → scan the QR, or open the file.",
 #"🛡 کانفیگ وایرگارد:": "🛡 WireGuard configs:",
 #"🛡 کانفیگ‌های وایرگارد": "🛡 WireGuard configs of",
 #"🟢 آنلاین": "🟢 online",

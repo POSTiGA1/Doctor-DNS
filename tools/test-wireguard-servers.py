@@ -71,7 +71,8 @@ sara = lambda: store.one("SELECT * FROM users WHERE id = 2")
 print("which server")
 view = panel.wg_view(store, user(), relays)
 check("both relays offered, named as beside the DNS",
-      view["relays"] == [{"ip": A, "label": "سرور 1"}, {"ip": B, "label": "سرور 2"}]
+      view["relays"] == [{"ip": A, "label": "سرور 1", "note": ""},
+                         {"ip": B, "label": "سرور 2", "note": ""}]
       and view["room"] == 2)
 r = panel.wg_customer_new(store, user(), relays, B)
 check("a config on the server chosen", r.get("ok") and store.one(
@@ -96,43 +97,87 @@ check("the customer's page and the bot pass the server chosen",
       'wg_customer_new(self.store, user, self.relays, body.get("relay"))' in psrc
       and psrc.count('body.get("relay")') >= 2)
 
-print("the customer's page")
+print("everything at once")
+store.set_setting("server_note:" + A, "مخابرات")
+store.set_setting("server_note:" + B, "ایرانسل")
+r = panel.wg_customer_new(store, sara(), relays)
+check("nothing chosen: a config for every server in one go",
+      r.get("ok") and len(r["device_ids"]) == 2 and {store.one(
+          "SELECT relay FROM wg_devices WHERE id = ?", (i,))["relay"] for i in r["device_ids"]}
+      == {A, B} and "همهٔ سرورها" in r["message"])
+check("  and again: nothing left to make",
+      panel.wg_customer_new(store, sara(), relays).get("error") == "wg_have")
+every = panel.wg_handout_all(store, sara(), relays)
+check("all of them handed out together, in the DNS's order, each with its server and its words",
+      [(c["server"], c["note"]) for c in every["configs"]]
+      == [("سرور 1", "مخابرات"), ("سرور 2", "ایرانسل")]
+      and all(c["config"].startswith("[Interface]") for c in every["configs"]))
+store.run("UPDATE users SET relays = ? WHERE id = 2", (B,))
+check("a customer given only the second server: it is their Server 1, as beside the DNS",
+      [c["server"] for c in panel.wg_handout_all(store, sara(), relays)["configs"]
+       if c["relay"] == B] == ["سرور 1"])
+store.run("UPDATE users SET relays = NULL WHERE id = 2")
+page = sync.wg_all_page(dict(every, self=True))
+check("the customer's page: every config on one page, each under its server and its words",
+      page.count("data:image/png;base64,") + page.count("/wg/") >= 2
+      and page.index("سرور 1") < page.index("مخابرات") < page.index("سرور 2")
+      < page.index("ایرانسل") and page.count("<textarea") == 2
+      and page.count("action='/wg-del'") == 2 and "action='/wg-new'" not in page)
 box = sync.wg_box({"wg": panel.wg_view(store, sara(), relays)})
-check("two servers without a config: the customer picks",
-      "<select name='relay'>" in box and "value='%s'" % B in box and "سرور 2" in box)
-box = sync.wg_box({"wg": panel.wg_view(store, user(), relays)})
-check("  one for each already: each named by its server, nothing more to get",
-      " — سرور 1" in box and " — سرور 2" in box and "action='/wg-new'" not in box)
-one = {"on": True, "self": True, "room": 1, "relays": [{"ip": A, "label": "سرور 1"}],
-       "devices": []}
-check("  one server: nothing to pick, the server sent along",
-      "<select" not in sync.wg_box({"wg": one})
-      and "name='relay' value='%s'" % A in sync.wg_box({"wg": one}))
+check("  the account page: how each is doing and one link, no button for another server",
+      "href='/wg'" in box and "مخابرات" in box and "ایرانسل" in box
+      and "action='/wg-new'" not in box and "<select" not in box)
+fresh = {"on": True, "self": True, "room": 2, "devices": [],
+         "relays": [{"ip": A, "label": "سرور 1"}, {"ip": B, "label": "سرور 2"}]}
+check("  none yet: one button for all, nothing to pick",
+      "action='/wg-new'" in sync.wg_box({"wg": fresh}) and "<select" not in sync.wg_box(
+          {"wg": fresh}) and "name='relay'" not in sync.wg_box({"wg": fresh}))
 ssrc = open(os.path.join(ROOT, "templates", "smartdns-sync"), encoding="utf-8").read()
-check("  the choice reaches the panel", '"relay": form.get("relay") or ""' in ssrc)
+check("  made or deleted: back to all of them together",
+      'return self.redirect("/wg", res.get("message", ""))' in ssrc
+      and 'self.ask_panel("/user-wg-all", {})' in ssrc)
 
 print("the bot")
-said, posted = [], []
+said, photos, docs = [], [], []
 
 
 class FakePanel:
     def call(self, method, path, body=None, idem=None):
-        posted.append((method, path, body))
+        if path.endswith("/wg/all"):
+            return panel.wg_handout_all(store, sara(), relays)
         return {"wg": panel.wg_view(store, sara(), relays)}
 
 
+class FakeTg:
+    def photo(self, chat, png, caption):
+        photos.append(caption)
+
+    def document(self, chat, name, blob, caption):
+        docs.append(name)
+
+
 b = bot.Bot.__new__(bot.Bot)
-b.panel, b.en = FakePanel(), False
+b.panel, b.en, b.tg = FakePanel(), False, FakeTg()
 b.say = lambda chat, text, markup=None: said.append((text, markup))
+b.t = lambda text: text
 bot.Bot.show_wg(b, 5, {"id": 222})
 text, markup = said[-1]
 flat = [x for row in markup["inline_keyboard"] for x in row]
-check("a button for each server without a config, its address in the button's data",
-      any(x["callback_data"] == "wgnew:" + A for x in flat)
-      and any(x["callback_data"] == "wgnew:" + B for x in flat))
+check("one button for all the configs, a delete for each server, no server to pick",
+      any(x["callback_data"] == "wgall" for x in flat)
+      and sum(x["callback_data"].startswith("wgdel:") for x in flat) == 2
+      and not any(x["callback_data"].startswith("wgnew") for x in flat)
+      and "مخابرات" in text and "ایرانسل" in text)
+bot.Bot.send_wg_all(b, 5, [dict(c, qr="iVBORw0KGgo=") for c in
+                           panel.wg_handout_all(store, sara(), relays)["configs"]])
+check("  sent one after another, each QR under its server and its words",
+      len(docs) == 2 and len(photos) == 2 and ((photos[0].startswith("🛡 سرور 1" + chr(10) + "مخابرات")
+                                         and photos[1].startswith("🛡 سرور 2" + chr(10) + "ایرانسل"))))
 bsrc = open(os.path.join(ROOT, "examples", "telegram-bot", "bot.py"), encoding="utf-8").read()
-check("  and the server sent with the new config",
-      '{"relay": arg} if arg else None' in bsrc)
+check("  a new one makes them all and sends them all",
+      "return self.send_wg_all(chat, res.get(\"configs\") or [res])" in bsrc)
+for d in store.q("SELECT id FROM wg_devices WHERE user_id = 2"):
+    panel.delete_wg_device(store, 2, d["id"])
 
 print("the admin panel")
 admin.DB = db
