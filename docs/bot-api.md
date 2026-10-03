@@ -157,6 +157,15 @@ curl -s -H "Authorization: Bearer $KEY" $API/users/123456789/usage
 
 آدرس DoH شخصی مشتری را عوض می‌کند، برای وقتی که به دست کس دیگری افتاده. آدرس قبلی تا یک دقیقه بعد (همگام‌سازی بعدی رله) از کار می‌افتد. جواب همان `user` است با `doh` تازه.
 
+### وایرگارد — `GET|POST /users/{telegram_id}/wg`، `GET|DELETE /users/{telegram_id}/wg/{id}`
+
+وایرگارد کنار DNS: گوشی مشتری با برنامهٔ WireGuard فقط به رله وصل می‌شود و از راه آن فقط سرویس‌هایی که این سرویس باز می‌کند؛ VPN نیست و آی‌پی ثبت کردن نمی‌خواهد. هر کانفیگ یک دستگاه از `max_ips` است. `user.wg_on` می‌گوید دکمه‌اش را نشان بدهید یا نه.
+
+- `GET /users/{telegram_id}/wg` — `{"wg": {"on", "self", "room", "devices": [{"id", "address", "name", "file", "last", "online", "blocked"}]}}`. `self` یعنی ادمین گذاشته مشتری خودش بسازد و حذف کند؛ `room` تعداد دستگاه‌های خالی.
+- `POST /users/{telegram_id}/wg` — کانفیگ تازه؛ `201` با همان چیزی که `GET .../wg/{id}` می‌دهد. پر بودن دستگاه‌ها `409` با `devices_full`؛ وقتی ادمین ساختن را به مشتری نداده `403` با `wg_admin_only`؛ پلنی که وایرگارد ندارد `400` با `wg_plan`.
+- `GET /users/{telegram_id}/wg/{id}` — `{"config": متن کانفیگ, "file": "doctor-dns-12.conf", "qr": PNG به base64 یا ""}`؛ عکس QR را بفرستید تا در برنامه اسکن شود و متن را به شکل فایل با همان `file`.
+- `DELETE /users/{telegram_id}/wg/{id}` — حذف؛ دستگاهش آزاد می‌شود.
+
 ### `POST /users/{telegram_id}/ips` — ثبت آی‌پی
 
 ```sh

@@ -112,7 +112,7 @@ check("the installer puts it on the exit",
       "payload SMARTDNS_API_GUARD > /usr/local/bin/smartdns-api-guard" in logic
       and logic.index("payload SMARTDNS_API_GUARD") < logic.index("install_payload PANEL_SERVICE"))
 check("the exit gets nftables for it",
-      re.search(r'WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables"', logic) is not None)
+      re.search(r'WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables[ "]', logic) is not None)
 check("the installer says whether it holds", "port 8443 answers the relays only" in logic)
 check("uninstall takes the rule away", "nft delete table inet smartdns_api;" in logic)
 

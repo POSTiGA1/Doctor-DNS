@@ -318,6 +318,31 @@ class Store:
             self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
         if have and "relay_exits" not in have:
             self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
+        # WireGuard configs, and their addresses in ips - the panel's too,
+        # here as well so the users page opened before the panel has started
+        # after an upgrade can tell them from typed addresses.
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(ips)")}
+        if have and "wg" not in have:
+            self.db.execute("ALTER TABLE ips ADD COLUMN wg INTEGER NOT NULL DEFAULT 0")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS wg_devices ("
+            " id INTEGER PRIMARY KEY,"
+            " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+            " relay TEXT NOT NULL, address TEXT NOT NULL UNIQUE,"
+            " public_key TEXT NOT NULL UNIQUE, private_key BLOB NOT NULL, name TEXT,"
+            " created_at TEXT NOT NULL, last_handshake TEXT, last_endpoint TEXT,"
+            " blocked_day TEXT)")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS wg_endpoints ("
+            " device_id INTEGER NOT NULL REFERENCES wg_devices(id) ON DELETE CASCADE,"
+            " day TEXT NOT NULL, ip TEXT NOT NULL, PRIMARY KEY (device_id, day, ip))")
+        if have:
+            self.db.execute(
+                "CREATE TRIGGER IF NOT EXISTS wg_ip_gone AFTER DELETE ON ips WHEN OLD.wg = 1"
+                " BEGIN DELETE FROM wg_devices WHERE address = OLD.ip; END")
+            self.db.execute(
+                "CREATE TRIGGER IF NOT EXISTS wg_device_gone AFTER DELETE ON wg_devices"
+                " BEGIN DELETE FROM ips WHERE ip = OLD.address AND wg = 1; END")
         # Plans bought to start when the running one ends - the panel's too.
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS reserved_plans ("
@@ -2927,6 +2952,10 @@ def forget_server(ip):
     STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
               ("alert_state:%:" + ip, "alert_state:exit:" + ip + ":%"))
     STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("net_month:" + ip, "cap:" + ip))
+    # Its WireGuard configs too: they point at a server that is gone, and
+    # each would keep a device of its customer's.
+    STORE.run("DELETE FROM wg_devices WHERE relay = ?", (ip,))
+    STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("wg_pub:" + ip, "wg_error:" + ip))
 
 
 def current_hosts():
@@ -4107,10 +4136,15 @@ def set_devices(db, uid, total, extra=None):
     else:
         db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
                    (total, max(0, int(extra)), uid))
-    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
-                     (uid,)).fetchall()
-    for row in ips[total:]:
-        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
+    # Each device has an address for the DNS and a WireGuard config, so the
+    # two are trimmed apart: the newest of each kind, up to the devices.
+    for wg in (0, 1):
+        ips = db.execute("SELECT id FROM ips WHERE user_id = ? AND wg = ?"
+                         " ORDER BY added_at DESC, id DESC", (uid, wg)).fetchall()
+        if wg:
+            continue            # configs are one per relay, not devices
+        for row in ips[total:]:
+            db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
     return total
 
 
@@ -4140,18 +4174,373 @@ def devices_card(p):
 def devices_cell(p, r):
     """The users table's address, with the account's devices: how many of
     them it holds, every address, and a way to change the number."""
-    ips = [x["ip"] for x in STORE.q("SELECT ip FROM ips WHERE user_id = ? ORDER BY added_at",
-                                    (r["id"],))]
+    ips = [x["ip"] for x in STORE.q("SELECT ip FROM ips WHERE user_id = ? AND wg = 0"
+                                    " ORDER BY added_at", (r["id"],))]
+    configs = STORE.one("SELECT count(*) c FROM wg_devices WHERE user_id = ?", (r["id"],))["c"]
     total = r["max_ips"] or 1
+    # A WireGuard config takes a device as an address does; it is listed on
+    # its own page, where it is made and deleted.
+    wg = ("<label><a href='/%s/wg?u=%d'>🛡 کانفیگ وایرگارد: %d از %d</a></label>"
+          % (p, r["id"], configs, max(len(wg_ready_relays()), configs))
+          if configs or wg_on() else "")
+    # A device has an address for the DNS and a WireGuard config both: the
+    # count beside it is the addresses'.
     return ("<details><summary title='دستگاه‌ها'>📱 %d/%d</summary>"
             "<form method='post' action='/%s/user-devices'>"
-            "<input type='hidden' name='id' value='%d'>%s"
+            "<input type='hidden' name='id' value='%d'>%s%s"
             "<label>تعداد دستگاه <input name='devices' value='%d' size='2' dir='ltr'></label>"
             "<button class='ghost'>ذخیره</button></form></details>"
             % (len(ips), total, p, r["id"],
                "".join("<label><code dir='ltr'>%s</code></label>" % html.escape(x)
                        for x in ips) or "<label class='muted'>آی‌پی ثبت نشده</label>",
-               total))
+               wg, total))
+
+
+# ---------------------------------------------------------------- WireGuard
+# Split WireGuard beside the DNS - see the panel, where the relays are told.
+# Here: the admin's switch, and a customer's configs to make and hand over.
+WG_NET_PREFIX = "10.66."
+WG_RELAY_ADDR = "10.66.0.1"
+_P25519 = 2 ** 255 - 19
+
+
+def x25519(scalar, point):
+    """RFC 7748's X25519 in plain Python - the panel's, to make a config's
+    key here without WireGuard or a library."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(bytes(k), "little")
+    p = _P25519
+    x1 = int.from_bytes(point, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b = (x2 + z2) % p, (x2 - z2) % p
+        aa, bb = a * a % p, b * b % p
+        e = (aa - bb) % p
+        c, d = (x3 + z3) % p, (x3 - z3) % p
+        da, cb = d * a % p, c * b % p
+        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+        x2, z2 = aa * bb % p, e * (aa + 121665 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+def wg_keypair():
+    priv = bytearray(os.urandom(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    pub = x25519(bytes(priv), (9).to_bytes(32, "little"))
+    return (base64.b64encode(bytes(priv)).decode("ascii"),
+            base64.b64encode(pub).decode("ascii"))
+
+
+def wg_setting(key):
+    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else ""
+
+
+def wg_on():
+    return wg_setting("wg_on") == "1"
+
+
+def wg_port():
+    raw = wg_setting("wg_port").strip()
+    return int(raw) if raw.isdigit() and 1 <= int(raw) <= 65535 else 51820
+
+
+WG_NAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+
+
+def wg_list(key):
+    """A list the admin ticked - relays, plans - or None for all of them."""
+    try:
+        value = json.loads(wg_setting(key) or "null")
+    except ValueError:
+        return None
+    return [str(x) for x in value] if isinstance(value, list) else None
+
+
+def wg_name():
+    raw = wg_setting("wg_name").strip()
+    return raw if WG_NAME_RE.fullmatch(raw) else "doctor-dns"
+
+
+def wg_file_name(device_id):
+    """name-12.conf, the name cut so the whole stays a valid tunnel name."""
+    tail = "-%d" % device_id
+    return "%s%s.conf" % (wg_name()[:max(1, 15 - len(tail))], tail)
+
+
+def wg_mtu():
+    raw = wg_setting("wg_mtu").strip()
+    return int(raw) if raw.isdigit() and 1280 <= int(raw) <= 1500 else None
+
+
+def wg_keepalive():
+    raw = wg_setting("wg_keepalive").strip()
+    return int(raw) if raw.isdigit() and int(raw) <= 120 else 25
+
+
+def wg_relay_domain(relay):
+    return urllib.parse.urlparse(wg_setting("panel_url:" + relay) or "").hostname or ""
+
+
+def wg_endpoint_host(relay):
+    if wg_setting("wg_endpoint") == "domain" and wg_relay_domain(relay):
+        return wg_relay_domain(relay)
+    return relay
+
+
+def wg_config(dev):
+    """The config a customer imports - the panel's, word for word."""
+    server = wg_setting("wg_pub:" + dev["relay"])
+    priv = unseal(dev["private_key"])
+    if not server or priv is None:
+        return ""
+    mtu, keep = wg_mtu(), wg_keepalive()
+    return ("[Interface]\nPrivateKey = %s\nAddress = %s/32\nDNS = %s\n%s\n"
+            "[Peer]\nPublicKey = %s\nEndpoint = %s:%d\nAllowedIPs = %s/32\n%s"
+            % (priv.decode("ascii"), dev["address"], dev["relay"],
+               "MTU = %d\n" % mtu if mtu else "", server, wg_endpoint_host(dev["relay"]),
+               wg_port(), dev["relay"], "PersistentKeepalive = %d\n" % keep if keep else ""))
+
+
+def wg_ready_relays():
+    """The relays WireGuard is ready on and the admin left it on."""
+    only = wg_list("wg_relays")
+    return [r for r in relay_list() if wg_setting("wg_pub:" + r)
+            and (only is None or r in only)]
+
+
+def wg_create(uid, relay=None):
+    """A new config for a customer, on the relay chosen or the first that
+    has WireGuard ready: its sentence, starting with ! when it was refused."""
+    if not wg_on():
+        return "!وایرگارد خاموش است؛ اول در تنظیمات روشنش کنید"
+    user = STORE.one("SELECT * FROM users WHERE id = ?", (uid,))
+    if not user:
+        return "!این کاربر پیدا نشد"
+    plans = wg_list("wg_plans")
+    if plans is not None and str(user["plan_id"]) not in plans:
+        return "!پلن این کاربر وایرگارد ندارد؛ در تب وایرگارد پلن‌ها را عوض کنید"
+    # One config for each relay, as one DNS address for each.
+    have = {r["relay"] for r in STORE.q("SELECT relay FROM wg_devices WHERE user_id = ?",
+                                        (uid,))}
+    ready = wg_ready_relays()
+    if relay and relay not in ready:
+        return "!روی این رله وایرگارد آماده نیست"
+    if relay in have:
+        return "!این کاربر برای این رله کانفیگ دارد"
+    if ready and all(r in have for r in ready):
+        return "!این کاربر برای همهٔ رله‌ها کانفیگ دارد"
+    relay = relay or next((r for r in ready if r not in have), None)
+    if not relay:
+        return "!وایرگارد هنوز روی هیچ رله‌ای آماده نیست؛ یک دقیقه بعد دوباره امتحان کنید"
+    priv, pub = wg_keypair()
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with STORE.lock:
+        taken = {r[0] for r in STORE.db.execute(
+            "SELECT address FROM wg_devices UNION SELECT ip FROM ips WHERE ip LIKE '10.66.%'")}
+        address = None
+        for n in range(2, 256 * 256 - 1):
+            a = "%s%d.%d" % (WG_NET_PREFIX, n // 256, n % 256)
+            if n % 256 not in (0, 255) and a != WG_RELAY_ADDR and a not in taken:
+                address = a
+                break
+        if address is None:
+            return "!جای کانفیگ تازه نمانده است"
+        STORE.db.execute(
+            "INSERT INTO wg_devices (user_id, relay, address, public_key, private_key,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (uid, relay, address, pub, seal(priv.encode("ascii")), stamp))
+        STORE.db.execute("INSERT INTO ips (user_id, ip, added_at, wg) VALUES (?, ?, ?, 1)",
+                         (uid, address, stamp))
+        STORE.db.commit()
+    return "کانفیگ وایرگارد ساخته شد؛ تا یک دقیقه دیگر روی رله فعال می‌شود"
+
+
+def wg_admin_page(p):
+    """The WireGuard tab: what is happening, every choice the admin has, and
+    the configs, newest connection first."""
+    on = wg_on()
+    relays = relay_list()
+    picked_relays = wg_list("wg_relays")
+    picked_plans = wg_list("wg_plans")
+    stamp = datetime.now(timezone.utc)
+    recent = (stamp - timedelta(minutes=3)).isoformat(timespec="seconds")
+    n_all = STORE.one("SELECT count(*) c FROM wg_devices")["c"]
+    n_on = STORE.one("SELECT count(*) c FROM wg_devices WHERE last_handshake > ?",
+                     (recent,))["c"]
+    n_users = STORE.one("SELECT count(DISTINCT user_id) c FROM wg_devices")["c"]
+    n_blocked = STORE.one("SELECT count(*) c FROM wg_devices WHERE blocked_day = ?",
+                          (stamp.astimezone(TEHRAN).strftime("%Y-%m-%d"),))["c"]
+    out = ["<div class='card'><h2>🛡 وایرگارد</h2><div class='grid'>%s</div></div>" % "".join(
+        "<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>" % (v, l)
+        for v, l in (
+            ("روشن" if on else "خاموش", "وایرگارد"), (n_all, "کانفیگ"),
+            (n_on, "آنلاین الان"), (n_users, "مشتری با کانفیگ"),
+            (n_blocked, "قطع تا فردا (سقف آی‌پی)")))]
+
+    def tick(name, value, checked, label):
+        return ("<label style='display:inline-block;margin-inline-end:14px'><input "
+                "type='checkbox' name='%s' value='%s'%s> %s</label>"
+                % (name, html.escape(value, quote=True), " checked" if checked else "", label))
+
+    relay_rows = []
+    for r in relays:
+        pub, error = wg_setting("wg_pub:" + r), wg_setting("wg_error:" + r)
+        state = ("<span class='bad'>%s</span>" % html.escape(error) if error
+                 else "آماده" if pub and on else "خاموش" if not on else "در انتظار رله")
+        dom = wg_relay_domain(r)
+        relay_rows.append(tick("relay", r, picked_relays is None or r in picked_relays,
+                               "<code dir='ltr'>%s</code>%s — %s" % (
+                                   html.escape(r), " (<code dir='ltr'>%s</code>)"
+                                   % html.escape(dom) if dom else "", state)))
+    plans = STORE.q("SELECT id, name FROM plans WHERE is_trial = 0 ORDER BY active DESC, price")
+    plan_rows = "".join(tick("plan", str(x["id"]), picked_plans is None
+                             or str(x["id"]) in picked_plans, html.escape(x["name"]))
+                        for x in plans) or "<span class='muted'>هنوز پلنی نیست</span>"
+    endpoint = wg_setting("wg_endpoint") or "ip"
+    out.append(
+        "<div class='card'><h2>🛡 تنظیمات وایرگارد</h2>"
+        "<form method='post' action='/%s/wg-save'>"
+        "<label style='display:inline'><input type='checkbox' name='on' value='1'%s> "
+        "<b>روشن</b></label> <label style='display:inline;margin-inline-start:14px'>"
+        "<input type='checkbox' name='self' value='1'%s> مشتری خودش در پنل و ربات کانفیگ "
+        "بسازد و حذف کند</label> <label style='display:inline;margin-inline-start:14px'>"
+        "<input type='checkbox' name='bind' value='1'%s> کانفیگ فقط روی آی‌پی‌های "
+        "ثبت‌شدهٔ مشتری کار کند</label>"
+        "<h3>رله‌هایی که وایرگارد دارند</h3><div>%s</div>"
+        "<h3>پلن‌هایی که وایرگارد دارند</h3>"
+        "<label style='display:inline'><input type='radio' name='plans_mode' value='all'%s> "
+        "همهٔ پلن‌ها</label> <label style='display:inline'><input type='radio' "
+        "name='plans_mode' value='some'%s> فقط این‌ها:</label><div>%s</div>"
+        "<h3>کانفیگ</h3>"
+        "<label>اسم تونل در اپ وایرگارد <input name='name' value='%s' size='16' dir='ltr' "
+        "maxlength='15'></label>"
+        "<label>آدرس سرور در کانفیگ "
+        "<label style='display:inline'><input type='radio' name='endpoint' value='ip'%s> "
+        "آی‌پی رله</label> <label style='display:inline'><input type='radio' name='endpoint' "
+        "value='domain'%s> دامنهٔ رله</label></label>"
+        "<label>پورت UDP <input name='port' value='%d' size='6' dir='ltr'></label>"
+        "<label>MTU <input name='mtu' value='%s' size='6' dir='ltr' placeholder='پیش‌فرض'>"
+        "</label>"
+        "<label>Keepalive (ثانیه) <input name='keepalive' value='%d' size='4' dir='ltr'>"
+        "</label>"
+        "<h3>محدودیت‌ها</h3>"
+        "<label>هر کانفیگ از چند آی‌پی در روز <input name='ips' value='%s' size='4' "
+        "dir='ltr' placeholder='بی‌حد'></label>"
+        "<label>حذف کانفیگی که چند روز وصل نشده <input name='unused' value='%s' size='4' "
+        "dir='ltr' placeholder='هرگز'></label>"
+        "<button>ذخیره</button></form>"
+        "<p class='muted'>گوشی مشتری با وایرگارد فقط به رلهٔ ایران وصل می‌شود و از راه "
+        "آن فقط DNS و سرویس‌هایی که این سرویس باز می‌کند؛ بقیهٔ اینترنتش مستقیم است و "
+        "رله چیزی را فوروارد نمی‌کند، پس VPN نیست. هر مشتری برای هر رله یک کانفیگ "
+        "می‌گیرد، مثل یک آدرس DNS برای هر رله. کانفیگ‌ها را از «کاربران ← 📱 دستگاه‌ها» "
+        "بسازید.</p>"
+        "<p class='muted'>با «دامنهٔ رله»، اگر آی‌پی رله عوض شود کانفیگ مشتری‌ها کار "
+        "می‌کند - فقط رکورد دامنه را عوض کنید؛ رله‌ای که دامنه ندارد با آی‌پی می‌ماند. "
+        "پورت و آدرس در کانفیگ‌های ساخته‌شده هم هست: بعد از عوض کردنشان، مشتری‌ها باید "
+        "کانفیگ را دوباره بگیرند. MTU خالی یعنی پیش‌فرض اپ (۱۴۲۰)؛ اگر روی بعضی "
+        "اینترنت‌ها سایت‌ها نیمه باز می‌شوند ۱۲۸۰ را امتحان کنید. Keepalive صفر یعنی "
+        "خاموش. اینترنت موبایل گاهی آی‌پی را عوض می‌کند، پس سقف آی‌پی روزانه را کم "
+        "نگیرید. کانفیگی که حذف خودکار شود، مشتری می‌تواند دوباره بگیرد. با «فقط روی "
+        "آی‌پی‌های ثبت‌شده»، کانفیگ مثل DNS فقط از اینترنتی کار می‌کند که مشتری آی‌پی‌اش "
+        "را ثبت کرده؛ کسی که کانفیگ را از کس دیگری گرفته وصل نمی‌شود، و آی‌پی مشتری‌ای "
+        "که با کانفیگ دیگری وصل شود ۱۰ دقیقه از وایرگارد بسته می‌شود. خاموشش کنید تا "
+        "کانفیگ روی هر اینترنتی و بدون ثبت آی‌پی کار کند.</p></div>"
+        % (p, " checked" if on else "", " checked" if wg_setting("wg_self") != "0" else "",
+           " checked" if wg_setting("wg_bind_ip") != "0" else "",
+           "<br>".join(relay_rows) or
+           "<span class='muted'>هنوز رله‌ای نیست</span>",
+           " checked" if picked_plans is None else "",
+           " checked" if picked_plans is not None else "", plan_rows,
+           html.escape(wg_name(), quote=True),
+           " checked" if endpoint != "domain" else "", " checked" if endpoint == "domain" else "",
+           wg_port(), html.escape(wg_setting("wg_mtu").strip()), wg_keepalive(),
+           html.escape(wg_setting("wg_ips_per_day").strip()),
+           html.escape(wg_setting("wg_unused_days").strip())))
+    rows = STORE.q("SELECT d.*, u.username, u.phone, u.telegram_id FROM wg_devices d"
+                   " JOIN users u ON u.id = d.user_id"
+                   " ORDER BY d.last_handshake IS NULL, d.last_handshake DESC, d.id DESC"
+                   " LIMIT 200")
+    if rows:
+        out.append("<div class='card'><h2>کانفیگ‌ها (%d)</h2><table><tr><th>مشتری</th>"
+                   "<th>آدرس</th><th>رله</th><th>آخرین اتصال</th><th>از</th><th></th></tr>"
+                   % n_all)
+        for d in rows:
+            who = d["username"] or d["phone"] or d["telegram_id"] or "#%d" % d["user_id"]
+            live = d["last_handshake"] and d["last_handshake"] > recent
+            out.append(
+                "<tr><td><a href='/%s/wg?u=%d'>%s</a></td><td><code dir='ltr'>%s</code></td>"
+                "<td><code dir='ltr'>%s</code></td><td>%s</td><td><code dir='ltr'>%s</code></td>"
+                "<td>%s</td></tr>"
+                % (p, d["user_id"], html.escape(str(who)), html.escape(d["address"]),
+                   html.escape(d["relay"]), html.escape(show_date(d["last_handshake"], True))
+                   if d["last_handshake"] else "هنوز وصل نشده",
+                   html.escape(d["last_endpoint"] or ""),
+                   "<span class='pill ok'>آنلاین</span>" if live
+                   else "<span class='pill bad'>قطع تا فردا</span>" if d["blocked_day"] else ""))
+        out.append("</table></div>")
+    return "".join(out)
+
+
+def wg_page(path):
+    """A customer's WireGuard configs: each to copy or download, or delete;
+    and a new one."""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    try:
+        uid = int((q.get("u") or ["0"])[0])
+    except ValueError:
+        uid = 0
+    extra, args = mine()
+    user = STORE.one("SELECT * FROM users u WHERE id = ?" + extra, (uid,) + args)
+    p = CFG["ADMIN_PATH"]
+    if not user:
+        return "<div class='card'><p class='muted'>این کاربر پیدا نشد.</p></div>"
+    who = user["username"] or user["phone"] or user["telegram_id"] or "#%d" % uid
+    devs = STORE.q("SELECT * FROM wg_devices WHERE user_id = ? ORDER BY id", (uid,))
+    out = ["<div class='card'><h2>🛡 کانفیگ‌های وایرگارد %s</h2>"
+           "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a> — برای هر رله یک "
+           "کانفیگ، مثل یک آدرس DNS برای هر رله؛ روی %d دستگاه (آی‌پی ثبت‌شده) کار می‌کند."
+           "</p>"
+           "<form method='post' action='/%s/user-wg-new'><input type='hidden' name='id' "
+           "value='%d'>%s<button>+ کانفیگ تازه</button></form></div>"
+           % (html.escape(str(who)), p, user["max_ips"] or 1, p, uid,
+              "<label>رله <select name='relay'>%s</select></label>" % "".join(
+                  "<option value='%s'>%s</option>" % (html.escape(r, quote=True), html.escape(r))
+                  for r in wg_ready_relays()) if len(wg_ready_relays()) > 1 else "")]
+    for d in devs:
+        text = wg_config(d)
+        seen = (show_date(d["last_handshake"], True) if d["last_handshake"]
+                else "هنوز وصل نشده")
+        out.append(
+            "<div class='card'><h2 dir='ltr' style='text-align:right'>%s</h2>"
+            "<p class='muted'>رله <code dir='ltr'>%s</code> — آخرین اتصال: %s%s%s</p>%s"
+            "<form method='post' action='/%s/user-wg-del' onsubmit='return confirm(%s)'>"
+            "<input type='hidden' name='id' value='%d'><input type='hidden' name='dev' "
+            "value='%d'><button class='del'>حذف این کانفیگ</button></form></div>"
+            % (html.escape(d["address"]), html.escape(d["relay"]), html.escape(seen),
+               " از <code dir='ltr'>%s</code>" % html.escape(d["last_endpoint"])
+               if d["last_endpoint"] else "",
+               " — <span class='bad'>امروز بیش از سقف آی‌پی وصل شده و تا فردا قطع است</span>"
+               if d["blocked_day"] else "",
+               ("<textarea readonly dir='ltr' rows='10' style='width:100%%;font-family:"
+                "monospace'>%s</textarea><p><a href='/%s/wg-conf/%d' download>دانلود فایل "
+                "کانفیگ</a></p>" % (html.escape(text), p, d["id"])) if text
+               else "<p class='muted'>کلید رله هنوز نرسیده؛ یک دقیقه بعد صفحه را تازه کنید.</p>",
+               p, html.escape(json.dumps("این کانفیگ حذف شود؟ گوشی‌ای که با آن وصل است "
+                                         "قطع می‌شود.", ensure_ascii=False), quote=True),
+               uid, d["id"]))
+    return "".join(out)
 
 
 def discounts_card(p):
@@ -5539,7 +5928,7 @@ ADMIN_SECTIONS = (("users", "کاربران"), ("receipts", "رسیدها و ک�
                   ("nodes", "نود و سرورها"), ("settings", "تنظیمات"),
                   ("logs", "لاگ و عیب‌یابی"))
 PAGE_SECTION = {"": ANYONE, "index": ANYONE, "me": ANYONE, "users": "users",
-                "users-rows": "users",
+                "users-rows": "users", "wg": "users", "wireguard": "settings",
                 "wallet": "users", "usage": "users", "receipts": "receipts",
                 "plans": "plans", "pay": "plans", "tickets": "tickets",
                 "templates": "templates", "domains": "templates", "bot": "bot", "api": "bot",
@@ -5551,6 +5940,7 @@ ACTION_SECTION = {
     "users-purge": "users", "user-reserve-cancel": "users",
     "user-relays": "users", "user-exit": "users", "user-devices": "users",
     "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
+    "user-wg-new": "users", "user-wg-del": "users", "wg-save": "settings",
     "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
     "plan-save": "plans", "plan-active": "plans", "plan-delete": "plans", "pay-save": "plans",
     "discount-save": "plans", "discount-active": "plans", "discount-delete": "plans",
@@ -6411,11 +6801,12 @@ def page(title, body, cfg, active="", msg=None, msg_kind="good"):
     for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
                         ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
                         ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
-                        ("bot", "ربات"), ("api", "API"), ("nodes", "نود"), ("settings", "تنظیمات"),
+                        ("bot", "ربات"), ("api", "API"), ("nodes", "نود"),
+                        ("wireguard", "وایرگارد"), ("settings", "تنظیمات"),
                         ("logs", "لاگ"), ("diagnose", "عیب‌یابی"), ("admins", "ادمین‌ها"),
                         ("me", "حساب من")):
         # A single machine has no relays of its own to manage.
-        if path == "nodes" and one_server():
+        if path in ("nodes", "wireguard") and one_server():
             continue
         # Only what this admin may use; the owner has no "my account".
         if not page_allowed(path) or (path == "me" and is_owner()):
@@ -7324,6 +7715,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
         if not self.session_ok():
             return self.send(login_page(CFG))
         special = ("receipts" if rest.startswith("receipt/") else
+                   "users" if rest.startswith("wg-conf/") else
                    "tickets" if rest.startswith("ticket-image/") else
                    OWNER if rest in ("backup.db", "db.key") else
                    PAGE_SECTION.get(rest, OWNER))
@@ -7345,6 +7737,16 @@ class Admin(http.server.BaseHTTPRequestHandler):
             return self.send_key()
         if rest.startswith("receipt/"):
             return self.send_receipt(rest.split("/", 1)[1])
+        if rest.startswith("wg-conf/"):
+            extra, args = mine()
+            dev = STORE.one("SELECT d.* FROM wg_devices d JOIN users u ON u.id = d.user_id"
+                            " WHERE d.id = ?" + extra, (ident,) + args)
+            text = wg_config(dev) if dev else ""
+            if not text:
+                return self.send("<h1>404</h1>", 404)
+            return self.send(text, 200, {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Disposition": "attachment; filename=%s" % wg_file_name(dev["id"])})
         if rest.startswith("ticket-image/"):
             return self.send_ticket_image(rest.split("/", 1)[1])
         if rest == "users-rows":
@@ -7451,6 +7853,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
                  "server": ("آمار سرور", self.server_page),
                  "usage": ("مصرف کاربر", self.user_usage_page),
                  "wallet": ("کیف پول کاربر", self.wallet_page),
+                 "wg": ("وایرگارد کاربر", lambda: wg_page(self.path)),
+                 "wireguard": ("وایرگارد", lambda: wg_admin_page(CFG["ADMIN_PATH"])),
                  "admins": ("ادمین‌ها", self.admins_page),
                  "me": ("حساب من", lambda: me_card(CFG["ADMIN_PATH"]))}
         if rest not in pages:
@@ -7480,12 +7884,18 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       " WHERE 1 = 1" + extra, args)
         act = STORE.one("SELECT count(*) c FROM users u WHERE status = 'active'" + extra, args)
         ips = STORE.one("SELECT count(*) c FROM ips i JOIN users u ON u.id = i.user_id"
-                        " WHERE 1 = 1" + extra, args)
+                        " WHERE i.wg = 0" + extra, args)
         online = online_rows(extra, args) if may("users") else None
         out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
         stats = [(u["c"], "کاربر"), (act["c"], "فعال")]
         if online is not None:
             stats.append((len(online), "آنلاین"))
+            if wg_on():
+                stats.append((STORE.one(
+                    "SELECT count(*) c FROM wg_devices d JOIN users u ON u.id = d.user_id"
+                    " WHERE d.last_handshake >= ?" + extra,
+                    ((datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(
+                        timespec="seconds"),) + args)["c"], "🛡 وایرگارد آنلاین"))
         stats += [(ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")]
         for n, l in stats:
             out.append("<div class='stat'><div class='n'>%s</div>"
@@ -7663,7 +8073,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
             start = 0
             count = min(max(-(-number("upto") // USERS_PER_PAGE), 1) * USERS_PER_PAGE,
                         USERS_MOST)
-        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
+        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id AND wg = 0"
+                       " LIMIT 1)"
                        " ip FROM users u WHERE 1 = 1" + extra + find
                        + " ORDER BY " + order + " LIMIT ? OFFSET ?",
                        args + find_args + (count, start))
@@ -10189,6 +10600,54 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (link,))
             return self.redirect("api?m=%s" % ("آدرس ربات ذخیره شد" if link
                                                else "آدرس ربات برداشته شد"))
+
+        if rest == "wg-save":
+            vals = {k: one(k).strip() for k in ("port", "ips", "mtu", "keepalive", "unused",
+                                                 "name")}
+            back = lambda m: self.redirect("wireguard?m=" + m)
+            if not (vals["port"].isdigit() and 1 <= int(vals["port"]) <= 65535):
+                return back("!پورت وایرگارد عددی از ۱ تا ۶۵۵۳۵ است")
+            for key, what in (("ips", "سقف آی‌پی روزانه"), ("unused", "روزهای حذف خودکار")):
+                if vals[key] and not vals[key].isdigit():
+                    return back("!%s را با عدد بنویسید؛ خالی یعنی خاموش" % what)
+            if vals["mtu"] and not (vals["mtu"].isdigit() and 1280 <= int(vals["mtu"]) <= 1500):
+                return back("!MTU عددی از ۱۲۸۰ تا ۱۵۰۰ است؛ خالی یعنی پیش‌فرض")
+            if not (vals["keepalive"].isdigit() and int(vals["keepalive"]) <= 120):
+                return back("!Keepalive عددی از ۰ تا ۱۲۰ ثانیه است")
+            if not WG_NAME_RE.fullmatch(vals["name"]):
+                return back("!اسم تونل حداکثر ۱۵ حرف انگلیسی، عدد یا - _ . است")
+            known = relay_list()
+            ticked = [r for r in params.get("relay", []) if r in known]
+            plan_ids = {str(r["id"]) for r in STORE.q("SELECT id FROM plans")}
+            plans = [x for x in params.get("plan", []) if x in plan_ids]
+            settings = {
+                "wg_on": "1" if one("on") == "1" else "0", "wg_port": vals["port"],
+                "wg_self": "1" if one("self") == "1" else "0",
+                "wg_bind_ip": "1" if one("bind") == "1" else "0",
+                "wg_ips_per_day": vals["ips"], "wg_mtu": vals["mtu"],
+                "wg_keepalive": vals["keepalive"], "wg_unused_days": vals["unused"],
+                "wg_name": vals["name"],
+                "wg_endpoint": "domain" if one("endpoint") == "domain" else "ip",
+                # Every relay ticked is "all": one added later gets it too.
+                "wg_relays": "" if set(ticked) == set(known) else json.dumps(ticked),
+                "wg_plans": "" if one("plans_mode") != "some" else json.dumps(plans)}
+            for key, value in settings.items():
+                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+            return back("تنظیمات وایرگارد ذخیره شد؛ تا یک دقیقه دیگر روی رله‌ها اعمال می‌شود"
+                        if one("on") == "1" else "وایرگارد خاموش شد")
+
+        if rest == "user-wg-new":
+            uid = int(one("id")) if one("id").isdigit() else 0
+            return self.redirect("wg?u=%d&m=%s" % (uid, wg_create(uid, one("relay").strip()
+                                                                  or None)))
+
+        if rest == "user-wg-del":
+            uid = int(one("id")) if one("id").isdigit() else 0
+            dev = int(one("dev")) if one("dev").isdigit() else 0
+            cur = STORE.run("DELETE FROM wg_devices WHERE id = ? AND user_id = ?", (dev, uid))
+            return self.redirect("wg?u=%d&m=%s" % (uid, "کانفیگ حذف شد" if cur.rowcount
+                                                    else "!این کانفیگ پیدا نشد"))
 
         if rest == "calendar-save":
             cal = "jalali" if one("cal") == "jalali" else "gregorian"

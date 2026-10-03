@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.25"
+VERSION="0.10.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -860,7 +860,7 @@ uninstall() {
     # machine's own python3, curl, openssl or nftables.
     local purge="" purge_list="" pkg
     for pkg in nginx nginx-common nginx-core libnginx-mod-stream dnsmasq coturn certbot \
-               python3-certbot-dns-cloudflare $packages; do
+               python3-certbot-dns-cloudflare wireguard-tools qrencode $packages; do
         case " python3 curl openssl nftables $purge_list " in *" $pkg "*) continue ;; esac
         dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
             && purge_list="$purge_list $pkg"
@@ -944,6 +944,13 @@ uninstall() {
     if nft list table inet smartdns_tunnel >/dev/null 2>&1; then
         nft delete table inet smartdns_tunnel; info "removed the tunnel's firewall table"
     fi
+    # WireGuard, which smartdns-sync brought up when the admin panel said so.
+    if ip link show wg0 >/dev/null 2>&1; then
+        ip link del wg0 && info "removed WireGuard (wg0)"
+    fi
+    nft delete table inet smartdns_wg >/dev/null 2>&1 || true
+    rm -f /etc/nftables.d/42-smartdns-wg.conf
+    rm -rf /etc/smart-dns/wg
     # The tunnels the admin panel set: one per relay on an exit, or a relay's
     # own when this installer did not make it. Not on the list of services.
     local t
@@ -1542,12 +1549,15 @@ remember installed-at "$(date -Is)"
 # ---------------------------------------------------------------- packages
 step "Installing packages"
 if [ "$ROLE" = single ]; then
-    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl"
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl qrencode"
 elif [ "$ROLE" = relay ]; then
-    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl"
+    # wireguard-tools for WireGuard beside the DNS, when the admin panel turns
+    # it on: the kernel has WireGuard, this is the wg command that drives it.
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl wireguard-tools"
 else
     # nftables for the rule that keeps strangers off the sync API.
-    WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables"
+    # qrencode for the WireGuard config's QR code the panel hands customers.
+    WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables qrencode"
 fi
 # Note what was missing beforehand, so uninstall can name exactly what this
 # script added rather than offering to purge nginx from a web server.

@@ -513,6 +513,19 @@ IOS_PROFILE_HELP = ("📲 پروفایل آیفون%s\n\nفایل را باز ک
                     "«Profile Downloaded» ← Install را بزنید.")
 
 
+B_WG = "🛡 کانفیگ وایرگارد"
+WG_HELP = ("🛡 وایرگارد\n\n"
+           "یک راه دیگر برای استفاده از سرویس، کنار DNS؛ جایی که DNS کار نمی‌کند، این کار "
+           "می‌کند.\n\n"
+           "۱. برنامهٔ WireGuard را از App Store یا Google Play نصب کنید.\n"
+           "۲. در برنامه + را بزنید و QR کد را اسکن کنید، یا فایل کانفیگ را باز کنید.\n"
+           "۳. تونل را روشن کنید.\n\n"
+           "فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ بقیهٔ اینترنت مستقیم "
+           "است. برای هر سرور یک کانفیگ، مثل یک آدرس DNS برای هر سرور؛ اگر یکی کار نکرد، "
+           "دیگری را روشن کنید. در اندروید اگر «Private DNS» روشن است خاموشش کنید. کانفیگ را "
+           "به کسی ندهید.")
+
+
 # ------------------------------------------------------------------ the bot
 class Bot:
     def __init__(self, cfg, panel=None, telegram=None):
@@ -854,6 +867,8 @@ class Bot:
                       "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
             buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
             buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+        if u.get("wg_on"):
+            buttons.append({"text": B_WG, "callback_data": "wg"})
         lines.append("")
         lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
         if not u["ips"]:
@@ -888,13 +903,68 @@ class Bot:
         if with_doh:
             buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
             buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+        if u.get("wg_on"):
+            buttons.append({"text": B_WG, "callback_data": "wg"})
         self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
 
     @staticmethod
     def dns_rows(buttons):
-        """The DNS message's buttons: the first two side by side, the iPhone
-        profile's on a row of its own - three do not fit one row on a phone."""
-        return [buttons[:2]] + ([buttons[2:]] if buttons[2:] else [])
+        """The DNS message's buttons: the first two side by side, each after
+        them - the iPhone profile, WireGuard - on a row of its own: three do
+        not fit one row on a phone."""
+        return [buttons[:2]] + [[b] for b in buttons[2:]]
+
+    def show_wg(self, chat, sender, said=""):
+        """The customer's WireGuard: their configs, each to fetch or delete,
+        and a new one while devices are free and the operator lets them."""
+        try:
+            wg = self.panel.call("GET", "/users/%d/wg" % sender["id"])["wg"]
+        except ApiError as e:
+            return self.say(chat, "⚠️ " + str(e))
+        rows = []
+        lines = ([said, ""] if said else []) + [WG_HELP, "", (
+            "روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
+            "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند."), ""]
+        servers = wg.get("relays") or []
+        many = len(servers) > 1 or len({d.get("relay") for d in wg.get("devices") or []}) > 1
+        for d in wg.get("devices") or []:
+            label = (d.get("name") or d.get("file") or d["address"]) + (
+                " — %s" % d["server"] if many and d.get("server") else "")
+            lines.append("• %s — %s" % (label, "🟢 آنلاین" if d.get("online") else
+                                        "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
+                                        "آخرین اتصال: %s" % d["last"] if d.get("last")
+                                        else "هنوز وصل نشده"))
+            row = [{"text": "📥 " + label, "callback_data": "wgget:%d" % d["id"]}]
+            if wg.get("self"):
+                row.append({"text": "🗑 حذف", "callback_data": "wgdel:%d" % d["id"]})
+            rows.append(row)
+        if wg.get("self") and wg.get("room") and len(servers) > 1:
+            # One button per server: one filtered in their city, another may not be.
+            lines.append("برای کانفیگ تازه، سرور را انتخاب کنید:")
+            rows.append([{"text": "➕ " + x["label"], "callback_data": "wgnew:" + x["ip"]}
+                         for x in servers][:3])
+        elif wg.get("self") and wg.get("room"):
+            rows.append([{"text": "➕ کانفیگ تازه" if wg.get("devices")
+                          else "📥 دریافت کانفیگ وایرگارد", "callback_data": "wgnew"}])
+        elif wg.get("self") and wg.get("devices"):
+            lines.append("برای همهٔ سرورها کانفیگ دارید.")
+        elif not wg.get("self") and not wg.get("devices"):
+            lines.append("برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.")
+        return self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else None)
+
+    def send_wg(self, chat, res):
+        """One config: its QR to scan, and its file to open."""
+        caption = self.t("🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا "
+                         "فایل را باز کنید.")
+        try:
+            if res.get("qr"):
+                self.tg.photo(chat, base64.b64decode(res["qr"]), caption)
+            self.tg.document(chat, res["file"], res["config"].encode("utf-8"),
+                             "" if res.get("qr") else caption)
+        except Exception as e:
+            log("WireGuard config not sent to %s: %s" % (chat, e))
+            self.say(chat, "⚠️ کانفیگ فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
+                     "بگیریدش.")
 
     def help_text(self):
         return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -1245,6 +1315,25 @@ class Bot:
                             else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
         if kind == "iosprofile":
             return self.send_profiles(chat, self.profiles_of(self.account(sender)))
+        if kind == "wg":
+            return self.show_wg(chat, sender)
+        if kind in ("wgget", "wgnew"):
+            try:
+                res = (self.panel.call("POST", "/users/%d/wg" % sender["id"],
+                                       {"relay": arg} if arg else None) if kind == "wgnew"
+                       else self.panel.call("GET", "/users/%d/wg/%d" % (sender["id"], int(arg))))
+            except ApiError as e:
+                return self.say(chat, "⚠️ " + str(e))
+            if kind == "wgnew":
+                self.say(chat, "✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
+                         "می‌شود.")
+            return self.send_wg(chat, res)
+        if kind == "wgdel":
+            try:
+                res = self.panel.call("DELETE", "/users/%d/wg/%d" % (sender["id"], int(arg)))
+            except ApiError as e:
+                return self.say(chat, "⚠️ " + str(e))
+            return self.show_wg(chat, sender, "🗑 " + res.get("message", ""))
         if kind == "dohnew":
             self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
             self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "

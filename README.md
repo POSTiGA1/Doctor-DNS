@@ -76,6 +76,7 @@ certificate naming no console host at all.
 | **Monitoring and backups** | alerts for a server gone quiet, a full disk or connection table, a certificate not renewed, high memory or processor; a monthly traffic cap per server; an encrypted backup of the whole panel sent by the bot |
 | **Usage resets** | a customer's or a seller's usage back to zero every so many days, whatever the plan |
 | **Telegram bot** | a ready bot for customers (buy, send the slip, register an address in one tap, the wallet, the invitation link, every server's DNS, DoT and DoH, tickets) and for the operator (approve a receipt with one button, answer tickets, a daily report, a message to many customers at once, with photos and videos); a channel customers must join first; set up from the admin panel; a seller sets up their own |
+| **WireGuard** | beside the DNS, for where DNS does not work: one config per relay, as a QR in the bot and on the customer's page; only the service's own sites go through it, the rest of the phone's internet goes direct, so it is not a VPN; by default a config works only from the customer's registered addresses; off until the admin turns it on |
 | **English** | the admin panel, the customer's page and the bot, in Persian or English |
 | **API** | to plug in a sales bot of your own: [docs/bot-api.md](docs/bot-api.md) (in Persian) |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
@@ -341,6 +342,7 @@ can see, but a firewall rule you wrote yourself it cannot.
 | **8446** tcp | — | loopback only: the exit's route to Google over IPv6, where it has IPv6 |
 | **18119** tcp | — | loopback only: the exit's route to Battle.net's version check |
 | **8444** tcp + udp | only with a tunnel: its port, answering the exit alone — a *reverse* tunnel listens here | the same, for a *direct* tunnel |
+| **51820** udp | only with WireGuard on: its port, changeable in the admin panel's WireGuard tab | — |
 | **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
 
 The admin panel is the one port you choose. It defaults to **9443** and can be

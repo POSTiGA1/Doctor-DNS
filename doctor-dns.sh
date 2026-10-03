@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.9.25"
+VERSION="0.10.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -860,7 +860,7 @@ uninstall() {
     # machine's own python3, curl, openssl or nftables.
     local purge="" purge_list="" pkg
     for pkg in nginx nginx-common nginx-core libnginx-mod-stream dnsmasq coturn certbot \
-               python3-certbot-dns-cloudflare $packages; do
+               python3-certbot-dns-cloudflare wireguard-tools qrencode $packages; do
         case " python3 curl openssl nftables $purge_list " in *" $pkg "*) continue ;; esac
         dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
             && purge_list="$purge_list $pkg"
@@ -944,6 +944,13 @@ uninstall() {
     if nft list table inet smartdns_tunnel >/dev/null 2>&1; then
         nft delete table inet smartdns_tunnel; info "removed the tunnel's firewall table"
     fi
+    # WireGuard, which smartdns-sync brought up when the admin panel said so.
+    if ip link show wg0 >/dev/null 2>&1; then
+        ip link del wg0 && info "removed WireGuard (wg0)"
+    fi
+    nft delete table inet smartdns_wg >/dev/null 2>&1 || true
+    rm -f /etc/nftables.d/42-smartdns-wg.conf
+    rm -rf /etc/smart-dns/wg
     # The tunnels the admin panel set: one per relay on an exit, or a relay's
     # own when this installer did not make it. Not on the list of services.
     local t
@@ -1542,12 +1549,15 @@ remember installed-at "$(date -Is)"
 # ---------------------------------------------------------------- packages
 step "Installing packages"
 if [ "$ROLE" = single ]; then
-    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl"
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl openssl qrencode"
 elif [ "$ROLE" = relay ]; then
-    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl"
+    # wireguard-tools for WireGuard beside the DNS, when the admin panel turns
+    # it on: the kernel has WireGuard, this is the wg command that drives it.
+    WANT="nginx libnginx-mod-stream dnsmasq coturn nftables dnsutils python3 curl wireguard-tools"
 else
     # nftables for the rule that keeps strangers off the sync API.
-    WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables"
+    # qrencode for the WireGuard config's QR code the panel hands customers.
+    WANT="nginx libnginx-mod-stream dnsutils curl python3 openssl nftables qrencode"
 fi
 # Note what was missing beforehand, so uninstall can name exactly what this
 # script added rather than offering to purge nginx from a web server.
@@ -4510,6 +4520,7 @@ exit 0
 #import shutil
 #import sqlite3
 #import ssl
+#import subprocess
 #import sys
 #import threading
 #import time
@@ -4574,6 +4585,37 @@ exit 0
 #    -- The last raw counter this address reported. Usage is the growth of that
 #    -- number, so a user who changes address keeps the total they had built up.
 #    last_counter INTEGER NOT NULL DEFAULT 0
+#);
+#
+#-- WireGuard configs: a customer's phone reaching one relay over WireGuard,
+#-- and through it only that relay - its DNS and the services it routes. Each
+#-- has a fixed address of its own, registered in ips beside the addresses
+#-- customers type (ips.wg = 1), so templates, counters and the gate treat it
+#-- like any other; the triggers below keep the two rows together. The private
+#-- key is kept sealed, as receipts are: it is the customer's config to fetch.
+#CREATE TABLE IF NOT EXISTS wg_devices (
+#    id             INTEGER PRIMARY KEY,
+#    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#    relay          TEXT NOT NULL,
+#    address        TEXT NOT NULL UNIQUE,
+#    public_key     TEXT NOT NULL UNIQUE,
+#    private_key    BLOB NOT NULL,
+#    name           TEXT,
+#    created_at     TEXT NOT NULL,
+#    last_handshake TEXT,
+#    last_endpoint  TEXT,
+#    -- The Tehran day it went over the admin's addresses a day; its peer is
+#    -- off the relay until the next.
+#    blocked_day    TEXT
+#);
+#
+#-- The addresses each config connected from, a day at a time, for the
+#-- admin's limit on how many a config may come from in a day.
+#CREATE TABLE IF NOT EXISTS wg_endpoints (
+#    device_id INTEGER NOT NULL REFERENCES wg_devices(id) ON DELETE CASCADE,
+#    day       TEXT NOT NULL,
+#    ip        TEXT NOT NULL,
+#    PRIMARY KEY (device_id, day, ip)
 #);
 #
 #-- A customer's claim that they paid, and the photograph of the slip.
@@ -5228,6 +5270,18 @@ exit 0
 #    ("admins", "reset_days", "INTEGER"),
 #    ("admins", "reset_next", "TEXT"),
 #    ("users", "extra_devices", "INTEGER NOT NULL DEFAULT 0"),
+#    # An address that is a WireGuard config's, not one the customer typed.
+#    ("ips", "wg", "INTEGER NOT NULL DEFAULT 0"),
+#]
+#
+## A WireGuard config and its address in ips go together, whichever goes
+## first: a customer's address list trimmed to fewer devices, a config
+## deleted, an account deleted. After MIGRATIONS, which adds ips.wg.
+#WG_TRIGGERS = [
+#    "CREATE TRIGGER IF NOT EXISTS wg_ip_gone AFTER DELETE ON ips WHEN OLD.wg = 1"
+#    " BEGIN DELETE FROM wg_devices WHERE address = OLD.ip; END",
+#    "CREATE TRIGGER IF NOT EXISTS wg_device_gone AFTER DELETE ON wg_devices"
+#    " BEGIN DELETE FROM ips WHERE ip = OLD.address AND wg = 1; END",
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -5842,6 +5896,8 @@ exit 0
 #                    )
 #            for statement in INDEXES:
 #                self.db.execute(statement)
+#            for statement in WG_TRIGGERS:
+#                self.db.execute(statement)
 #            for key, value in DEFAULT_SETTINGS.items():
 #                self.db.execute(
 #                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -5974,8 +6030,11 @@ exit 0
 #        plan["games"] = games_in_template(self, plan.pop("template_id"))
 #        return plan
 #
-#    def user_ips(self, user_id):
-#        return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
+#    def user_ips(self, user_id, wg=False):
+#        """The addresses a customer registered - and, with wg, their
+#        WireGuard configs' as well."""
+#        return self.q("SELECT * FROM ips WHERE user_id = ?%s ORDER BY added_at"
+#                      % ("" if wg else " AND wg = 0"), (user_id,))
 #
 #    def allowed(self):
 #        return self.q(
@@ -6821,8 +6880,10 @@ exit 0
 #    else:
 #        db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
 #                   (total, max(0, int(extra)), uid))
-#    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
-#                     (uid,)).fetchall()
+#    # The registered addresses only: WireGuard configs are one per relay,
+#    # not devices, and stay.
+#    ips = db.execute("SELECT id FROM ips WHERE user_id = ? AND wg = 0"
+#                     " ORDER BY added_at DESC, id DESC", (uid,)).fetchall()
 #    for row in ips[total:]:
 #        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
 #    return total
@@ -7250,7 +7311,9 @@ exit 0
 #        store.run("DELETE FROM ip_log WHERE at < ?", ((datetime.now(timezone.utc)
 #                  - timedelta(days=7)).isoformat(timespec="seconds"),))
 #    # One active address per account, with as many changes as they like.
-#    # Replacing rather than adding is what makes that true.
+#    # Replacing rather than adding is what makes that true. A device has its
+#    # WireGuard config besides its address, so configs are neither counted
+#    # here nor what gets replaced.
 #    if existing and len(existing) >= user["max_ips"]:
 #        for old in existing[: len(existing) - user["max_ips"] + 1]:
 #            if old["ip"] != ip:
@@ -7258,6 +7321,437 @@ exit 0
 #    store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
 #              (user_id, ip, now()))
 #    return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+#
+#
+## ---------------------------------------------------------------- WireGuard
+## Split WireGuard beside the DNS: a config reaches one relay, from inside
+## Iran, and through it only that relay - its DNS, and the services it routes,
+## which go on through the relay's tunnel to the exit as they always have.
+## WireGuard straight from Iran to an exit is blocked; to a relay it is not.
+## The relay forwards nothing, so a config is never a VPN.
+#WG_NET = ipaddress.ip_network("10.66.0.0/16")
+#WG_RELAY_ADDR = "10.66.0.1"
+#WG_PORT = 51820
+#WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+#_P25519 = 2 ** 255 - 19
+#
+#
+#def x25519(scalar, point):
+#    """RFC 7748's X25519, in plain Python: a key a config is made with, here,
+#    where there is no WireGuard to ask and no library to import."""
+#    k = bytearray(scalar)
+#    k[0] &= 248
+#    k[31] &= 127
+#    k[31] |= 64
+#    k = int.from_bytes(bytes(k), "little")
+#    p = _P25519
+#    x1 = int.from_bytes(point, "little") & ((1 << 255) - 1)
+#    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+#    for t in range(254, -1, -1):
+#        bit = (k >> t) & 1
+#        if swap ^ bit:
+#            x2, x3, z2, z3 = x3, x2, z3, z2
+#        swap = bit
+#        a, b = (x2 + z2) % p, (x2 - z2) % p
+#        aa, bb = a * a % p, b * b % p
+#        e = (aa - bb) % p
+#        c, d = (x3 + z3) % p, (x3 - z3) % p
+#        da, cb = d * a % p, c * b % p
+#        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+#        x2, z2 = aa * bb % p, e * (aa + 121665 * e) % p
+#    if swap:
+#        x2, z2 = x3, z3
+#    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+#
+#
+#def wg_keypair():
+#    """A new config's private and public key, base64 as WireGuard writes them."""
+#    priv = bytearray(os.urandom(32))
+#    priv[0] &= 248
+#    priv[31] &= 127
+#    priv[31] |= 64
+#    pub = x25519(bytes(priv), (9).to_bytes(32, "little"))
+#    return (base64.b64encode(bytes(priv)).decode("ascii"),
+#            base64.b64encode(pub).decode("ascii"))
+#
+#
+#def wg_on(store):
+#    return store.setting("wg_on") == "1"
+#
+#
+#def wg_port(store):
+#    raw = (store.setting("wg_port") or "").strip()
+#    return int(raw) if raw.isdigit() and 1 <= int(raw) <= 65535 else WG_PORT
+#
+#
+## The name a config goes by in the WireGuard app, which is its file's name:
+## what a network interface may be called, 15 characters at most.
+#WG_NAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+#
+#
+#def wg_list(store, key):
+#    """A list the admin ticked - relays, plans - or None for all of them."""
+#    try:
+#        value = json.loads(store.setting(key) or "null")
+#    except ValueError:
+#        return None
+#    return [str(x) for x in value] if isinstance(value, list) else None
+#
+#
+#def wg_relay_enabled(store, relay):
+#    only = wg_list(store, "wg_relays")
+#    return only is None or relay in only
+#
+#
+#def wg_plan_allows(store, user):
+#    only = wg_list(store, "wg_plans")
+#    return only is None or (user["plan_id"] is not None and str(user["plan_id"]) in only)
+#
+#
+#def wg_name(store):
+#    raw = (store.setting("wg_name") or "").strip()
+#    return raw if WG_NAME_RE.fullmatch(raw) else "doctor-dns"
+#
+#
+#def wg_file_name(name, device_id):
+#    """name-12.conf, the name cut so the whole stays a valid tunnel name."""
+#    tail = "-%d" % device_id
+#    return "%s%s.conf" % (name[:max(1, 15 - len(tail))], tail)
+#
+#
+#def wg_mtu(store):
+#    raw = (store.setting("wg_mtu") or "").strip()
+#    return int(raw) if raw.isdigit() and 1280 <= int(raw) <= 1500 else None
+#
+#
+#def wg_keepalive(store):
+#    raw = (store.setting("wg_keepalive") or "").strip()
+#    return int(raw) if raw.isdigit() and int(raw) <= 120 else 25
+#
+#
+#def wg_endpoint_host(store, relay):
+#    """The relay's name in a config, when the admin chose names and the relay
+#    has one - a config then outlives the relay's address - else its address."""
+#    if store.setting("wg_endpoint") == "domain":
+#        host = urllib.parse.urlparse(store.setting("panel_url:" + relay) or "").hostname
+#        if host:
+#            return host
+#    return relay
+#
+#
+#def wg_ips_limit(store):
+#    """How many addresses one config may connect from in a day, or None."""
+#    raw = (store.setting("wg_ips_per_day") or "").strip()
+#    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+#
+#
+#def wg_day(when=None):
+#    return (when or datetime.now(timezone.utc)).astimezone(TEHRAN).strftime("%Y-%m-%d")
+#
+#
+#def wg_relays_for(store, user, relays):
+#    """The relays this customer may have a config on: WireGuard ready there,
+#    the admin left it on, and it serves them - in the panel's order."""
+#    return [r for r in relays
+#            if store.setting("wg_pub:" + r) and wg_relay_enabled(store, r)
+#            and user["id"] not in kept_off(store, r, relays)]
+#
+#
+#def wg_relay_for(store, user, relays):
+#    """The relay a new config goes to when the customer did not choose."""
+#    ready = wg_relays_for(store, user, relays)
+#    return ready[0] if ready else None
+#
+#
+#def wg_server_label(store, relay, relays):
+#    """How a customer is shown a relay: Server 1, 2 - its place among the
+#    panel's relays, which they also see beside their DNS addresses."""
+#    n = relays.index(relay) + 1 if relay in relays else 0
+#    return "سرور %d" % n if n else relay
+#
+#
+#def wg_devices_of(store, uid):
+#    return store.q("SELECT * FROM wg_devices WHERE user_id = ? ORDER BY id", (uid,))
+#
+#
+#def create_wg_device(store, uid, relays, name=None, relay=None):
+#    """A new WireGuard config for a customer, on a device of theirs - on the
+#    relay they chose, or the first that serves them. Taken from the plan's
+#    devices, like an address; refused when they are full."""
+#    if not wg_on(store):
+#        return refused("wg_off", "وایرگارد روی این سرویس روشن نیست")
+#    user = store.one("SELECT * FROM users WHERE id = ?", (uid,))
+#    if not user:
+#        return refused("user_not_found", "این حساب پیدا نشد")
+#    if user["status"] == "suspended":
+#        return refused("suspended", "این حساب مسدود است")
+#    if not wg_plan_allows(store, user):
+#        return refused("wg_plan", "پلن این حساب وایرگارد ندارد")
+#    # One config for each relay, as there is one DNS address for each: the
+#    # devices are the addresses the customer registers, and every config
+#    # works on all of them, as both DNS addresses do.
+#    ready = wg_relays_for(store, user, relays)
+#    if relay and relay not in ready:
+#        return refused("wg_bad_relay", "روی این سرور وایرگارد نیست؛ سرور دیگری را "
+#                                       "انتخاب کنید")
+#    if not ready:
+#        return refused("wg_not_ready", "وایرگارد هنوز روی هیچ سروری آماده نیست؛ چند "
+#                                       "دقیقهٔ دیگر دوباره امتحان کنید")
+#    have = {d["relay"] for d in wg_devices_of(store, uid)}
+#    if relay in have:
+#        return refused("wg_have", "برای این سرور کانفیگ دارید")
+#    relay = relay or next((r for r in ready if r not in have), None)
+#    if not relay:
+#        return refused("wg_have", "برای همهٔ سرورها کانفیگ دارید")
+#    priv, pub = wg_keypair()
+#    stamp = now()
+#    with store.lock:
+#        taken = {r[0] for r in store.db.execute(
+#            "SELECT address FROM wg_devices UNION SELECT ip FROM ips WHERE ip LIKE '10.66.%'")}
+#        address = next((str(a) for a in WG_NET.hosts()
+#                        if str(a) != WG_RELAY_ADDR and a.packed[3] not in (0, 255)
+#                        and str(a) not in taken), None)
+#        if address is None:
+#            return refused("wg_full", "جای کانفیگ تازه نمانده است")
+#        cur = store.db.execute(
+#            "INSERT INTO wg_devices (user_id, relay, address, public_key, private_key, name,"
+#            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+#            (uid, relay, address, pub, seal(priv.encode("ascii")),
+#             (name or "").strip()[:40] or None, stamp))
+#        store.db.execute("INSERT INTO ips (user_id, ip, added_at, wg) VALUES (?, ?, ?, 1)",
+#                         (uid, address, stamp))
+#        store.db.commit()
+#    log(INFO, "WireGuard config %d for user %d on %s, %s" % (cur.lastrowid, uid, relay, address))
+#    return {"ok": True, "device_id": cur.lastrowid,
+#            "message": "کانفیگ وایرگارد ساخته شد",
+#            "config": wg_config(store, cur.lastrowid)}
+#
+#
+#def delete_wg_device(store, uid, device_id):
+#    cur = store.run("DELETE FROM wg_devices WHERE id = ? AND user_id = ?", (device_id, uid))
+#    if not cur.rowcount:
+#        return refused("wg_not_found", "این کانفیگ پیدا نشد")
+#    return {"ok": True, "message": "کانفیگ وایرگارد حذف شد"}
+#
+#
+#def wg_config(store, device_id):
+#    """The config a customer imports, or "" when it cannot be made here: the
+#    relay's key not known yet, or the private key sealed on another machine."""
+#    dev = store.one("SELECT * FROM wg_devices WHERE id = ?", (device_id,))
+#    if not dev:
+#        return ""
+#    server = store.setting("wg_pub:" + dev["relay"])
+#    priv = unseal(dev["private_key"])
+#    if not server or priv is None:
+#        return ""
+#    # Only the relay goes through the tunnel: its DNS, and the addresses its
+#    # DNS gives for the services it routes, which are its own.
+#    mtu, keep = wg_mtu(store), wg_keepalive(store)
+#    return ("[Interface]\n"
+#            "PrivateKey = %s\n"
+#            "Address = %s/32\n"
+#            "DNS = %s\n"
+#            "%s"
+#            "\n"
+#            "[Peer]\n"
+#            "PublicKey = %s\n"
+#            "Endpoint = %s:%d\n"
+#            "AllowedIPs = %s/32\n"
+#            "%s"
+#            % (priv.decode("ascii"), dev["address"], dev["relay"],
+#               "MTU = %d\n" % mtu if mtu else "", server,
+#               wg_endpoint_host(store, dev["relay"]), wg_port(store), dev["relay"],
+#               "PersistentKeepalive = %d\n" % keep if keep else ""))
+#
+#
+#def wg_self(store):
+#    """Whether customers make and delete their configs themselves, on their
+#    page and in the bot - the admin's choice, on unless turned off."""
+#    return store.setting("wg_self") != "0"
+#
+#
+#def wg_bind(store):
+#    """Whether a config works only from its customer's registered addresses,
+#    as the DNS does - the admin's choice, on unless turned off."""
+#    return store.setting("wg_bind_ip") != "0"
+#
+#
+#def wg_offered(store, user, relays):
+#    """Whether this customer is offered WireGuard at all: on, their plan has
+#    it, and a relay that serves them has it ready."""
+#    return bool(wg_on(store) and user["status"] != "suspended"
+#                and wg_plan_allows(store, user) and wg_relay_for(store, user, relays))
+#
+#
+#def wg_view(store, user, relays):
+#    """A customer's WireGuard, for their page and the bot: whether it is
+#    offered, whether they may make and delete configs, how many devices are
+#    free, and their configs - without the keys, which come one at a time."""
+#    devices = wg_devices_of(store, user["id"])
+#    recent = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec="seconds")
+#    day, name, cal = wg_day(), wg_name(store), calendar_of(store)
+#    view = {
+#        "on": wg_offered(store, user, relays) or bool(devices and wg_on(store)),
+#        "self": wg_self(store),
+#        # The servers without a config of theirs yet, one config each.
+#        "relays": [{"ip": r, "label": wg_server_label(store, r, relays)}
+#                   for r in wg_relays_for(store, user, relays)
+#                   if r not in {d["relay"] for d in devices}],
+#        "bind": wg_bind(store),
+#        "devices": [{"id": d["id"], "address": d["address"], "name": d["name"] or "",
+#                     "relay": d["relay"], "server": wg_server_label(store, d["relay"], relays),
+#                     "file": wg_file_name(name, d["id"]),
+#                     "last": show_date(d["last_handshake"], cal, True)
+#                     if d["last_handshake"] else "",
+#                     "online": bool(d["last_handshake"] and d["last_handshake"] > recent),
+#                     "blocked": d["blocked_day"] == day}
+#                    for d in devices]}
+#    view["room"] = len(view["relays"])
+#    return view
+#
+#
+#QRENCODE = "/usr/bin/qrencode"
+#
+#
+#def wg_qr_png(text):
+#    """A config as a QR code, a PNG the WireGuard app scans - from qrencode,
+#    which the installer puts on the exit; None when it is not there."""
+#    if not text or not os.access(QRENCODE, os.X_OK):
+#        return None
+#    try:
+#        made = subprocess.run([QRENCODE, "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"],
+#                              input=text.encode("utf-8"), capture_output=True, timeout=20)
+#    except (OSError, subprocess.SubprocessError):
+#        return None
+#    return made.stdout if made.returncode == 0 and made.stdout.startswith(b"\x89PNG") else None
+#
+#
+#def wg_handout(store, uid, device_id):
+#    """One config of this customer's, to import: its text, its file's name,
+#    and its QR as base64 PNG ("" without qrencode)."""
+#    dev = store.one("SELECT * FROM wg_devices WHERE id = ? AND user_id = ?", (device_id, uid))
+#    if not dev:
+#        return refused("wg_not_found", "این کانفیگ پیدا نشد")
+#    text = wg_config(store, dev["id"])
+#    if not text:
+#        return refused("wg_not_ready", "کانفیگ هنوز آماده نیست؛ یک دقیقهٔ دیگر دوباره "
+#                                       "امتحان کنید")
+#    qr = wg_qr_png(text)
+#    return {"ok": True, "id": dev["id"], "config": text, "file": wg_file_name(wg_name(store),
+#                                                                              dev["id"]),
+#            "qr": base64.b64encode(qr).decode("ascii") if qr else ""}
+#
+#
+#def wg_customer_new(store, user, relays, relay=None):
+#    """A config the customer makes themselves - when the admin lets them -
+#    on the server they chose, or the first."""
+#    if not wg_self(store):
+#        return refused("wg_admin_only", "کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ "
+#                                        "تیکت بزنید")
+#    relay = str(relay or "").strip() or None
+#    res = create_wg_device(store, user["id"], relays, relay=relay)
+#    if res.get("ok"):
+#        res.pop("config", None)
+#        res["message"] = ("کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
+#                          "می‌شود")
+#    return res
+#
+#
+#def wg_customer_delete(store, user, device_id):
+#    if not wg_self(store):
+#        return refused("wg_admin_only", "برای حذف کانفیگ به پشتیبانی پیام بدهید")
+#    return delete_wg_device(store, user["id"], device_id)
+#
+#
+#def wg_spec(store, relay):
+#    """What a relay's sync is told: WireGuard on or off, its port, and the
+#    configs that are its. A customer whose plan has ended stays on it: their
+#    address is not on the allowed list, so the gate shows them why."""
+#    if not wg_on(store) or not wg_relay_enabled(store, relay):
+#        return {"on": False}
+#    day = wg_day()
+#    rows = store.q("SELECT public_key, address, user_id FROM wg_devices WHERE relay = ?"
+#                   " AND (blocked_day IS NULL OR blocked_day != ?) ORDER BY id", (relay, day))
+#    bind = wg_bind(store)
+#    # Bound, each config carries its customer's registered addresses: the
+#    # relay lets only those reach WireGuard, and stops a config that is used
+#    # from somebody else's.
+#    typed = {}
+#    if bind:
+#        for r in store.q("SELECT i.user_id, i.ip FROM ips i JOIN wg_devices d"
+#                         " ON d.user_id = i.user_id WHERE d.relay = ? AND i.wg = 0", (relay,)):
+#            typed.setdefault(r["user_id"], set()).add(r["ip"])
+#    return {"on": True, "port": wg_port(store), "bind": bind,
+#            "peers": [dict({"pub": r["public_key"], "addr": r["address"]},
+#                           **({"ips": sorted(typed.get(r["user_id"], ()))} if bind else {}))
+#                      for r in rows]}
+#
+#
+#def wg_prune_unused(store, stamp=None):
+#    """Configs that have not connected for the admin's number of days - or
+#    never, that long after they were made - deleted, their devices free."""
+#    raw = (store.setting("wg_unused_days") or "").strip()
+#    if not raw.isdigit() or int(raw) < 1:
+#        return 0
+#    cutoff = ((stamp or datetime.now(timezone.utc)) - timedelta(days=int(raw))).isoformat(
+#        timespec="seconds")
+#    gone = store.q("SELECT id, user_id FROM wg_devices"
+#                   " WHERE COALESCE(last_handshake, created_at) < ?", (cutoff,))
+#    for row in gone:
+#        store.run("DELETE FROM wg_devices WHERE id = ?", (row["id"],))
+#        log(INFO, "WireGuard config %d of user %d deleted: unused for %s days"
+#            % (row["id"], row["user_id"], raw))
+#    return len(gone)
+#
+#
+#def record_wg_state(store, relay, state):
+#    """What a relay says of its WireGuard: its public key, and when and from
+#    where each config last connected - which is what the admin's limit on
+#    addresses a day is counted from."""
+#    if not isinstance(state, dict):
+#        return
+#    pub = str(state.get("pub") or "")
+#    if WG_KEY_RE.fullmatch(pub) and store.setting("wg_pub:" + relay) != pub:
+#        store.set_setting("wg_pub:" + relay, pub)
+#    error = str(state.get("error") or "")[:300]
+#    if store.setting("wg_error:" + relay) != error:
+#        store.set_setting("wg_error:" + relay, error)
+#    peers = state.get("peers")
+#    if not isinstance(peers, dict):
+#        return
+#    day, limit = wg_day(), wg_ips_limit(store)
+#    for key, seen in list(peers.items())[:5000]:
+#        if not isinstance(seen, dict) or not WG_KEY_RE.fullmatch(str(key)):
+#            continue
+#        dev = store.one("SELECT * FROM wg_devices WHERE public_key = ? AND relay = ?",
+#                        (str(key), relay))
+#        if not dev:
+#            continue
+#        try:
+#            hs = int(seen.get("hs") or 0)
+#        except (TypeError, ValueError):
+#            hs = 0
+#        ep = str(seen.get("ep") or "")
+#        ep = ep if valid_ip(ep) else ""
+#        if not hs:
+#            continue
+#        at = datetime.fromtimestamp(hs, timezone.utc).isoformat(timespec="seconds")
+#        if at != dev["last_handshake"] or ep != (dev["last_endpoint"] or ""):
+#            store.run("UPDATE wg_devices SET last_handshake = ?, last_endpoint = ? WHERE id = ?",
+#                      (at, ep or None, dev["id"]))
+#        if not ep:
+#            continue
+#        store.run("INSERT OR IGNORE INTO wg_endpoints (device_id, day, ip) VALUES (?, ?, ?)",
+#                  (dev["id"], day, ep))
+#        if limit and dev["blocked_day"] != day:
+#            n = store.one("SELECT count(*) c FROM wg_endpoints WHERE device_id = ? AND day = ?",
+#                          (dev["id"], day))["c"]
+#            if n > limit:
+#                store.run("UPDATE wg_devices SET blocked_day = ? WHERE id = ?", (day, dev["id"]))
+#                log(WARN, "WireGuard config %d of user %d connected from %d addresses today,"
+#                          " over %d - off until tomorrow" % (dev["id"], dev["user_id"], n, limit))
+#    store.run("DELETE FROM wg_endpoints WHERE day < ?",
+#              (wg_day(datetime.now(timezone.utc) - timedelta(days=7)),))
 #
 #
 ## ---------------------------------------------------------------- at rest
@@ -8775,6 +9269,8 @@ exit 0
 #
 ## How long a relay or node may go without a report before the operator is told.
 #ALERT_SILENT = 180
+## How long a relay may report without the panel's answers reaching it.
+#ALERT_UNANSWERED = 300
 #
 #
 #def alert(store, key, ok, text):
@@ -8807,6 +9303,21 @@ exit 0
 #            text = ("⚠️ سرور خارج %s از رلهٔ %s در دسترس نیست؛ مشتری‌های این رله از "
 #                    "سرور خارج بعدی می‌روند." % (to, relay))
 #        alert(store, "exit:%s:%s" % (relay, to), bool(st.get("ok")), text)
+#
+#
+#def record_unanswered(store, relay, seconds):
+#    """A relay whose reports arrive but whose answers are lost on the way back:
+#    new customers, plans and settings never reach it. Seen as silence nowhere
+#    else - its reports keep coming."""
+#    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+#        return              # a relay from before does not say
+#    kind = "تک‌سرور" if store.setting("single:" + relay) == "1" else "رله"
+#    stuck = seconds > ALERT_UNANSWERED
+#    alert(store, "unanswered:" + relay, not stuck,
+#          "⚠️ %s %s گزارش می‌دهد ولی %d دقیقه است جواب پنل به آن نمی‌رسد؛ کاربرها و "
+#          "تنظیمات تازه روی آن اعمال نمی‌شوند. راه بین این سرور و پنل را بررسی کنید."
+#          % (kind, relay, int(seconds) // 60) if stuck
+#          else "✅ %s %s دوباره جواب پنل را می‌گیرد." % (kind, relay))
 #
 #
 #def check_servers(store, relays, nodes):
@@ -9359,6 +9870,11 @@ exit 0
 #                             " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
 #        "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
 #        "online": one("SELECT count(*) FROM users u WHERE last_seen >= ?", (online_since(),)),
+#        # WireGuard: configs, and those connected in the last three minutes.
+#        "wg_configs": one("SELECT count(*) FROM wg_devices d JOIN users u ON u.id = d.user_id"
+#                          " WHERE 1 = 1"),
+#        "wg_online": one("SELECT count(*) FROM wg_devices d JOIN users u ON u.id = d.user_id"
+#                         " WHERE d.last_handshake >= ?", (online_since(),)),
 #    }
 #
 #
@@ -9372,11 +9888,13 @@ exit 0
 #            "تیکت منتظر جواب: %d\n"
 #            "تست رایگان امروز: %d\n"
 #            "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود\n"
-#            "آنلاین الان: %d"
+#            "آنلاین الان: %d%s"
 #            % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
 #               s["new_today"], s["receipts_pending"], s["approved_today"],
 #               format(s["income_today"], ","), format(s["income_7d"], ","),
-#               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0)))
+#               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0),
+#               "\nوایرگارد: %d کانفیگ، %d آنلاین" % (s["wg_configs"], s.get("wg_online", 0))
+#               if s.get("wg_configs") else ""))
 #
 #
 #def daily_report_due(store, stamp=None):
@@ -9967,6 +10485,11 @@ exit 0
 #                if self.store.setting("forward_check:" + who) != text:
 #                    self.store.set_setting("forward_check:" + who, text)
 #            note_bench(self.store, who, body.get("resolver_bench"))
+#            try:
+#                record_wg_state(self.store, who, body.get("wg_state"))
+#                wg_prune_unused(self.store)
+#            except Exception as e:
+#                log_exception("WireGuard state not recorded: %r" % e)
 #            report = body.get("upstream")
 #            if isinstance(report, dict):
 #                text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -9977,6 +10500,7 @@ exit 0
 #            self.store.record_metrics(who, body.get("host") or {})
 #            try:
 #                record_exit_health(self.store, who, body.get("exit_health"))
+#                record_unanswered(self.store, who, body.get("unanswered"))
 #            except Exception as e:
 #                log_exception("exit health not recorded: %r" % e)
 #            # Quotas are evaluated here, on fresh numbers, so a user who runs
@@ -10081,6 +10605,10 @@ exit 0
 #                                    # Customers sent through another exit.
 #                                    "customer_exits": customer_exits(
 #                                        self.store, [exit_self()] + list(self.nodes), who),
+#                                    # WireGuard, and the configs that are this
+#                                    # relay's - none on a single machine.
+#                                    "wg": wg_spec(self.store, who)
+#                                    if who in self.relays else {"on": False},
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -10121,6 +10649,22 @@ exit 0
 #            return self.reply(200, {"ok": True, "message": (
 #                "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
 #                "گزارش DNS خاموش و پاک شد")})
+#        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config"):
+#            user = self._session_user(body.get("session"))
+#            if not user:
+#                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+#            try:
+#                dev = int(body.get("id") or 0)
+#            except (TypeError, ValueError):
+#                dev = 0
+#            if self.path == "/user-wg-new":
+#                res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
+#            elif self.path == "/user-wg-del":
+#                res = wg_customer_delete(self.store, user, dev)
+#            else:
+#                res = wg_handout(self.store, user["id"], dev)
+#            res.pop("error", None)
+#            return self.reply(200, res)
 #        if self.path == "/user-doh-reset":
 #            user = self._session_user(body.get("session"))
 #            if not user:
@@ -10483,6 +11027,8 @@ exit 0
 #            "name": user["first_name"] or user["username"] or "",
 #            "telegram_id": user["telegram_id"],
 #            "ip": ips[0]["ip"] if ips else None,
+#            # WireGuard: offered or not, and the customer's configs.
+#            "wg": wg_view(self.store, user, self.relays),
 #            "used": user["used_bytes"],
 #            "quota": user["quota_bytes"],
 #            "status": user["status"],
@@ -10744,6 +11290,10 @@ exit 0
 #        # How the bot shows dates.
 #        "calendar": calendar_of(store),
 #        "ips": [r["ip"] for r in store.user_ips(user["id"])],
+#        # Whether the bot offers WireGuard: on for this customer, or configs
+#        # already theirs to fetch.
+#        "wg_on": bool(wg_on(store) and (wg_offered(store, user, relays)
+#                                        or wg_devices_of(store, user["id"]))),
 #        "max_ips": user["max_ips"],
 #        "extra_devices": user["extra_devices"] or 0,
 #        "device_offer": device_offer(store, user),
@@ -11038,6 +11588,10 @@ exit 0
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/discount$"), "discount"),
 #        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_list"),
+#        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_new"),
+#        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_get"),
+#        ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_delete"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
 #        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -11389,6 +11943,35 @@ exit 0
 #        for k in ("week", "last_week", "month", "last_month"):
 #            view[k] = {"up": view[k][0], "down": view[k][1]}
 #        return 200, view
+#
+#    def api_wg_list(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        return 200, {"ok": True, "wg": wg_view(self.store, user, self.relays)}
+#
+#    def api_wg_new(self, body, tg):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
+#        if not res.get("ok"):
+#            return {"wg_have": 409, "wg_admin_only": 403}.get(res["error"], 400), res
+#        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]))
+#
+#    def api_wg_get(self, body, tg, dev):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = wg_handout(self.store, user["id"], int(dev))
+#        return (200 if res.get("ok") else 404), res
+#
+#    def api_wg_delete(self, body, tg, dev):
+#        user, err = self.customer(tg)
+#        if err:
+#            return err
+#        res = wg_customer_delete(self.store, user, int(dev))
+#        return (200 if res.get("ok") else {"wg_admin_only": 403}.get(res["error"], 404)), res
 #
 #    def api_doh_reset(self, body, tg):
 #        user, err = self.customer(tg)
@@ -14845,6 +15428,235 @@ exit 0
 #        pass
 #
 #
+## ------------------------------------------------------------- WireGuard
+## Split WireGuard: a customer's phone reaches this relay over WireGuard, from
+## inside Iran, and through it only this relay - its DNS, and the services its
+## DNS sends here, which go on through the tunnel to the exit as ever. Each
+## config has an address of its own that the panel registers like any other,
+## so the allowed list, the templates, the counters and the gate all treat it
+## the same. Nothing arriving on wg0 is forwarded anywhere: it is never a VPN.
+#WG_BIN = "/usr/bin/wg"
+#WG_IF = "wg0"
+#WG_ADDR = "10.66.0.1/16"
+#WG_NET = ipaddress.ip_network("10.66.0.0/16")
+#WG_DIR = "/etc/smart-dns/wg"
+#WG_KEY = os.path.join(WG_DIR, "server.key")
+#WG_CONF = os.path.join(WG_DIR, WG_IF + ".conf")
+#WG_NFT = "/etc/nftables.d/42-smartdns-wg.conf"
+#WG_TABLE = "smartdns_wg"
+#WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+#WG_REPORT = {"state": None}
+## When the panel's answer last came back - from the start, so a relay just
+## started is not taken for one never answered.
+#SYNC_HEARD = {"at": time.time()}
+## The lock that keeps it from being a VPN, whatever ip_forward says: a
+## docker install or anything else that turns forwarding on still forwards
+## nothing in or out of wg0.
+## An address that used somebody else's config: kept off WireGuard for this
+## long. {address: until}, put back after the table is reloaded.
+#WG_DENY = {}
+#WG_DENY_SECONDS = 600
+#WG_FRESH_SECONDS = 180       # a connected config shakes hands every two minutes
+#
+#
+#def wg_nft_text(port, bind=False, ok=()):
+#    """The lock that keeps it from being a VPN, whatever ip_forward says -
+#    and, bound to registered addresses, the door: only the addresses the
+#    configs' customers registered reach WireGuard, and none that used
+#    somebody else's config lately."""
+#    door = ""
+#    if bind:
+#        door = ("    set ok {\n        type ipv4_addr\n%s    }\n"
+#                "    set deny {\n        type ipv4_addr\n        flags timeout\n    }\n"
+#                "    chain input {\n"
+#                "        type filter hook input priority -5 ; policy accept ;\n"
+#                "        udp dport %d ip saddr @deny drop\n"
+#                "        udp dport %d ip saddr != @ok drop\n"
+#                "    }\n" % (("        elements = { %s }\n" % ", ".join(sorted(ok))) if ok
+#                             else "", port, port))
+#    return ("# written by smartdns-sync: WireGuard reaches this relay and nothing else\n"
+#            "table inet %s\n"
+#            "delete table inet %s\n"
+#            "table inet %s {\n%s"
+#            "    chain forward {\n"
+#            "        type filter hook forward priority -10 ; policy accept ;\n"
+#            "        iifname \"%s\" drop\n"
+#            "        oifname \"%s\" drop\n"
+#            "    }\n"
+#            "}\n" % (WG_TABLE, WG_TABLE, WG_TABLE, door, WG_IF, WG_IF))
+#
+#
+#def wg_peer_ips(raw):
+#    """{config's key: its customer's registered addresses}, for a bound one."""
+#    out = {}
+#    for p in raw if isinstance(raw, list) else []:
+#        if not isinstance(p, dict) or not WG_KEY_RE.fullmatch(str(p.get("pub") or "")):
+#            continue
+#        ips = set()
+#        for ip in p.get("ips") or []:
+#            try:
+#                ips.add(str(ipaddress.IPv4Address(str(ip))))
+#            except ValueError:
+#                pass
+#        out[str(p["pub"])] = ips
+#    return out
+#
+#
+#def wg_police(peer_ips, seen, stamp=None):
+#    """A bound config used from an address that is not its customer's - a
+#    config handed on, from somebody else's registered address: that address
+#    kept off WireGuard for a while. Returns the addresses newly kept off."""
+#    stamp = stamp or time.time()
+#    for ip in [ip for ip, until in WG_DENY.items() if until <= stamp]:
+#        del WG_DENY[ip]
+#    caught = []
+#    for key, st in seen.items():
+#        ep = st.get("ep") or ""
+#        # Only a handshake of the last few minutes: wg keeps a config's last
+#        # address after it is gone, and that must not keep anybody off.
+#        fresh = 0 <= stamp - (st.get("hs") or 0) < WG_FRESH_SECONDS
+#        if (key in peer_ips and fresh and ep and ep not in peer_ips[key]
+#                and ep not in WG_DENY):
+#            WG_DENY[ep] = stamp + WG_DENY_SECONDS
+#            caught.append(ep)
+#            nft("add", "element", "inet", WG_TABLE, "deny",
+#                "{ %s timeout %ds }" % (ep, WG_DENY_SECONDS))
+#            log(WARN, "a WireGuard config was used from %s, not its customer's address -"
+#                      " that address is off WireGuard for %d minutes"
+#                % (ep, WG_DENY_SECONDS // 60))
+#    return caught
+#
+#
+#def wg_server_key():
+#    """This relay's WireGuard key, made once and kept across upgrades:
+#    every config handed out names its public half."""
+#    if not os.path.exists(WG_KEY):
+#        os.makedirs(WG_DIR, mode=0o700, exist_ok=True)
+#        made = sh(WG_BIN, "genkey")
+#        if made.returncode or not WG_KEY_RE.fullmatch(made.stdout.strip()):
+#            raise RuntimeError("wg genkey failed: %s" % made.stderr.strip()[:200])
+#        write_if_changed(WG_KEY, made.stdout.strip() + "\n", 0o600)
+#    priv = (read_text(WG_KEY) or "").strip()
+#    pub = subprocess.run([WG_BIN, "pubkey"], input=priv + "\n", capture_output=True,
+#                         text=True, timeout=30).stdout.strip()
+#    if not WG_KEY_RE.fullmatch(pub):
+#        raise RuntimeError("wg pubkey failed")
+#    return priv, pub
+#
+#
+#def clean_wg_peers(raw):
+#    """The configs the panel sent, each a valid key and an address of ours."""
+#    out = {}
+#    for p in raw if isinstance(raw, list) else []:
+#        if not isinstance(p, dict):
+#            continue
+#        key, addr = str(p.get("pub") or ""), str(p.get("addr") or "")
+#        try:
+#            ip = ipaddress.IPv4Address(addr)
+#        except ValueError:
+#            continue
+#        if WG_KEY_RE.fullmatch(key) and ip in WG_NET and addr != WG_ADDR.split("/")[0]:
+#            out[key] = addr
+#    return out
+#
+#
+#def wg_conf_text(priv, port, peers):
+#    text = "[Interface]\nPrivateKey = %s\nListenPort = %d\n" % (priv, port)
+#    for key, addr in sorted(peers.items(), key=lambda kv: kv[1]):
+#        text += "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n" % (key, addr)
+#    return text
+#
+#
+#def wg_dump():
+#    """{public key: {"hs": latest handshake, "ep": the address it came from}}
+#    for every config that has connected."""
+#    out = {}
+#    r = sh(WG_BIN, "show", WG_IF, "dump")
+#    for line in r.stdout.splitlines()[1:]:
+#        f = line.split("\t")
+#        if len(f) < 5 or not f[4].isdigit() or f[4] == "0":
+#            continue
+#        ep = f[2].rsplit(":", 1)[0] if f[2] != "(none)" else ""
+#        out[f[0]] = {"hs": int(f[4]), "ep": ep}
+#    return out
+#
+#
+#def wg_down():
+#    if sh("ip", "link", "show", WG_IF).returncode == 0:
+#        sh("ip", "link", "del", WG_IF)
+#        log(INFO, "WireGuard off, as the admin panel says")
+#    for path in (WG_NFT, WG_CONF):
+#        if os.path.exists(path):
+#            os.unlink(path)
+#    nft("delete", "table", "inet", WG_TABLE)
+#
+#
+#def apply_wg(raw):
+#    """Bring WireGuard here to what the panel says: on with these configs, or
+#    off. A panel too old to say leaves it as it is."""
+#    if raw is None:
+#        return
+#    if not isinstance(raw, dict) or not raw.get("on") or is_single():
+#        wg_down()
+#        WG_REPORT["state"] = {"on": False}
+#        return
+#    if not os.access(WG_BIN, os.X_OK):
+#        WG_REPORT["state"] = {"on": False, "error": "wireguard-tools روی این رله نصب نیست؛ "
+#                                                    "نصب‌کننده را یک بار دیگر روی رله اجرا کنید"}
+#        return
+#    try:
+#        port = int(raw.get("port") or 51820)
+#    except (TypeError, ValueError):
+#        port = 51820
+#    if not 1 <= port <= 65535:
+#        port = 51820
+#    priv, pub = wg_server_key()
+#    peers = clean_wg_peers(raw.get("peers"))
+#    bind = bool(raw.get("bind"))
+#    peer_ips = wg_peer_ips(raw.get("peers")) if bind else {}
+#    fresh = sh("ip", "link", "show", WG_IF).returncode != 0
+#    if fresh:
+#        made = sh("ip", "link", "add", WG_IF, "type", "wireguard")
+#        if made.returncode:
+#            WG_REPORT["state"] = {"on": False, "pub": pub,
+#                                  "error": "wg0 ساخته نشد: %s" % made.stderr.strip()[:200]}
+#            return
+#    # syncconf adds and drops peers without touching the ones that stay:
+#    # nobody connected is cut off because somebody else joined.
+#    if write_if_changed(WG_CONF, wg_conf_text(priv, port, peers), 0o600) or fresh:
+#        done = sh(WG_BIN, "syncconf", WG_IF, WG_CONF)
+#        if done.returncode:
+#            WG_REPORT["state"] = {"on": False, "pub": pub,
+#                                  "error": "wg syncconf: %s" % done.stderr.strip()[:200]}
+#            return
+#        log(INFO, "WireGuard on port %d, %d config(s)" % (port, len(peers)))
+#    sh("ip", "addr", "replace", WG_ADDR, "dev", WG_IF)
+#    sh("ip", "link", "set", WG_IF, "up")
+#    os.makedirs(os.path.dirname(WG_NFT), exist_ok=True)
+#    ok = set().union(*peer_ips.values()) if peer_ips else set()
+#    if write_if_changed(WG_NFT, wg_nft_text(port, bind, ok)) \
+#            or nft("list", "table", "inet", WG_TABLE).returncode:
+#        locked = nft("-f", WG_NFT)
+#        if locked.returncode:
+#            # Without the lock it would forward if anything turned forwarding
+#            # on: better no WireGuard than a VPN.
+#            wg_down()
+#            WG_REPORT["state"] = {"on": False, "pub": pub,
+#                                  "error": "قفل فوروارد وایرگارد بار نشد: %s"
+#                                           % locked.stderr.strip()[:200]}
+#            return
+#        # The table was made anew: the addresses still kept off go back in.
+#        stamp = time.time()
+#        for ip, until in WG_DENY.items():
+#            if bind and until > stamp:
+#                nft("add", "element", "inet", WG_TABLE, "deny",
+#                    "{ %s timeout %ds }" % (ip, int(until - stamp) + 1))
+#    seen = wg_dump()
+#    if bind:
+#        wg_police(peer_ips, seen)
+#    WG_REPORT["state"] = {"on": True, "pub": pub, "port": port, "peers": seen}
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -14912,6 +15724,13 @@ exit 0
 #        payload["probe_result"] = checked
 #    if TUNNEL_REPORT["state"] is not None:
 #        payload["tunnel_state"] = TUNNEL_REPORT["state"]
+#    if WG_REPORT["state"] is not None:
+#        if WG_REPORT["state"].get("on"):
+#            try:
+#                WG_REPORT["state"]["peers"] = wg_dump()
+#            except Exception as e:
+#                log(WARN, "WireGuard not read: %s" % e)
+#        payload["wg_state"] = WG_REPORT["state"]
 #    if NODE_TUNNEL_REPORT["state"] is not None:
 #        payload["node_tunnel_state"] = NODE_TUNNEL_REPORT["state"]
 #    try:
@@ -14928,7 +15747,11 @@ exit 0
 #    finished_domain = domain_result()
 #    if finished_domain:
 #        payload["domain_result"] = finished_domain
+#    # How long the panel's answers have not come back: the panel hears the
+#    # report and can tell its operator when what it sends is lost on the way.
+#    payload["unanswered"] = int(max(0, time.time() - SYNC_HEARD["at"]))
 #    answer = post("/sync", payload)
+#    SYNC_HEARD["at"] = time.time()
 #    if finished_domain and answer.get("domain_ack"):
 #        domain_heard()
 #    try:
@@ -15027,6 +15850,11 @@ exit 0
 #    except Exception as e:
 #        TUNNEL_REPORT["state"] = {"on": False, "error": str(e)[:300]}
 #        log_exception("tunnel not applied: %s" % e)
+#    try:
+#        apply_wg(answer.get("wg"))
+#    except Exception as e:
+#        WG_REPORT["state"] = {"on": False, "error": str(e)[:300]}
+#        log_exception("WireGuard not applied: %s" % e)
 #    try:
 #        maybe_bench(answer.get("bench"))
 #    except Exception as e:
@@ -16472,6 +17300,86 @@ exit 0
 #    return "".join(out)
 #
 #
+#WG_HELP = ("<h3>نصب</h3>"
+#           "<p class='note'>۱. برنامهٔ <b>WireGuard</b> را از App Store یا Google Play نصب "
+#           "کنید.<br>۲. در برنامه + را بزنید و QR کد را اسکن کنید؛ یا فایل کانفیگ را "
+#           "دانلود کنید و در برنامه «Import from file» / «Create from file» را بزنید."
+#           "<br>۳. تونل را روشن کنید.</p>"
+#           "<p class='note'>فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ "
+#           "بقیهٔ اینترنت شما مثل همیشه مستقیم است. برای هر سرور یک کانفیگ، مثل یک آدرس "
+#           "DNS برای هر سرور؛ اگر یکی کار نکرد، دیگری را روشن کنید. در اندروید اگر «Private "
+#           "DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.</p>")
+#
+#
+#def wg_box(info):
+#    """WireGuard on the account page, when it is offered: the customer's
+#    configs, each to show as a QR and download, and a new one while devices
+#    are free - when the operator lets customers make them."""
+#    wg = info.get("wg") or {}
+#    if not wg.get("on"):
+#        return ""
+#    devices = wg.get("devices") or []
+#    servers = wg.get("relays") or []
+#    many = len(servers) > 1 or len({d.get("relay") for d in devices}) > 1
+#    out = ["<details class='pw' id='wg' open><summary>🛡 وایرگارد</summary>",
+#           "<p class='note'>یک راه دیگر برای استفاده از سرویس، کنار DNS: برنامهٔ "
+#           "وایرگارد را روی گوشی نصب می‌کنید و کانفیگ را به آن می‌دهید. جایی که DNS "
+#           "کار نمی‌کند، این کار می‌کند. %s</p>"
+#           % ("روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
+#              "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند.")]
+#    for d in devices:
+#        state = ("<span class='ok'>آنلاین</span>" if d.get("online") else
+#                 "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
+#                 if d.get("blocked") else
+#                 "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
+#                 else "هنوز وصل نشده")
+#        out.append(
+#            "<div class='dns'><div class='k'>%s%s</div><p class='note' style='margin-top:0'>%s</p>"
+#            "<a class='btn' href='/wg/%d'>QR کد و فایل کانفیگ</a>%s</div>"
+#            % (html.escape(d.get("name") or d.get("file") or d["address"]),
+#               " — %s" % html.escape(d["server"]) if many and d.get("server") else "",
+#               state, d["id"],
+#               ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
+#                "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
+#                "name='id' value='%d'><button class='ghost small'>حذف</button></form>"
+#                % d["id"]) if wg.get("self") else ""))
+#    if wg.get("self") and wg.get("room"):
+#        # More than one server: the customer picks - one filtered in their
+#        # city, another may not be.
+#        pick = ("<label>برای کدام سرور؟</label><select name='relay'>%s</select>"
+#                % "".join("<option value='%s'>%s</option>"
+#                          % (html.escape(x["ip"], quote=True), html.escape(x["label"]))
+#                          for x in servers)) if len(servers) > 1 else "".join(
+#            "<input type='hidden' name='relay' value='%s'>" % html.escape(x["ip"], quote=True)
+#            for x in servers)
+#        out.append("<form method='post' action='/wg-new'>%s<button>%s</button></form>"
+#                   % (pick, "دریافت کانفیگ وایرگارد" if not devices else
+#                      "+ کانفیگ برای سرور دیگر"))
+#    elif wg.get("self") and devices:
+#        out.append("<p class='note'>برای همهٔ سرورها کانفیگ دارید.</p>")
+#    elif not wg.get("self") and not devices:
+#        out.append("<p class='note'>برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.</p>")
+#    out.append(WG_HELP + "</details>")
+#    return "".join(out)
+#
+#
+#def wg_config_page(res):
+#    """One config, to import: its QR, its file, its text to copy."""
+#    qr = res.get("qr") or ""
+#    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>"
+#            + ("<p style='text-align:center'><img alt='QR' style='width:100%%;max-width:300px;"
+#               "image-rendering:pixelated;border-radius:8px' "
+#               "src='data:image/png;base64,%s'></p>"
+#               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+#               "QR code</p>" % html.escape(qr) if qr else "")
+#            + "<a class='btn' href='/wg/%d.conf'>دانلود فایل کانفیگ</a>" % res["id"]
+#            + "<details class='pw'><summary>متن کانفیگ</summary>"
+#            "<textarea readonly dir='ltr' rows='11' style='width:100%%;font-family:monospace;"
+#            "font-size:12px' onclick='this.select()'>%s</textarea></details>"
+#            % html.escape(res.get("config") or "")
+#            + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
+#
+#
 #def doh_box(info, profile="/doh.mobileconfig", setup=False):
 #    """The encrypted-DNS section: folded away on the account page, open on
 #    the setup page a browser that opened the DoH address is sent to."""
@@ -17134,6 +18042,22 @@ exit 0
 #        if path == "/doh.mobileconfig":
 #            return self.send_profile()
 #
+#        m = re.fullmatch(r"/wg/(\d{1,12})(\.conf)?", path)
+#        if m:
+#            if not self.session():
+#                return self.redirect("/login")
+#            res = self.ask_panel("/user-wg-config", {"id": int(m.group(1))})
+#            if res is None:
+#                return self.send_html(NOT_NOW, 502)
+#            if not res.get("ok"):
+#                return self.redirect("/", res.get("message", ""), bad=True)
+#            if m.group(2):
+#                return self.send(res["config"], 200, {
+#                    "Content-Type": "text/plain; charset=utf-8",
+#                    "Content-Disposition": "attachment; filename=%s" % res["file"],
+#                    "Cache-Control": "no-store"})
+#            return self.send_html(wg_config_page(res))
+#
 #        if path.startswith("/doh-setup/"):
 #            return self.doh_setup(path)
 #
@@ -17299,6 +18223,19 @@ exit 0
 #            res = self.ask_panel("/user-qlog", {"on": self.form().get("on") == "1"})
 #            if res is None:
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+#
+#        if path in ("/wg-new", "/wg-del"):
+#            if not self.session():
+#                return self.redirect("/login")
+#            form = self.form()
+#            raw = form.get("id") or ""
+#            res = self.ask_panel("/user-" + path[1:], {"id": int(raw) if raw.isdigit() else 0,
+#                                                       "relay": form.get("relay") or ""})
+#            if res is None:
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            if path == "/wg-new" and res.get("ok") and res.get("device_id"):
+#                return self.redirect("/wg/%d" % res["device_id"], res.get("message", ""))
 #            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
 #        if path == "/doh-reset":
@@ -17755,6 +18692,7 @@ exit 0
 #                "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
 #        body.append(manual_ip_box("/"))
 #        body.append(doh_box(info))
+#        body.append(wg_box(info))
 #        body.append(trial_box(info))
 #        body.append(receipt_box(info))
 #        body.append(wallet_box(info))
@@ -19260,6 +20198,31 @@ exit 0
 #            self.db.execute("ALTER TABLE plans ADD COLUMN exit_pick TEXT")
 #        if have and "relay_exits" not in have:
 #            self.db.execute("ALTER TABLE plans ADD COLUMN relay_exits TEXT")
+#        # WireGuard configs, and their addresses in ips - the panel's too,
+#        # here as well so the users page opened before the panel has started
+#        # after an upgrade can tell them from typed addresses.
+#        have = {r[1] for r in self.db.execute("PRAGMA table_info(ips)")}
+#        if have and "wg" not in have:
+#            self.db.execute("ALTER TABLE ips ADD COLUMN wg INTEGER NOT NULL DEFAULT 0")
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS wg_devices ("
+#            " id INTEGER PRIMARY KEY,"
+#            " user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+#            " relay TEXT NOT NULL, address TEXT NOT NULL UNIQUE,"
+#            " public_key TEXT NOT NULL UNIQUE, private_key BLOB NOT NULL, name TEXT,"
+#            " created_at TEXT NOT NULL, last_handshake TEXT, last_endpoint TEXT,"
+#            " blocked_day TEXT)")
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS wg_endpoints ("
+#            " device_id INTEGER NOT NULL REFERENCES wg_devices(id) ON DELETE CASCADE,"
+#            " day TEXT NOT NULL, ip TEXT NOT NULL, PRIMARY KEY (device_id, day, ip))")
+#        if have:
+#            self.db.execute(
+#                "CREATE TRIGGER IF NOT EXISTS wg_ip_gone AFTER DELETE ON ips WHEN OLD.wg = 1"
+#                " BEGIN DELETE FROM wg_devices WHERE address = OLD.ip; END")
+#            self.db.execute(
+#                "CREATE TRIGGER IF NOT EXISTS wg_device_gone AFTER DELETE ON wg_devices"
+#                " BEGIN DELETE FROM ips WHERE ip = OLD.address AND wg = 1; END")
 #        # Plans bought to start when the running one ends - the panel's too.
 #        self.db.execute(
 #            "CREATE TABLE IF NOT EXISTS reserved_plans ("
@@ -21869,6 +22832,10 @@ exit 0
 #    STORE.run("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
 #              ("alert_state:%:" + ip, "alert_state:exit:" + ip + ":%"))
 #    STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("net_month:" + ip, "cap:" + ip))
+#    # Its WireGuard configs too: they point at a server that is gone, and
+#    # each would keep a device of its customer's.
+#    STORE.run("DELETE FROM wg_devices WHERE relay = ?", (ip,))
+#    STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("wg_pub:" + ip, "wg_error:" + ip))
 #
 #
 #def current_hosts():
@@ -23049,10 +24016,15 @@ exit 0
 #    else:
 #        db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
 #                   (total, max(0, int(extra)), uid))
-#    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
-#                     (uid,)).fetchall()
-#    for row in ips[total:]:
-#        db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
+#    # Each device has an address for the DNS and a WireGuard config, so the
+#    # two are trimmed apart: the newest of each kind, up to the devices.
+#    for wg in (0, 1):
+#        ips = db.execute("SELECT id FROM ips WHERE user_id = ? AND wg = ?"
+#                         " ORDER BY added_at DESC, id DESC", (uid, wg)).fetchall()
+#        if wg:
+#            continue            # configs are one per relay, not devices
+#        for row in ips[total:]:
+#            db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
 #    return total
 #
 #
@@ -23082,18 +24054,373 @@ exit 0
 #def devices_cell(p, r):
 #    """The users table's address, with the account's devices: how many of
 #    them it holds, every address, and a way to change the number."""
-#    ips = [x["ip"] for x in STORE.q("SELECT ip FROM ips WHERE user_id = ? ORDER BY added_at",
-#                                    (r["id"],))]
+#    ips = [x["ip"] for x in STORE.q("SELECT ip FROM ips WHERE user_id = ? AND wg = 0"
+#                                    " ORDER BY added_at", (r["id"],))]
+#    configs = STORE.one("SELECT count(*) c FROM wg_devices WHERE user_id = ?", (r["id"],))["c"]
 #    total = r["max_ips"] or 1
+#    # A WireGuard config takes a device as an address does; it is listed on
+#    # its own page, where it is made and deleted.
+#    wg = ("<label><a href='/%s/wg?u=%d'>🛡 کانفیگ وایرگارد: %d از %d</a></label>"
+#          % (p, r["id"], configs, max(len(wg_ready_relays()), configs))
+#          if configs or wg_on() else "")
+#    # A device has an address for the DNS and a WireGuard config both: the
+#    # count beside it is the addresses'.
 #    return ("<details><summary title='دستگاه‌ها'>📱 %d/%d</summary>"
 #            "<form method='post' action='/%s/user-devices'>"
-#            "<input type='hidden' name='id' value='%d'>%s"
+#            "<input type='hidden' name='id' value='%d'>%s%s"
 #            "<label>تعداد دستگاه <input name='devices' value='%d' size='2' dir='ltr'></label>"
 #            "<button class='ghost'>ذخیره</button></form></details>"
 #            % (len(ips), total, p, r["id"],
 #               "".join("<label><code dir='ltr'>%s</code></label>" % html.escape(x)
 #                       for x in ips) or "<label class='muted'>آی‌پی ثبت نشده</label>",
-#               total))
+#               wg, total))
+#
+#
+## ---------------------------------------------------------------- WireGuard
+## Split WireGuard beside the DNS - see the panel, where the relays are told.
+## Here: the admin's switch, and a customer's configs to make and hand over.
+#WG_NET_PREFIX = "10.66."
+#WG_RELAY_ADDR = "10.66.0.1"
+#_P25519 = 2 ** 255 - 19
+#
+#
+#def x25519(scalar, point):
+#    """RFC 7748's X25519 in plain Python - the panel's, to make a config's
+#    key here without WireGuard or a library."""
+#    k = bytearray(scalar)
+#    k[0] &= 248
+#    k[31] &= 127
+#    k[31] |= 64
+#    k = int.from_bytes(bytes(k), "little")
+#    p = _P25519
+#    x1 = int.from_bytes(point, "little") & ((1 << 255) - 1)
+#    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+#    for t in range(254, -1, -1):
+#        bit = (k >> t) & 1
+#        if swap ^ bit:
+#            x2, x3, z2, z3 = x3, x2, z3, z2
+#        swap = bit
+#        a, b = (x2 + z2) % p, (x2 - z2) % p
+#        aa, bb = a * a % p, b * b % p
+#        e = (aa - bb) % p
+#        c, d = (x3 + z3) % p, (x3 - z3) % p
+#        da, cb = d * a % p, c * b % p
+#        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+#        x2, z2 = aa * bb % p, e * (aa + 121665 * e) % p
+#    if swap:
+#        x2, z2 = x3, z3
+#    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+#
+#
+#def wg_keypair():
+#    priv = bytearray(os.urandom(32))
+#    priv[0] &= 248
+#    priv[31] &= 127
+#    priv[31] |= 64
+#    pub = x25519(bytes(priv), (9).to_bytes(32, "little"))
+#    return (base64.b64encode(bytes(priv)).decode("ascii"),
+#            base64.b64encode(pub).decode("ascii"))
+#
+#
+#def wg_setting(key):
+#    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+#    return row["value"] if row else ""
+#
+#
+#def wg_on():
+#    return wg_setting("wg_on") == "1"
+#
+#
+#def wg_port():
+#    raw = wg_setting("wg_port").strip()
+#    return int(raw) if raw.isdigit() and 1 <= int(raw) <= 65535 else 51820
+#
+#
+#WG_NAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+#
+#
+#def wg_list(key):
+#    """A list the admin ticked - relays, plans - or None for all of them."""
+#    try:
+#        value = json.loads(wg_setting(key) or "null")
+#    except ValueError:
+#        return None
+#    return [str(x) for x in value] if isinstance(value, list) else None
+#
+#
+#def wg_name():
+#    raw = wg_setting("wg_name").strip()
+#    return raw if WG_NAME_RE.fullmatch(raw) else "doctor-dns"
+#
+#
+#def wg_file_name(device_id):
+#    """name-12.conf, the name cut so the whole stays a valid tunnel name."""
+#    tail = "-%d" % device_id
+#    return "%s%s.conf" % (wg_name()[:max(1, 15 - len(tail))], tail)
+#
+#
+#def wg_mtu():
+#    raw = wg_setting("wg_mtu").strip()
+#    return int(raw) if raw.isdigit() and 1280 <= int(raw) <= 1500 else None
+#
+#
+#def wg_keepalive():
+#    raw = wg_setting("wg_keepalive").strip()
+#    return int(raw) if raw.isdigit() and int(raw) <= 120 else 25
+#
+#
+#def wg_relay_domain(relay):
+#    return urllib.parse.urlparse(wg_setting("panel_url:" + relay) or "").hostname or ""
+#
+#
+#def wg_endpoint_host(relay):
+#    if wg_setting("wg_endpoint") == "domain" and wg_relay_domain(relay):
+#        return wg_relay_domain(relay)
+#    return relay
+#
+#
+#def wg_config(dev):
+#    """The config a customer imports - the panel's, word for word."""
+#    server = wg_setting("wg_pub:" + dev["relay"])
+#    priv = unseal(dev["private_key"])
+#    if not server or priv is None:
+#        return ""
+#    mtu, keep = wg_mtu(), wg_keepalive()
+#    return ("[Interface]\nPrivateKey = %s\nAddress = %s/32\nDNS = %s\n%s\n"
+#            "[Peer]\nPublicKey = %s\nEndpoint = %s:%d\nAllowedIPs = %s/32\n%s"
+#            % (priv.decode("ascii"), dev["address"], dev["relay"],
+#               "MTU = %d\n" % mtu if mtu else "", server, wg_endpoint_host(dev["relay"]),
+#               wg_port(), dev["relay"], "PersistentKeepalive = %d\n" % keep if keep else ""))
+#
+#
+#def wg_ready_relays():
+#    """The relays WireGuard is ready on and the admin left it on."""
+#    only = wg_list("wg_relays")
+#    return [r for r in relay_list() if wg_setting("wg_pub:" + r)
+#            and (only is None or r in only)]
+#
+#
+#def wg_create(uid, relay=None):
+#    """A new config for a customer, on the relay chosen or the first that
+#    has WireGuard ready: its sentence, starting with ! when it was refused."""
+#    if not wg_on():
+#        return "!وایرگارد خاموش است؛ اول در تنظیمات روشنش کنید"
+#    user = STORE.one("SELECT * FROM users WHERE id = ?", (uid,))
+#    if not user:
+#        return "!این کاربر پیدا نشد"
+#    plans = wg_list("wg_plans")
+#    if plans is not None and str(user["plan_id"]) not in plans:
+#        return "!پلن این کاربر وایرگارد ندارد؛ در تب وایرگارد پلن‌ها را عوض کنید"
+#    # One config for each relay, as one DNS address for each.
+#    have = {r["relay"] for r in STORE.q("SELECT relay FROM wg_devices WHERE user_id = ?",
+#                                        (uid,))}
+#    ready = wg_ready_relays()
+#    if relay and relay not in ready:
+#        return "!روی این رله وایرگارد آماده نیست"
+#    if relay in have:
+#        return "!این کاربر برای این رله کانفیگ دارد"
+#    if ready and all(r in have for r in ready):
+#        return "!این کاربر برای همهٔ رله‌ها کانفیگ دارد"
+#    relay = relay or next((r for r in ready if r not in have), None)
+#    if not relay:
+#        return "!وایرگارد هنوز روی هیچ رله‌ای آماده نیست؛ یک دقیقه بعد دوباره امتحان کنید"
+#    priv, pub = wg_keypair()
+#    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+#    with STORE.lock:
+#        taken = {r[0] for r in STORE.db.execute(
+#            "SELECT address FROM wg_devices UNION SELECT ip FROM ips WHERE ip LIKE '10.66.%'")}
+#        address = None
+#        for n in range(2, 256 * 256 - 1):
+#            a = "%s%d.%d" % (WG_NET_PREFIX, n // 256, n % 256)
+#            if n % 256 not in (0, 255) and a != WG_RELAY_ADDR and a not in taken:
+#                address = a
+#                break
+#        if address is None:
+#            return "!جای کانفیگ تازه نمانده است"
+#        STORE.db.execute(
+#            "INSERT INTO wg_devices (user_id, relay, address, public_key, private_key,"
+#            " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+#            (uid, relay, address, pub, seal(priv.encode("ascii")), stamp))
+#        STORE.db.execute("INSERT INTO ips (user_id, ip, added_at, wg) VALUES (?, ?, ?, 1)",
+#                         (uid, address, stamp))
+#        STORE.db.commit()
+#    return "کانفیگ وایرگارد ساخته شد؛ تا یک دقیقه دیگر روی رله فعال می‌شود"
+#
+#
+#def wg_admin_page(p):
+#    """The WireGuard tab: what is happening, every choice the admin has, and
+#    the configs, newest connection first."""
+#    on = wg_on()
+#    relays = relay_list()
+#    picked_relays = wg_list("wg_relays")
+#    picked_plans = wg_list("wg_plans")
+#    stamp = datetime.now(timezone.utc)
+#    recent = (stamp - timedelta(minutes=3)).isoformat(timespec="seconds")
+#    n_all = STORE.one("SELECT count(*) c FROM wg_devices")["c"]
+#    n_on = STORE.one("SELECT count(*) c FROM wg_devices WHERE last_handshake > ?",
+#                     (recent,))["c"]
+#    n_users = STORE.one("SELECT count(DISTINCT user_id) c FROM wg_devices")["c"]
+#    n_blocked = STORE.one("SELECT count(*) c FROM wg_devices WHERE blocked_day = ?",
+#                          (stamp.astimezone(TEHRAN).strftime("%Y-%m-%d"),))["c"]
+#    out = ["<div class='card'><h2>🛡 وایرگارد</h2><div class='grid'>%s</div></div>" % "".join(
+#        "<div class='stat'><div class='n'>%s</div><div class='l'>%s</div></div>" % (v, l)
+#        for v, l in (
+#            ("روشن" if on else "خاموش", "وایرگارد"), (n_all, "کانفیگ"),
+#            (n_on, "آنلاین الان"), (n_users, "مشتری با کانفیگ"),
+#            (n_blocked, "قطع تا فردا (سقف آی‌پی)")))]
+#
+#    def tick(name, value, checked, label):
+#        return ("<label style='display:inline-block;margin-inline-end:14px'><input "
+#                "type='checkbox' name='%s' value='%s'%s> %s</label>"
+#                % (name, html.escape(value, quote=True), " checked" if checked else "", label))
+#
+#    relay_rows = []
+#    for r in relays:
+#        pub, error = wg_setting("wg_pub:" + r), wg_setting("wg_error:" + r)
+#        state = ("<span class='bad'>%s</span>" % html.escape(error) if error
+#                 else "آماده" if pub and on else "خاموش" if not on else "در انتظار رله")
+#        dom = wg_relay_domain(r)
+#        relay_rows.append(tick("relay", r, picked_relays is None or r in picked_relays,
+#                               "<code dir='ltr'>%s</code>%s — %s" % (
+#                                   html.escape(r), " (<code dir='ltr'>%s</code>)"
+#                                   % html.escape(dom) if dom else "", state)))
+#    plans = STORE.q("SELECT id, name FROM plans WHERE is_trial = 0 ORDER BY active DESC, price")
+#    plan_rows = "".join(tick("plan", str(x["id"]), picked_plans is None
+#                             or str(x["id"]) in picked_plans, html.escape(x["name"]))
+#                        for x in plans) or "<span class='muted'>هنوز پلنی نیست</span>"
+#    endpoint = wg_setting("wg_endpoint") or "ip"
+#    out.append(
+#        "<div class='card'><h2>🛡 تنظیمات وایرگارد</h2>"
+#        "<form method='post' action='/%s/wg-save'>"
+#        "<label style='display:inline'><input type='checkbox' name='on' value='1'%s> "
+#        "<b>روشن</b></label> <label style='display:inline;margin-inline-start:14px'>"
+#        "<input type='checkbox' name='self' value='1'%s> مشتری خودش در پنل و ربات کانفیگ "
+#        "بسازد و حذف کند</label> <label style='display:inline;margin-inline-start:14px'>"
+#        "<input type='checkbox' name='bind' value='1'%s> کانفیگ فقط روی آی‌پی‌های "
+#        "ثبت‌شدهٔ مشتری کار کند</label>"
+#        "<h3>رله‌هایی که وایرگارد دارند</h3><div>%s</div>"
+#        "<h3>پلن‌هایی که وایرگارد دارند</h3>"
+#        "<label style='display:inline'><input type='radio' name='plans_mode' value='all'%s> "
+#        "همهٔ پلن‌ها</label> <label style='display:inline'><input type='radio' "
+#        "name='plans_mode' value='some'%s> فقط این‌ها:</label><div>%s</div>"
+#        "<h3>کانفیگ</h3>"
+#        "<label>اسم تونل در اپ وایرگارد <input name='name' value='%s' size='16' dir='ltr' "
+#        "maxlength='15'></label>"
+#        "<label>آدرس سرور در کانفیگ "
+#        "<label style='display:inline'><input type='radio' name='endpoint' value='ip'%s> "
+#        "آی‌پی رله</label> <label style='display:inline'><input type='radio' name='endpoint' "
+#        "value='domain'%s> دامنهٔ رله</label></label>"
+#        "<label>پورت UDP <input name='port' value='%d' size='6' dir='ltr'></label>"
+#        "<label>MTU <input name='mtu' value='%s' size='6' dir='ltr' placeholder='پیش‌فرض'>"
+#        "</label>"
+#        "<label>Keepalive (ثانیه) <input name='keepalive' value='%d' size='4' dir='ltr'>"
+#        "</label>"
+#        "<h3>محدودیت‌ها</h3>"
+#        "<label>هر کانفیگ از چند آی‌پی در روز <input name='ips' value='%s' size='4' "
+#        "dir='ltr' placeholder='بی‌حد'></label>"
+#        "<label>حذف کانفیگی که چند روز وصل نشده <input name='unused' value='%s' size='4' "
+#        "dir='ltr' placeholder='هرگز'></label>"
+#        "<button>ذخیره</button></form>"
+#        "<p class='muted'>گوشی مشتری با وایرگارد فقط به رلهٔ ایران وصل می‌شود و از راه "
+#        "آن فقط DNS و سرویس‌هایی که این سرویس باز می‌کند؛ بقیهٔ اینترنتش مستقیم است و "
+#        "رله چیزی را فوروارد نمی‌کند، پس VPN نیست. هر مشتری برای هر رله یک کانفیگ "
+#        "می‌گیرد، مثل یک آدرس DNS برای هر رله. کانفیگ‌ها را از «کاربران ← 📱 دستگاه‌ها» "
+#        "بسازید.</p>"
+#        "<p class='muted'>با «دامنهٔ رله»، اگر آی‌پی رله عوض شود کانفیگ مشتری‌ها کار "
+#        "می‌کند - فقط رکورد دامنه را عوض کنید؛ رله‌ای که دامنه ندارد با آی‌پی می‌ماند. "
+#        "پورت و آدرس در کانفیگ‌های ساخته‌شده هم هست: بعد از عوض کردنشان، مشتری‌ها باید "
+#        "کانفیگ را دوباره بگیرند. MTU خالی یعنی پیش‌فرض اپ (۱۴۲۰)؛ اگر روی بعضی "
+#        "اینترنت‌ها سایت‌ها نیمه باز می‌شوند ۱۲۸۰ را امتحان کنید. Keepalive صفر یعنی "
+#        "خاموش. اینترنت موبایل گاهی آی‌پی را عوض می‌کند، پس سقف آی‌پی روزانه را کم "
+#        "نگیرید. کانفیگی که حذف خودکار شود، مشتری می‌تواند دوباره بگیرد. با «فقط روی "
+#        "آی‌پی‌های ثبت‌شده»، کانفیگ مثل DNS فقط از اینترنتی کار می‌کند که مشتری آی‌پی‌اش "
+#        "را ثبت کرده؛ کسی که کانفیگ را از کس دیگری گرفته وصل نمی‌شود، و آی‌پی مشتری‌ای "
+#        "که با کانفیگ دیگری وصل شود ۱۰ دقیقه از وایرگارد بسته می‌شود. خاموشش کنید تا "
+#        "کانفیگ روی هر اینترنتی و بدون ثبت آی‌پی کار کند.</p></div>"
+#        % (p, " checked" if on else "", " checked" if wg_setting("wg_self") != "0" else "",
+#           " checked" if wg_setting("wg_bind_ip") != "0" else "",
+#           "<br>".join(relay_rows) or
+#           "<span class='muted'>هنوز رله‌ای نیست</span>",
+#           " checked" if picked_plans is None else "",
+#           " checked" if picked_plans is not None else "", plan_rows,
+#           html.escape(wg_name(), quote=True),
+#           " checked" if endpoint != "domain" else "", " checked" if endpoint == "domain" else "",
+#           wg_port(), html.escape(wg_setting("wg_mtu").strip()), wg_keepalive(),
+#           html.escape(wg_setting("wg_ips_per_day").strip()),
+#           html.escape(wg_setting("wg_unused_days").strip())))
+#    rows = STORE.q("SELECT d.*, u.username, u.phone, u.telegram_id FROM wg_devices d"
+#                   " JOIN users u ON u.id = d.user_id"
+#                   " ORDER BY d.last_handshake IS NULL, d.last_handshake DESC, d.id DESC"
+#                   " LIMIT 200")
+#    if rows:
+#        out.append("<div class='card'><h2>کانفیگ‌ها (%d)</h2><table><tr><th>مشتری</th>"
+#                   "<th>آدرس</th><th>رله</th><th>آخرین اتصال</th><th>از</th><th></th></tr>"
+#                   % n_all)
+#        for d in rows:
+#            who = d["username"] or d["phone"] or d["telegram_id"] or "#%d" % d["user_id"]
+#            live = d["last_handshake"] and d["last_handshake"] > recent
+#            out.append(
+#                "<tr><td><a href='/%s/wg?u=%d'>%s</a></td><td><code dir='ltr'>%s</code></td>"
+#                "<td><code dir='ltr'>%s</code></td><td>%s</td><td><code dir='ltr'>%s</code></td>"
+#                "<td>%s</td></tr>"
+#                % (p, d["user_id"], html.escape(str(who)), html.escape(d["address"]),
+#                   html.escape(d["relay"]), html.escape(show_date(d["last_handshake"], True))
+#                   if d["last_handshake"] else "هنوز وصل نشده",
+#                   html.escape(d["last_endpoint"] or ""),
+#                   "<span class='pill ok'>آنلاین</span>" if live
+#                   else "<span class='pill bad'>قطع تا فردا</span>" if d["blocked_day"] else ""))
+#        out.append("</table></div>")
+#    return "".join(out)
+#
+#
+#def wg_page(path):
+#    """A customer's WireGuard configs: each to copy or download, or delete;
+#    and a new one."""
+#    q = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+#    try:
+#        uid = int((q.get("u") or ["0"])[0])
+#    except ValueError:
+#        uid = 0
+#    extra, args = mine()
+#    user = STORE.one("SELECT * FROM users u WHERE id = ?" + extra, (uid,) + args)
+#    p = CFG["ADMIN_PATH"]
+#    if not user:
+#        return "<div class='card'><p class='muted'>این کاربر پیدا نشد.</p></div>"
+#    who = user["username"] or user["phone"] or user["telegram_id"] or "#%d" % uid
+#    devs = STORE.q("SELECT * FROM wg_devices WHERE user_id = ? ORDER BY id", (uid,))
+#    out = ["<div class='card'><h2>🛡 کانفیگ‌های وایرگارد %s</h2>"
+#           "<p class='muted'><a href='/%s/users'>‹ برگشت به کاربران</a> — برای هر رله یک "
+#           "کانفیگ، مثل یک آدرس DNS برای هر رله؛ روی %d دستگاه (آی‌پی ثبت‌شده) کار می‌کند."
+#           "</p>"
+#           "<form method='post' action='/%s/user-wg-new'><input type='hidden' name='id' "
+#           "value='%d'>%s<button>+ کانفیگ تازه</button></form></div>"
+#           % (html.escape(str(who)), p, user["max_ips"] or 1, p, uid,
+#              "<label>رله <select name='relay'>%s</select></label>" % "".join(
+#                  "<option value='%s'>%s</option>" % (html.escape(r, quote=True), html.escape(r))
+#                  for r in wg_ready_relays()) if len(wg_ready_relays()) > 1 else "")]
+#    for d in devs:
+#        text = wg_config(d)
+#        seen = (show_date(d["last_handshake"], True) if d["last_handshake"]
+#                else "هنوز وصل نشده")
+#        out.append(
+#            "<div class='card'><h2 dir='ltr' style='text-align:right'>%s</h2>"
+#            "<p class='muted'>رله <code dir='ltr'>%s</code> — آخرین اتصال: %s%s%s</p>%s"
+#            "<form method='post' action='/%s/user-wg-del' onsubmit='return confirm(%s)'>"
+#            "<input type='hidden' name='id' value='%d'><input type='hidden' name='dev' "
+#            "value='%d'><button class='del'>حذف این کانفیگ</button></form></div>"
+#            % (html.escape(d["address"]), html.escape(d["relay"]), html.escape(seen),
+#               " از <code dir='ltr'>%s</code>" % html.escape(d["last_endpoint"])
+#               if d["last_endpoint"] else "",
+#               " — <span class='bad'>امروز بیش از سقف آی‌پی وصل شده و تا فردا قطع است</span>"
+#               if d["blocked_day"] else "",
+#               ("<textarea readonly dir='ltr' rows='10' style='width:100%%;font-family:"
+#                "monospace'>%s</textarea><p><a href='/%s/wg-conf/%d' download>دانلود فایل "
+#                "کانفیگ</a></p>" % (html.escape(text), p, d["id"])) if text
+#               else "<p class='muted'>کلید رله هنوز نرسیده؛ یک دقیقه بعد صفحه را تازه کنید.</p>",
+#               p, html.escape(json.dumps("این کانفیگ حذف شود؟ گوشی‌ای که با آن وصل است "
+#                                         "قطع می‌شود.", ensure_ascii=False), quote=True),
+#               uid, d["id"]))
+#    return "".join(out)
 #
 #
 #def discounts_card(p):
@@ -24481,7 +25808,7 @@ exit 0
 #                  ("nodes", "نود و سرورها"), ("settings", "تنظیمات"),
 #                  ("logs", "لاگ و عیب‌یابی"))
 #PAGE_SECTION = {"": ANYONE, "index": ANYONE, "me": ANYONE, "users": "users",
-#                "users-rows": "users",
+#                "users-rows": "users", "wg": "users", "wireguard": "settings",
 #                "wallet": "users", "usage": "users", "receipts": "receipts",
 #                "plans": "plans", "pay": "plans", "tickets": "tickets",
 #                "templates": "templates", "domains": "templates", "bot": "bot", "api": "bot",
@@ -24493,6 +25820,7 @@ exit 0
 #    "users-purge": "users", "user-reserve-cancel": "users",
 #    "user-relays": "users", "user-exit": "users", "user-devices": "users",
 #    "user-password-reset": "users", "user-unlink-telegram": "users", "wallet-adjust": "users",
+#    "user-wg-new": "users", "user-wg-del": "users", "wg-save": "settings",
 #    "receipt-decide": "receipts", "ticket-reply": "tickets", "ticket-status": "tickets",
 #    "plan-save": "plans", "plan-active": "plans", "plan-delete": "plans", "pay-save": "plans",
 #    "discount-save": "plans", "discount-active": "plans", "discount-delete": "plans",
@@ -25353,11 +26681,12 @@ exit 0
 #    for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
 #                        ("tickets", "تیکت‌ها (%d)" % waiting if waiting else "تیکت‌ها"),
 #                        ("plans", "پلن‌ها"), ("pay", "پرداخت"), ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
-#                        ("bot", "ربات"), ("api", "API"), ("nodes", "نود"), ("settings", "تنظیمات"),
+#                        ("bot", "ربات"), ("api", "API"), ("nodes", "نود"),
+#                        ("wireguard", "وایرگارد"), ("settings", "تنظیمات"),
 #                        ("logs", "لاگ"), ("diagnose", "عیب‌یابی"), ("admins", "ادمین‌ها"),
 #                        ("me", "حساب من")):
 #        # A single machine has no relays of its own to manage.
-#        if path == "nodes" and one_server():
+#        if path in ("nodes", "wireguard") and one_server():
 #            continue
 #        # Only what this admin may use; the owner has no "my account".
 #        if not page_allowed(path) or (path == "me" and is_owner()):
@@ -26266,6 +27595,7 @@ exit 0
 #        if not self.session_ok():
 #            return self.send(login_page(CFG))
 #        special = ("receipts" if rest.startswith("receipt/") else
+#                   "users" if rest.startswith("wg-conf/") else
 #                   "tickets" if rest.startswith("ticket-image/") else
 #                   OWNER if rest in ("backup.db", "db.key") else
 #                   PAGE_SECTION.get(rest, OWNER))
@@ -26287,6 +27617,16 @@ exit 0
 #            return self.send_key()
 #        if rest.startswith("receipt/"):
 #            return self.send_receipt(rest.split("/", 1)[1])
+#        if rest.startswith("wg-conf/"):
+#            extra, args = mine()
+#            dev = STORE.one("SELECT d.* FROM wg_devices d JOIN users u ON u.id = d.user_id"
+#                            " WHERE d.id = ?" + extra, (ident,) + args)
+#            text = wg_config(dev) if dev else ""
+#            if not text:
+#                return self.send("<h1>404</h1>", 404)
+#            return self.send(text, 200, {
+#                "Content-Type": "text/plain; charset=utf-8",
+#                "Content-Disposition": "attachment; filename=%s" % wg_file_name(dev["id"])})
 #        if rest.startswith("ticket-image/"):
 #            return self.send_ticket_image(rest.split("/", 1)[1])
 #        if rest == "users-rows":
@@ -26393,6 +27733,8 @@ exit 0
 #                 "server": ("آمار سرور", self.server_page),
 #                 "usage": ("مصرف کاربر", self.user_usage_page),
 #                 "wallet": ("کیف پول کاربر", self.wallet_page),
+#                 "wg": ("وایرگارد کاربر", lambda: wg_page(self.path)),
+#                 "wireguard": ("وایرگارد", lambda: wg_admin_page(CFG["ADMIN_PATH"])),
 #                 "admins": ("ادمین‌ها", self.admins_page),
 #                 "me": ("حساب من", lambda: me_card(CFG["ADMIN_PATH"]))}
 #        if rest not in pages:
@@ -26422,12 +27764,18 @@ exit 0
 #                      " WHERE 1 = 1" + extra, args)
 #        act = STORE.one("SELECT count(*) c FROM users u WHERE status = 'active'" + extra, args)
 #        ips = STORE.one("SELECT count(*) c FROM ips i JOIN users u ON u.id = i.user_id"
-#                        " WHERE 1 = 1" + extra, args)
+#                        " WHERE i.wg = 0" + extra, args)
 #        online = online_rows(extra, args) if may("users") else None
 #        out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
 #        stats = [(u["c"], "کاربر"), (act["c"], "فعال")]
 #        if online is not None:
 #            stats.append((len(online), "آنلاین"))
+#            if wg_on():
+#                stats.append((STORE.one(
+#                    "SELECT count(*) c FROM wg_devices d JOIN users u ON u.id = d.user_id"
+#                    " WHERE d.last_handshake >= ?" + extra,
+#                    ((datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(
+#                        timespec="seconds"),) + args)["c"], "🛡 وایرگارد آنلاین"))
 #        stats += [(ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")]
 #        for n, l in stats:
 #            out.append("<div class='stat'><div class='n'>%s</div>"
@@ -26605,7 +27953,8 @@ exit 0
 #            start = 0
 #            count = min(max(-(-number("upto") // USERS_PER_PAGE), 1) * USERS_PER_PAGE,
 #                        USERS_MOST)
-#        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
+#        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id AND wg = 0"
+#                       " LIMIT 1)"
 #                       " ip FROM users u WHERE 1 = 1" + extra + find
 #                       + " ORDER BY " + order + " LIMIT ? OFFSET ?",
 #                       args + find_args + (count, start))
@@ -29131,6 +30480,54 @@ exit 0
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (link,))
 #            return self.redirect("api?m=%s" % ("آدرس ربات ذخیره شد" if link
 #                                               else "آدرس ربات برداشته شد"))
+#
+#        if rest == "wg-save":
+#            vals = {k: one(k).strip() for k in ("port", "ips", "mtu", "keepalive", "unused",
+#                                                 "name")}
+#            back = lambda m: self.redirect("wireguard?m=" + m)
+#            if not (vals["port"].isdigit() and 1 <= int(vals["port"]) <= 65535):
+#                return back("!پورت وایرگارد عددی از ۱ تا ۶۵۵۳۵ است")
+#            for key, what in (("ips", "سقف آی‌پی روزانه"), ("unused", "روزهای حذف خودکار")):
+#                if vals[key] and not vals[key].isdigit():
+#                    return back("!%s را با عدد بنویسید؛ خالی یعنی خاموش" % what)
+#            if vals["mtu"] and not (vals["mtu"].isdigit() and 1280 <= int(vals["mtu"]) <= 1500):
+#                return back("!MTU عددی از ۱۲۸۰ تا ۱۵۰۰ است؛ خالی یعنی پیش‌فرض")
+#            if not (vals["keepalive"].isdigit() and int(vals["keepalive"]) <= 120):
+#                return back("!Keepalive عددی از ۰ تا ۱۲۰ ثانیه است")
+#            if not WG_NAME_RE.fullmatch(vals["name"]):
+#                return back("!اسم تونل حداکثر ۱۵ حرف انگلیسی، عدد یا - _ . است")
+#            known = relay_list()
+#            ticked = [r for r in params.get("relay", []) if r in known]
+#            plan_ids = {str(r["id"]) for r in STORE.q("SELECT id FROM plans")}
+#            plans = [x for x in params.get("plan", []) if x in plan_ids]
+#            settings = {
+#                "wg_on": "1" if one("on") == "1" else "0", "wg_port": vals["port"],
+#                "wg_self": "1" if one("self") == "1" else "0",
+#                "wg_bind_ip": "1" if one("bind") == "1" else "0",
+#                "wg_ips_per_day": vals["ips"], "wg_mtu": vals["mtu"],
+#                "wg_keepalive": vals["keepalive"], "wg_unused_days": vals["unused"],
+#                "wg_name": vals["name"],
+#                "wg_endpoint": "domain" if one("endpoint") == "domain" else "ip",
+#                # Every relay ticked is "all": one added later gets it too.
+#                "wg_relays": "" if set(ticked) == set(known) else json.dumps(ticked),
+#                "wg_plans": "" if one("plans_mode") != "some" else json.dumps(plans)}
+#            for key, value in settings.items():
+#                STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+#                          " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+#            return back("تنظیمات وایرگارد ذخیره شد؛ تا یک دقیقه دیگر روی رله‌ها اعمال می‌شود"
+#                        if one("on") == "1" else "وایرگارد خاموش شد")
+#
+#        if rest == "user-wg-new":
+#            uid = int(one("id")) if one("id").isdigit() else 0
+#            return self.redirect("wg?u=%d&m=%s" % (uid, wg_create(uid, one("relay").strip()
+#                                                                  or None)))
+#
+#        if rest == "user-wg-del":
+#            uid = int(one("id")) if one("id").isdigit() else 0
+#            dev = int(one("dev")) if one("dev").isdigit() else 0
+#            cur = STORE.run("DELETE FROM wg_devices WHERE id = ? AND user_id = ?", (dev, uid))
+#            return self.redirect("wg?u=%d&m=%s" % (uid, "کانفیگ حذف شد" if cur.rowcount
+#                                                    else "!این کانفیگ پیدا نشد"))
 #
 #        if rest == "calendar-save":
 #            cal = "jalali" if one("cal") == "jalali" else "gregorian"
@@ -33005,6 +34402,19 @@ exit 0
 #                    "«Profile Downloaded» ← Install را بزنید.")
 #
 #
+#B_WG = "🛡 کانفیگ وایرگارد"
+#WG_HELP = ("🛡 وایرگارد\n\n"
+#           "یک راه دیگر برای استفاده از سرویس، کنار DNS؛ جایی که DNS کار نمی‌کند، این کار "
+#           "می‌کند.\n\n"
+#           "۱. برنامهٔ WireGuard را از App Store یا Google Play نصب کنید.\n"
+#           "۲. در برنامه + را بزنید و QR کد را اسکن کنید، یا فایل کانفیگ را باز کنید.\n"
+#           "۳. تونل را روشن کنید.\n\n"
+#           "فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ بقیهٔ اینترنت مستقیم "
+#           "است. برای هر سرور یک کانفیگ، مثل یک آدرس DNS برای هر سرور؛ اگر یکی کار نکرد، "
+#           "دیگری را روشن کنید. در اندروید اگر «Private DNS» روشن است خاموشش کنید. کانفیگ را "
+#           "به کسی ندهید.")
+#
+#
 ## ------------------------------------------------------------------ the bot
 #class Bot:
 #    def __init__(self, cfg, panel=None, telegram=None):
@@ -33346,6 +34756,8 @@ exit 0
 #                      "آدرس DoH مخصوص حساب شماست؛ آن را به کسی ندهید."]
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
 #            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+#        if u.get("wg_on"):
+#            buttons.append({"text": B_WG, "callback_data": "wg"})
 #        lines.append("")
 #        lines.append("همهٔ این‌ها فقط روی اینترنتی کار می‌کنند که آی‌پی‌اش را ثبت کرده‌اید.")
 #        if not u["ips"]:
@@ -33380,13 +34792,68 @@ exit 0
 #        if with_doh:
 #            buttons.append({"text": "🔄 آدرس DoH تازه", "callback_data": "dohnew"})
 #            buttons.append({"text": B_IOS_PROFILE, "callback_data": "iosprofile"})
+#        if u.get("wg_on"):
+#            buttons.append({"text": B_WG, "callback_data": "wg"})
 #        self.say(chat, "\n".join(lines), {"inline_keyboard": self.dns_rows(buttons)})
 #
 #    @staticmethod
 #    def dns_rows(buttons):
-#        """The DNS message's buttons: the first two side by side, the iPhone
-#        profile's on a row of its own - three do not fit one row on a phone."""
-#        return [buttons[:2]] + ([buttons[2:]] if buttons[2:] else [])
+#        """The DNS message's buttons: the first two side by side, each after
+#        them - the iPhone profile, WireGuard - on a row of its own: three do
+#        not fit one row on a phone."""
+#        return [buttons[:2]] + [[b] for b in buttons[2:]]
+#
+#    def show_wg(self, chat, sender, said=""):
+#        """The customer's WireGuard: their configs, each to fetch or delete,
+#        and a new one while devices are free and the operator lets them."""
+#        try:
+#            wg = self.panel.call("GET", "/users/%d/wg" % sender["id"])["wg"]
+#        except ApiError as e:
+#            return self.say(chat, "⚠️ " + str(e))
+#        rows = []
+#        lines = ([said, ""] if said else []) + [WG_HELP, "", (
+#            "روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
+#            "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند."), ""]
+#        servers = wg.get("relays") or []
+#        many = len(servers) > 1 or len({d.get("relay") for d in wg.get("devices") or []}) > 1
+#        for d in wg.get("devices") or []:
+#            label = (d.get("name") or d.get("file") or d["address"]) + (
+#                " — %s" % d["server"] if many and d.get("server") else "")
+#            lines.append("• %s — %s" % (label, "🟢 آنلاین" if d.get("online") else
+#                                        "⛔ تا فردا قطع (آی‌پی زیاد)" if d.get("blocked") else
+#                                        "آخرین اتصال: %s" % d["last"] if d.get("last")
+#                                        else "هنوز وصل نشده"))
+#            row = [{"text": "📥 " + label, "callback_data": "wgget:%d" % d["id"]}]
+#            if wg.get("self"):
+#                row.append({"text": "🗑 حذف", "callback_data": "wgdel:%d" % d["id"]})
+#            rows.append(row)
+#        if wg.get("self") and wg.get("room") and len(servers) > 1:
+#            # One button per server: one filtered in their city, another may not be.
+#            lines.append("برای کانفیگ تازه، سرور را انتخاب کنید:")
+#            rows.append([{"text": "➕ " + x["label"], "callback_data": "wgnew:" + x["ip"]}
+#                         for x in servers][:3])
+#        elif wg.get("self") and wg.get("room"):
+#            rows.append([{"text": "➕ کانفیگ تازه" if wg.get("devices")
+#                          else "📥 دریافت کانفیگ وایرگارد", "callback_data": "wgnew"}])
+#        elif wg.get("self") and wg.get("devices"):
+#            lines.append("برای همهٔ سرورها کانفیگ دارید.")
+#        elif not wg.get("self") and not wg.get("devices"):
+#            lines.append("برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.")
+#        return self.say(chat, "\n".join(lines), {"inline_keyboard": rows} if rows else None)
+#
+#    def send_wg(self, chat, res):
+#        """One config: its QR to scan, and its file to open."""
+#        caption = self.t("🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا "
+#                         "فایل را باز کنید.")
+#        try:
+#            if res.get("qr"):
+#                self.tg.photo(chat, base64.b64decode(res["qr"]), caption)
+#            self.tg.document(chat, res["file"], res["config"].encode("utf-8"),
+#                             "" if res.get("qr") else caption)
+#        except Exception as e:
+#            log("WireGuard config not sent to %s: %s" % (chat, e))
+#            self.say(chat, "⚠️ کانفیگ فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب "
+#                     "بگیریدش.")
 #
 #    def help_text(self):
 #        return ("📊 حساب من: وضعیت، حجم مانده و روزهای باقی‌مانده\n"
@@ -33737,6 +35204,25 @@ exit 0
 #                            else "⚠️ آدرس پنل هنوز معلوم نیست؛ چند دقیقه دیگر امتحان کنید.")
 #        if kind == "iosprofile":
 #            return self.send_profiles(chat, self.profiles_of(self.account(sender)))
+#        if kind == "wg":
+#            return self.show_wg(chat, sender)
+#        if kind in ("wgget", "wgnew"):
+#            try:
+#                res = (self.panel.call("POST", "/users/%d/wg" % sender["id"],
+#                                       {"relay": arg} if arg else None) if kind == "wgnew"
+#                       else self.panel.call("GET", "/users/%d/wg/%d" % (sender["id"], int(arg))))
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ " + str(e))
+#            if kind == "wgnew":
+#                self.say(chat, "✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
+#                         "می‌شود.")
+#            return self.send_wg(chat, res)
+#        if kind == "wgdel":
+#            try:
+#                res = self.panel.call("DELETE", "/users/%d/wg/%d" % (sender["id"], int(arg)))
+#            except ApiError as e:
+#                return self.say(chat, "⚠️ " + str(e))
+#            return self.show_wg(chat, sender, "🗑 " + res.get("message", ""))
 #        if kind == "dohnew":
 #            self.panel.call("POST", "/users/%d/doh-reset" % sender["id"])
 #            self.say(chat, "🔄 آدرس تازه ساخته شد. آدرس قبلی تا یک دقیقه دیگر کار نمی‌کند؛ "
@@ -38973,6 +40459,8 @@ exit 0
 #") با رمز بکاپش باز می‌شود.": ") opens with its backup password.",
 #") روی این سرور نیست، ولی": ") is not on this server, but",
 #"). با رمز بکاپ باز می‌شود؛ برای بازگردانی در صفحهٔ «تنظیمات» بفرستیدش.": "). It opens with the backup password; to restore, upload it on the “Settings” page.",
+#"+ کانفیگ برای سرور دیگر": "+ A config for another server",
+#"+ کانفیگ تازه": "+ New config",
 #". با موجودی کیف پول، پلن را از بخش «خرید یا تمدید» بدون رسید و فوری بخرید.": ". With your wallet balance, buy a plan instantly and with no receipt from “Buy or renew”.",
 #". جدول هر بار که صفحه را باز کنید تازه می‌شود؛ تا یک دقیقه طول می‌کشد اسم تازه برسد.": ". The table refreshes every time you open the page; a new name takes up to a minute to arrive.",
 #". رله‌ها ظرف یک دقیقه خودشان امتحان و اعمال می‌کنند": ". The relays try it and apply it themselves within a minute",
@@ -39018,11 +40506,15 @@ exit 0
 #"GOG و itch.io": "GOG / itch.io",
 #"Google Ads و AdMob": "Google Ads and AdMob",
 #"Idempotency-Key حداکثر ۱۰۰ نویسه": "Idempotency-Key at most 100 characters",
+#"Keepalive (ثانیه)": "Keepalive (seconds)",
+#"Keepalive عددی از ۰ تا ۱۲۰ ثانیه است": "The keepalive is from 0 to 120 seconds",
+#"MTU عددی از ۱۲۸۰ تا ۱۵۰۰ است؛ خالی یعنی پیش‌فرض": "The MTU is a number from 1280 to 1500; empty means the default",
 #"PNG بزرگ‌تر از ۵۱۲×۵۱۲ است": "the PNG is larger than 512×512",
 #"PNG بیشتر از ۶۴ کیلوبایت است": "the PNG is over 64 KB",
 #"Pangle (تبلیغات تیک‌تاک)": "Pangle (TikTok’s ads)",
 #"PlayStation — STUN و API": "PlayStation — STUN and API",
 #"PowerShell را با Run as administrator باز کنید و این را بزنید:": "Open PowerShell with Run as administrator and enter this:",
+#"QR کد و فایل کانفیگ": "QR code and config file",
 #"RedTube، YouPorn و Tube8": "RedTube, YouPorn and Tube8",
 #"SVG اسکریپت یا چیز فعال دارد؛ یک SVG ساده بدهید": "the SVG has a script or something active in it; give a plain SVG",
 #"SVG بیشتر از ۱۶ کیلوبایت است": "the SVG is over 16 KB",
@@ -39043,6 +40535,8 @@ exit 0
 #"status یکی از open، answered، closed یا all است": "status is one of open, answered, closed or all",
 #"status یکی از pending، approved، rejected یا all است": "status is one of pending, approved, rejected or all",
 #"telegram_id باید عدد مثبت باشد": "telegram_id must be a positive number",
+#"wg0 ساخته نشد:": "wg0 was not made:",
+#"wireguard-tools روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید": "wireguard-tools is not installed on this relay; run the installer on it once more",
 #"«ترافیک این ماه» از شمارندهٔ کارت شبکهٔ خود سرور است، همان چیزی که سرویس‌دهنده حساب می‌کند؛ رویش بزنید تا سقف ماهانه، روز شروع دوره و کاری که با رسیدن به سقف بشود را تعیین کنید. هشدار در ۸۰ و ۹۵ و ۱۰۰ درصد می‌آید.": "“This month’s traffic” comes from the server’s own network card counter, the same thing the provider bills; click it to set the monthly cap, the day the period starts and what happens when the cap is reached. Alerts come at 80, 95 and 100 percent.",
 #"· آخرین نسخه در گیت‌هاب:": "· latest on GitHub:",
 #"· از کیف پول": "· from wallet",
@@ -39084,6 +40578,8 @@ exit 0
 #"؛ هر هفته به‌روز می‌شود و فقط یک‌جا روشن یا خاموش می‌شود": "; updated weekly, and turned on or off only as a whole",
 #"آخرین (UTC)": "Last (UTC)",
 #"آخرین آنلاین:": "Last online:",
+#"آخرین اتصال": "Last connected",
+#"آخرین اتصال:": "Last connected:",
 #"آخرین استفاده": "Last used",
 #"آخرین بار": "Last seen",
 #"آخرین ترافیک": "Last traffic",
@@ -39094,6 +40590,7 @@ exit 0
 #"آخرین نسخه در گیت‌هاب:": "Latest on GitHub:",
 #"آخرین پیام‌های ربات:": "The bot’s latest messages:",
 #"آخرین گزارش": "Last report",
+#"آدرس": "Address",
 #"آدرس API:": "API address:",
 #"آدرس DNS": "DNS address",
 #"آدرس DoH شخصی": "Personal DoH address",
@@ -39109,6 +40606,7 @@ exit 0
 #"آدرس ربات برداشته شد": "Bot address removed",
 #"آدرس ربات ذخیره شد": "Bot address saved",
 #"آدرس سرور خارج معلوم نیست": "The exit server’s address is not known",
+#"آدرس سرور در کانفیگ": "Server address in the config",
 #"آدرس فعلی از کار می‌افتد و باید آدرس تازه را روی دستگاه‌هایتان بگذارید. ادامه می‌دهید؟": "The current address stops working and you must put the new one on your devices. Continue?",
 #"آدرس پنل عوض شد": "Panel address changed",
 #"آدرس پنل مشتری هنوز معلوم نیست؛ چند دقیقه دیگر": "The customer panel address is not known yet; in a few minutes",
@@ -39125,11 +40623,13 @@ exit 0
 #"آزمایش و ذخیره": "Test and save",
 #"آستتو کورسا": "Assetto Corsa",
 #"آلبیون آنلاین": "Albion Online",
+#"آماده": "ready",
 #"آماده: آخرین بکاپ و نصب‌کننده روی": "Ready: the latest backup and installer are on",
 #"آمار سرور": "Server stats",
 #"آمار و کارها": "Stats and actions",
 #"آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر بیرون ماندید، از روی خود سرور:": "there, or it will not be reachable from outside. If you get locked out, from the server itself:",
 #"آنلاین": "Online",
+#"آنلاین الان": "online now",
 #"آنلاین الان:": "Online now:",
 #"آنلاین و آخرین فعالیت": "Online and last seen",
 #"آنلاین یعنی در ۳ دقیقهٔ اخیر از راه رله ترافیک داشته. فقط سرویس‌هایی که قالبش از رله می‌برد شمرده می‌شوند؛ کسی که فقط چیزهای دیگر را باز کرده این‌جا نمی‌آید.": "Online means traffic through a relay in the last 3 minutes. Only the services their template routes through the relay count; someone who has opened only other things does not show here.",
@@ -39160,9 +40660,11 @@ exit 0
 #"آی‌پی اینترنتی را که می‌خواهید سرویس رویش کار کند بفرستید.": "Send the IP of the internet connection you want the service to work on.",
 #"آی‌پی تک‌سرور تازه": "New single server’s IP",
 #"آی‌پی ثبت نشده": "No IP registered",
+#"آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند.": "No address to register; it works on any connection.",
 #"آی‌پی ثبت‌شده": "Registered IP",
 #"آی‌پی خانگی معمولاً ثابت نیست. اگر مودم را ریست کردید و سرویس قطع شد، دوباره به همین صفحه بیایید و ثبت کنید.": "A home IP is usually not fixed. If you reset your router and the service stops, come back to this page and register again.",
 #"آی‌پی درستی نیست": "is not a valid IP",
+#"آی‌پی رله": "the relay's IP",
 #"آی‌پی رلهٔ تازه": "New relay’s IP",
 #"آی‌پی رلهٔ تازه را این بالا اضافه کنید.": "Add the new relay’s IP up here.",
 #"آی‌پی سرور تازه را این بالا اضافه کنید.": "Add the new server’s IP up here.",
@@ -39236,6 +40738,8 @@ exit 0
 #"استودیوها": "Studios",
 #"استیم": "Steam",
 #"اسم": "Name",
+#"اسم تونل حداکثر ۱۵ حرف انگلیسی، عدد یا - _ . است": "The tunnel name is at most 15 English letters, digits or - _ .",
+#"اسم تونل در اپ وایرگارد": "Tunnel name in the WireGuard app",
 #"اسم و آیکون تازه": "New name and icon",
 #"اسم پلن لازم است": "A plan name is required",
 #"اسم گروه": "Group name",
@@ -39268,6 +40772,8 @@ exit 0
 #"الدر اسکرولز آنلاین": "Elder Scrolls Online",
 #"الدن رینگ": "Elden Ring",
 #"امروز": "Today",
+#"امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است": "connected from too many addresses today; off until tomorrow",
+#"امروز بیش از سقف آی‌پی وصل شده و تا فردا قطع است": "connected from more addresses than allowed today; off until tomorrow",
 #"انتخاب رله و سرور خارج برای حساب شما باز نیست": "Picking relays and exit servers is not open to your account",
 #"انتخاب پلن…": "Choose a plan…",
 #"انتقال پنل — سرور پشتیبان": "Move the panel — standby server",
@@ -39324,9 +40830,11 @@ exit 0
 #"این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید": "This account has no password; contact support",
 #"این حساب فقط با تلگرام کار می‌کند و جدا کردنش یعنی دیگر کسی واردش نمی‌شود": "This account only works through Telegram, and unlinking it means nobody can get into it any more",
 #"این حساب فقط با تلگرام کار می‌کند؛ جدا کردنش یعنی دیگر کسی واردش نمی‌شود": "This account only works through Telegram; unlinking it means nobody can get into it any more",
+#"این حساب مسدود است": "This account is blocked",
 #"این حساب نام کاربری دارد:": "This account has a username:",
 #"این حساب نام کاربری ندارد و از پنل وارد نمی‌شود": "This account has no username and does not sign in to the panel",
 #"این حساب هنوز نام کاربری ندارد": "This account has no username yet",
+#"این حساب پیدا نشد": "This account was not found",
 #"این دامنه درست نیست یا برای دو سرور نوشته شده:": "This domain is not valid or is written for two servers:",
 #"این دامنه را نمی‌شود مسیر داد": "This domain cannot be routed",
 #"این دامنه و همهٔ زیردامنه‌هایش برای مشتری‌های قالب‌های انتخاب‌شده از همین DNS پرسیده می‌شوند، نه از DNS بالادستی. اگر جزو دامنه‌هایی باشد که سرویس از رله می‌برد، دیگر از رله نمی‌رود و جواب همین DNS به مشتری داده می‌شود. چند DNS را با فاصله بنویسید؛ پورت غیر ۵۳ با #، مثل": "This domain and all its subdomains are asked of this DNS for customers of the chosen templates, not of the upstream DNS. If it is one of the domains the service routes through the relay, it no longer goes through the relay and the customer gets this DNS’s answer. Write several DNS servers separated by spaces; a port other than 53 with #, like",
@@ -39385,9 +40893,13 @@ exit 0
 #"این پیام برای همه‌ی کسانی که انتخاب کرده‌اید فرستاده شود؟": "Send this message to everyone you chose?",
 #"این کار با این روش نمی‌شود": "This cannot be done this way",
 #"این کار فقط با مالک پنل است": "Only the panel’s owner can do this",
+#"این کاربر برای این رله کانفیگ دارد": "This customer has a config for this relay",
+#"این کاربر برای همهٔ رله‌ها کانفیگ دارد": "This customer has a config for every relay",
 #"این کاربر مال شما نیست": "This customer is not yours",
 #"این کاربر پیدا نشد": "User not found",
 #"این کاربر پیدا نشد.": "User not found.",
+#"این کانفیگ حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.": "Delete this config? A phone connected with it is cut off.",
+#"این کانفیگ پیدا نشد": "That config was not found",
 #"این کد تخفیف برای این پلن نیست": "This discount code is not for this plan",
 #"این کد تخفیف را قبلاً استفاده کرده‌اید": "You have already used this discount code",
 #"این کد تخفیف معتبر نیست": "This discount code is not valid",
@@ -39409,6 +40921,7 @@ exit 0
 #"ایکس‌باکس و گیم‌پس": "Xbox / Game Pass",
 #"ای‌فوتبال": "eFootball",
 #"با": "with",
+#"با «دامنهٔ رله»، اگر آی‌پی رله عوض شود کانفیگ مشتری‌ها کار می‌کند - فقط رکورد دامنه را عوض کنید؛ رله‌ای که دامنه ندارد با آی‌پی می‌ماند. پورت و آدرس در کانفیگ‌های ساخته‌شده هم هست: بعد از عوض کردنشان، مشتری‌ها باید کانفیگ را دوباره بگیرند. MTU خالی یعنی پیش‌فرض اپ (۱۴۲۰)؛ اگر روی بعضی اینترنت‌ها سایت‌ها نیمه باز می‌شوند ۱۲۸۰ را امتحان کنید. Keepalive صفر یعنی خاموش. اینترنت موبایل گاهی آی‌پی را عوض می‌کند، پس سقف آی‌پی روزانه را کم نگیرید. کانفیگی که حذف خودکار شود، مشتری می‌تواند دوباره بگیرد. با «فقط روی آی‌پی‌های ثبت‌شده»، کانفیگ مثل DNS فقط از اینترنتی کار می‌کند که مشتری آی‌پی‌اش را ثبت کرده؛ کسی که کانفیگ را از کس دیگری گرفته وصل نمی‌شود، و آی‌پی مشتری‌ای که با کانفیگ دیگری وصل شود ۱۰ دقیقه از وایرگارد بسته می‌شود. خاموشش کنید تا کانفیگ روی هر اینترنتی و بدون ثبت آی‌پی کار کند.": "With the relay's domain, customers' configs keep working if the relay's IP changes - change only the domain's record; a relay without a domain stays on its IP. The port and address are in configs already made too: after changing them, customers must fetch their config again. An empty MTU is the app's default (1420); if sites half-load on some connections, try 1280. A keepalive of zero is off. Mobile internet sometimes changes address, so do not set the daily address limit low. A customer can get a config deleted for disuse again. With “only from registered addresses”, a config works, like the DNS, only on connections whose address the customer registered; somebody given a config by another does not connect, and a customer's address that connects with somebody else's config is kept off WireGuard for 10 minutes. Untick it for configs that work on any connection without registering.",
 #"با اتصال به تلگرام، اگر رمز را فراموش کنید خودتان با یک کد بازیابی‌اش می‌کنید.": "With Telegram linked, if you forget your password you recover it yourself with a code.",
 #"با اجازهٔ خود مشتری؛ هر اسم یک ساعت بعد از آخرین بار پاک می‌شود. «مستقیم» یعنی از رله رد نشد؛ ستون «چرا» می‌گوید به خاطر قالبش است یا اسم در فهرست نیست.": "With the customer’s own permission; each name is deleted an hour after it was last seen. “Direct” means it did not go through the relay; the “Why” column says whether that is because of their template or because the name is not in the list.",
 #"با اولین ورود باید رمز خودش را انتخاب کند؛ بعد از آن این رمز دیگر کار نمی‌کند.": "On first sign-in they must choose their own password; after that this one no longer works.",
@@ -39461,8 +40974,10 @@ exit 0
 #"برای آیفون دکمهٔ «دریافت پروفایل آیفون📱» را بزنید. آدرس‌های DoH مخصوص حساب شماست؛ آن‌ها را به کسی ندهید.": "For an iPhone, press “Get iPhone profile📱”. The DoH addresses are your account’s own; do not give them to anyone.",
 #"برای استفاده از ربات، اول عضو کانال «": "To use the bot, first join the channel “",
 #"برای استفاده از سرویس، وارد پنل مشتری شوید:": "To use the service, open your customer panel:",
+#"برای این سرور کانفیگ دارید": "You have a config for this server",
 #"برای بکاپ یک رمز بگذارید": "Set a password for the backup",
 #"برای تست رایگان، اول حسابتان را به تلگرام وصل کنید": "For the free trial, first link your account to Telegram",
+#"برای حذف کانفیگ به پشتیبانی پیام بدهید": "Message support to delete a config",
 #"برای خرید یا تمدید، اول حسابتان را به تلگرام وصل کنید. هر تلگرام فقط به یک حساب وصل می‌شود.": "To buy or renew, first link your account to Telegram. Each Telegram links to only one account.",
 #"برای خرید، اول حسابتان را به تلگرام وصل کنید": "To buy, first link your account to Telegram",
 #"برای دیدن حساب و ثبت آی‌پی وارد شوید.": "Sign in to see your account and register your IP.",
@@ -39472,11 +40987,16 @@ exit 0
 #"برای فعال شدن سرویس، رسید پرداختتان را از پایین همین صفحه بفرستید — بعد از تأیید، پلن برایتان ثبت می‌شود.": "To activate the service, send your payment receipt from the bottom of this page — after it is approved, your plan is set.",
 #"برای مسیری که TCP وصل می‌شود و بعد می‌میرد": "For a path where TCP connects and then dies",
 #"برای هر سرویسی که از سرور می‌رود، چند دامنه‌اش امتحان می‌شود: یک اتصال امن روی ۴۴۳ با گواهی خود سرویس. دو جا:": "For every service that goes through the server, a few of its domains are tested: a secure connection on 443 with the service’s own certificate. In two places:",
+#"برای همهٔ سرورها کانفیگ دارید": "You have a config for every server",
+#"برای همهٔ سرورها کانفیگ دارید.": "You have a config for every server.",
 #"برای همهٔ قالب‌ها مسدود است (": "is blocked for every template (",
 #"برای پیدا کردن اینکه یک سرویس چه دامنه‌ای لازم دارد: مشتری را انتخاب کنید، دکمه را بزنید و از او بخواهید در همین مدت سرویسی را که کار نمی‌کند باز کند. «via relay» یعنی از سرور رد شد، «direct» یعنی مستقیم رفت (اگر سرویس ایران را قبول نمی‌کند، همین دامنه‌ها را در صفحهٔ دامنه‌ها اضافه کنید)، «filtered» یعنی فیلتر خود ایران است. کوئری‌های DoH و DoT هم دیده می‌شوند، با علامت (DOH) یا (DOT) جلویشان.": "To find which domain a service needs: pick the customer, press the button and ask them to open the service that does not work during that time. “via relay” means it went through the server, “direct” means it went directly (if the service does not accept Iran, add those domains on the domains page), “filtered” means Iran’s own filter. DoH and DoT queries show too, marked (DOH) or (DOT).",
 #"برای کار کردن، این‌ها هم باید روشن باشند:": "For it to work, these must be on too:",
 #"برای کانال خصوصی، لینک دعوت کانال را هم بنویسید (مثل https://t.me/+AbCd...)": "For a private channel, write its invitation link too (like https://t.me/+AbCd...)",
+#"برای کانفیگ تازه، سرور را انتخاب کنید:": "For a new config, choose the server:",
 #"برای کدام خریدها": "For which purchases",
+#"برای کدام سرور؟": "For which server?",
+#"برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.": "Message support for a WireGuard config.",
 #"برداشتن": "Remove",
 #"برداشته شد": "Removed",
 #"بررسی دوباره": "Check again",
@@ -39485,6 +41005,7 @@ exit 0
 #"برنامه‌نویسی و ابزار": "Development and tools",
 #"بروید،": "go to",
 #"برگرداندن": "Restore",
+#"برگشت": "Back",
 #"برگشت به API": "Back to API",
 #"برگشت به حساب": "Back to account",
 #"برگشت به حساب خودم": "Back to my own account",
@@ -39620,6 +41141,7 @@ exit 0
 #"تنظیمات": "Settings",
 #"تنظیمات ذخیره شد ولی ربات روشن نشد؛ پیام‌های پایین صفحه را ببینید": "Settings saved but the bot did not start; see the messages below",
 #"تنظیمات ربات": "Bot settings",
+#"تنظیمات وایرگارد ذخیره شد؛ تا یک دقیقه دیگر روی رله‌ها اعمال می‌شود": "WireGuard settings saved; the relays take them within a minute",
 #"توضیح": "Description",
 #"توضیح برای مشتری": "Description for customers",
 #"توضیح سرورها برای مشتری‌های شما": "Server notes for your customers",
@@ -39700,6 +41222,7 @@ exit 0
 #"ثبت‌نام کنید": "sign up",
 #"ثبت‌نام:": "Joined:",
 #"ثرون اند لیبرتی": "Throne and Liberty",
+#"جای کانفیگ تازه نمانده است": "There is no room for another config",
 #"جدا کردن تلگرام": "Unlink Telegram",
 #"جدول روزانه": "Daily table",
 #"جدیدترین ثبت‌نام": "Newest sign-up",
@@ -39734,11 +41257,13 @@ exit 0
 #"حداکثر چهار DNS برای هر دامنه": "At most four DNS servers per domain",
 #"حدود": "About",
 #"حذف": "Delete",
+#"حذف این کانفیگ": "Delete this config",
 #"حذف شد": "Deleted",
 #"حذف قالب": "Delete template",
 #"حذف همیشگی": "Delete for good",
 #"حذف همیشگی این کاربر": "Delete this user for good",
 #"حذف کاربر": "Delete user",
+#"حذف کانفیگی که چند روز وصل نشده": "Delete a config unused for this many days",
 #"حذف گروه دامنه‌های داخلش را هم پاک می‌کند.": "Deleting a group deletes the domains in it too.",
 #"حساب": "Account",
 #"حساب این مشتری ←": "This customer’s account →",
@@ -39806,6 +41331,7 @@ exit 0
 #"دامنه: اول یک رکورد A بسازید که به آی‌پی همان سرور اشاره کند و پورت‌های ۸۰، ۴۴۳ و ۸۵۳ آن را باز کنید؛ بعد دامنه را این‌جا بنویسید و ذخیره کنید. سرور تا یک دقیقه خودش گواهی می‌گیرد و DoH و DoT را روی آن روشن می‌کند (چند دقیقه‌ای طول می‌کشد، و دانلود کنسول‌ها روی همان سرور حدود بیست ثانیه مکث می‌کند)؛ بعد به مشتری‌ها نشان داده می‌شود. اگر رکورد هنوز درست نباشد، همین‌جا گفته می‌شود و ربع ساعت بعد دوباره امتحان می‌شود.": "Domain: first make an A record pointing at that server’s IP and open its ports 80, 443 and 853; then write the domain here and save. Within a minute the server gets a certificate by itself and turns DoH and DoT on for it (it takes a few minutes, and console downloads on that server pause for about twenty seconds); then customers are shown it. If the record is not right yet, it says so here and tries again a quarter of an hour later.",
 #"دامنهٔ داخلش پاک شوند؟": "domains in it?",
 #"دامنهٔ دلخواهی که بعداً اضافه کنید، در قالبی که دست‌کم یکی از این‌ها تیک خورده، خودکار از رله می‌رود.": "A custom domain you add later goes through the relay automatically in a template where at least one of these is ticked.",
+#"دامنهٔ رله": "the relay's domain",
 #"دامنه‌اش پاک شد": "of its domains were deleted",
 #"دامنه‌ای ندارد.": "Has no domains.",
 #"دامنه‌ای که با نصاب می‌آید.": "domains that come with the installer.",
@@ -39822,6 +41348,7 @@ exit 0
 #"دامنه‌هایی که مشتری باز می‌کند": "Domains the customer opens",
 #"دانلود": "Download",
 #"دانلود بازی": "Game downloads",
+#"دانلود فایل کانفیگ": "Download the config file",
 #"دانلود نسخهٔ پشتیبان": "Download backup",
 #"دانلود و آپدیت": "Downloads and updates",
 #"دانلود و آپلود": "Download and upload",
@@ -39832,9 +41359,11 @@ exit 0
 #"در انتظار": "Waiting",
 #"در انتظار بررسی است. رسید تازه جای آن را می‌گیرد.": "is waiting for review. A new receipt replaces it.",
 #"در انتظار خرید پلن": "Waiting for a plan",
+#"در انتظار رله": "waiting for the relay",
 #"در انتظار فعال‌سازی": "Waiting for activation",
 #"در انتظار همگام‌سازی": "Waiting for sync",
 #"در انتظار پلن": "Waiting for a plan",
+#"در برنامهٔ WireGuard: + ← Scan from QR code": "In the WireGuard app: + → Scan from QR code",
 #"در تلگرام به": "in Telegram to",
 #"در تیکت «": "in ticket “",
 #"در حال آوردن کاربرهای بعدی…": "Loading more users…",
@@ -39878,6 +41407,7 @@ exit 0
 #"دریافت نشد": "Not fetched",
 #"دریافت پروفایل": "Get the profile",
 #"دریافت پروفایل آیفون📱": "Get iPhone profile📱",
+#"دریافت کانفیگ وایرگارد": "Get a WireGuard config",
 #"دسترسی": "Access",
 #"دسترسی ادمین": "Admin access",
 #"دسترسی ندارید": "No access",
@@ -39885,6 +41415,7 @@ exit 0
 #"دستور ویندوز": "Windows command",
 #"دستور ویندوز ۱۱": "Windows 11 command",
 #"دستگاه": "devices",
+#"دستگاه (آی‌پی ثبت‌شده) کار می‌کند.": "devices (registered addresses).",
 #"دستگاه اضافه": "Extra device",
 #"دستگاه اضافه ·": "Extra device ·",
 #"دستگاه اضافه از کیف پول": "Extra device from wallet",
@@ -39905,6 +41436,7 @@ exit 0
 #"دعوت از دوستان روشن شد:": "Inviting friends turned on:",
 #"دعوت‌شده": "Invited",
 #"دعوت‌شده‌ها (": "Invited (",
+#"دقیقه است جواب پنل به آن نمی‌رسد؛ کاربرها و تنظیمات تازه روی آن اعمال نمی‌شوند. راه بین این سرور و پنل را بررسی کنید.": "minutes the panel's answers have not reached it; new customers and settings are not applied there. Check the road between this server and the panel.",
 #"دقیقه اعتبار دارد و یک بار کار می‌کند)": "minutes and works once)",
 #"دقیقه اعتبار دارد.": "minutes.",
 #"دقیقه اعتبار دارد. اگر خودتان درخواست نکرده‌اید، این پیام را نادیده بگیرید.": "minutes. If you did not ask for this, ignore this message.",
@@ -39922,6 +41454,7 @@ exit 0
 #"دوباره بفرستید": "Send it again",
 #"دوباره بفرستید یا «انصراف».": "Send it again, or “Cancel”.",
 #"دوباره جا دارد:": "has room again:",
+#"دوباره جواب پنل را می‌گیرد.": "is getting the panel's answers again.",
 #"دوباره در دسترس است.": "is reachable again.",
 #"دوباره زیر": "below again",
 #"دوباره عادی است:": "is back to normal:",
@@ -39962,6 +41495,8 @@ exit 0
 #"ذخیرهٔ تونل": "Save tunnel",
 #"ذخیرهٔ رمز": "Save password",
 #"ذخیرهٔ فهرست مشتری‌ها": "Save the customers list",
+#"را از App Store یا Google Play نصب کنید.": "app from the App Store or Google Play.",
+#"را با عدد بنویسید؛ خالی یعنی خاموش": "must be a number; empty means off",
 #"را بزنید؛ وگرنه ربات نمی‌تواند به شما پیام بدهد.": "; otherwise the bot cannot message you.",
 #"را بنویسید:": ":",
 #"را به آی‌پی": "to the IP",
@@ -40045,6 +41580,7 @@ exit 0
 #"رله‌ها و سرورهای دیگر": "Relays and other servers",
 #"رله‌ها و نودها ظرف یک دقیقه خودشان پنل تازه را پیدا می‌کنند و از آن به بعد فقط با آن حرف می‌زنند؛ این سرور اگر برگردد، دیگر کسی سراغش نمی‌آید.": "The relays and nodes find the new panel by themselves within a minute and from then on only talk to it; if this server comes back, nobody goes to it any more.",
 #"رله‌هایی که از آن می‌روند": "Relays that go through it",
+#"رله‌هایی که وایرگارد دارند": "Relays with WireGuard",
 #"رمز": "Password",
 #"رمز امضای webhook": "Webhook signing secret",
 #"رمز امضای webhook «": "Webhook signing secret “",
@@ -40100,6 +41636,7 @@ exit 0
 #"روز یک بار، برای ادمین‌های ربات بفرست": "days, send it to the bot’s admins",
 #"روزانه": "Daily",
 #"روزشان تمام شده (منقضی) یا حجمشان (سهمیه تمام شده)": "their days ran out (expired) or their allowance (used up)",
+#"روزهای حذف خودکار": "The days before deleting",
 #"روزی که این سرور از دست رفت": "The day this server is lost",
 #"روشن": "On",
 #"روشن / تیره": "Light / dark",
@@ -40124,6 +41661,8 @@ exit 0
 #"روی UDP — در آزمایش ما وصل نشد": "Over UDP — did not connect in our test",
 #"روی UDP، برای مسیری که بسته گم می‌کند": "Over UDP, for a path that loses packets",
 #"روی آن سرور، با فایل نصب‌کنندهٔ همین نسخه، این را اجرا کنید:": "On that server, with this version’s installer file, run:",
+#"روی این رله وایرگارد آماده نیست": "WireGuard is not ready on that relay",
+#"روی این سرور وایرگارد نیست؛ سرور دیگری را انتخاب کنید": "That server has no WireGuard; choose another",
 #"روی رله نصب‌کننده را اجرا کنید و «relay» را انتخاب کنید؛ آدرس این سرور": "Run the installer on the relay and choose “relay”; this server’s address",
 #"روی رله.": "on the relay.",
 #"روی سرور هم:": "On the server too:",
@@ -40131,6 +41670,7 @@ exit 0
 #"روی نام هر سرور بزنید تا نمودارها و مشتری‌هایش را ببینید. مصرف مشتری‌های ثبت‌شده: روی رله از شمارندهٔ خود رله (همانی که حجم مشتری از آن کم می‌شود)، و روی سرور خارج از روی اینکه رله‌ها هر اتصال را از کدام سرور فرستاده‌اند. روز به وقت تهران.": "Click a server’s name to see its charts and customers. Registered customers’ usage: on a relay from the relay’s own counter (the one the customer’s quota comes off), and on the exit server from which server the relays sent each connection through. Days in Tehran time.",
 #"روی هر سرور بزنید تا نمودارهای خودش را ببینید. روز به وقت تهران.": "Click a server to see its own charts. Days in Tehran time.",
 #"روی همان اینترنت (مودم یا سیم‌کارت) یک سایت «آی‌پی من چیست» را باز کنید تا پیدایش کنید. مثال: 5.123.45.67": "On that same connection (router or SIM card) open a “what is my IP” website to find it. Example: 5.123.45.67",
+#"روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS.": "It works on the connections whose address you registered, as the DNS does.",
 #"رویدادهای اخیر": "Recent events",
 #"رک روم": "Rec Room",
 #"رکورد A دامنه به این سرور (": "The domain’s A record does not point at this server (",
@@ -40218,6 +41758,7 @@ exit 0
 #"سرویس فروشندهٔ شما موقتاً قطع است.": "Your seller’s service is paused for now.",
 #"سرویس‌ها": "Services",
 #"سرویس‌هایی که مشکل دارند بالاترند. «گواهی نامعتبر» یعنی جواب از جایی جز خود سرویس آمد — مثلاً صفحهٔ فیلتر. هر اسمی که خراب شد یک بار دیگر آرام‌تر آزموده می‌شود، و فقط اگر بار دوم هم خراب بود این‌جا می‌آید. گروه‌های «پیش‌فرض خاموش» فقط وقتی آزموده می‌شوند که در قالبی روشن باشند. یک دامنهٔ خراب در سرویسی بزرگ همیشه یعنی خرابی نیست؛ جزئیات هر سرویس را باز کنید.": "Services with problems are at the top. “Invalid certificate” means the answer came from somewhere other than the service itself — a filter page, for example. Every name that failed is tried once more, more slowly, and only shows here if it failed the second time too. “Off by default” groups are only tested when they are on in some template. One broken domain in a big service does not always mean an outage; open each service’s details.",
+#"سقف آی‌پی روزانه": "The daily address limit",
 #"سقف استفادهٔ کل": "Total use limit",
 #"سقف باید بیشتر از صفر و روز بین ۱ و ۲۸ باشد": "The cap must be more than zero and the day between 1 and 28",
 #"سقف ترافیک این سرور برداشته شد": "This server’s traffic cap removed",
@@ -40355,11 +41896,14 @@ exit 0
 #"فقط از این آدرس‌ها (اختیاری، با ویرگول جدا)": "Only from these addresses (optional, separated by commas)",
 #"فقط از قالب‌های تیک‌خورده": "Only the ticked templates",
 #"فقط اولین خرید": "First purchase only",
+#"فقط این‌ها:": "Only these:",
 #"فقط برای این پلن‌ها (هیچ‌کدام = همه):": "Only for these plans (none = all):",
 #"فقط تعداد؛ اینکه چه اسمی پرسیده شد جایی نگه داشته نمی‌شود. روز به وقت تهران.": "Counts only; which names were asked is not kept anywhere. Days in Tehran time.",
 #"فقط خروجی": "Outgoing only",
 #"فقط خطاها). توکن ربات همه‌جا با": "errors only). The bot token everywhere as",
 #"فقط خودتان این را می‌بینید. چیزی که نگه داشته می‌شود فقط «کدام سرویس، کدام روز، چقدر» است — نه اینکه چه سایتی را کِی باز کرده‌اید — و بعد از ۳۰ روز پاک می‌شود. «دانلود کنسول و HTTP» بیشتر دانلود بازی‌های پلی‌استیشن و ایکس‌باکس است.": "Only you see this. All that is kept is “which service, which day, how much” — not which site you opened when — and it is deleted after 30 days. “Console downloads and HTTP” is mostly PlayStation and Xbox game downloads.",
+#"فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ بقیهٔ اینترنت شما مثل همیشه مستقیم است. برای هر سرور یک کانفیگ، مثل یک آدرس DNS برای هر سرور؛ اگر یکی کار نکرد، دیگری را روشن کنید. در اندروید اگر «Private DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.": "Only the services this service opens go through WireGuard; the rest of your internet goes direct as always. One config for each server, as one DNS address for each; if one does not work, turn the other on. On Android, turn Private DNS off if it is on. Do not give your config to anybody.",
+#"فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ بقیهٔ اینترنت مستقیم است. برای هر سرور یک کانفیگ، مثل یک آدرس DNS برای هر سرور؛ اگر یکی کار نکرد، دیگری را روشن کنید. در اندروید اگر «Private DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.": "Only the services this service opens go through WireGuard; the rest of your internet goes direct. One config for each server, as one DNS address for each; if one does not work, turn the other on. On Android, turn Private DNS off if it is on. Do not give your config to anybody.",
 #"فقط عکس (JPG، PNG یا WEBP) قبول می‌شود": "Only a picture (JPG, PNG or WEBP) is accepted",
 #"فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود": "Only a picture (JPG, PNG, WEBP) or PDF is accepted",
 #"فقط عکس JPG، PNG یا WEBP": "Only JPG, PNG or WEBP pictures",
@@ -40397,6 +41941,9 @@ exit 0
 #"قبل": "Before",
 #"قدیمی‌ترین ثبت‌نام": "Oldest sign-up",
 #"قطع": "Down",
+#"قطع تا فردا": "off until tomorrow",
+#"قطع تا فردا (سقف آی‌پی)": "off until tomorrow (address limit)",
+#"قفل فوروارد وایرگارد بار نشد:": "WireGuard's forwarding lock did not load:",
 #"قیمت (تومان)": "Price (Toman)",
 #"قیمت باید عدد درست باشد، به تومان": "The price must be a whole number, in Toman",
 #"قیمت دستگاه را به تومان و با عدد بنویسید": "Write the device price in Toman, as a number",
@@ -40444,12 +41991,14 @@ exit 0
 #"متن پیام را بنویسید (یا «انصراف»).": "Write your message (or “Cancel”).",
 #"متن پیام را بنویسید یا عکس یا فیلم بگذارید": "Write a message, or add a photo or video",
 #"متن پیامتان را بنویسید (می‌توانید عکس هم با توضیح بفرستید):": "Write your message (you can also send a photo with a caption):",
+#"متن کانفیگ": "The config's text",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it.",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it. It also blocks ads and trackers, and some games and stores need those same domains.",
 #"مثلاً 203.0.113.7": "e.g. 203.0.113.7",
 #"مثلاً مخصوص ایرانسل": "e.g. for Irancell",
 #"مثلاً گیمینگ ماهانه": "e.g. Gaming monthly",
 #"مجموع مصرف": "Total usage",
+#"محدودیت‌ها": "Limits",
 #"مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰": "The length must be a whole number of days, from 1 to 3650",
 #"مرتب‌سازی:": "Sort:",
 #"مستقیم": "Direct",
@@ -40470,10 +42019,12 @@ exit 0
 #"مشتری از همهٔ دستگاه‌ها بیرون آمد. اینترنتش قطع نشده.": "The customer was signed out of every device. Their internet was not cut.",
 #"مشتری این را می‌بیند": "The customer sees this",
 #"مشتری با رسیدها و تیکت‌هایشان، و پلن‌ها، قالب‌ها و رباتش پاک می‌شوند و قابل برگشت نیست.": "customers with their receipts and tickets, and their plans, templates and bot are deleted, with no undo.",
+#"مشتری با کانفیگ": "customers with a config",
 #"مشتری بتواند کیف پولش را شارژ کند": "Customers can top up their wallet",
 #"مشتری تازه از ربات:": "New customer from the bot:",
 #"مشتری تازه از پنل وب:": "New customer from the web panel:",
 #"مشتری جواب را در پنل خودش یا در ربات می‌بیند. اگر در تیکت بسته بنویسد، دوباره باز می‌شود. عکس‌های تیکت بسته": "The customer sees the reply in their own panel or in the bot. If they write in a closed ticket, it reopens. Pictures of a closed ticket",
+#"مشتری خودش در پنل و ربات کانفیگ بسازد و حذف کند": "Customers make and delete their own configs, on their page and in the bot",
 #"مشتری سرورها را به همین ترتیب می‌بیند، با شماره و توضیح هر کدام (در ربات و پنل خودش، کنار DNS، DoT و DoH آن سرور)؛ اولی را معمولاً برمی‌دارد. «پنهان» سرور را از فهرست همهٔ مشتری‌ها برمی‌دارد، مثلاً وقتی در حال تعمیر است، بدون اینکه تیک مشتری‌ها عوض شود. سرور پنهان هنوز کار می‌کند؛ فقط نشان داده نمی‌شود. فروشنده‌ای که اجازهٔ انتخاب رله دارد، می‌تواند برای مشتری‌های خودش توضیح خودش را بنویسد.": "Customers see the servers in this order, each with its number and note (in the bot and in their panel, beside that server’s DNS, DoT and DoH); they usually take the first. “Hidden” takes a server off every customer’s list, for example while it is being repaired, without changing anyone’s ticks. A hidden server still works; it is only not shown. A seller allowed to pick relays can write their own notes for their own customers.",
 #"مشتری مبلغی را که می‌خواهد می‌نویسد و عکس رسید واریز را می‌فرستد. این رسید در صفحهٔ رسیدها با برچسب «شارژ کیف پول» می‌آید و با تأیید شما، همان مبلغ به کیف پولش اضافه می‌شود (اگر مبلغ رسید فرق داشت، همان‌جا درستش کنید). بعد مشتری با موجودی کیف پول، پلن را بدون رسید و فوری می‌خرد. خرید از کیف پول همیشه باز است، حتی وقتی شارژ بسته باشد؛ چون پورسانت دعوت و پولی که خودتان به کیف پول کسی اضافه کرده‌اید هم قابل خرج است.": "The customer writes the amount they want and sends a photo of the payment slip. The receipt appears on the receipts page marked “Wallet top-up”, and once you approve it that amount is added to their wallet (if the slip says otherwise, correct it there). The customer then buys a plan from the wallet at once, with no receipt. Buying from the wallet is always open, even when top-ups are closed, since referral commission and money you add to someone’s wallet can be spent too.",
 #"مشتری و همهٔ پلن‌ها، قالب‌ها و رباتش": "customers and all their plans, templates and bot",
@@ -40585,6 +42136,7 @@ exit 0
 #"نشد؛ پیام‌های ربات را ببینید": "Failed; see the bot’s messages",
 #"نشست معتبر نیست": "The session is not valid",
 #"نشست منقضی شده": "Session expired",
+#"نصب": "Installing",
 #"نصب یک تک‌سرور تازه": "Install a new single server",
 #"نصب یک رلهٔ تازه": "Install a new relay",
 #"نصب یک سرور خارج تازه": "Install a new exit server",
@@ -40635,6 +42187,7 @@ exit 0
 #"هر پلن تعداد دستگاه خودش را دارد (ستون «دستگاه»)، یعنی چند آی‌پی هم‌زمان می‌توانند وصل باشند. اگر آی‌پی تازه‌ای بیاید و جا نباشد، قدیمی‌ترین آی‌پی حذف می‌شود. مشتری روی پلن فعالش می‌تواند از پنل یا ربات دستگاه اضافه بخرد، با رسید یا از کیف پول. دستگاه اضافه تا وقتی همان پلن را تمدید کند می‌ماند و با خرید پلن دیگر از بین می‌رود. حداکثر": "Each plan has its own number of devices (the “Devices” column): how many IPs can be connected at once. When a new IP comes and there is no room, the oldest one is removed. On an active plan, a customer can buy extra devices from the panel or the bot, by receipt or from the wallet. An extra device lasts while the same plan is renewed and ends when another plan is bought. At most",
 #"هر پلن یعنی یک قالب، برای چند روز، با یک حجم و یک قیمت. مشتری در پنل خودش پلن را انتخاب می‌کند و رسید می‌فرستد؛ با تأیید رسید همه‌چیز خودکار روی حسابش می‌نشیند. خرید دوبارهٔ همان پلن پیش از تمام شدنش تمدید است: روزها و حجم روی باقی‌مانده اضافه می‌شوند. خرید پلن دیگر از همان لحظه از نو شروع می‌شود و باقی‌ماندهٔ قبلی از بین می‌رود؛ این را پیش از خرید به مشتری می‌گوییم. «نامحدود» فقط با تیک خودش؛ خانهٔ خالیِ حجم پذیرفته نمی‌شود.": "Each plan is a template, for a number of days, with a quota and a price. The customer picks a plan in their own panel and sends a receipt; on approval everything is put on their account automatically. Buying the same plan again before it ends is a renewal: the days and quota are added to what is left. Buying another plan starts over from that moment and what was left is lost; the customer is told this before buying. “Unlimited” only by its own tick; an empty quota box is not accepted.",
 #"هر چند روز: عددی بین ۱ و ۶۰": "Every how many days: a number from 1 to 60",
+#"هر کانفیگ از چند آی‌پی در روز": "Addresses a config may connect from in a day",
 #"هر کس با این لینک ثبت‌نام کند، مشتری شما می‌شود و پلن‌ها و اطلاعات پرداخت شما را می‌بیند.": "Whoever signs up with this link becomes your customer and sees your plans and payment details.",
 #"هر کس با لینک شما حساب بسازد و پلن بخرد،": "When someone makes an account with your link and buys a plan,",
 #"هرگز": "Never",
@@ -40666,6 +42219,7 @@ exit 0
 #"همهٔ سرورها همین حالا": "Every server already has",
 #"همهٔ قالب‌ها": "All templates",
 #"همهٔ مشتری‌ها": "All customers",
+#"همهٔ پلن‌ها": "Every plan",
 #"همگام‌سازی با پنل": "Sync with the panel",
 #"همگام‌سازی و پنل مشتری": "Sync and customer panel",
 #"همین آدرس": "This address",
@@ -40687,12 +42241,14 @@ exit 0
 #"هنوز تیکتی نفرستاده‌اید.": "You have not sent any tickets yet.",
 #"هنوز دامنهٔ دلخواه، مسدود یا DNS جداگانه‌ای نساخته‌اید؛ از": "You have not made any custom domains, blocks or separate DNS yet; from the",
 #"هنوز رباتی به پنل وصل نیست (صفحهٔ API)؛ تا وقتی نباشد این قانون اعمال نمی‌شود تا کسی گیر نیفتد.": "No bot is connected to the panel yet (API page); until there is one this rule is not enforced, so nobody gets stuck.",
+#"هنوز رله‌ای نیست": "No relay yet",
 #"هنوز عضو کانال نشده‌اید.": "You have not joined the channel yet.",
 #"هنوز قالبی نیست": "No templates yet",
 #"هنوز لاگی نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ سرورهای قدیمی‌تر بعد از ارتقا.": "They have not sent logs yet. Each Iran server sends its log every 5 minutes; older servers after they are upgraded.",
 #"هنوز مصرفی از این سرور ثبت نشده.": "No usage recorded from this server yet.",
 #"هنوز مصرفی ثبت نشده. نمودارها از اولین همگام‌سازی رله بعد از این نسخه پر می‌شوند.": "No usage recorded yet. The charts fill from the relays’ first sync after this version.",
 #"هنوز نه": "not yet",
+#"هنوز وصل نشده": "not connected yet",
 #"هنوز پلن نخریده‌اند": "Have not bought a plan yet",
 #"هنوز پلنی نساخته‌اید. تا وقتی پلنی نباشد، مشتری رسید را بدون انتخاب پلن می‌فرستد و سهمیه را خودتان می‌گذارید.": "You have not made any plans yet. Until there is a plan, the customer sends a receipt without choosing one and you set the quota yourself.",
 #"هنوز پلنی نیست": "No plans yet",
@@ -40721,6 +42277,14 @@ exit 0
 #"وارهمر دارک‌تاید": "Warhammer: Darktide",
 #"والورانت": "Valorant",
 #"وانس هیومن": "Once Human",
+#"وایرگارد": "WireGuard",
+#"وایرگارد خاموش است؛ اول در تنظیمات روشنش کنید": "WireGuard is off; turn it on in Settings first",
+#"وایرگارد خاموش شد": "WireGuard is off",
+#"وایرگارد روی این سرویس روشن نیست": "WireGuard is not on for this service",
+#"وایرگارد هنوز روی هیچ رله‌ای آماده نیست؛ یک دقیقه بعد دوباره امتحان کنید": "WireGuard is not ready on any relay yet; try again in a minute",
+#"وایرگارد هنوز روی هیچ سروری آماده نیست؛ چند دقیقهٔ دیگر دوباره امتحان کنید": "WireGuard is not ready on any server yet; try again in a few minutes",
+#"وایرگارد کاربر": "Customer's WireGuard",
+#"وایرگارد:": "WireGuard:",
 #"وایلد ریفت": "Wild Rift",
 #"وب‌سوکت مشترک — رمز ندارد": "Shared WebSocket — no encryption",
 #"وب‌سوکت — رمز ندارد": "WebSocket — no encryption",
@@ -40798,6 +42362,8 @@ exit 0
 #"پلن": "Plan",
 #"پلن «": "Plan “",
 #"پلن انتخاب‌شده فوراً فعال می‌شود و قیمتش از کیف پول کم می‌شود؛ رسید لازم نیست.": "The chosen plan is activated at once and its price comes off the wallet; no receipt needed.",
+#"پلن این حساب وایرگارد ندارد": "This account's plan has no WireGuard",
+#"پلن این کاربر وایرگارد ندارد؛ در تب وایرگارد پلن‌ها را عوض کنید": "This customer's plan has no WireGuard; change the plans on the WireGuard tab",
 #"پلن تازه": "New plan",
 #"پلن تست رایگان ساخته شد؛ مشتری‌ها با تلگرام وصل‌شده یک بار می‌گیرندش": "Free trial plan created; customers with a linked Telegram get it once",
 #"پلن حذف شد": "Plan deleted",
@@ -40821,6 +42387,7 @@ exit 0
 #"پلن‌ها (": "Plans (",
 #"پلن‌ها و پرداخت": "Plans and payment",
 #"پلن‌هایی این قالب را می‌فروشند؛ اول آن‌ها را حذف کنید یا قالبشان را عوض کنید": "Plans sell this template; delete them or change their template first",
+#"پلن‌هایی که وایرگارد دارند": "Plans with WireGuard",
 #"پلی‌استیشن": "PlayStation Network",
 #"پنل ادمین — سرور خارج": "Admin panel — exit server",
 #"پنل به این آدرس ربات خبر می‌دهد: تأیید یا رد رسید، جواب تیکت، ۸۰٪ و ۹۵٪ حجم، تمام شدن حجم، نزدیک شدن و تمام شدن دوره. هر خبر یک متن فارسی آماده دارد که ربات می‌تواند عیناً برای مشتری بفرستد.": "The panel tells the bot at this address about: a receipt approved or rejected, a ticket reply, 80% and 95% of the quota, the quota running out, the period ending soon and ending. Each message has a ready text the bot can send to the customer as it is.",
@@ -40839,8 +42406,10 @@ exit 0
 #"پنل‌ها": "Panels",
 #"پنهان": "Hidden",
 #"پورت": "Port",
+#"پورت UDP": "UDP port",
 #"پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد": "The port must be a number from 1 to 65535",
 #"پورت را که عوض کنید، پنل روی پورت تازه بالا می‌آید — ولی اگر سرور فایروال یا security group دارد (روی AWS، Hetzner و مانندش) باید پورت تازه را": "When you change the port, the panel comes up on the new port — but if the server has a firewall or security group (on AWS, Hetzner and the like) you must open the new port",
+#"پورت وایرگارد عددی از ۱ تا ۶۵۵۳۵ است": "The WireGuard port is a number from 1 to 65535",
 #"پورت ۸۵۳. برای Private DNS اندروید، و برنامه‌ها و مودم‌هایی که DoT دارند؛ بعضی‌ها آن را به شکل": "Port 853. For Android’s Private DNS, and apps and routers that have DoT; some want it in the form",
 #"پورسانت دعوت": "Invitation commission",
 #"پورسانت گرفته (تومان)": "Commission earned (Toman)",
@@ -40859,6 +42428,7 @@ exit 0
 #"پیام‌هایتان زیاد شده؛ کمی بعد دوباره بنویسید": "You have sent many messages; write again a little later",
 #"پیش از ذخیره از همین سرور آزموده می‌شوند — اگر جواب ندهند، همان قبلی می‌ماند.": "They are tested from this server before saving — if they do not answer, the previous ones stay.",
 #"پیش از ذخیره از همین سرور آزموده می‌شوند، و هر رله هم پیش از اعمال، خودش از ایران امتحان می‌کند — اگر جواب ندهد همان قبلی را نگه می‌دارد.": "They are tested from this server before saving, and each relay also tries them from Iran before applying — if they do not answer, it keeps the previous ones.",
+#"پیش‌فرض": "default",
 #"پیش‌فرض خاموش —": "Off by default —",
 #"پیش‌فرض خاموش: روی بیشتر اپراتورها مستقیم بهتر کار می‌کند": "off by default: works better direct on most operators",
 #"پیش‌فرض خاموش: روی ۵۲۲۳ است، که رله نمی‌برد": "off by default: it is on 5223, which the relay does not carry",
@@ -40899,6 +42469,18 @@ exit 0
 #"کال آو دیوتی": "Call of Duty",
 #"کامل": "Full",
 #"کامند اند کانکر": "Command and Conquer",
+#"کانفیگ": "configs",
+#"کانفیگ حذف شد": "Config deleted",
+#"کانفیگ فقط روی آی‌پی‌های ثبت‌شدهٔ مشتری کار کند": "Configs work only from the customer's registered addresses",
+#"کانفیگ هنوز آماده نیست؛ یک دقیقهٔ دیگر دوباره امتحان کنید": "The config is not ready yet; try again in a minute",
+#"کانفیگ وایرگارد": "WireGuard config",
+#"کانفیگ وایرگارد حذف شد": "WireGuard config deleted",
+#"کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ تیکت بزنید": "Support makes WireGuard configs for you; open a ticket",
+#"کانفیگ وایرگارد ساخته شد": "WireGuard config made",
+#"کانفیگ وایرگارد ساخته شد؛ تا یک دقیقه دیگر روی رله فعال می‌شود": "WireGuard config made; it works on the relay within a minute",
+#"کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود": "WireGuard config made; it works on the server within a minute",
+#"کانفیگ،": "configs,",
+#"کانفیگ‌ها (": "Configs (",
 #"کجا رفت": "Where it went",
 #"کد": "Code",
 #"کد اتصال درست نیست": "The link code is not correct",
@@ -40931,6 +42513,7 @@ exit 0
 #"کلید «": "Key “",
 #"کلید باطل شد؛ رباتی که با آن کار می‌کرد قطع شد": "Key revoked; the bot that used it has been cut off",
 #"کلید تازه": "New key",
+#"کلید رله هنوز نرسیده؛ یک دقیقه بعد صفحه را تازه کنید.": "The relay's key has not arrived yet; refresh in a minute.",
 #"کلید رمزگذاری عکس‌ها": "Picture encryption key",
 #"کلید رمزگذاری عکس‌ها (": "Picture encryption key (",
 #"کلیدها": "Keys",
@@ -40973,11 +42556,13 @@ exit 0
 #"گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود": "DNS report turned on; kept for up to an hour",
 #"گزارش DNS —": "DNS report —",
 #"گزارش روزانه": "Daily report",
+#"گزارش می‌دهد ولی": "reports, but for",
 #"گنشین ایمپکت": "Genshin Impact",
 #"گواهی": "Certificate",
 #"گواهی خود سایت منقضی یا ناقص است": "The site’s own certificate is expired or incomplete",
 #"گواهی خود سایت منقضی یا ناقص است — مشکل از خود سرویس است، نه از ما": "The site’s own certificate is expired or incomplete — the problem is with the service itself, not with us",
 #"گواهی نامعتبر — جواب از جای دیگری آمد": "Invalid certificate — the answer came from somewhere else",
+#"گوشی مشتری با وایرگارد فقط به رلهٔ ایران وصل می‌شود و از راه آن فقط DNS و سرویس‌هایی که این سرویس باز می‌کند؛ بقیهٔ اینترنتش مستقیم است و رله چیزی را فوروارد نمی‌کند، پس VPN نیست. هر مشتری برای هر رله یک کانفیگ می‌گیرد، مثل یک آدرس DNS برای هر رله. کانفیگ‌ها را از «کاربران ← 📱 دستگاه‌ها» بسازید.": "With WireGuard a customer's phone reaches only the relay in Iran, and through it only DNS and the services this service opens; the rest of their internet goes direct, and the relay forwards nothing, so it is not a VPN. Each customer gets one config for each relay, as one DNS address for each relay. Make configs from Users → 📱 Devices.",
 #"گیت‌هاب جواب درستی نداد:": "GitHub did not answer properly:",
 #"گیرنده‌ها را انتخاب کنید": "Choose the recipients",
 #"گیلتی گیر": "Guilty Gear",
@@ -40999,6 +42584,8 @@ exit 0
 #"یک ادمین این نام کاربری را دارد": "An admin has this username",
 #"یک استثنا: گروه‌هایی که «پیش‌فرض خاموش» علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید.": "One exception: groups marked “off by default” are not routed even in this template. To turn them on, make a new template and tick them there.",
 #"یک بار": "Once",
+#"یک راه دیگر برای استفاده از سرویس، کنار DNS: برنامهٔ وایرگارد را روی گوشی نصب می‌کنید و کانفیگ را به آن می‌دهید. جایی که DNS کار نمی‌کند، این کار می‌کند.": "Another way to use the service, beside DNS: you install the WireGuard app on your phone and give it the config. Where DNS does not work, this does.",
+#"یک راه دیگر برای استفاده از سرویس، کنار DNS؛ جایی که DNS کار نمی‌کند، این کار می‌کند.": "Another way to use the service, beside DNS; where DNS does not work, this does.",
 #"یک ربات تلگرام برای مشتری‌ها و خودتان: خرید پلن و فرستادن رسید، ثبت آی‌پی، تیکت، و برای شما رسید تازه با دکمهٔ تأیید. همه‌چیز روی همین سرور است.": "A Telegram bot for your customers and yourself: buying a plan and sending a receipt, registering an IP, tickets, and for you new receipts with an approve button. Everything is on this server.",
 #"یک فایل sqlite با همهٔ کاربران، آی‌پی‌ها، قالب‌ها، تراکنش‌ها و تنظیمات. آمار سلامت سرورها داخلش نیست — حجم زیادی است و ارزشی در بازگردانی ندارد.": "An sqlite file with all users, IPs, templates, transactions and settings. The servers’ health stats are not in it — they are large and not worth restoring.",
 #"یک فایل، رمزگذاری‌شده با همین رمز: دیتابیس، کلید عکس‌ها، و آنچه برای بالا آوردن همین پنل روی سرور دیگری لازم است. رمز را جایی جدا نگه دارید؛ بدون آن فایل باز نمی‌شود و این‌جا هم نشان داده نمی‌شود. برای بازگردانی، فایل را با همین رمز در کارت «نسخهٔ پشتیبان» بفرستید؛ یا روی هر سیستمی با openssl:": "One file, encrypted with this password: the database, the picture key, and what is needed to bring this panel up on another server. Keep the password somewhere separate; without it the file does not open, and it is not shown here either. To restore, upload the file with this password in the “Backup” card; or on any system with openssl:",
@@ -41010,10 +42597,15 @@ exit 0
 #"یکی از رله‌هاست": "is one of the relays",
 #"یکی از سرورهای خارج است": "is one of the exit servers",
 #"۱ دقیقه": "1 minute",
+#"۱. برنامهٔ": "1. Install the",
+#"۱. برنامهٔ WireGuard را از App Store یا Google Play نصب کنید.": "1. Install the WireGuard app from the App Store or Google Play.",
 #"۲ دقیقه": "2 minutes",
+#"۲. در برنامه + را بزنید و QR کد را اسکن کنید، یا فایل کانفیگ را باز کنید.": "2. In the app tap + and scan the QR code, or open the config file.",
+#"۲. در برنامه + را بزنید و QR کد را اسکن کنید؛ یا فایل کانفیگ را دانلود کنید و در برنامه «Import from file» / «Create from file» را بزنید.": "2. In the app tap + and scan the QR code; or download the config file and choose “Import from file” / “Create from file” in the app.",
 #"۲۰۰ خط آخر": "Last 200 lines",
 #"۳ تا ۳۲ حرف انگلیسی کوچک، عدد، . - _": "3 to 32 lower-case English letters, digits, . - _",
 #"۳ تا ۳۲ حرف انگلیسی کوچک، عدد، نقطه، خط تیره یا زیرخط. از روی سرور هم:": "3 to 32 lower-case English letters, digits, dots, dashes or underscores. From the server too:",
+#"۳. تونل را روشن کنید.": "3. Turn the tunnel on.",
 #"۳۰ روز": "30 days",
 #"۳۰ روز اخیر": "Last 30 days",
 #"۳۰ روز اخیر — دانلود / آپلود": "Last 30 days — download / upload",
@@ -41023,12 +42615,14 @@ exit 0
 #"۷ روز": "7 days",
 #"۷ روز اخیر": "Last 7 days",
 #"۷ روز اخیر — دانلود / آپلود": "Last 7 days — download / upload",
+#"— آخرین اتصال:": "— last connected:",
 #"— آیفون، ویندوز، کروم و فایرفاکس": "— iPhone, Windows, Chrome and Firefox",
 #"— از نصب‌کننده؛ با": "— from the installer; with",
 #"— اندروید ← DNS خصوصی": "— Android → Private DNS",
 #"— این سرور": "— this server",
 #"— این پلن رزرو می‌شود": "— this plan will be reserved",
 #"— با تأیید، یک دستگاه به حسابش اضافه می‌شود": "— on approval, one device is added to their account",
+#"— برای هر رله یک کانفیگ، مثل یک آدرس DNS برای هر رله؛ روی": "— one config for each relay, as one DNS address for each; it works on",
 #"— بررسی:": "— checked:",
 #"— بعد از تمام شدن پلن فعلی خودکار فعال می‌شود": "— starts by itself when the current plan ends",
 #"— تا چند دقیقهٔ دیگر آماده می‌شود": "— ready within a few minutes",
@@ -41073,7 +42667,9 @@ exit 0
 #"⚠️ هنوز آی‌پی ثبت نکرده‌اید؛ اول «ثبت آی‌پی» را بزنید.": "⚠️ You have not registered an IP yet; tap “Register IP” first.",
 #"⚠️ پردازندهٔ": "⚠️ Processor of",
 #"⚠️ پروفایل فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب بگیریدش.": "⚠️ The profile was not sent; press again in a little while, or get it from the web panel.",
+#"⚠️ کانفیگ فرستاده نشد؛ کمی بعد دوباره بزنید، یا از پنل وب بگیریدش.": "⚠️ The config was not sent; try again shortly, or get it from the web panel.",
 #"⚠️ گواهی HTTPS": "⚠️ HTTPS certificate",
+#"⛔ تا فردا قطع (آی‌پی زیاد)": "⛔ off until tomorrow (too many addresses)",
 #"⛔ حجم فروشنده": "⛔ The traffic of seller",
 #"⛔ روزهای فروشنده": "⛔ The days of seller",
 #"⛔ فیلتر داخل ایران": "⛔ Filtered inside Iran",
@@ -41093,6 +42689,7 @@ exit 0
 #"✅ همهٔ سرورها به نسخهٔ": "✅ All servers upgraded to version",
 #"✅ پردازندهٔ": "✅ Processor of",
 #"✅ پلن رزرو شما فعال شد:": "✅ Your reserved plan has started:",
+#"✅ کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال می‌شود.": "✅ WireGuard config made; it works on the server within a minute.",
 #"✅ گواهی HTTPS": "✅ HTTPS certificate",
 #"✅ یک دستگاه اضافه شد؛ حالا": "✅ A device was added; now you have",
 #"✍️ جواب": "✍️ Reply",
@@ -41106,6 +42703,7 @@ exit 0
 #"❓ راهنما": "❓ Help",
 #"➕ تیکت تازه": "➕ New ticket",
 #"➕ شارژ کیف پول": "➕ Top up wallet",
+#"➕ کانفیگ تازه": "➕ New config",
 #"🆕 نسخهٔ تازه از گیت‌هاب": "🆕 New version from GitHub",
 #"🌍 DNS عمومی روشن است: هر کسی آدرس رله را بگذارد، بدون ثبت‌نام و ثبت آی‌پی سرویس می‌گیرد.": "🌍 Public DNS is on: anyone who sets the relay’s address gets the service, with no sign-up and no registered IP.",
 #"🌐 DNS معمولی — در کنسول، مودم یا گوشی، هم DNS اول و هم دوم را روی یکی از این‌ها بگذارید:": "🌐 Plain DNS — on a console, modem or phone, set both the first and the second DNS to one of these:",
@@ -41158,6 +42756,7 @@ exit 0
 #"📢 تبلیغات": "📢 Ads",
 #"📢 عضویت در کانال": "📢 Join the channel",
 #"📣 پیام همگانی": "📣 Broadcast message",
+#"📥 دریافت کانفیگ وایرگارد": "📥 Get a WireGuard config",
 #"📦 پلن:": "📦 Plan:",
 #"📱 اندروید — تنظیمات ← شبکه ← DNS خصوصی ← نام میزبان (DoT):": "📱 Android — Settings → Network → Private DNS → hostname (DoT):",
 #"📱 دستگاه اضافه": "📱 Extra device",
@@ -41184,12 +42783,21 @@ exit 0
 #"🕒 زمان:": "🕒 Sent:",
 #"🗂 قالب:": "🗂 Template:",
 #"🗄 بکاپ پنل —": "🗄 Panel backup —",
+#"🗑 حذف": "🗑 Delete",
 #"🚀 سرعت:": "🚀 Speed:",
 #"🚫 مسدودی‌ها": "🚫 Blocks",
 #"🛒 تمدید": "🛒 Renew",
 #"🛒 خرید / تمدید": "🛒 Buy / Renew",
 #"🛒 خرید / تمدید: انتخاب پلن و فرستادن رسید": "🛒 Buy / Renew: choose a plan and send the receipt",
 #"🛒 خرید پلن": "🛒 Buy a plan",
+#"🛡 تنظیمات وایرگارد": "🛡 WireGuard settings",
+#"🛡 وایرگارد": "🛡 WireGuard",
+#"🛡 وایرگارد آنلاین": "🛡 WireGuard online",
+#"🛡 کانفیگ وایرگارد": "🛡 WireGuard config",
+#"🛡 کانفیگ وایرگارد — در برنامهٔ WireGuard: + ← اسکن QR، یا فایل را باز کنید.": "🛡 WireGuard config — in the WireGuard app: + → scan the QR, or open the file.",
+#"🛡 کانفیگ وایرگارد:": "🛡 WireGuard configs:",
+#"🛡 کانفیگ‌های وایرگارد": "🛡 WireGuard configs of",
+#"🟢 آنلاین": "🟢 online",
 #"🟢 آنلاین الان (": "🟢 Online now (",
 #"🤖 لینک ربات:": "🤖 Bot link:",
 #"🧾 رسید #": "🧾 Receipt #",

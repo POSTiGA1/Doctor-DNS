@@ -2871,6 +2871,235 @@ def upgrade_heard():
         pass
 
 
+# ------------------------------------------------------------- WireGuard
+# Split WireGuard: a customer's phone reaches this relay over WireGuard, from
+# inside Iran, and through it only this relay - its DNS, and the services its
+# DNS sends here, which go on through the tunnel to the exit as ever. Each
+# config has an address of its own that the panel registers like any other,
+# so the allowed list, the templates, the counters and the gate all treat it
+# the same. Nothing arriving on wg0 is forwarded anywhere: it is never a VPN.
+WG_BIN = "/usr/bin/wg"
+WG_IF = "wg0"
+WG_ADDR = "10.66.0.1/16"
+WG_NET = ipaddress.ip_network("10.66.0.0/16")
+WG_DIR = "/etc/smart-dns/wg"
+WG_KEY = os.path.join(WG_DIR, "server.key")
+WG_CONF = os.path.join(WG_DIR, WG_IF + ".conf")
+WG_NFT = "/etc/nftables.d/42-smartdns-wg.conf"
+WG_TABLE = "smartdns_wg"
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+WG_REPORT = {"state": None}
+# When the panel's answer last came back - from the start, so a relay just
+# started is not taken for one never answered.
+SYNC_HEARD = {"at": time.time()}
+# The lock that keeps it from being a VPN, whatever ip_forward says: a
+# docker install or anything else that turns forwarding on still forwards
+# nothing in or out of wg0.
+# An address that used somebody else's config: kept off WireGuard for this
+# long. {address: until}, put back after the table is reloaded.
+WG_DENY = {}
+WG_DENY_SECONDS = 600
+WG_FRESH_SECONDS = 180       # a connected config shakes hands every two minutes
+
+
+def wg_nft_text(port, bind=False, ok=()):
+    """The lock that keeps it from being a VPN, whatever ip_forward says -
+    and, bound to registered addresses, the door: only the addresses the
+    configs' customers registered reach WireGuard, and none that used
+    somebody else's config lately."""
+    door = ""
+    if bind:
+        door = ("    set ok {\n        type ipv4_addr\n%s    }\n"
+                "    set deny {\n        type ipv4_addr\n        flags timeout\n    }\n"
+                "    chain input {\n"
+                "        type filter hook input priority -5 ; policy accept ;\n"
+                "        udp dport %d ip saddr @deny drop\n"
+                "        udp dport %d ip saddr != @ok drop\n"
+                "    }\n" % (("        elements = { %s }\n" % ", ".join(sorted(ok))) if ok
+                             else "", port, port))
+    return ("# written by smartdns-sync: WireGuard reaches this relay and nothing else\n"
+            "table inet %s\n"
+            "delete table inet %s\n"
+            "table inet %s {\n%s"
+            "    chain forward {\n"
+            "        type filter hook forward priority -10 ; policy accept ;\n"
+            "        iifname \"%s\" drop\n"
+            "        oifname \"%s\" drop\n"
+            "    }\n"
+            "}\n" % (WG_TABLE, WG_TABLE, WG_TABLE, door, WG_IF, WG_IF))
+
+
+def wg_peer_ips(raw):
+    """{config's key: its customer's registered addresses}, for a bound one."""
+    out = {}
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict) or not WG_KEY_RE.fullmatch(str(p.get("pub") or "")):
+            continue
+        ips = set()
+        for ip in p.get("ips") or []:
+            try:
+                ips.add(str(ipaddress.IPv4Address(str(ip))))
+            except ValueError:
+                pass
+        out[str(p["pub"])] = ips
+    return out
+
+
+def wg_police(peer_ips, seen, stamp=None):
+    """A bound config used from an address that is not its customer's - a
+    config handed on, from somebody else's registered address: that address
+    kept off WireGuard for a while. Returns the addresses newly kept off."""
+    stamp = stamp or time.time()
+    for ip in [ip for ip, until in WG_DENY.items() if until <= stamp]:
+        del WG_DENY[ip]
+    caught = []
+    for key, st in seen.items():
+        ep = st.get("ep") or ""
+        # Only a handshake of the last few minutes: wg keeps a config's last
+        # address after it is gone, and that must not keep anybody off.
+        fresh = 0 <= stamp - (st.get("hs") or 0) < WG_FRESH_SECONDS
+        if (key in peer_ips and fresh and ep and ep not in peer_ips[key]
+                and ep not in WG_DENY):
+            WG_DENY[ep] = stamp + WG_DENY_SECONDS
+            caught.append(ep)
+            nft("add", "element", "inet", WG_TABLE, "deny",
+                "{ %s timeout %ds }" % (ep, WG_DENY_SECONDS))
+            log(WARN, "a WireGuard config was used from %s, not its customer's address -"
+                      " that address is off WireGuard for %d minutes"
+                % (ep, WG_DENY_SECONDS // 60))
+    return caught
+
+
+def wg_server_key():
+    """This relay's WireGuard key, made once and kept across upgrades:
+    every config handed out names its public half."""
+    if not os.path.exists(WG_KEY):
+        os.makedirs(WG_DIR, mode=0o700, exist_ok=True)
+        made = sh(WG_BIN, "genkey")
+        if made.returncode or not WG_KEY_RE.fullmatch(made.stdout.strip()):
+            raise RuntimeError("wg genkey failed: %s" % made.stderr.strip()[:200])
+        write_if_changed(WG_KEY, made.stdout.strip() + "\n", 0o600)
+    priv = (read_text(WG_KEY) or "").strip()
+    pub = subprocess.run([WG_BIN, "pubkey"], input=priv + "\n", capture_output=True,
+                         text=True, timeout=30).stdout.strip()
+    if not WG_KEY_RE.fullmatch(pub):
+        raise RuntimeError("wg pubkey failed")
+    return priv, pub
+
+
+def clean_wg_peers(raw):
+    """The configs the panel sent, each a valid key and an address of ours."""
+    out = {}
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        key, addr = str(p.get("pub") or ""), str(p.get("addr") or "")
+        try:
+            ip = ipaddress.IPv4Address(addr)
+        except ValueError:
+            continue
+        if WG_KEY_RE.fullmatch(key) and ip in WG_NET and addr != WG_ADDR.split("/")[0]:
+            out[key] = addr
+    return out
+
+
+def wg_conf_text(priv, port, peers):
+    text = "[Interface]\nPrivateKey = %s\nListenPort = %d\n" % (priv, port)
+    for key, addr in sorted(peers.items(), key=lambda kv: kv[1]):
+        text += "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n" % (key, addr)
+    return text
+
+
+def wg_dump():
+    """{public key: {"hs": latest handshake, "ep": the address it came from}}
+    for every config that has connected."""
+    out = {}
+    r = sh(WG_BIN, "show", WG_IF, "dump")
+    for line in r.stdout.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) < 5 or not f[4].isdigit() or f[4] == "0":
+            continue
+        ep = f[2].rsplit(":", 1)[0] if f[2] != "(none)" else ""
+        out[f[0]] = {"hs": int(f[4]), "ep": ep}
+    return out
+
+
+def wg_down():
+    if sh("ip", "link", "show", WG_IF).returncode == 0:
+        sh("ip", "link", "del", WG_IF)
+        log(INFO, "WireGuard off, as the admin panel says")
+    for path in (WG_NFT, WG_CONF):
+        if os.path.exists(path):
+            os.unlink(path)
+    nft("delete", "table", "inet", WG_TABLE)
+
+
+def apply_wg(raw):
+    """Bring WireGuard here to what the panel says: on with these configs, or
+    off. A panel too old to say leaves it as it is."""
+    if raw is None:
+        return
+    if not isinstance(raw, dict) or not raw.get("on") or is_single():
+        wg_down()
+        WG_REPORT["state"] = {"on": False}
+        return
+    if not os.access(WG_BIN, os.X_OK):
+        WG_REPORT["state"] = {"on": False, "error": "wireguard-tools روی این رله نصب نیست؛ "
+                                                    "نصب‌کننده را یک بار دیگر روی رله اجرا کنید"}
+        return
+    try:
+        port = int(raw.get("port") or 51820)
+    except (TypeError, ValueError):
+        port = 51820
+    if not 1 <= port <= 65535:
+        port = 51820
+    priv, pub = wg_server_key()
+    peers = clean_wg_peers(raw.get("peers"))
+    bind = bool(raw.get("bind"))
+    peer_ips = wg_peer_ips(raw.get("peers")) if bind else {}
+    fresh = sh("ip", "link", "show", WG_IF).returncode != 0
+    if fresh:
+        made = sh("ip", "link", "add", WG_IF, "type", "wireguard")
+        if made.returncode:
+            WG_REPORT["state"] = {"on": False, "pub": pub,
+                                  "error": "wg0 ساخته نشد: %s" % made.stderr.strip()[:200]}
+            return
+    # syncconf adds and drops peers without touching the ones that stay:
+    # nobody connected is cut off because somebody else joined.
+    if write_if_changed(WG_CONF, wg_conf_text(priv, port, peers), 0o600) or fresh:
+        done = sh(WG_BIN, "syncconf", WG_IF, WG_CONF)
+        if done.returncode:
+            WG_REPORT["state"] = {"on": False, "pub": pub,
+                                  "error": "wg syncconf: %s" % done.stderr.strip()[:200]}
+            return
+        log(INFO, "WireGuard on port %d, %d config(s)" % (port, len(peers)))
+    sh("ip", "addr", "replace", WG_ADDR, "dev", WG_IF)
+    sh("ip", "link", "set", WG_IF, "up")
+    os.makedirs(os.path.dirname(WG_NFT), exist_ok=True)
+    ok = set().union(*peer_ips.values()) if peer_ips else set()
+    if write_if_changed(WG_NFT, wg_nft_text(port, bind, ok)) \
+            or nft("list", "table", "inet", WG_TABLE).returncode:
+        locked = nft("-f", WG_NFT)
+        if locked.returncode:
+            # Without the lock it would forward if anything turned forwarding
+            # on: better no WireGuard than a VPN.
+            wg_down()
+            WG_REPORT["state"] = {"on": False, "pub": pub,
+                                  "error": "قفل فوروارد وایرگارد بار نشد: %s"
+                                           % locked.stderr.strip()[:200]}
+            return
+        # The table was made anew: the addresses still kept off go back in.
+        stamp = time.time()
+        for ip, until in WG_DENY.items():
+            if bind and until > stamp:
+                nft("add", "element", "inet", WG_TABLE, "deny",
+                    "{ %s timeout %ds }" % (ip, int(until - stamp) + 1))
+    seen = wg_dump()
+    if bind:
+        wg_police(peer_ips, seen)
+    WG_REPORT["state"] = {"on": True, "pub": pub, "port": port, "peers": seen}
+
+
 def sync_once():
     rows = current_state()
     counters = {r["ip"]: r["total"] for r in rows}
@@ -2938,6 +3167,13 @@ def sync_once():
         payload["probe_result"] = checked
     if TUNNEL_REPORT["state"] is not None:
         payload["tunnel_state"] = TUNNEL_REPORT["state"]
+    if WG_REPORT["state"] is not None:
+        if WG_REPORT["state"].get("on"):
+            try:
+                WG_REPORT["state"]["peers"] = wg_dump()
+            except Exception as e:
+                log(WARN, "WireGuard not read: %s" % e)
+        payload["wg_state"] = WG_REPORT["state"]
     if NODE_TUNNEL_REPORT["state"] is not None:
         payload["node_tunnel_state"] = NODE_TUNNEL_REPORT["state"]
     try:
@@ -2954,7 +3190,11 @@ def sync_once():
     finished_domain = domain_result()
     if finished_domain:
         payload["domain_result"] = finished_domain
+    # How long the panel's answers have not come back: the panel hears the
+    # report and can tell its operator when what it sends is lost on the way.
+    payload["unanswered"] = int(max(0, time.time() - SYNC_HEARD["at"]))
     answer = post("/sync", payload)
+    SYNC_HEARD["at"] = time.time()
     if finished_domain and answer.get("domain_ack"):
         domain_heard()
     try:
@@ -3053,6 +3293,11 @@ def sync_once():
     except Exception as e:
         TUNNEL_REPORT["state"] = {"on": False, "error": str(e)[:300]}
         log_exception("tunnel not applied: %s" % e)
+    try:
+        apply_wg(answer.get("wg"))
+    except Exception as e:
+        WG_REPORT["state"] = {"on": False, "error": str(e)[:300]}
+        log_exception("WireGuard not applied: %s" % e)
     try:
         maybe_bench(answer.get("bench"))
     except Exception as e:
@@ -4498,6 +4743,86 @@ def servers_doh_box(info, servers):
     return "".join(out)
 
 
+WG_HELP = ("<h3>نصب</h3>"
+           "<p class='note'>۱. برنامهٔ <b>WireGuard</b> را از App Store یا Google Play نصب "
+           "کنید.<br>۲. در برنامه + را بزنید و QR کد را اسکن کنید؛ یا فایل کانفیگ را "
+           "دانلود کنید و در برنامه «Import from file» / «Create from file» را بزنید."
+           "<br>۳. تونل را روشن کنید.</p>"
+           "<p class='note'>فقط سرویس‌هایی که این سرویس باز می‌کند از وایرگارد می‌روند؛ "
+           "بقیهٔ اینترنت شما مثل همیشه مستقیم است. برای هر سرور یک کانفیگ، مثل یک آدرس "
+           "DNS برای هر سرور؛ اگر یکی کار نکرد، دیگری را روشن کنید. در اندروید اگر «Private "
+           "DNS» روشن است خاموشش کنید. کانفیگ را به کسی ندهید.</p>")
+
+
+def wg_box(info):
+    """WireGuard on the account page, when it is offered: the customer's
+    configs, each to show as a QR and download, and a new one while devices
+    are free - when the operator lets customers make them."""
+    wg = info.get("wg") or {}
+    if not wg.get("on"):
+        return ""
+    devices = wg.get("devices") or []
+    servers = wg.get("relays") or []
+    many = len(servers) > 1 or len({d.get("relay") for d in devices}) > 1
+    out = ["<details class='pw' id='wg' open><summary>🛡 وایرگارد</summary>",
+           "<p class='note'>یک راه دیگر برای استفاده از سرویس، کنار DNS: برنامهٔ "
+           "وایرگارد را روی گوشی نصب می‌کنید و کانفیگ را به آن می‌دهید. جایی که DNS "
+           "کار نمی‌کند، این کار می‌کند. %s</p>"
+           % ("روی همان اینترنت‌هایی کار می‌کند که آی‌پی‌شان را ثبت کرده‌اید، مثل DNS." if wg.get("bind") else
+              "آی‌پی ثبت کردن لازم نیست و روی هر اینترنتی کار می‌کند.")]
+    for d in devices:
+        state = ("<span class='ok'>آنلاین</span>" if d.get("online") else
+                 "<span class='bad'>امروز از آی‌پی‌های زیادی وصل شده؛ تا فردا قطع است</span>"
+                 if d.get("blocked") else
+                 "آخرین اتصال: %s" % html.escape(d["last"]) if d.get("last")
+                 else "هنوز وصل نشده")
+        out.append(
+            "<div class='dns'><div class='k'>%s%s</div><p class='note' style='margin-top:0'>%s</p>"
+            "<a class='btn' href='/wg/%d'>QR کد و فایل کانفیگ</a>%s</div>"
+            % (html.escape(d.get("name") or d.get("file") or d["address"]),
+               " — %s" % html.escape(d["server"]) if many and d.get("server") else "",
+               state, d["id"],
+               ("<form method='post' action='/wg-del' onsubmit=\"return confirm('این کانفیگ "
+                "حذف شود؟ گوشی‌ای که با آن وصل است قطع می‌شود.')\"><input type='hidden' "
+                "name='id' value='%d'><button class='ghost small'>حذف</button></form>"
+                % d["id"]) if wg.get("self") else ""))
+    if wg.get("self") and wg.get("room"):
+        # More than one server: the customer picks - one filtered in their
+        # city, another may not be.
+        pick = ("<label>برای کدام سرور؟</label><select name='relay'>%s</select>"
+                % "".join("<option value='%s'>%s</option>"
+                          % (html.escape(x["ip"], quote=True), html.escape(x["label"]))
+                          for x in servers)) if len(servers) > 1 else "".join(
+            "<input type='hidden' name='relay' value='%s'>" % html.escape(x["ip"], quote=True)
+            for x in servers)
+        out.append("<form method='post' action='/wg-new'>%s<button>%s</button></form>"
+                   % (pick, "دریافت کانفیگ وایرگارد" if not devices else
+                      "+ کانفیگ برای سرور دیگر"))
+    elif wg.get("self") and devices:
+        out.append("<p class='note'>برای همهٔ سرورها کانفیگ دارید.</p>")
+    elif not wg.get("self") and not devices:
+        out.append("<p class='note'>برای گرفتن کانفیگ وایرگارد به پشتیبانی پیام بدهید.</p>")
+    out.append(WG_HELP + "</details>")
+    return "".join(out)
+
+
+def wg_config_page(res):
+    """One config, to import: its QR, its file, its text to copy."""
+    qr = res.get("qr") or ""
+    return ("<div class='icon'>🛡</div><h1>کانفیگ وایرگارد</h1>"
+            + ("<p style='text-align:center'><img alt='QR' style='width:100%%;max-width:300px;"
+               "image-rendering:pixelated;border-radius:8px' "
+               "src='data:image/png;base64,%s'></p>"
+               "<p class='note' style='text-align:center'>در برنامهٔ WireGuard: + ← Scan from "
+               "QR code</p>" % html.escape(qr) if qr else "")
+            + "<a class='btn' href='/wg/%d.conf'>دانلود فایل کانفیگ</a>" % res["id"]
+            + "<details class='pw'><summary>متن کانفیگ</summary>"
+            "<textarea readonly dir='ltr' rows='11' style='width:100%%;font-family:monospace;"
+            "font-size:12px' onclick='this.select()'>%s</textarea></details>"
+            % html.escape(res.get("config") or "")
+            + WG_HELP + "<a class='btn ghost' href='/#wg'>برگشت</a>")
+
+
 def doh_box(info, profile="/doh.mobileconfig", setup=False):
     """The encrypted-DNS section: folded away on the account page, open on
     the setup page a browser that opened the DoH address is sent to."""
@@ -5160,6 +5485,22 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if path == "/doh.mobileconfig":
             return self.send_profile()
 
+        m = re.fullmatch(r"/wg/(\d{1,12})(\.conf)?", path)
+        if m:
+            if not self.session():
+                return self.redirect("/login")
+            res = self.ask_panel("/user-wg-config", {"id": int(m.group(1))})
+            if res is None:
+                return self.send_html(NOT_NOW, 502)
+            if not res.get("ok"):
+                return self.redirect("/", res.get("message", ""), bad=True)
+            if m.group(2):
+                return self.send(res["config"], 200, {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Content-Disposition": "attachment; filename=%s" % res["file"],
+                    "Cache-Control": "no-store"})
+            return self.send_html(wg_config_page(res))
+
         if path.startswith("/doh-setup/"):
             return self.doh_setup(path)
 
@@ -5325,6 +5666,19 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             res = self.ask_panel("/user-qlog", {"on": self.form().get("on") == "1"})
             if res is None:
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
+        if path in ("/wg-new", "/wg-del"):
+            if not self.session():
+                return self.redirect("/login")
+            form = self.form()
+            raw = form.get("id") or ""
+            res = self.ask_panel("/user-" + path[1:], {"id": int(raw) if raw.isdigit() else 0,
+                                                       "relay": form.get("relay") or ""})
+            if res is None:
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            if path == "/wg-new" and res.get("ok") and res.get("device_id"):
+                return self.redirect("/wg/%d" % res["device_id"], res.get("message", ""))
             return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
         if path == "/doh-reset":
@@ -5781,6 +6135,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
         body.append(manual_ip_box("/"))
         body.append(doh_box(info))
+        body.append(wg_box(info))
         body.append(trial_box(info))
         body.append(receipt_box(info))
         body.append(wallet_box(info))

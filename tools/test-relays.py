@@ -204,7 +204,7 @@ check("on a page of its own, 'نود', not in the settings",
       '"nodes": ("نود", nodes_page),' in asrc and '("nodes", "نود")' in asrc
       and "out.append(relays_card(p))" not in asrc)
 check("  which a single machine, with no relays of its own, does not list",
-      'if path == "nodes" and one_server():' in asrc)
+      'if path in ("nodes", "wireguard") and one_server():' in asrc)
 admin.CFG = {"ADMIN_PATH": "p"}
 admin.one_server = lambda: False
 check("  the page is the relays card", "رله‌ها (" in admin.nodes_page())

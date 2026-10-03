@@ -36,6 +36,7 @@ import signal
 import shutil
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -100,6 +101,37 @@ CREATE TABLE IF NOT EXISTS ips (
     -- The last raw counter this address reported. Usage is the growth of that
     -- number, so a user who changes address keeps the total they had built up.
     last_counter INTEGER NOT NULL DEFAULT 0
+);
+
+-- WireGuard configs: a customer's phone reaching one relay over WireGuard,
+-- and through it only that relay - its DNS and the services it routes. Each
+-- has a fixed address of its own, registered in ips beside the addresses
+-- customers type (ips.wg = 1), so templates, counters and the gate treat it
+-- like any other; the triggers below keep the two rows together. The private
+-- key is kept sealed, as receipts are: it is the customer's config to fetch.
+CREATE TABLE IF NOT EXISTS wg_devices (
+    id             INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    relay          TEXT NOT NULL,
+    address        TEXT NOT NULL UNIQUE,
+    public_key     TEXT NOT NULL UNIQUE,
+    private_key    BLOB NOT NULL,
+    name           TEXT,
+    created_at     TEXT NOT NULL,
+    last_handshake TEXT,
+    last_endpoint  TEXT,
+    -- The Tehran day it went over the admin's addresses a day; its peer is
+    -- off the relay until the next.
+    blocked_day    TEXT
+);
+
+-- The addresses each config connected from, a day at a time, for the
+-- admin's limit on how many a config may come from in a day.
+CREATE TABLE IF NOT EXISTS wg_endpoints (
+    device_id INTEGER NOT NULL REFERENCES wg_devices(id) ON DELETE CASCADE,
+    day       TEXT NOT NULL,
+    ip        TEXT NOT NULL,
+    PRIMARY KEY (device_id, day, ip)
 );
 
 -- A customer's claim that they paid, and the photograph of the slip.
@@ -754,6 +786,18 @@ MIGRATIONS = [
     ("admins", "reset_days", "INTEGER"),
     ("admins", "reset_next", "TEXT"),
     ("users", "extra_devices", "INTEGER NOT NULL DEFAULT 0"),
+    # An address that is a WireGuard config's, not one the customer typed.
+    ("ips", "wg", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+# A WireGuard config and its address in ips go together, whichever goes
+# first: a customer's address list trimmed to fewer devices, a config
+# deleted, an account deleted. After MIGRATIONS, which adds ips.wg.
+WG_TRIGGERS = [
+    "CREATE TRIGGER IF NOT EXISTS wg_ip_gone AFTER DELETE ON ips WHEN OLD.wg = 1"
+    " BEGIN DELETE FROM wg_devices WHERE address = OLD.ip; END",
+    "CREATE TRIGGER IF NOT EXISTS wg_device_gone AFTER DELETE ON wg_devices"
+    " BEGIN DELETE FROM ips WHERE ip = OLD.address AND wg = 1; END",
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -1368,6 +1412,8 @@ class Store:
                     )
             for statement in INDEXES:
                 self.db.execute(statement)
+            for statement in WG_TRIGGERS:
+                self.db.execute(statement)
             for key, value in DEFAULT_SETTINGS.items():
                 self.db.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -1500,8 +1546,11 @@ class Store:
         plan["games"] = games_in_template(self, plan.pop("template_id"))
         return plan
 
-    def user_ips(self, user_id):
-        return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
+    def user_ips(self, user_id, wg=False):
+        """The addresses a customer registered - and, with wg, their
+        WireGuard configs' as well."""
+        return self.q("SELECT * FROM ips WHERE user_id = ?%s ORDER BY added_at"
+                      % ("" if wg else " AND wg = 0"), (user_id,))
 
     def allowed(self):
         return self.q(
@@ -2347,8 +2396,10 @@ def set_devices(db, uid, total, extra=None):
     else:
         db.execute("UPDATE users SET max_ips = ?, extra_devices = ? WHERE id = ?",
                    (total, max(0, int(extra)), uid))
-    ips = db.execute("SELECT id FROM ips WHERE user_id = ? ORDER BY added_at DESC, id DESC",
-                     (uid,)).fetchall()
+    # The registered addresses only: WireGuard configs are one per relay,
+    # not devices, and stay.
+    ips = db.execute("SELECT id FROM ips WHERE user_id = ? AND wg = 0"
+                     " ORDER BY added_at DESC, id DESC", (uid,)).fetchall()
     for row in ips[total:]:
         db.execute("DELETE FROM ips WHERE id = ?", (row[0],))
     return total
@@ -2776,7 +2827,9 @@ def register_ip(store, user_id, ip, limited=False):
         store.run("DELETE FROM ip_log WHERE at < ?", ((datetime.now(timezone.utc)
                   - timedelta(days=7)).isoformat(timespec="seconds"),))
     # One active address per account, with as many changes as they like.
-    # Replacing rather than adding is what makes that true.
+    # Replacing rather than adding is what makes that true. A device has its
+    # WireGuard config besides its address, so configs are neither counted
+    # here nor what gets replaced.
     if existing and len(existing) >= user["max_ips"]:
         for old in existing[: len(existing) - user["max_ips"] + 1]:
             if old["ip"] != ip:
@@ -2784,6 +2837,437 @@ def register_ip(store, user_id, ip, limited=False):
     store.run("INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
               (user_id, ip, now()))
     return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+
+
+# ---------------------------------------------------------------- WireGuard
+# Split WireGuard beside the DNS: a config reaches one relay, from inside
+# Iran, and through it only that relay - its DNS, and the services it routes,
+# which go on through the relay's tunnel to the exit as they always have.
+# WireGuard straight from Iran to an exit is blocked; to a relay it is not.
+# The relay forwards nothing, so a config is never a VPN.
+WG_NET = ipaddress.ip_network("10.66.0.0/16")
+WG_RELAY_ADDR = "10.66.0.1"
+WG_PORT = 51820
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+_P25519 = 2 ** 255 - 19
+
+
+def x25519(scalar, point):
+    """RFC 7748's X25519, in plain Python: a key a config is made with, here,
+    where there is no WireGuard to ask and no library to import."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(bytes(k), "little")
+    p = _P25519
+    x1 = int.from_bytes(point, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b = (x2 + z2) % p, (x2 - z2) % p
+        aa, bb = a * a % p, b * b % p
+        e = (aa - bb) % p
+        c, d = (x3 + z3) % p, (x3 - z3) % p
+        da, cb = d * a % p, c * b % p
+        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+        x2, z2 = aa * bb % p, e * (aa + 121665 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+def wg_keypair():
+    """A new config's private and public key, base64 as WireGuard writes them."""
+    priv = bytearray(os.urandom(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    pub = x25519(bytes(priv), (9).to_bytes(32, "little"))
+    return (base64.b64encode(bytes(priv)).decode("ascii"),
+            base64.b64encode(pub).decode("ascii"))
+
+
+def wg_on(store):
+    return store.setting("wg_on") == "1"
+
+
+def wg_port(store):
+    raw = (store.setting("wg_port") or "").strip()
+    return int(raw) if raw.isdigit() and 1 <= int(raw) <= 65535 else WG_PORT
+
+
+# The name a config goes by in the WireGuard app, which is its file's name:
+# what a network interface may be called, 15 characters at most.
+WG_NAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+
+
+def wg_list(store, key):
+    """A list the admin ticked - relays, plans - or None for all of them."""
+    try:
+        value = json.loads(store.setting(key) or "null")
+    except ValueError:
+        return None
+    return [str(x) for x in value] if isinstance(value, list) else None
+
+
+def wg_relay_enabled(store, relay):
+    only = wg_list(store, "wg_relays")
+    return only is None or relay in only
+
+
+def wg_plan_allows(store, user):
+    only = wg_list(store, "wg_plans")
+    return only is None or (user["plan_id"] is not None and str(user["plan_id"]) in only)
+
+
+def wg_name(store):
+    raw = (store.setting("wg_name") or "").strip()
+    return raw if WG_NAME_RE.fullmatch(raw) else "doctor-dns"
+
+
+def wg_file_name(name, device_id):
+    """name-12.conf, the name cut so the whole stays a valid tunnel name."""
+    tail = "-%d" % device_id
+    return "%s%s.conf" % (name[:max(1, 15 - len(tail))], tail)
+
+
+def wg_mtu(store):
+    raw = (store.setting("wg_mtu") or "").strip()
+    return int(raw) if raw.isdigit() and 1280 <= int(raw) <= 1500 else None
+
+
+def wg_keepalive(store):
+    raw = (store.setting("wg_keepalive") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) <= 120 else 25
+
+
+def wg_endpoint_host(store, relay):
+    """The relay's name in a config, when the admin chose names and the relay
+    has one - a config then outlives the relay's address - else its address."""
+    if store.setting("wg_endpoint") == "domain":
+        host = urllib.parse.urlparse(store.setting("panel_url:" + relay) or "").hostname
+        if host:
+            return host
+    return relay
+
+
+def wg_ips_limit(store):
+    """How many addresses one config may connect from in a day, or None."""
+    raw = (store.setting("wg_ips_per_day") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def wg_day(when=None):
+    return (when or datetime.now(timezone.utc)).astimezone(TEHRAN).strftime("%Y-%m-%d")
+
+
+def wg_relays_for(store, user, relays):
+    """The relays this customer may have a config on: WireGuard ready there,
+    the admin left it on, and it serves them - in the panel's order."""
+    return [r for r in relays
+            if store.setting("wg_pub:" + r) and wg_relay_enabled(store, r)
+            and user["id"] not in kept_off(store, r, relays)]
+
+
+def wg_relay_for(store, user, relays):
+    """The relay a new config goes to when the customer did not choose."""
+    ready = wg_relays_for(store, user, relays)
+    return ready[0] if ready else None
+
+
+def wg_server_label(store, relay, relays):
+    """How a customer is shown a relay: Server 1, 2 - its place among the
+    panel's relays, which they also see beside their DNS addresses."""
+    n = relays.index(relay) + 1 if relay in relays else 0
+    return "سرور %d" % n if n else relay
+
+
+def wg_devices_of(store, uid):
+    return store.q("SELECT * FROM wg_devices WHERE user_id = ? ORDER BY id", (uid,))
+
+
+def create_wg_device(store, uid, relays, name=None, relay=None):
+    """A new WireGuard config for a customer, on a device of theirs - on the
+    relay they chose, or the first that serves them. Taken from the plan's
+    devices, like an address; refused when they are full."""
+    if not wg_on(store):
+        return refused("wg_off", "وایرگارد روی این سرویس روشن نیست")
+    user = store.one("SELECT * FROM users WHERE id = ?", (uid,))
+    if not user:
+        return refused("user_not_found", "این حساب پیدا نشد")
+    if user["status"] == "suspended":
+        return refused("suspended", "این حساب مسدود است")
+    if not wg_plan_allows(store, user):
+        return refused("wg_plan", "پلن این حساب وایرگارد ندارد")
+    # One config for each relay, as there is one DNS address for each: the
+    # devices are the addresses the customer registers, and every config
+    # works on all of them, as both DNS addresses do.
+    ready = wg_relays_for(store, user, relays)
+    if relay and relay not in ready:
+        return refused("wg_bad_relay", "روی این سرور وایرگارد نیست؛ سرور دیگری را "
+                                       "انتخاب کنید")
+    if not ready:
+        return refused("wg_not_ready", "وایرگارد هنوز روی هیچ سروری آماده نیست؛ چند "
+                                       "دقیقهٔ دیگر دوباره امتحان کنید")
+    have = {d["relay"] for d in wg_devices_of(store, uid)}
+    if relay in have:
+        return refused("wg_have", "برای این سرور کانفیگ دارید")
+    relay = relay or next((r for r in ready if r not in have), None)
+    if not relay:
+        return refused("wg_have", "برای همهٔ سرورها کانفیگ دارید")
+    priv, pub = wg_keypair()
+    stamp = now()
+    with store.lock:
+        taken = {r[0] for r in store.db.execute(
+            "SELECT address FROM wg_devices UNION SELECT ip FROM ips WHERE ip LIKE '10.66.%'")}
+        address = next((str(a) for a in WG_NET.hosts()
+                        if str(a) != WG_RELAY_ADDR and a.packed[3] not in (0, 255)
+                        and str(a) not in taken), None)
+        if address is None:
+            return refused("wg_full", "جای کانفیگ تازه نمانده است")
+        cur = store.db.execute(
+            "INSERT INTO wg_devices (user_id, relay, address, public_key, private_key, name,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (uid, relay, address, pub, seal(priv.encode("ascii")),
+             (name or "").strip()[:40] or None, stamp))
+        store.db.execute("INSERT INTO ips (user_id, ip, added_at, wg) VALUES (?, ?, ?, 1)",
+                         (uid, address, stamp))
+        store.db.commit()
+    log(INFO, "WireGuard config %d for user %d on %s, %s" % (cur.lastrowid, uid, relay, address))
+    return {"ok": True, "device_id": cur.lastrowid,
+            "message": "کانفیگ وایرگارد ساخته شد",
+            "config": wg_config(store, cur.lastrowid)}
+
+
+def delete_wg_device(store, uid, device_id):
+    cur = store.run("DELETE FROM wg_devices WHERE id = ? AND user_id = ?", (device_id, uid))
+    if not cur.rowcount:
+        return refused("wg_not_found", "این کانفیگ پیدا نشد")
+    return {"ok": True, "message": "کانفیگ وایرگارد حذف شد"}
+
+
+def wg_config(store, device_id):
+    """The config a customer imports, or "" when it cannot be made here: the
+    relay's key not known yet, or the private key sealed on another machine."""
+    dev = store.one("SELECT * FROM wg_devices WHERE id = ?", (device_id,))
+    if not dev:
+        return ""
+    server = store.setting("wg_pub:" + dev["relay"])
+    priv = unseal(dev["private_key"])
+    if not server or priv is None:
+        return ""
+    # Only the relay goes through the tunnel: its DNS, and the addresses its
+    # DNS gives for the services it routes, which are its own.
+    mtu, keep = wg_mtu(store), wg_keepalive(store)
+    return ("[Interface]\n"
+            "PrivateKey = %s\n"
+            "Address = %s/32\n"
+            "DNS = %s\n"
+            "%s"
+            "\n"
+            "[Peer]\n"
+            "PublicKey = %s\n"
+            "Endpoint = %s:%d\n"
+            "AllowedIPs = %s/32\n"
+            "%s"
+            % (priv.decode("ascii"), dev["address"], dev["relay"],
+               "MTU = %d\n" % mtu if mtu else "", server,
+               wg_endpoint_host(store, dev["relay"]), wg_port(store), dev["relay"],
+               "PersistentKeepalive = %d\n" % keep if keep else ""))
+
+
+def wg_self(store):
+    """Whether customers make and delete their configs themselves, on their
+    page and in the bot - the admin's choice, on unless turned off."""
+    return store.setting("wg_self") != "0"
+
+
+def wg_bind(store):
+    """Whether a config works only from its customer's registered addresses,
+    as the DNS does - the admin's choice, on unless turned off."""
+    return store.setting("wg_bind_ip") != "0"
+
+
+def wg_offered(store, user, relays):
+    """Whether this customer is offered WireGuard at all: on, their plan has
+    it, and a relay that serves them has it ready."""
+    return bool(wg_on(store) and user["status"] != "suspended"
+                and wg_plan_allows(store, user) and wg_relay_for(store, user, relays))
+
+
+def wg_view(store, user, relays):
+    """A customer's WireGuard, for their page and the bot: whether it is
+    offered, whether they may make and delete configs, how many devices are
+    free, and their configs - without the keys, which come one at a time."""
+    devices = wg_devices_of(store, user["id"])
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec="seconds")
+    day, name, cal = wg_day(), wg_name(store), calendar_of(store)
+    view = {
+        "on": wg_offered(store, user, relays) or bool(devices and wg_on(store)),
+        "self": wg_self(store),
+        # The servers without a config of theirs yet, one config each.
+        "relays": [{"ip": r, "label": wg_server_label(store, r, relays)}
+                   for r in wg_relays_for(store, user, relays)
+                   if r not in {d["relay"] for d in devices}],
+        "bind": wg_bind(store),
+        "devices": [{"id": d["id"], "address": d["address"], "name": d["name"] or "",
+                     "relay": d["relay"], "server": wg_server_label(store, d["relay"], relays),
+                     "file": wg_file_name(name, d["id"]),
+                     "last": show_date(d["last_handshake"], cal, True)
+                     if d["last_handshake"] else "",
+                     "online": bool(d["last_handshake"] and d["last_handshake"] > recent),
+                     "blocked": d["blocked_day"] == day}
+                    for d in devices]}
+    view["room"] = len(view["relays"])
+    return view
+
+
+QRENCODE = "/usr/bin/qrencode"
+
+
+def wg_qr_png(text):
+    """A config as a QR code, a PNG the WireGuard app scans - from qrencode,
+    which the installer puts on the exit; None when it is not there."""
+    if not text or not os.access(QRENCODE, os.X_OK):
+        return None
+    try:
+        made = subprocess.run([QRENCODE, "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"],
+                              input=text.encode("utf-8"), capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return made.stdout if made.returncode == 0 and made.stdout.startswith(b"\x89PNG") else None
+
+
+def wg_handout(store, uid, device_id):
+    """One config of this customer's, to import: its text, its file's name,
+    and its QR as base64 PNG ("" without qrencode)."""
+    dev = store.one("SELECT * FROM wg_devices WHERE id = ? AND user_id = ?", (device_id, uid))
+    if not dev:
+        return refused("wg_not_found", "این کانفیگ پیدا نشد")
+    text = wg_config(store, dev["id"])
+    if not text:
+        return refused("wg_not_ready", "کانفیگ هنوز آماده نیست؛ یک دقیقهٔ دیگر دوباره "
+                                       "امتحان کنید")
+    qr = wg_qr_png(text)
+    return {"ok": True, "id": dev["id"], "config": text, "file": wg_file_name(wg_name(store),
+                                                                              dev["id"]),
+            "qr": base64.b64encode(qr).decode("ascii") if qr else ""}
+
+
+def wg_customer_new(store, user, relays, relay=None):
+    """A config the customer makes themselves - when the admin lets them -
+    on the server they chose, or the first."""
+    if not wg_self(store):
+        return refused("wg_admin_only", "کانفیگ وایرگارد را پشتیبانی برایتان می‌سازد؛ "
+                                        "تیکت بزنید")
+    relay = str(relay or "").strip() or None
+    res = create_wg_device(store, user["id"], relays, relay=relay)
+    if res.get("ok"):
+        res.pop("config", None)
+        res["message"] = ("کانفیگ وایرگارد ساخته شد؛ تا یک دقیقهٔ دیگر روی سرور فعال "
+                          "می‌شود")
+    return res
+
+
+def wg_customer_delete(store, user, device_id):
+    if not wg_self(store):
+        return refused("wg_admin_only", "برای حذف کانفیگ به پشتیبانی پیام بدهید")
+    return delete_wg_device(store, user["id"], device_id)
+
+
+def wg_spec(store, relay):
+    """What a relay's sync is told: WireGuard on or off, its port, and the
+    configs that are its. A customer whose plan has ended stays on it: their
+    address is not on the allowed list, so the gate shows them why."""
+    if not wg_on(store) or not wg_relay_enabled(store, relay):
+        return {"on": False}
+    day = wg_day()
+    rows = store.q("SELECT public_key, address, user_id FROM wg_devices WHERE relay = ?"
+                   " AND (blocked_day IS NULL OR blocked_day != ?) ORDER BY id", (relay, day))
+    bind = wg_bind(store)
+    # Bound, each config carries its customer's registered addresses: the
+    # relay lets only those reach WireGuard, and stops a config that is used
+    # from somebody else's.
+    typed = {}
+    if bind:
+        for r in store.q("SELECT i.user_id, i.ip FROM ips i JOIN wg_devices d"
+                         " ON d.user_id = i.user_id WHERE d.relay = ? AND i.wg = 0", (relay,)):
+            typed.setdefault(r["user_id"], set()).add(r["ip"])
+    return {"on": True, "port": wg_port(store), "bind": bind,
+            "peers": [dict({"pub": r["public_key"], "addr": r["address"]},
+                           **({"ips": sorted(typed.get(r["user_id"], ()))} if bind else {}))
+                      for r in rows]}
+
+
+def wg_prune_unused(store, stamp=None):
+    """Configs that have not connected for the admin's number of days - or
+    never, that long after they were made - deleted, their devices free."""
+    raw = (store.setting("wg_unused_days") or "").strip()
+    if not raw.isdigit() or int(raw) < 1:
+        return 0
+    cutoff = ((stamp or datetime.now(timezone.utc)) - timedelta(days=int(raw))).isoformat(
+        timespec="seconds")
+    gone = store.q("SELECT id, user_id FROM wg_devices"
+                   " WHERE COALESCE(last_handshake, created_at) < ?", (cutoff,))
+    for row in gone:
+        store.run("DELETE FROM wg_devices WHERE id = ?", (row["id"],))
+        log(INFO, "WireGuard config %d of user %d deleted: unused for %s days"
+            % (row["id"], row["user_id"], raw))
+    return len(gone)
+
+
+def record_wg_state(store, relay, state):
+    """What a relay says of its WireGuard: its public key, and when and from
+    where each config last connected - which is what the admin's limit on
+    addresses a day is counted from."""
+    if not isinstance(state, dict):
+        return
+    pub = str(state.get("pub") or "")
+    if WG_KEY_RE.fullmatch(pub) and store.setting("wg_pub:" + relay) != pub:
+        store.set_setting("wg_pub:" + relay, pub)
+    error = str(state.get("error") or "")[:300]
+    if store.setting("wg_error:" + relay) != error:
+        store.set_setting("wg_error:" + relay, error)
+    peers = state.get("peers")
+    if not isinstance(peers, dict):
+        return
+    day, limit = wg_day(), wg_ips_limit(store)
+    for key, seen in list(peers.items())[:5000]:
+        if not isinstance(seen, dict) or not WG_KEY_RE.fullmatch(str(key)):
+            continue
+        dev = store.one("SELECT * FROM wg_devices WHERE public_key = ? AND relay = ?",
+                        (str(key), relay))
+        if not dev:
+            continue
+        try:
+            hs = int(seen.get("hs") or 0)
+        except (TypeError, ValueError):
+            hs = 0
+        ep = str(seen.get("ep") or "")
+        ep = ep if valid_ip(ep) else ""
+        if not hs:
+            continue
+        at = datetime.fromtimestamp(hs, timezone.utc).isoformat(timespec="seconds")
+        if at != dev["last_handshake"] or ep != (dev["last_endpoint"] or ""):
+            store.run("UPDATE wg_devices SET last_handshake = ?, last_endpoint = ? WHERE id = ?",
+                      (at, ep or None, dev["id"]))
+        if not ep:
+            continue
+        store.run("INSERT OR IGNORE INTO wg_endpoints (device_id, day, ip) VALUES (?, ?, ?)",
+                  (dev["id"], day, ep))
+        if limit and dev["blocked_day"] != day:
+            n = store.one("SELECT count(*) c FROM wg_endpoints WHERE device_id = ? AND day = ?",
+                          (dev["id"], day))["c"]
+            if n > limit:
+                store.run("UPDATE wg_devices SET blocked_day = ? WHERE id = ?", (day, dev["id"]))
+                log(WARN, "WireGuard config %d of user %d connected from %d addresses today,"
+                          " over %d - off until tomorrow" % (dev["id"], dev["user_id"], n, limit))
+    store.run("DELETE FROM wg_endpoints WHERE day < ?",
+              (wg_day(datetime.now(timezone.utc) - timedelta(days=7)),))
 
 
 # ---------------------------------------------------------------- at rest
@@ -4301,6 +4785,8 @@ def who_label(user):
 
 # How long a relay or node may go without a report before the operator is told.
 ALERT_SILENT = 180
+# How long a relay may report without the panel's answers reaching it.
+ALERT_UNANSWERED = 300
 
 
 def alert(store, key, ok, text):
@@ -4333,6 +4819,21 @@ def record_exit_health(store, relay, health):
             text = ("⚠️ سرور خارج %s از رلهٔ %s در دسترس نیست؛ مشتری‌های این رله از "
                     "سرور خارج بعدی می‌روند." % (to, relay))
         alert(store, "exit:%s:%s" % (relay, to), bool(st.get("ok")), text)
+
+
+def record_unanswered(store, relay, seconds):
+    """A relay whose reports arrive but whose answers are lost on the way back:
+    new customers, plans and settings never reach it. Seen as silence nowhere
+    else - its reports keep coming."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return              # a relay from before does not say
+    kind = "تک‌سرور" if store.setting("single:" + relay) == "1" else "رله"
+    stuck = seconds > ALERT_UNANSWERED
+    alert(store, "unanswered:" + relay, not stuck,
+          "⚠️ %s %s گزارش می‌دهد ولی %d دقیقه است جواب پنل به آن نمی‌رسد؛ کاربرها و "
+          "تنظیمات تازه روی آن اعمال نمی‌شوند. راه بین این سرور و پنل را بررسی کنید."
+          % (kind, relay, int(seconds) // 60) if stuck
+          else "✅ %s %s دوباره جواب پنل را می‌گیرد." % (kind, relay))
 
 
 def check_servers(store, relays, nodes):
@@ -4885,6 +5386,11 @@ def admin_stats(store, seller=None):
                              " AND expires_at IS NOT NULL AND expires_at <= ?", (soon,)),
         "used_bytes": one("SELECT sum(used_bytes) FROM users u WHERE 1 = 1"),
         "online": one("SELECT count(*) FROM users u WHERE last_seen >= ?", (online_since(),)),
+        # WireGuard: configs, and those connected in the last three minutes.
+        "wg_configs": one("SELECT count(*) FROM wg_devices d JOIN users u ON u.id = d.user_id"
+                          " WHERE 1 = 1"),
+        "wg_online": one("SELECT count(*) FROM wg_devices d JOIN users u ON u.id = d.user_id"
+                         " WHERE d.last_handshake >= ?", (online_since(),)),
     }
 
 
@@ -4898,11 +5404,13 @@ def daily_report_text(s):
             "تیکت منتظر جواب: %d\n"
             "تست رایگان امروز: %d\n"
             "دورهٔ %d نفر تا ۳ روز دیگر تمام می‌شود\n"
-            "آنلاین الان: %d"
+            "آنلاین الان: %d%s"
             % (s["users"], s["by_status"].get("active", 0), s["by_status"].get("pending", 0),
                s["new_today"], s["receipts_pending"], s["approved_today"],
                format(s["income_today"], ","), format(s["income_7d"], ","),
-               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0)))
+               s["tickets_open"], s["trials_today"], s["expiring_soon"], s.get("online", 0),
+               "\nوایرگارد: %d کانفیگ، %d آنلاین" % (s["wg_configs"], s.get("wg_online", 0))
+               if s.get("wg_configs") else ""))
 
 
 def daily_report_due(store, stamp=None):
@@ -5493,6 +6001,11 @@ class API(http.server.BaseHTTPRequestHandler):
                 if self.store.setting("forward_check:" + who) != text:
                     self.store.set_setting("forward_check:" + who, text)
             note_bench(self.store, who, body.get("resolver_bench"))
+            try:
+                record_wg_state(self.store, who, body.get("wg_state"))
+                wg_prune_unused(self.store)
+            except Exception as e:
+                log_exception("WireGuard state not recorded: %r" % e)
             report = body.get("upstream")
             if isinstance(report, dict):
                 text = json.dumps(report, ensure_ascii=False, sort_keys=True)[:2000]
@@ -5503,6 +6016,7 @@ class API(http.server.BaseHTTPRequestHandler):
             self.store.record_metrics(who, body.get("host") or {})
             try:
                 record_exit_health(self.store, who, body.get("exit_health"))
+                record_unanswered(self.store, who, body.get("unanswered"))
             except Exception as e:
                 log_exception("exit health not recorded: %r" % e)
             # Quotas are evaluated here, on fresh numbers, so a user who runs
@@ -5607,6 +6121,10 @@ class API(http.server.BaseHTTPRequestHandler):
                                     # Customers sent through another exit.
                                     "customer_exits": customer_exits(
                                         self.store, [exit_self()] + list(self.nodes), who),
+                                    # WireGuard, and the configs that are this
+                                    # relay's - none on a single machine.
+                                    "wg": wg_spec(self.store, who)
+                                    if who in self.relays else {"on": False},
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----
@@ -5647,6 +6165,22 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"ok": True, "message": (
                 "گزارش DNS روشن شد؛ تا یک ساعت نگه داشته می‌شود" if on else
                 "گزارش DNS خاموش و پاک شد")})
+        if self.path in ("/user-wg-new", "/user-wg-del", "/user-wg-config"):
+            user = self._session_user(body.get("session"))
+            if not user:
+                return self.reply(200, {"ok": False, "message": "نشست معتبر نیست"})
+            try:
+                dev = int(body.get("id") or 0)
+            except (TypeError, ValueError):
+                dev = 0
+            if self.path == "/user-wg-new":
+                res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
+            elif self.path == "/user-wg-del":
+                res = wg_customer_delete(self.store, user, dev)
+            else:
+                res = wg_handout(self.store, user["id"], dev)
+            res.pop("error", None)
+            return self.reply(200, res)
         if self.path == "/user-doh-reset":
             user = self._session_user(body.get("session"))
             if not user:
@@ -6009,6 +6543,8 @@ class API(http.server.BaseHTTPRequestHandler):
             "name": user["first_name"] or user["username"] or "",
             "telegram_id": user["telegram_id"],
             "ip": ips[0]["ip"] if ips else None,
+            # WireGuard: offered or not, and the customer's configs.
+            "wg": wg_view(self.store, user, self.relays),
             "used": user["used_bytes"],
             "quota": user["quota_bytes"],
             "status": user["status"],
@@ -6270,6 +6806,10 @@ def user_view(store, user, relays):
         # How the bot shows dates.
         "calendar": calendar_of(store),
         "ips": [r["ip"] for r in store.user_ips(user["id"])],
+        # Whether the bot offers WireGuard: on for this customer, or configs
+        # already theirs to fetch.
+        "wg_on": bool(wg_on(store) and (wg_offered(store, user, relays)
+                                        or wg_devices_of(store, user["id"]))),
         "max_ips": user["max_ips"],
         "extra_devices": user["extra_devices"] or 0,
         "device_offer": device_offer(store, user),
@@ -6564,6 +7104,10 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/discount$"), "discount"),
         ("GET", re.compile(r"/api/v1/users/(\d{1,20})/usage$"), "usage"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/doh-reset$"), "doh_reset"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_list"),
+        ("POST", re.compile(r"/api/v1/users/(\d{1,20})/wg$"), "wg_new"),
+        ("GET", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_get"),
+        ("DELETE", re.compile(r"/api/v1/users/(\d{1,20})/wg/(\d{1,12})$"), "wg_delete"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/credentials$"), "credentials"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/password$"), "password"),
         ("POST", re.compile(r"/api/v1/users/(\d{1,20})/login-link$"), "login_link"),
@@ -6915,6 +7459,35 @@ class BotAPI(AdminAPI, http.server.BaseHTTPRequestHandler):
         for k in ("week", "last_week", "month", "last_month"):
             view[k] = {"up": view[k][0], "down": view[k][1]}
         return 200, view
+
+    def api_wg_list(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        return 200, {"ok": True, "wg": wg_view(self.store, user, self.relays)}
+
+    def api_wg_new(self, body, tg):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = wg_customer_new(self.store, user, self.relays, body.get("relay"))
+        if not res.get("ok"):
+            return {"wg_have": 409, "wg_admin_only": 403}.get(res["error"], 400), res
+        return 201, dict(res, **wg_handout(self.store, user["id"], res["device_id"]))
+
+    def api_wg_get(self, body, tg, dev):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = wg_handout(self.store, user["id"], int(dev))
+        return (200 if res.get("ok") else 404), res
+
+    def api_wg_delete(self, body, tg, dev):
+        user, err = self.customer(tg)
+        if err:
+            return err
+        res = wg_customer_delete(self.store, user, int(dev))
+        return (200 if res.get("ok") else {"wg_admin_only": 403}.get(res["error"], 404)), res
 
     def api_doh_reset(self, body, tg):
         user, err = self.customer(tg)
