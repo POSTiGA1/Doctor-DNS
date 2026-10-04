@@ -140,11 +140,16 @@ print("the installer checks the same path")
 logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
 at = logic.find('check "the exit\'s sync API answers this relay"')
 check("there is a check for it", at > 0)
-line = logic[at:logic.index("\n", logic.index("\n", at) + 1)]
+# The request itself is api_code's, asked first of the path the sync takes
+# straight, then of the tunnel's end.
+start = logic.find("    api_code() {")
+line = logic[start:logic.index("\n    }\n", start)] if start > 0 else ""
 check("it names itself the same way - on the exit's 8443, or a single machine's own port",
-      '${PANEL_DOMAIN:-sync.example.com}:${api_port}:${api_at}' in line
+      '${PANEL_DOMAIN:-sync.example.com}:$2:$1' in line
+      and 'api_got="$(api_code "$api_at" "$api_port")"' in logic
       and 'else api_at="$EXIT_IP"; api_port=8443; fi' in logic
       and 'api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"' in logic, line)
+line += logic[at:logic.index("\n", at)]
 check("and asks with a GET, so no secret is involved", '"501"' in line and "-X POST" not in line,
       line)
 

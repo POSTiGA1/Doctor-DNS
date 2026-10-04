@@ -1908,6 +1908,20 @@ def tunnel_token(secret):
     return hashlib.sha256(("doctor-dns-tunnel:%s" % secret).encode()).hexdigest()[:48]
 
 
+# The transports BackPack builds on KCP - over UDP, inside ping, inside
+# hand-made TCP - and how they are driven. Left unset, BackPack runs KCP in
+# its slow mode: no fast retransmit, its own congestion window halving the
+# rate at every loss, a 20 ms tick - an xdi tunnel moved 1.2 MB in seven
+# seconds. These are its Turbo preset's numbers, less the error correction:
+# FEC has to be the same at both ends, and the two ends of a tunnel are
+# upgraded minutes apart, so it stays off, as it was. Everything here may
+# differ between the ends.
+KCP_TRANSPORTS = ("kcp", "xdi", "pck")
+KCP_TUNING = ("kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n"
+              "kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\n"
+              "kcp_acknodelay = true\n")
+
+
 def exit_tunnel_toml(ip, spec, secret, where):
     out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
     if spec["direction"] == "reverse":
@@ -1922,6 +1936,8 @@ def exit_tunnel_toml(ip, spec, secret, where):
                                 "-out", c], capture_output=True, timeout=60)
             out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
     out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
+    if spec["transport"] in KCP_TRANSPORTS:
+        out.append(KCP_TUNING)
     if spec["direction"] == "reverse":
         out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
     return "".join(out)

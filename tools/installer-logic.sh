@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.2"
+VERSION="0.10.3"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -619,6 +619,12 @@ tunnel_toml() {
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     fi
     printf 'transport = "%s"\ntoken = "%s"\n' "$TUNNEL_TRANSPORT" "$token"
+    # The KCP transports' drive, as the admin panel and smartdns-sync write
+    # it (KCP_TUNING there, which says why): BackPack's Turbo, less FEC.
+    case "$TUNNEL_TRANSPORT" in kcp|xdi|pck)
+        printf 'kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n'
+        printf 'kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\nkcp_acknodelay = true\n' ;;
+    esac
     # The reverse engine's own extras: no web panel, no kernel tuning of its
     # own, and a log at the level journald is read at.
     if [ "$TUNNEL_DIRECTION" = reverse ]; then
@@ -2560,7 +2566,7 @@ if is_relay; then
     check "an unrouted domain is not pointed at this relay" \
           "$(printf '%s\n' "$unrouted" | grep -c "^${RELAY_IP}$" || true)" "0"
     check "a site loads through the full chain" \
-          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${LISTEN_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
+          "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${LISTEN_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || true)" "200"
     # The API the relay syncs with, reached the way smartdns-sync reaches it -
     # by address, with a name in the handshake - but with a GET, which the API
     # refuses as 501 without looking at any secret, so this proves the path
@@ -2570,8 +2576,24 @@ if is_relay; then
     if [ -n "$JOINED" ]; then api_at="$PANEL_IP"; api_port=8443
     elif [ "$ROLE" = single ]; then api_at="127.0.0.1"; api_port="$SINGLE_API_PORT"
     else api_at="$EXIT_IP"; api_port=8443; fi
-    check "the exit's sync API answers this relay" \
-          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:${api_port}:${api_at}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:${api_port}/" 2>/dev/null || true)" "501"
+    api_code() {
+        curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:$2:$1" \
+             -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:$2/" 2>/dev/null || true
+    }
+    api_got="$(api_code "$api_at" "$api_port")"
+    # The sync tries the tunnel first and the direct path after. Where only
+    # the tunnel gets through - which is when xdi is chosen - the direct path
+    # failing is no failure of the sync, and saying so here sent people
+    # looking for a fault that was not there.
+    if [ "$api_got" != 501 ] && [ "$ROLE" = relay ] && [ -z "$JOINED" ] \
+            && [ "${TUNNEL:-off}" = backpack ]; then
+        if [ "$(api_code 127.0.0.1 "$TUNNEL_LOCAL_API")" = 501 ]; then
+            api_got=501
+            warn "The exit's sync API answers through the tunnel only: the direct path to"
+            warn "$EXIT_IP is closed. The sync uses the tunnel, so this relay works."
+        fi
+    fi
+    check "the exit's sync API answers this relay" "$api_got" "501"
 fi
 if [ "$ROLE" = node ]; then
     check "the node's sync is running" "$(systemctl is-active smartdns-node.service)" active
