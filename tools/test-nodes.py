@@ -103,7 +103,7 @@ if bash:
     out = subprocess.run([bash, posix(guard), "--print"], capture_output=True, text=True,
                          env=dict(os.environ, SMARTDNS_ETC=posix(etc))).stdout
     check("the panel lets its nodes in beside its relays",
-          "{ 127.0.0.1, 198.51.100.1, 93.184.216.20 } accept" in out, out)
+          "{ 127.0.0.1, 198.51.100.1, 10.10.58.65, 93.184.216.20 } accept" in out, out)
     out = subprocess.run([bash, posix(guard), "--print"], capture_output=True, text=True,
                          env=dict(os.environ, SMARTDNS_ETC=posix(os.path.join(tmp, "none")))).stdout
     check("a node, with no panel, closes no API port - and keeps nginx off itself",

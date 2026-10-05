@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.3"
+VERSION="0.10.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -177,6 +177,11 @@ relay_allows() {
     {
         printf '# The relays this exit lets in: written by the installer and the admin panel.\n'
         for ip in $out; do printf 'allow %s;\n' "$ip"; done
+        # And where each would arrive from over a layer-3 tunnel: an address
+        # only that tunnel's interface can carry.
+        if [ "$ROLE" != node ]; then
+            for ip in $out; do l3_block "$ip"; printf 'allow %s;\n' "$L3_RELAY"; done
+        fi
     } > "$RELAYS_CONF"
     chmod 644 "$RELAYS_CONF"
 }
@@ -371,16 +376,109 @@ TUNNEL_LOCAL_API=18843
 TUNNEL_LOCAL_SPOTIFY=14070
 # Battle.net's launcher, on 1119 - the same story as Spotify's port.
 TUNNEL_LOCAL_BLIZZARD=11119
-# Which transports each direction has. A direct tunnel has four; BackPack's
-# spoofing carrier is a different kind of tunnel and is not offered.
+# Which transports each direction has. A direct tunnel has four. l3 is
+# BackPack's layer-3 direct tunnel - the relay dials, as in direct, but the two
+# machines get a small network of their own and the ports ride on it - and
+# what it has are carriers rather than transports. Its spoofing carrier wants
+# addresses forged on purpose and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
 TUNNEL_DIRECT_TRANSPORTS="stealth wss tcp ws"
+TUNNEL_L3_TRANSPORTS="xdi pck sni udp quic"
 
 tunnel_transport_ok() {
     local list="$TUNNEL_REVERSE_TRANSPORTS"
     [ "$1" = direct ] && list="$TUNNEL_DIRECT_TRANSPORTS"
+    [ "$1" = l3 ] && list="$TUNNEL_L3_TRANSPORTS"
     case " $list " in *" $2 "*) return 0 ;; esac
     return 1
+}
+
+# BackPack's performance presets - the admin panel's and smartdns-sync's
+# TUNNEL_PRESETS and tunnel_tuning: the same numbers, BackPack v1.8.5's own,
+# and the very same lines. None picked is the tunnel as it always was.
+tunnel_preset_ok() {
+    case "$3" in "") return 0 ;; esac
+    case "$1:$3" in
+        reverse:balance|reverse:turbo|reverse:aggressive) return 0 ;;
+        reverse:throughput) [ "$2" = kcp ] ;;
+        direct:balance|direct:turbo|direct:throughput) return 0 ;;
+        l3:balance|l3:turbo|l3:aggressive) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The preset's lines for one end: server or client of a reverse tunnel, or
+# either end of a direct or a layer-3 one. With none, a KCP transport still
+# gets its drive - Turbo's, less the error correction, which has to match at
+# both ends and comes with a preset only, written at both at once.
+tunnel_tuning() {
+    local side="$1" p="${TUNNEL_PRESET:-}" t="$TUNNEL_TRANSPORT" v iv ack
+    if [ -z "$p" ]; then
+        case "$side:$t" in server:kcp|server:xdi|server:pck|client:kcp|client:xdi|client:pck)
+            printf 'kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n'
+            printf 'kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\nkcp_acknodelay = true\n' ;;
+        esac
+        return 0
+    fi
+    case "$side" in
+    l3)
+        case "$p" in balance) v="1024 4194304" ;; turbo) v="4096 8388608" ;; *) v="16384 33554432" ;; esac
+        # shellcheck disable=SC2086
+        set -- $v
+        printf 'preset = "%s"\ntxqueuelen = %s\nsockbuf = %s\nqdisc = "fq_codel"\n' "$p" "$1" "$2"
+        return 0 ;;
+    direct)
+        case "$p" in
+            balance) v="32768 4194304 262144 1" ;;
+            turbo) v="32768 16777216 2097152 1" ;;
+            *) v="65535 33554432 16777216 4" ;;
+        esac
+        # shellcheck disable=SC2086
+        set -- $v
+        printf 'sessions = %s\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %s\n' "$4" "$1"
+        printf 'mux_recievebuffer = %s\nmux_streambuffer = %s\n' "$2" "$3"
+        return 0 ;;
+    esac
+    # keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+    # mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+    case "$p" in
+        balance) v="75 40 2048 4 false 4194304 4 32768 4194304 262144 512 2" ;;
+        turbo) v="75 40 4096 8 false 8388608 8 32768 16777216 2097152 1024 3" ;;
+        aggressive) v="60 25 8192 16 true 33554432 16 65535 33554432 16777216 2048 4" ;;
+        *) v="75 40 8192 16 false 33554432 8 65535 67108864 33554432 4096 1" ;;
+    esac
+    # shellcheck disable=SC2086
+    set -- $v
+    printf 'preset = "%s"\n' "$p"
+    if [ "$side" = server ]; then
+        printf 'channel_size = %s\nkeepalive_period = %s\nnodelay = true\nheartbeat = %s\n' "$3" "$1" "$2"
+    else
+        printf 'connection_pool = %s\naggressive_pool = %s\nkeepalive_period = %s\nnodelay = true\n' "$4" "$5" "$1"
+    fi
+    printf 'so_rcvbuf = %s\nso_sndbuf = %s\n' "$6" "$6"
+    case "$t" in tcpmux|wsmux|wssmux)
+        if [ "$side" = server ]; then printf 'mux_con = %s\n' "$7"; else printf 'mux_session = %s\n' "$7"; fi
+        printf 'mux_version = 2\nmux_framesize = %s\nmux_recievebuffer = %s\nmux_streambuffer = %s\n' \
+               "$8" "$9" "${10}" ;;
+    esac
+    case "$t" in kcp|xdi|pck)
+        if [ "$p" = throughput ]; then iv=20; ack=false; else iv=10; ack=true; fi
+        printf 'kcp_mtu = 1250\nkcp_interval = %s\nkcp_resend = 2\nkcp_nodelay = 1\nkcp_nocongestion = 1\n' "$iv"
+        printf 'kcp_sndwnd = %s\nkcp_rcvwnd = %s\nkcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %s\n' \
+               "${11}" "${11}" "$ack" "${12}" ;;
+    esac
+}
+
+# A relay's addresses on its layer-3 tunnel: a /30 of 10.10.0.0/16 picked by
+# its own address, so the relay and the exit each work out the same block
+# with nothing to pass between them, and every relay of an exit has its own -
+# and its own interface beside it. The smartdns-sync and the admin panel
+# compute it the same way (l3_block there).
+l3_block() {
+    local h n o3 o4
+    h="$(printf 'doctor-dns-l3:%s' "$1" | sha256sum | cut -c1-4)"
+    n=$((16#$h % 16384)); o3=$((n / 64)); o4=$(((n % 64) * 4))
+    L3_RELAY="10.10.$o3.$((o4 + 1))"; L3_EXIT="10.10.$o3.$((o4 + 2))"; L3_IFACE="ddl$h"
 }
 
 # Why a port cannot carry the tunnel, or nothing when it can. The same ports
@@ -415,11 +513,15 @@ tunnel_port_problem() {
 # pairing token so the two ends are never set up differently.
 parse_tunnel_spec() {
     local s="$1" d
-    case "$s" in bp-*-*-[rd]) ;; *) return 1 ;; esac
+    # bp-xdi-8477-l-turbo: a preset, when the exit picked one.
+    TUNNEL_PRESET=""
+    case "$s" in *-balance|*-turbo|*-aggressive|*-throughput) TUNNEL_PRESET="${s##*-}"; s="${s%-*}" ;; esac
+    case "$s" in bp-*-*-[rdl]) ;; *) return 1 ;; esac
     s="${s#bp-}"; d="${s##*-}"; s="${s%-*}"
     TUNNEL_PORT="${s##*-}"; TUNNEL_TRANSPORT="${s%-*}"
-    if [ "$d" = r ]; then TUNNEL_DIRECTION=reverse; else TUNNEL_DIRECTION=direct; fi
+    case "$d" in r) TUNNEL_DIRECTION=reverse ;; d) TUNNEL_DIRECTION=direct ;; *) TUNNEL_DIRECTION=l3 ;; esac
     tunnel_transport_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" || return 1
+    tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "$TUNNEL_PRESET" || return 1
     [ -z "$(tunnel_port_problem "$TUNNEL_PORT")" ] || return 1
     TUNNEL=backpack
 }
@@ -435,10 +537,11 @@ ask_tunnel() {
     # line typed, not four.
     local d1=1 d2=1 d3=1
     [ "${CUR_TUNNEL:-}" = backpack ] && d1=2
-    [ "${CUR_DIRECTION:-}" = direct ] && d2=2
+    [ "${CUR_DIRECTION:-}" = l3 ] && d2=2
     printf '\n%sBetween the relay and this exit%s\n\n' "$B" "$N"
     if [ "${CUR_TUNNEL:-}" = backpack ]; then
-        printf '  now: BackPack, %s, %s, port %s\n\n' "${CUR_TRANSPORT:-?}" "${CUR_DIRECTION:-?}" "${CUR_PORT:-?}"
+        case "${CUR_DIRECTION:-}" in l3) t=direct ;; direct) t="the old direct" ;; *) t="${CUR_DIRECTION:-?}" ;; esac
+        printf '  now: BackPack, %s, %s, port %s\n\n' "${CUR_TRANSPORT:-?}" "$t" "${CUR_PORT:-?}"
     elif [ -n "${CUR_TUNNEL:-}" ]; then
         printf '  now: direct TCP\n\n'
     fi
@@ -446,12 +549,16 @@ ask_tunnel() {
     printf '  2) BackPack tunnel   hides the names of the sites from filtering on the way\n\n'
     read -r -p "  choice [$d1]: " a
     case "${a:-$d1}" in 1) TUNNEL=off; return 0 ;; 2) TUNNEL=backpack ;; *) die "answer 1 or 2" ;; esac
+    # Direct is BackPack's direct as its own menu makes it now - the layer-3
+    # one, l3 here. The older direct engine is not offered any more; a
+    # machine that has it keeps it until it is asked again.
     printf '\n  Which end dials the other?\n\n'
     printf '  1) reverse   this exit dials the relay - BackPack'"'"'s usual way\n'
-    printf '  2) direct    the relay dials this exit - for where connections into Iran do not\n'
-    printf '               get through\n\n'
+    printf '  2) direct    the relay dials this exit, over a network of the two machines'"'"' own -\n'
+    printf '               for where connections into Iran do not get through\n\n'
     read -r -p "  choice [$d2]: " a
-    case "${a:-$d2}" in 1) TUNNEL_DIRECTION=reverse ;; 2) TUNNEL_DIRECTION=direct ;; *) die "answer 1 or 2" ;; esac
+    case "${a:-$d2}" in 1) TUNNEL_DIRECTION=reverse ;; 2) TUNNEL_DIRECTION=l3 ;;
+        *) die "answer 1 or 2" ;; esac
     # What each transport is. How one performs depends on the route, so that is
     # not said here; only the two that did not connect at all in our own test
     # say so.
@@ -472,6 +579,7 @@ tcpmux|plain and pooled - not encrypted: site names show
 kcp|over UDP, for a route that loses packets
 pck|for a route where TCP connects, then dies
 xdi|inside ping - for where only ping gets through
+sni|as pck, opening with the name of a site the route lets through
 quic|over UDP - did not connect in our test
 udp|raw datagrams, no reliability - did not connect in our test
 NOTES
@@ -489,8 +597,33 @@ NOTES
         [ -z "$t" ] && { TUNNEL_PORT="$a"; break; }
         warn "port $a cannot carry the tunnel: $t - pick another"
     done
+    # The preset: BackPack's own, those this kind of tunnel has.
+    list=""; i=0; d3=1
+    printf '\n  Performance preset (both ends get it):\n\n'
+    while IFS='|' read -r t note; do
+        [ -z "$t" ] || tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "$t" || continue
+        i=$((i + 1)); list="$list ${t:--}"
+        [ "$t" = "${CUR_PRESET:-}" ] && d3=$i
+        printf '  %2d) %-11s %s\n' "$i" "${t:-none}" "$note"
+    done <<'PRESETS'
+|as it has always been
+balance|light on memory - a small server
+turbo|BackPack's choice for most routes
+aggressive|the most memory and speed
+throughput|heavy downloads
+PRESETS
+    printf '\n'
+    read -r -p "  choice [$d3]: " a
+    a="${a:-$d3}"
+    case "$a" in *[!0-9]*) die "answer with the number" ;; esac
+    # shellcheck disable=SC2086
+    TUNNEL_PRESET="$(echo $list | cut -d' ' -f"$a")"
+    [ -n "$TUNNEL_PRESET" ] || die "there is no preset number $a"
+    [ "$TUNNEL_PRESET" = - ] && TUNNEL_PRESET=""
     if [ "$TUNNEL_DIRECTION" = reverse ]; then
         info "open port $TUNNEL_PORT to this exit in the relay's firewall, if it has one"
+    elif [ "$TUNNEL_TRANSPORT" = xdi ]; then
+        info "xdi needs no port opened - only ping, both ways"
     else
         info "open port $TUNNEL_PORT to the relay in this exit's firewall, if it has one"
     fi
@@ -603,6 +736,24 @@ tunnel_toml() {
         fi ;;
     esac
     printf "# written by doctor dns: the installer, or the admin panel's relays card\n"
+    if [ "$TUNNEL_DIRECTION" = l3 ]; then
+        # The relay dials and keeps the same five ports on its loopback as
+        # every other tunnel, each going to the exit's own port at the far
+        # end of the network the two of them share.
+        l3_block "$RELAY_IP"
+        if [ "$ROLE" = relay ]; then
+            printf '[l3]\nmode = "dial"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
+            printf 'local_ip = "%s/30"\npeer_ip = "%s"\n' "$L3_RELAY" "$L3_EXIT"
+            printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+                   "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
+        else
+            printf '[l3]\nmode = "listen"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
+            printf 'local_ip = "%s/30"\npeer_ip = "%s"\n' "$L3_EXIT" "$L3_RELAY"
+        fi
+        printf 'carrier = "%s"\niface = "%s"\ntoken = "%s"\n' "$TUNNEL_TRANSPORT" "$L3_IFACE" "$token"
+        tunnel_tuning l3
+        return 0
+    fi
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
@@ -619,12 +770,9 @@ tunnel_toml() {
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     fi
     printf 'transport = "%s"\ntoken = "%s"\n' "$TUNNEL_TRANSPORT" "$token"
-    # The KCP transports' drive, as the admin panel and smartdns-sync write
-    # it (KCP_TUNING there, which says why): BackPack's Turbo, less FEC.
-    case "$TUNNEL_TRANSPORT" in kcp|xdi|pck)
-        printf 'kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n'
-        printf 'kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\nkcp_acknodelay = true\n' ;;
-    esac
+    if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then tunnel_tuning server
+    elif [ "$TUNNEL_DIRECTION" = reverse ]; then tunnel_tuning client
+    else tunnel_tuning direct; fi
     # The reverse engine's own extras: no web panel, no kernel tuning of its
     # own, and a log at the level journald is read at.
     if [ "$TUNNEL_DIRECTION" = reverse ]; then
@@ -673,7 +821,7 @@ apply_tunnel() {
     # by the service itself as well, so it holds on a machine whose nftables
     # service does not read /etc/nftables.d.
     if { [ "$ROLE" = relay ] && [ "$TUNNEL_DIRECTION" = reverse ]; } \
-       || { [ "$ROLE" = exit ] && [ "$TUNNEL_DIRECTION" = direct ]; }; then
+       || { [ "$ROLE" = exit ] && [ "$TUNNEL_DIRECTION" != reverse ]; }; then
         if [ "$ROLE" = relay ]; then peer="$EXIT_IP"; else peer="$RELAY_IP"; fi
         mkdir -p /etc/nftables.d
         note_file "$TUNNEL_NFT"
@@ -753,8 +901,10 @@ case "${1:-}" in
         printf '  DELETE_DB=1    on --uninstall, delete the database too, without asking\n'
         printf '  PURGE_PACKAGES=1  on --uninstall, remove nginx, dnsmasq, coturn and certbot\n'
         printf '                 too, with their config, without asking\n'
-        printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|direct\n'
+        printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|l3\n'
+        printf '                 (l3 is BackPack'"'"'s direct, as its menu makes it now)\n'
         printf '  TUNNEL_PORT=8444     the tunnel between relay and exit, asked on the exit\n'
+        printf '  TUNNEL_PRESET=turbo  balance|turbo|aggressive|throughput - BackPack'"'"'s, or none\n'
         printf '  ROLE=node PANEL_IP=<main exit> SYNC_TOKEN=<token>   another exit, joined to\n'
         printf '                 that panel - the token is on its admin panel'"'"'s Node page\n'
         printf '  ROLE=single PANEL_IP=<main exit> SYNC_TOKEN=<token>   a single server in\n'
@@ -1443,6 +1593,7 @@ if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
         CUR_TRANSPORT="$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)"
         CUR_DIRECTION="$(env_get /etc/smart-dns/panel.env TUNNEL_DIRECTION)"
         CUR_PORT="$(env_get /etc/smart-dns/panel.env TUNNEL_PORT)"
+        CUR_PRESET="$(env_get /etc/smart-dns/panel.env TUNNEL_PRESET)"
         ask_tunnel
     elif [ -z "${SYNC_TOKEN:-}" ]; then
         printf '\n%sTunnel%s\n\n' "$B" "$N"
@@ -1460,6 +1611,7 @@ if [ -z "$TUNNEL" ]; then
         TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)}"
         TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-$(env_get /etc/smart-dns/panel.env TUNNEL_DIRECTION)}"
         TUNNEL_PORT="${TUNNEL_PORT:-$(env_get /etc/smart-dns/panel.env TUNNEL_PORT)}"
+        TUNNEL_PRESET="${TUNNEL_PRESET-$(env_get /etc/smart-dns/panel.env TUNNEL_PRESET)}"
     elif [ "$ROLE" = relay ]; then
         spec="$(printf '%s' "${SYNC_TOKEN:-}" | cut -s -d. -f3)"
         if [ -n "$spec" ]; then
@@ -1472,6 +1624,7 @@ if [ -z "$TUNNEL" ]; then
             TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-$(env_get /etc/smart-dns/sync.env TUNNEL_TRANSPORT)}"
             TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-$(env_get /etc/smart-dns/sync.env TUNNEL_DIRECTION)}"
             TUNNEL_PORT="${TUNNEL_PORT:-$(env_get /etc/smart-dns/sync.env TUNNEL_PORT)}"
+            TUNNEL_PRESET="${TUNNEL_PRESET-$(env_get /etc/smart-dns/sync.env TUNNEL_PRESET)}"
         fi
     fi
 fi
@@ -1487,9 +1640,11 @@ if [ "$TUNNEL" = backpack ]; then
     TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-reverse}"
     TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-stealth}"
     TUNNEL_PORT="${TUNNEL_PORT:-8444}"
-    case "$TUNNEL_DIRECTION" in reverse|direct) ;; *) die "TUNNEL_DIRECTION must be reverse or direct" ;; esac
+    case "$TUNNEL_DIRECTION" in reverse|direct|l3) ;; *) die "TUNNEL_DIRECTION must be reverse, direct or l3" ;; esac
     tunnel_transport_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" \
         || die "BackPack's $TUNNEL_DIRECTION tunnel has no transport called '$TUNNEL_TRANSPORT'"
+    tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "${TUNNEL_PRESET:-}" \
+        || die "BackPack's $TUNNEL_DIRECTION tunnel on $TUNNEL_TRANSPORT has no preset called '$TUNNEL_PRESET'"
     why="$(tunnel_port_problem "$TUNNEL_PORT")"
     [ -z "$why" ] || die "port $TUNNEL_PORT cannot carry the tunnel: $why"
     # The tunnel runs between this relay and its own exit, on a secret only
@@ -1499,9 +1654,11 @@ if [ "$TUNNEL" = backpack ]; then
         TUNNEL=off
     fi
 fi
-[ "$TUNNEL" = backpack ] && TUNNEL_SPEC="bp-$TUNNEL_TRANSPORT-$TUNNEL_PORT-$(printf '%.1s' "$TUNNEL_DIRECTION")"
+[ "$TUNNEL" = backpack ] && TUNNEL_SPEC="bp-$TUNNEL_TRANSPORT-$TUNNEL_PORT-$(printf '%.1s' "$TUNNEL_DIRECTION")${TUNNEL_PRESET:+-$TUNNEL_PRESET}"
+[ "$TUNNEL" = backpack ] || TUNNEL_PRESET=""
 if [ "$TUNNEL" = backpack ]; then
-    TUNNEL_OUT="BackPack, $TUNNEL_TRANSPORT, $TUNNEL_DIRECTION, port $TUNNEL_PORT"
+    case "$TUNNEL_DIRECTION" in l3) d=direct ;; direct) d="the old direct" ;; *) d="$TUNNEL_DIRECTION" ;; esac
+    TUNNEL_OUT="BackPack, $TUNNEL_TRANSPORT, $d, port $TUNNEL_PORT${TUNNEL_PRESET:+, $TUNNEL_PRESET}"
 else
     TUNNEL_OUT="none - the relay reaches the exit directly"
 fi
@@ -2121,6 +2278,7 @@ EOF
     set_env_key /etc/smart-dns/panel.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/panel.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/panel.env TUNNEL_PORT "${TUNNEL_PORT:-}"
+    set_env_key /etc/smart-dns/panel.env TUNNEL_PRESET "${TUNNEL_PRESET:-}"
     umask 022
     chmod 600 /etc/smart-dns/panel.env
 
@@ -2448,6 +2606,7 @@ EOF
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_PORT "${TUNNEL_PORT:-}"
+    set_env_key /etc/smart-dns/sync.env TUNNEL_PRESET "${TUNNEL_PRESET:-}"
     umask 022
     chmod 600 /etc/smart-dns/sync.env
 
@@ -10344,8 +10503,10 @@ exit 0
 #        # Loopback as well as the paired relays: a relay whose sync comes
 #        # through the tunnel arrives here from this machine's own address.
 #        # Nothing is waved through - the secret below is still required.
+#        # And a relay over a layer-3 tunnel, from its address on it.
 #        if self.client_address[0] not in self.relays \
 #                and self.client_address[0] not in self.nodes \
+#                and self.client_address[0] not in getattr(self, "l3_relays", ()) \
 #                and self.client_address[0] not in ("127.0.0.1", "::1"):
 #            return False
 #        given = self.headers.get("Authorization", "")
@@ -11165,11 +11326,20 @@ exit 0
 #    return (cfg.get("API_BIND") or "0.0.0.0", port)
 #
 #
+#def l3_relay(relay):
+#    """Where a relay arrives from over a layer-3 tunnel to this exit: its end
+#    of the /30 the installer's l3_block picks by its address. Only that
+#    tunnel's interface carries it."""
+#    n = int(hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4], 16) % 16384
+#    return "10.10.%d.%d" % (n // 64, (n % 64) * 4 + 1)
+#
+#
 #def serve_api(cfg, store):
 #    API.store = store
 #    API.secret = cfg["SYNC_SECRET"]
 #    # Comma separated, so one exit can serve several relays.
 #    API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+#    API.l3_relays = frozenset(l3_relay(r) for r in API.relays)
 #    # The installer's tunnel, which is to the first relay only.
 #    API.tunnel = cfg.get("TUNNEL") or "off"
 #    API.nodes = tuple(x.strip() for x in (cfg.get("NODE_IP") or "").split(",") if x.strip())
@@ -12780,6 +12950,24 @@ exit 0
 ## It comes out on the exit's own 8443, which is why the exit accepts the
 ## request from its own loopback.
 #API_TUNNEL_PORT = 18843
+## Whether the tunnel carries anything, as the last call to the API found it:
+## down when the call through the tunnel failed and the one straight to the
+## exit answered. nginx is sent straight to the exit while it is down. A
+## tunnel whose own end stops listening when it is down needs none of this -
+## nginx turns to the exit by itself - but one whose end stays open does not
+## let it: a layer-3 tunnel's forwarder takes each connection and closes it,
+## and a tunnel that connected but carries nothing takes it and keeps it. Both
+## cut every customer of the relay until the tunnel came back.
+#TUNNEL_DOWN = {"down": False}
+#
+#
+#def note_tunnel(down):
+#    """What the last call found of the tunnel; said when it changes."""
+#    if down != TUNNEL_DOWN["down"]:
+#        log(WARN if down else INFO,
+#            "the tunnel carries nothing - customers go straight to the exit until it does"
+#            if down else "the tunnel carries again - customers go through it")
+#    TUNNEL_DOWN["down"] = down
 #
 #
 #def api_endpoints():
@@ -12863,7 +13051,9 @@ exit 0
 #    ctx.check_hostname = False
 #    ctx.verify_mode = ssl.CERT_NONE
 #    ways = api_endpoints()
+#    tunnel_failed = False
 #    for i, (host, port) in enumerate(ways):
+#        through_tunnel = (host, port) == ("127.0.0.1", API_TUNNEL_PORT)
 #        conn = NamedHTTPS(host, port, sync_sni(), timeout=25, context=ctx)
 #        try:
 #            try:
@@ -12875,6 +13065,7 @@ exit 0
 #                if i + 1 < len(ways):
 #                    log(WARN, "the API is not answering through the tunnel"
 #                              " (%s) - going straight to the exit" % e)
+#                    tunnel_failed = tunnel_failed or through_tunnel
 #                    continue
 #                raise
 #            if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
@@ -12890,6 +13081,11 @@ exit 0
 #            )
 #            res = conn.getresponse()
 #            data = json.loads(res.read() or b"{}")
+#            if through_tunnel:
+#                note_tunnel(False)
+#            elif tunnel_failed:
+#                # Straight to the exit answered where the tunnel did not.
+#                note_tunnel(True)
 #            if res.status != 200:
 #                raise RuntimeError("exit returned %d: %s" % (res.status, data))
 #            return data
@@ -14642,7 +14838,21 @@ exit 0
 #    "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
 #                "wsmux", "xdi", "udp"),
 #    "direct": ("stealth", "wss", "tcp", "ws"),
+#    # BackPack's layer-3 direct tunnel: the relay dials, and the two machines
+#    # share a small network the ports ride on. Carriers, not transports.
+#    "l3": ("xdi", "pck", "sni", "udp", "quic"),
 #}
+#
+#
+#def l3_block(relay):
+#    """A relay's layer-3 tunnel to its exit: (its address, the exit's, the
+#    interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
+#    both ends work out the same one with nothing passed between them. The
+#    installer's l3_block, the same way."""
+#    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+#    n = int(h, 16) % 16384
+#    base = "10.10.%d.%%d" % (n // 64)
+#    return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
 ## This end of each port the tunnel carries, and the exit's port it comes out on.
 #TUNNEL_PORTS = (("https", 18443, 443), ("http", 18080, 80), ("spotify", 14070, 4070),
 #                ("blizzard", 11119, 1119))
@@ -14733,6 +14943,79 @@ exit 0
 #              "kcp_acknodelay = true\n")
 #
 #
+## BackPack's performance presets, with its own numbers - tunnelspec/preset.go,
+## directpreset.go and l3preset.go in v1.8.5, the version installed - picked by
+## the admin for a tunnel and written at both of its ends. None picked is the
+## tunnel as it always was. Which a kind of tunnel has is BackPack's too:
+## throughput on kcp alone, none of aggressive on the direct engine, none of
+## throughput on layer 3. The installer has the same table (tunnel_tuning).
+#TUNNEL_PRESETS = ("balance", "turbo", "aggressive", "throughput")
+## keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+## mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+#PRESET_REVERSE = {
+#    "balance": (75, 40, 2048, 4, False, 4 << 20, 4, 32768, 4 << 20, 256 << 10, 512, 2),
+#    "turbo": (75, 40, 4096, 8, False, 8 << 20, 8, 32768, 16 << 20, 2 << 20, 1024, 3),
+#    "aggressive": (60, 25, 8192, 16, True, 32 << 20, 16, 65535, 32 << 20, 16 << 20, 2048, 4),
+#    "throughput": (75, 40, 8192, 16, False, 32 << 20, 8, 65535, 64 << 20, 32 << 20, 4096, 1),
+#}
+## mux frame, receive and stream buffers, sessions
+#PRESET_DIRECT = {"balance": (32768, 4 << 20, 256 << 10, 1),
+#                 "turbo": (32768, 16 << 20, 2 << 20, 1),
+#                 "throughput": (65535, 32 << 20, 16 << 20, 4)}
+## interface queue, socket buffers
+#PRESET_L3 = {"balance": (1024, 4 << 20), "turbo": (4096, 8 << 20), "aggressive": (16384, 32 << 20)}
+#MUX_TRANSPORTS = ("tcpmux", "wsmux", "wssmux")
+#
+#
+#def preset_ok(direction, transport, preset):
+#    """Whether this kind of tunnel has this preset - none always."""
+#    if not preset:
+#        return True
+#    if direction == "direct":
+#        return preset in PRESET_DIRECT
+#    if direction == "l3":
+#        return preset in PRESET_L3
+#    return preset in PRESET_REVERSE and (preset != "throughput" or transport == "kcp")
+#
+#
+#def tunnel_tuning(spec, side):
+#    """The preset's lines for one end - server or client of a reverse tunnel,
+#    either end of a direct or a layer-3 one. With none picked, a KCP
+#    transport still gets its drive (KCP_TUNING) and nothing else changes.
+#    Error correction comes with a preset only: it has to match at both ends,
+#    and a preset is written at both at once."""
+#    p, t = spec.get("preset") or "", spec["transport"]
+#    if not p:
+#        return KCP_TUNING if side in ("server", "client") and t in KCP_TRANSPORTS else ""
+#    if side == "l3":
+#        q, b = PRESET_L3[p]
+#        return 'preset = "%s"\ntxqueuelen = %d\nsockbuf = %d\nqdisc = "fq_codel"\n' % (p, q, b)
+#    if side == "direct":
+#        f, r, st, se = PRESET_DIRECT[p]
+#        return ("sessions = %d\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %d\n"
+#                "mux_recievebuffer = %d\nmux_streambuffer = %d\n" % (se, f, r, st))
+#    ka, hb, ch, pool, aggr, buf, mc, mf, mr, ms, wnd, par = PRESET_REVERSE[p]
+#    out = ['preset = "%s"\n' % p]
+#    if side == "server":
+#        out.append("channel_size = %d\nkeepalive_period = %d\nnodelay = true\nheartbeat = %d\n"
+#                   % (ch, ka, hb))
+#    else:
+#        out.append("connection_pool = %d\naggressive_pool = %s\nkeepalive_period = %d\n"
+#                   "nodelay = true\n" % (pool, "true" if aggr else "false", ka))
+#    out.append("so_rcvbuf = %d\nso_sndbuf = %d\n" % (buf, buf))
+#    if t in MUX_TRANSPORTS:
+#        out.append("%s = %d\nmux_version = 2\nmux_framesize = %d\nmux_recievebuffer = %d\n"
+#                   "mux_streambuffer = %d\n"
+#                   % ("mux_con" if side == "server" else "mux_session", mc, mf, mr, ms))
+#    if t in KCP_TRANSPORTS:
+#        bulk = p == "throughput"
+#        out.append("kcp_mtu = 1250\nkcp_interval = %d\nkcp_resend = 2\nkcp_nodelay = 1\n"
+#                   "kcp_nocongestion = 1\nkcp_sndwnd = %d\nkcp_rcvwnd = %d\n"
+#                   "kcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %d\n"
+#                   % (20 if bulk else 10, wnd, wnd, "false" if bulk else "true", par))
+#    return "".join(out)
+#
+#
 #def tunnel_toml_text(spec, exit_ip, secret, carried=None):
 #    # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
 #    # a node's carries only the proxy's ports, on its own.
@@ -14740,6 +15023,14 @@ exit 0
 #        carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
 #    ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
 #    out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
+#    if spec["direction"] == "l3":
+#        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "")
+#        out.append('[l3]\nmode = "dial"\naddr = "%s:%d"\nlocal_ip = "%s/30"\npeer_ip = "%s"\n'
+#                   'ports = [%s]\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+#                   % (exit_ip, spec["port"], mine, theirs, ports, spec["transport"], iface,
+#                      tunnel_token(secret)))
+#        out.append(tunnel_tuning(spec, "l3"))
+#        return "".join(out)
 #    if spec["direction"] == "reverse":
 #        out.append('[server]\nbind_addr = "0.0.0.0:%d"\nports = [%s]\n' % (spec["port"], ports))
 #        if spec["transport"] in ("wss", "wssmux"):
@@ -14748,8 +15039,7 @@ exit 0
 #        out.append('[direct]\nrole = "iran"\naddr = "%s:%d"\nports = [%s]\n'
 #                   % (exit_ip, spec["port"], ports))
 #    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-#    if spec["transport"] in KCP_TRANSPORTS:
-#        out.append(KCP_TUNING)
+#    out.append(tunnel_tuning(spec, "server" if spec["direction"] == "reverse" else "direct"))
 #    if spec["direction"] == "reverse":
 #        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
 #    return "".join(out)
@@ -14771,7 +15061,13 @@ exit 0
 #    if direction not in TUNNEL_TRANSPORTS or transport not in TUNNEL_TRANSPORTS[direction] \
 #            or not 1 <= port <= 65535:
 #        return None
-#    return {"direction": direction, "transport": transport, "port": port}
+#    preset = spec.get("preset") or ""
+#    if not preset_ok(direction, transport, preset):
+#        return None
+#    out = {"direction": direction, "transport": transport, "port": port}
+#    if preset:
+#        out["preset"] = preset
+#    return out
 #
 #
 #def write_if_changed(path, text, mode=0o644):
@@ -14858,7 +15154,7 @@ exit 0
 #        if not point_exit_nginx(exit_ip, False):
 #            error = error or "nginx راه مستقیم را نپذیرفت"
 #        set_sync_env({"TUNNEL": "off", "TUNNEL_TRANSPORT": "", "TUNNEL_DIRECTION": "",
-#                      "TUNNEL_PORT": ""})
+#                      "TUNNEL_PORT": "", "TUNNEL_PRESET": ""})
 #        TUNNEL_REPORT["state"] = {"on": False, "error": error}
 #        return
 #    os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
@@ -14880,10 +15176,13 @@ exit 0
 #        running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
 #        log(INFO, "tunnel %s, %s, port %d, as the admin panel says"
 #            % (spec["transport"], spec["direction"], spec["port"]))
-#    if not point_exit_nginx(exit_ip, True):
+#    if not point_exit_nginx(exit_ip, not TUNNEL_DOWN["down"]):
 #        error = error or "nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود"
+#    if TUNNEL_DOWN["down"]:
+#        error = error or "تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به سرور خارج می‌رود"
 #    set_sync_env({"TUNNEL": "backpack", "TUNNEL_TRANSPORT": spec["transport"],
-#                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"])})
+#                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"]),
+#                  "TUNNEL_PRESET": spec.get("preset") or ""})
 #    TUNNEL_REPORT["state"] = {"on": True, "error": error, "running": running}
 #
 #
@@ -15247,8 +15546,7 @@ exit 0
 #                   "-subj", "/CN=localhost", "-keyout", k, "-out", c)
 #            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
 #    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-#    if spec["transport"] in KCP_TRANSPORTS:
-#        out.append(KCP_TUNING)
+#    out.append(tunnel_tuning(spec, "client" if spec["direction"] == "reverse" else "direct"))
 #    if spec["direction"] == "reverse":
 #        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
 #    return "".join(out)
@@ -15288,7 +15586,8 @@ exit 0
 #    changed = EXIT_PLAN["order"] != order[:8]
 #    EXIT_PLAN.update(main=main, order=order[:8],
 #                     capped={ip for ip in raw.get("capped") or [] if is_ipv4(ip)})
-#    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"):
+#    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"
+#                            and not TUNNEL_DOWN["down"]):
 #        log(WARN, "nginx refused the way to the exits - kept the one it had")
 #    elif changed:
 #        log(INFO, "exits: %s first" % order[0])
@@ -21719,7 +22018,9 @@ exit 0
 #    back if refused, then the panel's list - the panel restarts on it, which
 #    reloads the sync API's list and its firewall rule. "" or why not."""
 #    body = ("# The relays this exit lets in: written by the installer and the admin panel.\n"
-#            + "".join("allow %s;\n" % ip for ip in ips))
+#            + "".join("allow %s;\n" % ip for ip in ips)
+#            # And where each would arrive from over a layer-3 tunnel.
+#            + "".join("allow %s;\n" % l3_block(ip)[0] for ip in ips))
 #    try:
 #        with open(RELAYS_CONF, encoding="utf-8") as fh:
 #            before = fh.read()
@@ -21788,7 +22089,35 @@ exit 0
 #    "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
 #                "wsmux", "xdi", "udp"),
 #    "direct": ("stealth", "wss", "tcp", "ws"),
+#    # BackPack's layer-3 direct tunnel: the relay dials, and the two machines
+#    # share a small network the ports ride on. Carriers, not transports.
+#    "l3": ("xdi", "pck", "sni", "udp", "quic"),
 #}
+## What a direction can carry, said when something else is picked.
+#TRANSPORT_LIMIT = {
+#    "reverse": "این ترنسپورت در حالت معکوس نیست",
+#    "direct": "مستقیم قدیمی فقط stealth، wss، tcp و ws را دارد",
+#    "l3": "حالت مستقیم فقط xdi، pck، sni، udp و quic را دارد",
+#}
+## Direct is BackPack's direct as its own menu makes it now - the layer-3 one,
+## "l3" in the settings. The older direct engine ("direct") is not offered
+## for a new tunnel: one that has it keeps it, shown as the old direct, until
+## the admin moves it.
+#DIRECTION_WORDS = {"reverse": "معکوس", "direct": "مستقیم قدیمی", "l3": "مستقیم"}
+#OLD_DIRECT_GONE = "مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید"
+#
+#
+#def l3_block(relay):
+#    """A relay's layer-3 tunnel to this exit: (its address, this exit's, the
+#    interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
+#    both ends work out the same one with nothing passed between them. The
+#    installer's l3_block and smartdns-sync's, the same way."""
+#    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+#    n = int(h, 16) % 16384
+#    base = "10.10.%d.%%d" % (n // 64)
+#    return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
+#
+#
 #TRANSPORT_WORDS = {
 #    "stealth": "رمزشده، شبیه بایت‌های تصادفی — پیشنهادی",
 #    "wss": "شبیه یک سایت HTTPS معمولی",
@@ -21801,6 +22130,7 @@ exit 0
 #    "ws": "وب‌سوکت — رمز ندارد",
 #    "wsmux": "وب‌سوکت مشترک — رمز ندارد",
 #    "xdi": "داخل پینگ — برای جایی که فقط پینگ رد می‌شود",
+#    "sni": "مثل pck، که با نام یک سایت مجاز شروع می‌شود — فقط L3",
 #    "udp": "دیتاگرام خام — در آزمایش ما وصل نشد",
 #}
 ## The ports a tunnel may not take - the installer's list, on either machine.
@@ -21914,8 +22244,96 @@ exit 0
 #              "kcp_acknodelay = true\n")
 #
 #
+## BackPack's performance presets, with its own numbers - tunnelspec/preset.go,
+## directpreset.go and l3preset.go in v1.8.5, the version installed - picked by
+## the admin for a tunnel and written at both of its ends. None picked is the
+## tunnel as it always was. Which a kind of tunnel has is BackPack's too:
+## throughput on kcp alone, none of aggressive on the direct engine, none of
+## throughput on layer 3. The installer has the same table (tunnel_tuning).
+#TUNNEL_PRESETS = ("balance", "turbo", "aggressive", "throughput")
+## keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+## mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+#PRESET_REVERSE = {
+#    "balance": (75, 40, 2048, 4, False, 4 << 20, 4, 32768, 4 << 20, 256 << 10, 512, 2),
+#    "turbo": (75, 40, 4096, 8, False, 8 << 20, 8, 32768, 16 << 20, 2 << 20, 1024, 3),
+#    "aggressive": (60, 25, 8192, 16, True, 32 << 20, 16, 65535, 32 << 20, 16 << 20, 2048, 4),
+#    "throughput": (75, 40, 8192, 16, False, 32 << 20, 8, 65535, 64 << 20, 32 << 20, 4096, 1),
+#}
+## mux frame, receive and stream buffers, sessions
+#PRESET_DIRECT = {"balance": (32768, 4 << 20, 256 << 10, 1),
+#                 "turbo": (32768, 16 << 20, 2 << 20, 1),
+#                 "throughput": (65535, 32 << 20, 16 << 20, 4)}
+## interface queue, socket buffers
+#PRESET_L3 = {"balance": (1024, 4 << 20), "turbo": (4096, 8 << 20), "aggressive": (16384, 32 << 20)}
+#MUX_TRANSPORTS = ("tcpmux", "wsmux", "wssmux")
+#
+#
+#def preset_ok(direction, transport, preset):
+#    """Whether this kind of tunnel has this preset - none always."""
+#    if not preset:
+#        return True
+#    if direction == "direct":
+#        return preset in PRESET_DIRECT
+#    if direction == "l3":
+#        return preset in PRESET_L3
+#    return preset in PRESET_REVERSE and (preset != "throughput" or transport == "kcp")
+#
+#
+#def tunnel_tuning(spec, side):
+#    """The preset's lines for one end - server or client of a reverse tunnel,
+#    either end of a direct or a layer-3 one. With none picked, a KCP
+#    transport still gets its drive (KCP_TUNING) and nothing else changes.
+#    Error correction comes with a preset only: it has to match at both ends,
+#    and a preset is written at both at once."""
+#    p, t = spec.get("preset") or "", spec["transport"]
+#    if not p:
+#        return KCP_TUNING if side in ("server", "client") and t in KCP_TRANSPORTS else ""
+#    if side == "l3":
+#        q, b = PRESET_L3[p]
+#        return 'preset = "%s"\ntxqueuelen = %d\nsockbuf = %d\nqdisc = "fq_codel"\n' % (p, q, b)
+#    if side == "direct":
+#        f, r, st, se = PRESET_DIRECT[p]
+#        return ("sessions = %d\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %d\n"
+#                "mux_recievebuffer = %d\nmux_streambuffer = %d\n" % (se, f, r, st))
+#    ka, hb, ch, pool, aggr, buf, mc, mf, mr, ms, wnd, par = PRESET_REVERSE[p]
+#    out = ['preset = "%s"\n' % p]
+#    if side == "server":
+#        out.append("channel_size = %d\nkeepalive_period = %d\nnodelay = true\nheartbeat = %d\n"
+#                   % (ch, ka, hb))
+#    else:
+#        out.append("connection_pool = %d\naggressive_pool = %s\nkeepalive_period = %d\n"
+#                   "nodelay = true\n" % (pool, "true" if aggr else "false", ka))
+#    out.append("so_rcvbuf = %d\nso_sndbuf = %d\n" % (buf, buf))
+#    if t in MUX_TRANSPORTS:
+#        out.append("%s = %d\nmux_version = 2\nmux_framesize = %d\nmux_recievebuffer = %d\n"
+#                   "mux_streambuffer = %d\n"
+#                   % ("mux_con" if side == "server" else "mux_session", mc, mf, mr, ms))
+#    if t in KCP_TRANSPORTS:
+#        bulk = p == "throughput"
+#        out.append("kcp_mtu = 1250\nkcp_interval = %d\nkcp_resend = 2\nkcp_nodelay = 1\n"
+#                   "kcp_nocongestion = 1\nkcp_sndwnd = %d\nkcp_rcvwnd = %d\n"
+#                   "kcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %d\n"
+#                   % (20 if bulk else 10, wnd, wnd, "false" if bulk else "true", par))
+#    return "".join(out)
+#PRESET_WORDS = {
+#    "": "پیش‌فرض — مثل همیشه",
+#    "balance": "balance — کم‌مصرف، برای سرور کوچک",
+#    "turbo": "turbo — پیشنهاد BackPack برای بیشتر مسیرها",
+#    "aggressive": "aggressive — بیشترین حافظه و سرعت",
+#    "throughput": "throughput — دانلود سنگین؛ فقط kcp در حالت معکوس",
+#}
+#
+#
 #def exit_tunnel_toml(ip, spec, secret, where):
 #    out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
+#    if spec["direction"] == "l3":
+#        theirs, mine, iface = l3_block(ip)
+#        out.append('[l3]\nmode = "listen"\naddr = "0.0.0.0:%d"\nlocal_ip = "%s/30"\n'
+#                   'peer_ip = "%s"\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+#                   % (spec["port"], mine, theirs, spec["transport"], iface,
+#                      tunnel_token(secret)))
+#        out.append(tunnel_tuning(spec, "l3"))
+#        return "".join(out)
 #    if spec["direction"] == "reverse":
 #        out.append('[client]\nremote_addr = "%s:%d"\n' % (ip, spec["port"]))
 #    else:
@@ -21928,8 +22346,7 @@ exit 0
 #                                "-out", c], capture_output=True, timeout=60)
 #            out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
 #    out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-#    if spec["transport"] in KCP_TRANSPORTS:
-#        out.append(KCP_TUNING)
+#    out.append(tunnel_tuning(spec, "client" if spec["direction"] == "reverse" else "direct"))
 #    if spec["direction"] == "reverse":
 #        out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
 #    return "".join(out)
@@ -21979,7 +22396,7 @@ exit 0
 #            fh.write(text)
 #        os.chmod(path + ".tmp", 0o600)
 #        os.replace(path + ".tmp", path)
-#    if spec["direction"] == "direct":
+#    if spec["direction"] != "reverse":
 #        # This end listens: its port answers that relay and nobody else.
 #        port = spec["port"]
 #        rules = ("# written by the doctor dns admin panel: the tunnel's port answers %s only\n"
@@ -22067,9 +22484,10 @@ exit 0
 #            row = STORE.one("SELECT value FROM settings WHERE key = ?",
 #                            ("node_tunnel_state:%s:%s" % (to, ip),))
 #            there = bool(row and row["value"] == "1")
-#        words = {"reverse": "معکوس", "direct": "مستقیم"}
-#        summary = "%s، %s، درگاه %d" % (spec["transport"], words.get(spec["direction"], ""),
-#                                         spec["port"])
+#        summary = "%s، %s، درگاه %d" % (spec["transport"],
+#                                         DIRECTION_WORDS.get(spec["direction"], ""),
+#                                         spec["port"]) + (
+#            "، " + spec["preset"] if spec.get("preset") else "")
 #        if seen.get("error"):
 #            state = "<span class='warn'>رله: %s</span>" % html.escape(seen["error"])
 #        elif not seen.get("on"):
@@ -22088,7 +22506,12 @@ exit 0
 #    options = "".join(
 #        "<option value='%s'%s>%s — %s</option>"
 #        % (t, " selected" if t == spec.get("transport", "stealth") else "", t,
-#           TRANSPORT_WORDS.get(t, "")) for t in TUNNEL_TRANSPORTS["reverse"])
+#           TRANSPORT_WORDS.get(t, ""))
+#        for t in TUNNEL_TRANSPORTS["reverse"] + ("sni",))
+#    presets = "".join(
+#        "<option value='%s'%s>%s</option>"
+#        % (k, " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
+#        for k in ("",) + TUNNEL_PRESETS)
 #    return (
 #        "<details><summary>%s%s</summary>"
 #        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px'>"
@@ -22098,19 +22521,44 @@ exit 0
 #        "<label style='display:block'><input type='radio' name='on' value='1'%s> تونل BackPack</label>"
 #        "<label style='display:block'>کدام سر وصل شود: <select name='direction'>"
 #        "<option value='reverse'%s>معکوس — سرور خارج به رله وصل می‌شود</option>"
-#        "<option value='direct'%s>مستقیم — رله به سرور خارج وصل می‌شود</option></select></label>"
+#        "%s%s</select></label>"
 #        "<label style='display:block'>ترنسپورت: <select name='transport'>%s</select></label>"
 #        "<label style='display:block'>درگاه: <input name='port' value='%s' dir='ltr' "
 #        "style='width:90px'></label>"
-#        "<p class='muted'>حالت مستقیم فقط stealth، wss، tcp و ws را دارد. در حالت معکوس این "
-#        "درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، "
-#        "بازش کنید. تا وقتی تونل وصل نیست، رله مستقیم به سرور خارج می‌رود.</p>"
+#        "<label style='display:block'>پروفایل سرعت: <select name='preset'>%s</select></label>"
+#        "<p class='muted'>پروفایل‌ها همان‌های خود BackPack‌اند و روی هر دو سر تونل نوشته "
+#        "می‌شوند؛ «پیش‌فرض» یعنی تونل همان‌طور که تا حالا بود. مستقیم throughput ندارد و "
+#        "در حالت معکوس throughput فقط روی kcp است. با عوض کردن پروفایل، تونل یک بار "
+#        "ری‌استارت می‌شود.</p>"
+#        "<p class='muted'>مستقیم همان Direct منوی خود BackPack است: رله به سرور خارج وصل "
+#        "می‌شود، دو سرور یک شبکهٔ کوچک مشترک می‌گیرند، و فقط xdi، pck، sni، udp و quic را "
+#        "دارد؛ xdi درگاه باز نمی‌خواهد، فقط پینگ در دو جهت. در حالت معکوس این درگاه روی "
+#        "رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش "
+#        "کنید. تا وقتی تونل چیزی رد نمی‌کند، رله مستقیم به سرور خارج می‌رود.</p>"
 #        "<button class='ghost'>ذخیرهٔ تونل</button></form></details>"
 #        % (label, summary, p, ip, html.escape(to), "" if spec else " checked",
 #           " checked" if spec else "",
 #           " selected" if direction == "reverse" else "",
-#           " selected" if direction == "direct" else "", options,
-#           spec.get("port") or 8444))
+#           # Only to the main exit: a node's end is built by its own sync,
+#           # which does not make this kind.
+#           "<option value='l3'%s>مستقیم — رله به سرور خارج وصل می‌شود، با شبکهٔ مشترک دو "
+#           "سرور</option>" % (" selected" if direction == "l3" else "")
+#           if to == exit_address() else "",
+#           # The old direct, only for a tunnel that already has it.
+#           "<option value='direct' selected>مستقیم قدیمی — دیگر انتخاب نمی‌شود</option>"
+#           if direction == "direct" else "", options,
+#           spec.get("port") or 8444, presets))
+#
+#def preset_problem(direction, transport, preset):
+#    """Why this tunnel cannot have this preset, or "" when it can."""
+#    if preset and preset not in TUNNEL_PRESETS:
+#        return "پروفایل را از فهرست انتخاب کنید"
+#    if preset_ok(direction, transport, preset):
+#        return ""
+#    if preset == "throughput":
+#        return "throughput فقط روی kcp در حالت معکوس است"
+#    return "%s: این نوع تونل این پروفایل را ندارد" % preset
+#
 #
 #def save_node_tunnel(ip, to, one):
 #    """The tunnel from relay `ip` to node `to`: kept here, and built by
@@ -22124,19 +22572,26 @@ exit 0
 #        return ("nodes?m=تونل رلهٔ %s به %s خاموش شد؛ تا یک دقیقه دیگر "
 #                             "مستقیم وصل می‌شود" % (ip, to))
 #    direction, transport = one("direction"), one("transport")
+#    if direction == "l3":
+#        return "nodes?m=!مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید"
+#    if direction == "direct" and (relay_tunnel(ip, to) or {}).get("direction") != "direct":
+#        return "nodes?m=!" + OLD_DIRECT_GONE
 #    if direction not in TUNNEL_TRANSPORTS:
 #        return "nodes?m=!جهت تونل را انتخاب کنید"
 #    if transport not in TUNNEL_TRANSPORTS[direction]:
-#        return "nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد"
+#        return "nodes?m=!" + TRANSPORT_LIMIT[direction]
 #    try:
 #        port = int(one("port").strip())
 #    except ValueError:
 #        return "nodes?m=!درگاه را عددی بنویسید"
-#    why = tunnel_port_problem(port, ip, direction, to)
+#    why = tunnel_port_problem(port, ip, direction, to) \
+#        or preset_problem(direction, transport, one("preset"))
 #    if why:
 #        return ("nodes?m=!%s" % why)
 #    spec = {"transport": transport, "direction": direction, "port": port, "exit": to,
 #            "slot": node_slot(to)}
+#    if one("preset"):
+#        spec["preset"] = one("preset")
 #    STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
 #              " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 #              (key, json.dumps(spec, sort_keys=True)))
@@ -22964,6 +23419,8 @@ exit 0
 #    # each would keep a device of its customer's.
 #    STORE.run("DELETE FROM wg_devices WHERE relay = ?", (ip,))
 #    STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("wg_pub:" + ip, "wg_error:" + ip))
+#    # And the last log it sent, which the logs page kept showing for good.
+#    STORE.run("DELETE FROM relay_logs WHERE relay = ?", (ip,))
 #
 #
 #def current_hosts():
@@ -29249,7 +29706,13 @@ exit 0
 #        out.append("</div>")
 #
 #        out.append("<div id='relays'></div>")
-#        rows = STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+#        # The servers the panel has now: one taken off before its log went
+#        # with it is not shown, nor kept.
+#        hosts = current_hosts()
+#        rows = [r for r in STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+#                if r["relay"] in hosts]
+#        STORE.run("DELETE FROM relay_logs WHERE relay NOT IN (%s)"
+#                  % ",".join("?" * len(hosts)), tuple(hosts))
 #        if not rows:
 #            out.append("<div class='card'><h2>سرورهای ایران</h2><p class='muted'>هنوز لاگی "
 #                       "نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ "
@@ -30930,19 +31393,24 @@ exit 0
 #                return self.redirect("nodes?m=تونل رلهٔ %s خاموش شد؛ رله تا یک دقیقه دیگر "
 #                                     "مستقیم وصل می‌شود" % ip)
 #            direction, transport = one("direction"), one("transport")
+#            if direction == "direct" and (relay_tunnel(ip) or {}).get("direction") != "direct":
+#                return self.redirect("nodes?m=!" + OLD_DIRECT_GONE)
 #            if direction not in TUNNEL_TRANSPORTS:
 #                return self.redirect("nodes?m=!جهت تونل را انتخاب کنید")
 #            if transport not in TUNNEL_TRANSPORTS[direction]:
-#                return self.redirect("nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد")
+#                return self.redirect("nodes?m=!" + TRANSPORT_LIMIT[direction])
 #            try:
 #                port = int(one("port").strip())
 #            except ValueError:
 #                return self.redirect("nodes?m=!درگاه را عددی بنویسید")
-#            why = tunnel_port_problem(port, ip, direction)
+#            why = tunnel_port_problem(port, ip, direction) \
+#                or preset_problem(direction, transport, one("preset"))
 #            if why:
 #                return self.redirect("nodes?m=!%s" % why)
 #            spec = {"transport": transport, "direction": direction, "port": port,
 #                    "exit": exit_address()}
+#            if one("preset"):
+#                spec["preset"] = one("preset")
 #            STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
 #                      " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 #                      ("relay_tunnel:" + ip, json.dumps(spec, sort_keys=True)))
@@ -33605,11 +34073,24 @@ exit 0
 #port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
 #case "$port" in ""|*[!0-9]*) port=8443 ;; esac
 #
-## The relays, and the other exits joined to this panel as nodes.
+## A relay's address on a layer-3 tunnel to this exit - the installer's
+## l3_block, which says how it is picked.
+#l3_relay() {
+#    local h n
+#    h="$(printf 'doctor-dns-l3:%s' "$1" | sha256sum | cut -c1-4)"
+#    n=$((16#$h % 16384))
+#    echo "10.10.$((n / 64)).$(((n % 64) * 4 + 1))"
+#}
+#
+## The relays, and the other exits joined to this panel as nodes - and each
+## relay as it arrives over a layer-3 tunnel, from an address only that
+## tunnel's interface carries.
 #list="127.0.0.1"
 #for key in RELAY_IP NODE_IP; do
 #    for ip in $(sed -n "s/^$key=//p" "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
-#        if valid_ip "$ip"; then list="$list, $ip"
+#        if valid_ip "$ip"; then
+#            list="$list, $ip"
+#            [ "$key" = RELAY_IP ] && list="$list, $(l3_relay "$ip")"
 #        else echo "ignoring '$ip' in $key - not an IPv4 address" >&2; fi
 #    done
 #done
@@ -40655,6 +41136,7 @@ exit 0
 #". پورت ۸۴۴۵ را اگر فایروال سرور یا دیتاسنتر دارد باز کنید.": ". Open port 8445 if the server or data center has a firewall.",
 #". یک بار، با یک کلیک، بدون رسید.": ". Once, with one click, no receipt.",
 #"50000 یا -50000": "50000 or -50000",
+#": این نوع تونل این پروفایل را ندارد": ": this kind of tunnel does not have this preset",
 #"API ربات": "Bot API",
 #"API همگام‌سازی و پنل مشتری": "Sync API and customer panel",
 #"BackPack روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید": "BackPack is not installed on this relay; run the installer on the relay once more",
@@ -40708,6 +41190,8 @@ exit 0
 #"Taboola و Outbrain": "Taboola and Outbrain",
 #"Vungle و Liftoff": "Vungle and Liftoff",
 #"XVideos و XNXX": "XVideos and XNXX",
+#"aggressive — بیشترین حافظه و سرعت": "aggressive - the most memory and speed",
+#"balance — کم‌مصرف، برای سرور کوچک": "balance - light, for a small server",
 #"dnsmasq نپذیرفت؛ همان قبلی ماند": "dnsmasq refused it; the previous one stayed",
 #"nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود": "nginx refused the tunnel path; the relay goes straight to the exit server",
 #"nginx راه مستقیم را نپذیرفت": "nginx refused the direct path",
@@ -40720,6 +41204,9 @@ exit 0
 #"status یکی از open، answered، closed یا all است": "status is one of open, answered, closed or all",
 #"status یکی از pending، approved، rejected یا all است": "status is one of pending, approved, rejected or all",
 #"telegram_id باید عدد مثبت باشد": "telegram_id must be a positive number",
+#"throughput فقط روی kcp در حالت معکوس است": "throughput is on kcp in reverse only",
+#"throughput — دانلود سنگین؛ فقط kcp در حالت معکوس": "throughput - heavy downloads; kcp in reverse only",
+#"turbo — پیشنهاد BackPack برای بیشتر مسیرها": "turbo - BackPack's choice for most routes",
 #"wg0 ساخته نشد:": "wg0 was not made:",
 #"wireguard-tools روی این رله نصب نیست؛ نصب‌کننده را یک بار دیگر روی رله اجرا کنید": "wireguard-tools is not installed on this relay; run the installer on it once more",
 #"«ترافیک این ماه» از شمارندهٔ کارت شبکهٔ خود سرور است، همان چیزی که سرویس‌دهنده حساب می‌کند؛ رویش بزنید تا سقف ماهانه، روز شروع دوره و کاری که با رسیدن به سقف بشود را تعیین کنید. هشدار در ۸۰ و ۹۵ و ۱۰۰ درصد می‌آید.": "“This month’s traffic” comes from the server’s own network card counter, the same thing the provider bills; click it to set the monthly cap, the day the period starts and what happens when the cap is reached. Alerts come at 80, 95 and 100 percent.",
@@ -41006,6 +41493,7 @@ exit 0
 #"این اسم خودش سایتی ندارد — فقط پسوند زیردامنه‌هاست، یا فقط به سایت دیگری هدایت می‌کند — و آزموده نشد؛ خود سرویس از دامنه‌های دیگرش کار می‌کند": "This name has no site of its own — it is only a suffix for subdomains, or only redirects to another site — and was not tested; the service works through its other domains",
 #"این بخش برای حساب شما باز نیست؛ اگر لازمش دارید، به مالک پنل بگویید.": "This part is not open to your account; if you need it, ask the panel’s owner.",
 #"این بکاپ رمزگذاری شده؛ رمزش را هم بنویسید": "This backup is encrypted; write its password too",
+#"این ترنسپورت در حالت معکوس نیست": "Reverse has no such transport",
 #"این تلگرام به حساب دیگری وصل است؛ از همان ربات استفاده کنید": "This Telegram is linked to another account; use that bot",
 #"این تلگرام به حساب دیگری وصل است؛ با پشتیبانی تماس بگیرید": "This Telegram is linked to another account; contact support",
 #"این تک‌سرور از پنل جدا می‌شود و مشتری‌هایی که DNS را رویش گذاشته‌اند قطع می‌شوند. ادامه؟": "This single server is detached from the panel and customers who set their DNS to it are cut off. Continue?",
@@ -41360,6 +41848,7 @@ exit 0
 #"تونل این رله مال نصب‌کننده است؛ با --tunnel عوضش کنید": "This relay’s tunnel belongs to the installer; change it with --tunnel",
 #"تونل رلهٔ": "Tunnel of relay",
 #"تونل رله‌ها — سرور خارج": "Relays’ tunnels — exit server",
+#"تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به سرور خارج می‌رود": "The tunnel is up but carries nothing; the relay goes straight to the exit for now",
 #"تونل — سرور خارج": "Tunnel — exit server",
 #"تونل‌ها": "Tunnels",
 #"توکن درست نیست؛ از @BotFather کپی کنید": "The token is not valid; copy it from @BotFather",
@@ -41424,8 +41913,7 @@ exit 0
 #"جوابی از رله‌ها نیامد. رله‌ها باید روی نسخهٔ تازه باشند.": "No answer from the relays. The relays must be on the new version.",
 #"جوابی نیامد": "No answer",
 #"حالا اگر رمز پنل را فراموش کنید، کد بازیابی همین‌جا می‌آید.": "Now if you forget your panel password, the recovery code will come here.",
-#"حالت مستقیم فقط stealth، wss، tcp و ws را دارد": "Direct mode only has stealth, wss, tcp and ws",
-#"حالت مستقیم فقط stealth، wss، tcp و ws را دارد. در حالت معکوس این درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش کنید. تا وقتی تونل وصل نیست، رله مستقیم به سرور خارج می‌رود.": "Direct mode only has stealth, wss, tcp and ws. In reverse mode this port opens on the relay, and in direct mode on the exit server; if a firewall is in front of it, open it. While the tunnel is not connected, the relay goes straight to the exit server.",
+#"حالت مستقیم فقط xdi، pck، sni، udp و quic را دارد": "Direct has xdi, pck, sni, udp and quic only",
 #"حجم": "Traffic",
 #"حجم (گیگ)": "Quota (GB)",
 #"حجم تمام شده ⛔": "Quota used up ⛔",
@@ -42179,6 +42667,7 @@ exit 0
 #"متن کانفیگ": "The config's text",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it.",
 #"مثل Google زیرشبکهٔ پرسنده (ECS) را به سرویس‌ها می‌گوید؛ بازی‌های Tencent مثل PUBG Mobile با آن باز نمی‌شوند. تبلیغ و ردیاب را هم می‌بندد، و بعضی بازی‌ها و فروشگاه‌ها به همان دامنه‌ها نیاز دارند.": "Like Google, tells services the asker's subnet (ECS); Tencent games such as PUBG Mobile do not open with it. It also blocks ads and trackers, and some games and stores need those same domains.",
+#"مثل pck، که با نام یک سایت مجاز شروع می‌شود — فقط L3": "as pck, opening with the name of a site the route lets through - L3 only",
 #"مثلاً 203.0.113.7": "e.g. 203.0.113.7",
 #"مثلاً مخصوص ایرانسل": "e.g. for Irancell",
 #"مثلاً گیمینگ ماهانه": "e.g. Gaming monthly",
@@ -42187,8 +42676,14 @@ exit 0
 #"مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰": "The length must be a whole number of days, from 1 to 3650",
 #"مرتب‌سازی:": "Sort:",
 #"مستقیم": "Direct",
+#"مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید": "Direct is to the main exit only, for now; pick reverse to the nodes",
+#"مستقیم قدیمی": "old direct",
+#"مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید": "The old direct is not offered any more; pick reverse or direct",
+#"مستقیم قدیمی فقط stealth، wss، tcp و ws را دارد": "The old direct has stealth, wss, tcp and ws only",
+#"مستقیم قدیمی — دیگر انتخاب نمی‌شود": "Old direct - not offered any more",
+#"مستقیم همان Direct منوی خود BackPack است: رله به سرور خارج وصل می‌شود، دو سرور یک شبکهٔ کوچک مشترک می‌گیرند، و فقط xdi، pck، sni، udp و quic را دارد؛ xdi درگاه باز نمی‌خواهد، فقط پینگ در دو جهت. در حالت معکوس این درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش کنید. تا وقتی تونل چیزی رد نمی‌کند، رله مستقیم به سرور خارج می‌رود.": "Direct is BackPack's own menu's Direct: the relay dials the exit, the two servers get a small network of their own, and it has xdi, pck, sni, udp and quic only; xdi needs no port opened, only ping both ways. In reverse this port is opened on the relay, and in direct on the exit; if a firewall is in front of it, open it. While the tunnel carries nothing, the relay goes straight to the exit.",
 #"مستقیم کار می‌کند؛ فقط برای مشتری‌های اپراتوری روشن کنید که بازی رویش باز نمی‌شود — آپدیت‌های بازی هم از سرورها رد می‌شود": "works directly; only turn it on for customers of an operator the game does not open on — game updates go through the servers too",
-#"مستقیم — رله به سرور خارج وصل می‌شود": "Direct — the relay connects to the exit server",
+#"مستقیم — رله به سرور خارج وصل می‌شود، با شبکهٔ مشترک دو سرور": "Direct - the relay dials the exit, over a network of the two servers' own",
 #"مسدود": "Blocked",
 #"مسدود شد": "blocked",
 #"مسدود کردن": "Block",
@@ -42537,6 +43032,9 @@ exit 0
 #"پرفکت ورلد": "Perfect World",
 #"پرمصرف‌ترین‌ها — ۷ روز اخیر": "Top users — last 7 days",
 #"پروفایل آیفون این سرور": "iPhone profile for this server",
+#"پروفایل را از فهرست انتخاب کنید": "Pick a preset from the list",
+#"پروفایل سرعت:": "Performance preset:",
+#"پروفایل‌ها همان‌های خود BackPack‌اند و روی هر دو سر تونل نوشته می‌شوند؛ «پیش‌فرض» یعنی تونل همان‌طور که تا حالا بود. مستقیم throughput ندارد و در حالت معکوس throughput فقط روی kcp است. با عوض کردن پروفایل، تونل یک بار ری‌استارت می‌شود.": "The presets are BackPack's own and are written at both ends of the tunnel; \"default\" is the tunnel as it has always been. Direct has no throughput, and in reverse throughput is on kcp only. Changing the preset restarts the tunnel once.",
 #"پشتیبان": "Standby",
 #"پشتیبان باید یکی از نودها باشد": "The standby must be one of the nodes",
 #"پشتیبان هر ۶ ساعت آخرین بکاپ پنل (رمزگذاری‌شده با رمز بکاپ) و نصب‌کننده را از همین سرور می‌گیرد و نگه می‌دارد. همهٔ رله‌ها و نودها هم آدرسش را می‌دانند.": "Every 6 hours the standby gets the panel’s latest backup (encrypted with the backup password) and the installer from this server and keeps them. All relays and nodes know its address too.",
@@ -42619,6 +43117,7 @@ exit 0
 #"پیش‌فرض خاموش: روی بیشتر اپراتورها مستقیم بهتر کار می‌کند": "off by default: works better direct on most operators",
 #"پیش‌فرض خاموش: روی ۵۲۲۳ است، که رله نمی‌برد": "off by default: it is on 5223, which the relay does not carry",
 #"پیش‌فرض رله": "Relay default",
+#"پیش‌فرض — مثل همیشه": "default - as it has always been",
 #"پینگ شما تا سرور:": "Your ping to the server:",
 #"پی‌دی": "PAYDAY",
 #"چت رایوت": "Riot chat (PVP.net)",

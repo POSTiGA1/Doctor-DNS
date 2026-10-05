@@ -78,7 +78,8 @@ check("no error correction at either end: it must match, and the ends upgrade ap
 
 print("the installer")
 logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
-m = re.search(r"case \"\$TUNNEL_TRANSPORT\" in kcp\|xdi\|pck\)\n((?:\s+printf '[^']*'\n?)+)", logic)
+m = re.search(r"case \"\$side:\$t\" in server:kcp\|server:xdi\|server:pck\|client:kcp\|"
+              r"client:xdi\|client:pck\)\n((?:\s+printf '[^']*'[^\n]*\n?)+)", logic)
 lines = "".join(re.findall(r"printf '([^']*)'", m.group(1))).replace("\\n", "\n") if m else ""
 check("its own tunnel gets the very same lines", lines == sync.KCP_TUNING, lines)
 check("the full-chain check no longer prints 000000",

@@ -78,7 +78,14 @@ consts = "\n".join(l for l in logic.splitlines() if re.match(r"TUNNEL_LOCAL_\w+=
 
 
 def installer(script):
-    r = subprocess.run([bash, "-c", script], capture_output=True, text=True)
+    # From a file: Windows passes a long `bash -c` argument on mangled.
+    path = os.path.join(tmp, "installer-part.sh")
+    with open(path, "w", newline="\n", encoding="utf-8") as fh:
+        fh.write(script)
+    unix = path.replace("\\", "/")
+    if len(unix) > 1 and unix[1] == ":":
+        unix = "/" + unix[0].lower() + unix[2:]
+    r = subprocess.run([bash, unix], capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else "rc=%d %s" % (r.returncode, r.stderr)
 
 
@@ -95,7 +102,7 @@ if bash:
         check("the installer's and the sync's way to the exit agree, %s" %
               ("through the tunnel" if tunnel else "straight"),
               got == sync.exit_conf_text("203.0.113.9", tunnel), got)
-    toml = func(logic, "tunnel_toml")
+    toml = func(logic, "tunnel_toml") + func(logic, "tunnel_tuning")
     tok = func(logic, "tunnel_token")
     for direction, transport in (("reverse", "stealth"), ("direct", "tcp"), ("reverse", "kcp")):
         got = installer(consts + "\n" + tok + toml + "\nROLE=relay\nEXIT_IP=203.0.113.9\n"
@@ -302,30 +309,41 @@ check("the first relay's tunnel is the installer's, not set here",
 check("a direct transport there is none of is refused",
       act(ip="198.51.100.2", on="1", direction="direct", transport="kcp",
           port="9000").startswith("nodes?m=!"))
-got = act(ip="198.51.100.2", on="1", direction="direct", transport="stealth", port="9000")
+check("the old direct engine is not taken for a new tunnel",
+      "مستقیم قدیمی دیگر انتخاب نمی‌شود" in act(ip="198.51.100.2", on="1", direction="direct",
+                                                transport="stealth", port="9000"))
+got = act(ip="198.51.100.2", on="1", direction="l3", transport="xdi", port="9000")
 saved = admin.relay_tunnel("198.51.100.2")
 where = os.path.join(admin.RELAY_TUNNELS, "198.51.100.2")
 check("a good one is saved, with this exit's address for the relay",
-      not got.startswith("nodes?m=!") and saved == {"transport": "stealth", "direction": "direct",
+      not got.startswith("nodes?m=!") and saved == {"transport": "xdi", "direction": "l3",
                                                        "port": 9000, "exit": "203.0.113.9"}, got)
 toml = open(os.path.join(where, "tunnel.toml")).read()
 check("  this end: listening for that relay, on the shared token",
-      'role = "kharej"' in toml and 'addr = "0.0.0.0:9000"' in toml
+      'mode = "listen"' in toml and 'addr = "0.0.0.0:9000"' in toml
       and 'token = "%s"' % sync.tunnel_token("s3cret") in toml)
 check("  its port answering that relay only",
       "ip saddr != 198.51.100.2 drop" in open(admin.tunnel_nft_path("198.51.100.2")).read())
 check("  and its own BackPack started",
       ("systemctl", "restart", "smartdns-tunnel@198.51.100.2.service") in exits)
 check("another relay may not take the same port on this exit",
-      act(ip="198.51.100.3", on="1", direction="direct", transport="tcp",
-          port="9000").startswith("nodes?m=!"))
+      "9000" in act(ip="198.51.100.3", on="1", direction="l3", transport="pck", port="9000"))
 act(ip="198.51.100.3", on="1", direction="reverse", transport="kcp", port="9000")
 check("  but a reverse one may - that port is on the relay",
       '[client]\nremote_addr = "198.51.100.3:9000"' in
       open(os.path.join(admin.RELAY_TUNNELS, "198.51.100.3", "tunnel.toml")).read())
 cell = admin.tunnel_cell("p", "198.51.100.2")
 check("the card shows it, with the relay's word on it",
-      "stealth" in cell and "رله هنوز نگرفته است" in cell and "action='/p/relay-tunnel'" in cell)
+      "xdi، مستقیم، درگاه 9000" in cell and "رله هنوز نگرفته است" in cell
+      and "action='/p/relay-tunnel'" in cell and "value='direct'" not in cell)
+admin.STORE.run("UPDATE settings SET value = ? WHERE key = 'relay_tunnel:198.51.100.2'",
+                (json.dumps({"transport": "stealth", "direction": "direct", "port": 9000,
+                             "exit": "203.0.113.9"}),))
+check("a tunnel that has the old direct keeps it, shown as such, and may be saved as it is",
+      "<option value='direct' selected>مستقیم قدیمی" in admin.tunnel_cell("p", "198.51.100.2")
+      and not act(ip="198.51.100.2", on="1", direction="direct", transport="stealth",
+                  port="9000").startswith("nodes?m=!"))
+act(ip="198.51.100.2", on="1", direction="l3", transport="xdi", port="9000")
 admin.STORE.run("INSERT INTO settings (key, value) VALUES ('relay_tunnel_state:198.51.100.2', ?)",
                 (json.dumps({"on": True, "running": True, "error": ""}),))
 check("  and both ends up once they are",

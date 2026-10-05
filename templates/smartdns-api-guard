@@ -47,11 +47,24 @@ valid_ip() {
 port="$(sed -n 's/^API_PORT=//p' "$ETC/panel.env" 2>/dev/null | head -1)"
 case "$port" in ""|*[!0-9]*) port=8443 ;; esac
 
-# The relays, and the other exits joined to this panel as nodes.
+# A relay's address on a layer-3 tunnel to this exit - the installer's
+# l3_block, which says how it is picked.
+l3_relay() {
+    local h n
+    h="$(printf 'doctor-dns-l3:%s' "$1" | sha256sum | cut -c1-4)"
+    n=$((16#$h % 16384))
+    echo "10.10.$((n / 64)).$(((n % 64) * 4 + 1))"
+}
+
+# The relays, and the other exits joined to this panel as nodes - and each
+# relay as it arrives over a layer-3 tunnel, from an address only that
+# tunnel's interface carries.
 list="127.0.0.1"
 for key in RELAY_IP NODE_IP; do
     for ip in $(sed -n "s/^$key=//p" "$ETC/panel.env" 2>/dev/null | head -1 | tr ',' ' '); do
-        if valid_ip "$ip"; then list="$list, $ip"
+        if valid_ip "$ip"; then
+            list="$list, $ip"
+            [ "$key" = RELAY_IP ] && list="$list, $(l3_relay "$ip")"
         else echo "ignoring '$ip' in $key - not an IPv4 address" >&2; fi
     done
 done

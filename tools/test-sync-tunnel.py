@@ -56,8 +56,8 @@ print("the tunnel carries a third port")
 logic = text("tools/installer-logic.sh")
 check("the relay's end of it is named once", "TUNNEL_LOCAL_API=18843" in logic)
 ports = [l for l in logic.splitlines() if "ports = [" in l]
-check("both tunnel shapes carry it to the exit's 8443",
-      len(ports) == 2 and all('=8443' in l for l in ports), str(ports))
+check("every tunnel shape carries it to the exit's 8443 - reverse, direct and l3",
+      len(ports) == 3 and all('=8443' in l for l in ports), str(ports))
 check("and nobody can pick it as the tunnel's own port",
       any('"$TUNNEL_LOCAL_API"' in l and 'echo "the tunnel' in l for l in logic.splitlines()))
 

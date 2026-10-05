@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.3"
+VERSION="0.10.4"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -177,6 +177,11 @@ relay_allows() {
     {
         printf '# The relays this exit lets in: written by the installer and the admin panel.\n'
         for ip in $out; do printf 'allow %s;\n' "$ip"; done
+        # And where each would arrive from over a layer-3 tunnel: an address
+        # only that tunnel's interface can carry.
+        if [ "$ROLE" != node ]; then
+            for ip in $out; do l3_block "$ip"; printf 'allow %s;\n' "$L3_RELAY"; done
+        fi
     } > "$RELAYS_CONF"
     chmod 644 "$RELAYS_CONF"
 }
@@ -371,16 +376,109 @@ TUNNEL_LOCAL_API=18843
 TUNNEL_LOCAL_SPOTIFY=14070
 # Battle.net's launcher, on 1119 - the same story as Spotify's port.
 TUNNEL_LOCAL_BLIZZARD=11119
-# Which transports each direction has. A direct tunnel has four; BackPack's
-# spoofing carrier is a different kind of tunnel and is not offered.
+# Which transports each direction has. A direct tunnel has four. l3 is
+# BackPack's layer-3 direct tunnel - the relay dials, as in direct, but the two
+# machines get a small network of their own and the ports ride on it - and
+# what it has are carriers rather than transports. Its spoofing carrier wants
+# addresses forged on purpose and is not offered.
 TUNNEL_REVERSE_TRANSPORTS="stealth wss wssmux tcp tcpmux kcp pck quic ws wsmux xdi udp"
 TUNNEL_DIRECT_TRANSPORTS="stealth wss tcp ws"
+TUNNEL_L3_TRANSPORTS="xdi pck sni udp quic"
 
 tunnel_transport_ok() {
     local list="$TUNNEL_REVERSE_TRANSPORTS"
     [ "$1" = direct ] && list="$TUNNEL_DIRECT_TRANSPORTS"
+    [ "$1" = l3 ] && list="$TUNNEL_L3_TRANSPORTS"
     case " $list " in *" $2 "*) return 0 ;; esac
     return 1
+}
+
+# BackPack's performance presets - the admin panel's and smartdns-sync's
+# TUNNEL_PRESETS and tunnel_tuning: the same numbers, BackPack v1.8.5's own,
+# and the very same lines. None picked is the tunnel as it always was.
+tunnel_preset_ok() {
+    case "$3" in "") return 0 ;; esac
+    case "$1:$3" in
+        reverse:balance|reverse:turbo|reverse:aggressive) return 0 ;;
+        reverse:throughput) [ "$2" = kcp ] ;;
+        direct:balance|direct:turbo|direct:throughput) return 0 ;;
+        l3:balance|l3:turbo|l3:aggressive) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The preset's lines for one end: server or client of a reverse tunnel, or
+# either end of a direct or a layer-3 one. With none, a KCP transport still
+# gets its drive - Turbo's, less the error correction, which has to match at
+# both ends and comes with a preset only, written at both at once.
+tunnel_tuning() {
+    local side="$1" p="${TUNNEL_PRESET:-}" t="$TUNNEL_TRANSPORT" v iv ack
+    if [ -z "$p" ]; then
+        case "$side:$t" in server:kcp|server:xdi|server:pck|client:kcp|client:xdi|client:pck)
+            printf 'kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n'
+            printf 'kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\nkcp_acknodelay = true\n' ;;
+        esac
+        return 0
+    fi
+    case "$side" in
+    l3)
+        case "$p" in balance) v="1024 4194304" ;; turbo) v="4096 8388608" ;; *) v="16384 33554432" ;; esac
+        # shellcheck disable=SC2086
+        set -- $v
+        printf 'preset = "%s"\ntxqueuelen = %s\nsockbuf = %s\nqdisc = "fq_codel"\n' "$p" "$1" "$2"
+        return 0 ;;
+    direct)
+        case "$p" in
+            balance) v="32768 4194304 262144 1" ;;
+            turbo) v="32768 16777216 2097152 1" ;;
+            *) v="65535 33554432 16777216 4" ;;
+        esac
+        # shellcheck disable=SC2086
+        set -- $v
+        printf 'sessions = %s\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %s\n' "$4" "$1"
+        printf 'mux_recievebuffer = %s\nmux_streambuffer = %s\n' "$2" "$3"
+        return 0 ;;
+    esac
+    # keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+    # mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+    case "$p" in
+        balance) v="75 40 2048 4 false 4194304 4 32768 4194304 262144 512 2" ;;
+        turbo) v="75 40 4096 8 false 8388608 8 32768 16777216 2097152 1024 3" ;;
+        aggressive) v="60 25 8192 16 true 33554432 16 65535 33554432 16777216 2048 4" ;;
+        *) v="75 40 8192 16 false 33554432 8 65535 67108864 33554432 4096 1" ;;
+    esac
+    # shellcheck disable=SC2086
+    set -- $v
+    printf 'preset = "%s"\n' "$p"
+    if [ "$side" = server ]; then
+        printf 'channel_size = %s\nkeepalive_period = %s\nnodelay = true\nheartbeat = %s\n' "$3" "$1" "$2"
+    else
+        printf 'connection_pool = %s\naggressive_pool = %s\nkeepalive_period = %s\nnodelay = true\n' "$4" "$5" "$1"
+    fi
+    printf 'so_rcvbuf = %s\nso_sndbuf = %s\n' "$6" "$6"
+    case "$t" in tcpmux|wsmux|wssmux)
+        if [ "$side" = server ]; then printf 'mux_con = %s\n' "$7"; else printf 'mux_session = %s\n' "$7"; fi
+        printf 'mux_version = 2\nmux_framesize = %s\nmux_recievebuffer = %s\nmux_streambuffer = %s\n' \
+               "$8" "$9" "${10}" ;;
+    esac
+    case "$t" in kcp|xdi|pck)
+        if [ "$p" = throughput ]; then iv=20; ack=false; else iv=10; ack=true; fi
+        printf 'kcp_mtu = 1250\nkcp_interval = %s\nkcp_resend = 2\nkcp_nodelay = 1\nkcp_nocongestion = 1\n' "$iv"
+        printf 'kcp_sndwnd = %s\nkcp_rcvwnd = %s\nkcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %s\n' \
+               "${11}" "${11}" "$ack" "${12}" ;;
+    esac
+}
+
+# A relay's addresses on its layer-3 tunnel: a /30 of 10.10.0.0/16 picked by
+# its own address, so the relay and the exit each work out the same block
+# with nothing to pass between them, and every relay of an exit has its own -
+# and its own interface beside it. The smartdns-sync and the admin panel
+# compute it the same way (l3_block there).
+l3_block() {
+    local h n o3 o4
+    h="$(printf 'doctor-dns-l3:%s' "$1" | sha256sum | cut -c1-4)"
+    n=$((16#$h % 16384)); o3=$((n / 64)); o4=$(((n % 64) * 4))
+    L3_RELAY="10.10.$o3.$((o4 + 1))"; L3_EXIT="10.10.$o3.$((o4 + 2))"; L3_IFACE="ddl$h"
 }
 
 # Why a port cannot carry the tunnel, or nothing when it can. The same ports
@@ -415,11 +513,15 @@ tunnel_port_problem() {
 # pairing token so the two ends are never set up differently.
 parse_tunnel_spec() {
     local s="$1" d
-    case "$s" in bp-*-*-[rd]) ;; *) return 1 ;; esac
+    # bp-xdi-8477-l-turbo: a preset, when the exit picked one.
+    TUNNEL_PRESET=""
+    case "$s" in *-balance|*-turbo|*-aggressive|*-throughput) TUNNEL_PRESET="${s##*-}"; s="${s%-*}" ;; esac
+    case "$s" in bp-*-*-[rdl]) ;; *) return 1 ;; esac
     s="${s#bp-}"; d="${s##*-}"; s="${s%-*}"
     TUNNEL_PORT="${s##*-}"; TUNNEL_TRANSPORT="${s%-*}"
-    if [ "$d" = r ]; then TUNNEL_DIRECTION=reverse; else TUNNEL_DIRECTION=direct; fi
+    case "$d" in r) TUNNEL_DIRECTION=reverse ;; d) TUNNEL_DIRECTION=direct ;; *) TUNNEL_DIRECTION=l3 ;; esac
     tunnel_transport_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" || return 1
+    tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "$TUNNEL_PRESET" || return 1
     [ -z "$(tunnel_port_problem "$TUNNEL_PORT")" ] || return 1
     TUNNEL=backpack
 }
@@ -435,10 +537,11 @@ ask_tunnel() {
     # line typed, not four.
     local d1=1 d2=1 d3=1
     [ "${CUR_TUNNEL:-}" = backpack ] && d1=2
-    [ "${CUR_DIRECTION:-}" = direct ] && d2=2
+    [ "${CUR_DIRECTION:-}" = l3 ] && d2=2
     printf '\n%sBetween the relay and this exit%s\n\n' "$B" "$N"
     if [ "${CUR_TUNNEL:-}" = backpack ]; then
-        printf '  now: BackPack, %s, %s, port %s\n\n' "${CUR_TRANSPORT:-?}" "${CUR_DIRECTION:-?}" "${CUR_PORT:-?}"
+        case "${CUR_DIRECTION:-}" in l3) t=direct ;; direct) t="the old direct" ;; *) t="${CUR_DIRECTION:-?}" ;; esac
+        printf '  now: BackPack, %s, %s, port %s\n\n' "${CUR_TRANSPORT:-?}" "$t" "${CUR_PORT:-?}"
     elif [ -n "${CUR_TUNNEL:-}" ]; then
         printf '  now: direct TCP\n\n'
     fi
@@ -446,12 +549,16 @@ ask_tunnel() {
     printf '  2) BackPack tunnel   hides the names of the sites from filtering on the way\n\n'
     read -r -p "  choice [$d1]: " a
     case "${a:-$d1}" in 1) TUNNEL=off; return 0 ;; 2) TUNNEL=backpack ;; *) die "answer 1 or 2" ;; esac
+    # Direct is BackPack's direct as its own menu makes it now - the layer-3
+    # one, l3 here. The older direct engine is not offered any more; a
+    # machine that has it keeps it until it is asked again.
     printf '\n  Which end dials the other?\n\n'
     printf '  1) reverse   this exit dials the relay - BackPack'"'"'s usual way\n'
-    printf '  2) direct    the relay dials this exit - for where connections into Iran do not\n'
-    printf '               get through\n\n'
+    printf '  2) direct    the relay dials this exit, over a network of the two machines'"'"' own -\n'
+    printf '               for where connections into Iran do not get through\n\n'
     read -r -p "  choice [$d2]: " a
-    case "${a:-$d2}" in 1) TUNNEL_DIRECTION=reverse ;; 2) TUNNEL_DIRECTION=direct ;; *) die "answer 1 or 2" ;; esac
+    case "${a:-$d2}" in 1) TUNNEL_DIRECTION=reverse ;; 2) TUNNEL_DIRECTION=l3 ;;
+        *) die "answer 1 or 2" ;; esac
     # What each transport is. How one performs depends on the route, so that is
     # not said here; only the two that did not connect at all in our own test
     # say so.
@@ -472,6 +579,7 @@ tcpmux|plain and pooled - not encrypted: site names show
 kcp|over UDP, for a route that loses packets
 pck|for a route where TCP connects, then dies
 xdi|inside ping - for where only ping gets through
+sni|as pck, opening with the name of a site the route lets through
 quic|over UDP - did not connect in our test
 udp|raw datagrams, no reliability - did not connect in our test
 NOTES
@@ -489,8 +597,33 @@ NOTES
         [ -z "$t" ] && { TUNNEL_PORT="$a"; break; }
         warn "port $a cannot carry the tunnel: $t - pick another"
     done
+    # The preset: BackPack's own, those this kind of tunnel has.
+    list=""; i=0; d3=1
+    printf '\n  Performance preset (both ends get it):\n\n'
+    while IFS='|' read -r t note; do
+        [ -z "$t" ] || tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "$t" || continue
+        i=$((i + 1)); list="$list ${t:--}"
+        [ "$t" = "${CUR_PRESET:-}" ] && d3=$i
+        printf '  %2d) %-11s %s\n' "$i" "${t:-none}" "$note"
+    done <<'PRESETS'
+|as it has always been
+balance|light on memory - a small server
+turbo|BackPack's choice for most routes
+aggressive|the most memory and speed
+throughput|heavy downloads
+PRESETS
+    printf '\n'
+    read -r -p "  choice [$d3]: " a
+    a="${a:-$d3}"
+    case "$a" in *[!0-9]*) die "answer with the number" ;; esac
+    # shellcheck disable=SC2086
+    TUNNEL_PRESET="$(echo $list | cut -d' ' -f"$a")"
+    [ -n "$TUNNEL_PRESET" ] || die "there is no preset number $a"
+    [ "$TUNNEL_PRESET" = - ] && TUNNEL_PRESET=""
     if [ "$TUNNEL_DIRECTION" = reverse ]; then
         info "open port $TUNNEL_PORT to this exit in the relay's firewall, if it has one"
+    elif [ "$TUNNEL_TRANSPORT" = xdi ]; then
+        info "xdi needs no port opened - only ping, both ways"
     else
         info "open port $TUNNEL_PORT to the relay in this exit's firewall, if it has one"
     fi
@@ -603,6 +736,24 @@ tunnel_toml() {
         fi ;;
     esac
     printf "# written by doctor dns: the installer, or the admin panel's relays card\n"
+    if [ "$TUNNEL_DIRECTION" = l3 ]; then
+        # The relay dials and keeps the same five ports on its loopback as
+        # every other tunnel, each going to the exit's own port at the far
+        # end of the network the two of them share.
+        l3_block "$RELAY_IP"
+        if [ "$ROLE" = relay ]; then
+            printf '[l3]\nmode = "dial"\naddr = "%s:%s"\n' "$EXIT_IP" "$TUNNEL_PORT"
+            printf 'local_ip = "%s/30"\npeer_ip = "%s"\n' "$L3_RELAY" "$L3_EXIT"
+            printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
+                   "$TUNNEL_LOCAL_HTTPS" "$TUNNEL_LOCAL_HTTP" "$TUNNEL_LOCAL_API" "$TUNNEL_LOCAL_SPOTIFY" "$TUNNEL_LOCAL_BLIZZARD"
+        else
+            printf '[l3]\nmode = "listen"\naddr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
+            printf 'local_ip = "%s/30"\npeer_ip = "%s"\n' "$L3_EXIT" "$L3_RELAY"
+        fi
+        printf 'carrier = "%s"\niface = "%s"\ntoken = "%s"\n' "$TUNNEL_TRANSPORT" "$L3_IFACE" "$token"
+        tunnel_tuning l3
+        return 0
+    fi
     if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then
         printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "$TUNNEL_PORT"
         printf 'ports = ["127.0.0.1:%s=443", "127.0.0.1:%s=80", "127.0.0.1:%s=8443", "127.0.0.1:%s=4070", "127.0.0.1:%s=1119"]\n' \
@@ -619,12 +770,9 @@ tunnel_toml() {
         [ -n "$c" ] && printf 'tls_cert = "%s"\ntls_key = "%s"\n' "$c" "$k"
     fi
     printf 'transport = "%s"\ntoken = "%s"\n' "$TUNNEL_TRANSPORT" "$token"
-    # The KCP transports' drive, as the admin panel and smartdns-sync write
-    # it (KCP_TUNING there, which says why): BackPack's Turbo, less FEC.
-    case "$TUNNEL_TRANSPORT" in kcp|xdi|pck)
-        printf 'kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 1\n'
-        printf 'kcp_nocongestion = 1\nkcp_sndwnd = 1024\nkcp_rcvwnd = 1024\nkcp_acknodelay = true\n' ;;
-    esac
+    if [ "$TUNNEL_DIRECTION" = reverse ] && [ "$ROLE" = relay ]; then tunnel_tuning server
+    elif [ "$TUNNEL_DIRECTION" = reverse ]; then tunnel_tuning client
+    else tunnel_tuning direct; fi
     # The reverse engine's own extras: no web panel, no kernel tuning of its
     # own, and a log at the level journald is read at.
     if [ "$TUNNEL_DIRECTION" = reverse ]; then
@@ -673,7 +821,7 @@ apply_tunnel() {
     # by the service itself as well, so it holds on a machine whose nftables
     # service does not read /etc/nftables.d.
     if { [ "$ROLE" = relay ] && [ "$TUNNEL_DIRECTION" = reverse ]; } \
-       || { [ "$ROLE" = exit ] && [ "$TUNNEL_DIRECTION" = direct ]; }; then
+       || { [ "$ROLE" = exit ] && [ "$TUNNEL_DIRECTION" != reverse ]; }; then
         if [ "$ROLE" = relay ]; then peer="$EXIT_IP"; else peer="$RELAY_IP"; fi
         mkdir -p /etc/nftables.d
         note_file "$TUNNEL_NFT"
@@ -753,8 +901,10 @@ case "${1:-}" in
         printf '  DELETE_DB=1    on --uninstall, delete the database too, without asking\n'
         printf '  PURGE_PACKAGES=1  on --uninstall, remove nginx, dnsmasq, coturn and certbot\n'
         printf '                 too, with their config, without asking\n'
-        printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|direct\n'
+        printf '  TUNNEL=backpack|off  TUNNEL_TRANSPORT=stealth  TUNNEL_DIRECTION=reverse|l3\n'
+        printf '                 (l3 is BackPack'"'"'s direct, as its menu makes it now)\n'
         printf '  TUNNEL_PORT=8444     the tunnel between relay and exit, asked on the exit\n'
+        printf '  TUNNEL_PRESET=turbo  balance|turbo|aggressive|throughput - BackPack'"'"'s, or none\n'
         printf '  ROLE=node PANEL_IP=<main exit> SYNC_TOKEN=<token>   another exit, joined to\n'
         printf '                 that panel - the token is on its admin panel'"'"'s Node page\n'
         printf '  ROLE=single PANEL_IP=<main exit> SYNC_TOKEN=<token>   a single server in\n'
@@ -1443,6 +1593,7 @@ if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
         CUR_TRANSPORT="$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)"
         CUR_DIRECTION="$(env_get /etc/smart-dns/panel.env TUNNEL_DIRECTION)"
         CUR_PORT="$(env_get /etc/smart-dns/panel.env TUNNEL_PORT)"
+        CUR_PRESET="$(env_get /etc/smart-dns/panel.env TUNNEL_PRESET)"
         ask_tunnel
     elif [ -z "${SYNC_TOKEN:-}" ]; then
         printf '\n%sTunnel%s\n\n' "$B" "$N"
@@ -1460,6 +1611,7 @@ if [ -z "$TUNNEL" ]; then
         TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)}"
         TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-$(env_get /etc/smart-dns/panel.env TUNNEL_DIRECTION)}"
         TUNNEL_PORT="${TUNNEL_PORT:-$(env_get /etc/smart-dns/panel.env TUNNEL_PORT)}"
+        TUNNEL_PRESET="${TUNNEL_PRESET-$(env_get /etc/smart-dns/panel.env TUNNEL_PRESET)}"
     elif [ "$ROLE" = relay ]; then
         spec="$(printf '%s' "${SYNC_TOKEN:-}" | cut -s -d. -f3)"
         if [ -n "$spec" ]; then
@@ -1472,6 +1624,7 @@ if [ -z "$TUNNEL" ]; then
             TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-$(env_get /etc/smart-dns/sync.env TUNNEL_TRANSPORT)}"
             TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-$(env_get /etc/smart-dns/sync.env TUNNEL_DIRECTION)}"
             TUNNEL_PORT="${TUNNEL_PORT:-$(env_get /etc/smart-dns/sync.env TUNNEL_PORT)}"
+            TUNNEL_PRESET="${TUNNEL_PRESET-$(env_get /etc/smart-dns/sync.env TUNNEL_PRESET)}"
         fi
     fi
 fi
@@ -1487,9 +1640,11 @@ if [ "$TUNNEL" = backpack ]; then
     TUNNEL_DIRECTION="${TUNNEL_DIRECTION:-reverse}"
     TUNNEL_TRANSPORT="${TUNNEL_TRANSPORT:-stealth}"
     TUNNEL_PORT="${TUNNEL_PORT:-8444}"
-    case "$TUNNEL_DIRECTION" in reverse|direct) ;; *) die "TUNNEL_DIRECTION must be reverse or direct" ;; esac
+    case "$TUNNEL_DIRECTION" in reverse|direct|l3) ;; *) die "TUNNEL_DIRECTION must be reverse, direct or l3" ;; esac
     tunnel_transport_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" \
         || die "BackPack's $TUNNEL_DIRECTION tunnel has no transport called '$TUNNEL_TRANSPORT'"
+    tunnel_preset_ok "$TUNNEL_DIRECTION" "$TUNNEL_TRANSPORT" "${TUNNEL_PRESET:-}" \
+        || die "BackPack's $TUNNEL_DIRECTION tunnel on $TUNNEL_TRANSPORT has no preset called '$TUNNEL_PRESET'"
     why="$(tunnel_port_problem "$TUNNEL_PORT")"
     [ -z "$why" ] || die "port $TUNNEL_PORT cannot carry the tunnel: $why"
     # The tunnel runs between this relay and its own exit, on a secret only
@@ -1499,9 +1654,11 @@ if [ "$TUNNEL" = backpack ]; then
         TUNNEL=off
     fi
 fi
-[ "$TUNNEL" = backpack ] && TUNNEL_SPEC="bp-$TUNNEL_TRANSPORT-$TUNNEL_PORT-$(printf '%.1s' "$TUNNEL_DIRECTION")"
+[ "$TUNNEL" = backpack ] && TUNNEL_SPEC="bp-$TUNNEL_TRANSPORT-$TUNNEL_PORT-$(printf '%.1s' "$TUNNEL_DIRECTION")${TUNNEL_PRESET:+-$TUNNEL_PRESET}"
+[ "$TUNNEL" = backpack ] || TUNNEL_PRESET=""
 if [ "$TUNNEL" = backpack ]; then
-    TUNNEL_OUT="BackPack, $TUNNEL_TRANSPORT, $TUNNEL_DIRECTION, port $TUNNEL_PORT"
+    case "$TUNNEL_DIRECTION" in l3) d=direct ;; direct) d="the old direct" ;; *) d="$TUNNEL_DIRECTION" ;; esac
+    TUNNEL_OUT="BackPack, $TUNNEL_TRANSPORT, $d, port $TUNNEL_PORT${TUNNEL_PRESET:+, $TUNNEL_PRESET}"
 else
     TUNNEL_OUT="none - the relay reaches the exit directly"
 fi
@@ -2121,6 +2278,7 @@ EOF
     set_env_key /etc/smart-dns/panel.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/panel.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/panel.env TUNNEL_PORT "${TUNNEL_PORT:-}"
+    set_env_key /etc/smart-dns/panel.env TUNNEL_PRESET "${TUNNEL_PRESET:-}"
     umask 022
     chmod 600 /etc/smart-dns/panel.env
 
@@ -2448,6 +2606,7 @@ EOF
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_PORT "${TUNNEL_PORT:-}"
+    set_env_key /etc/smart-dns/sync.env TUNNEL_PRESET "${TUNNEL_PRESET:-}"
     umask 022
     chmod 600 /etc/smart-dns/sync.env
 

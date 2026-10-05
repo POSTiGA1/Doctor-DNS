@@ -58,9 +58,10 @@ def function(name):
 tmp = tempfile.mkdtemp()
 variables = "\n".join(re.findall(
     r"^(?:BACKPACK_\w+|TUNNEL_(?:DIR|NFT|LOCAL_HTTPS|LOCAL_HTTP|LOCAL_API|LOCAL_SPOTIFY|LOCAL_BLIZZARD"
-    r"|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS))=.*$",
+    r"|REVERSE_TRANSPORTS|DIRECT_TRANSPORTS|L3_TRANSPORTS))=.*$",
     LOGIC, re.M))
-names = ["tunnel_transport_ok", "tunnel_port_problem", "parse_tunnel_spec",
+names = ["tunnel_transport_ok", "tunnel_preset_ok", "tunnel_tuning", "tunnel_port_problem",
+         "parse_tunnel_spec",
          "tunnel_token", "tunnel_toml", "ask_tunnel"]
 bodies = [function(n) for n in names]
 check("the tunnel's functions are all in the installer", all(bodies),
@@ -96,7 +97,11 @@ check("  and so does 1", ask(["1"]) == "off", ask(["1"]))
 got = ask(["2", "", "", ""])
 check("every other default: a reverse stealth tunnel on 8444", got == "backpack reverse stealth 8444", got)
 got = ask(["2", "2", "2", "9443"])
-check("a direct tunnel offers its own four, so its second is wss", got == "backpack direct wss 9443", got)
+check("direct is BackPack's direct as its menu makes it now, so its second is xdi",
+      got == "backpack l3 xdi 9443", got)
+check("  and the old direct engine is not offered", "answer 1 or 2" in function("ask_tunnel")
+      and "2) TUNNEL_DIRECTION=l3 ;;" in function("ask_tunnel")
+      and "TUNNEL_DIRECTION=direct" not in function("ask_tunnel"))
 got = ask(["2", "1", "12", ""])
 check("the twelfth reverse transport is udp", got == "backpack reverse udp 8444", got)
 got = ask(["2", "1", "1", "443", "8447"])

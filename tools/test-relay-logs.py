@@ -210,7 +210,16 @@ with open(admin.BOT_ENV, "w") as fh:
     fh.write("BOT_TOKEN=%s\n" % TOKEN)
 admin.subprocess.run = lambda cmd, **kw: Ran("line from %s with %s\n" % (cmd[2], TOKEN))
 admin.NGINX_ERRORS = errlog
+admin.PANEL_ENV = os.path.join(tmp, "panel.env")
+with open(admin.PANEL_ENV, "w") as fh:
+    fh.write("RELAY_IP=127.0.0.1\n")
+# A server taken off the panel before its log went with it.
+admin.STORE.run("INSERT INTO relay_logs (relay, at, text) VALUES ('198.51.100.66', ?, ?)",
+                (panel.now(), "lines of a server gone"))
 page = admin.Admin.logs(None)
+check("a server no longer on the panel: its log neither shown nor kept",
+      "lines of a server gone" not in page and "198.51.100.66" not in page
+      and not admin.STORE.q("SELECT 1 FROM relay_logs WHERE relay = '198.51.100.66'"))
 check("the certificate renewals, and nginx, of this machine",
       "line from smartdns-cert" in page and "line from nginx" in page)
 check("and this machine's nginx errors, without the gate's noise",
@@ -261,6 +270,12 @@ check("a target that is not a name or an address is refused",
       json.loads(store.setting("watch_job"))["target"] == "5.120.1.2")
 
 shutil.rmtree(tmp, ignore_errors=True)
+admin.STORE.run("INSERT OR REPLACE INTO relay_logs (relay, at, text) VALUES ('198.51.100.67', ?, 'x')",
+                (panel.now(),))
+admin.forget_server("198.51.100.67")
+check("a server taken off the panel takes its log with it",
+      not admin.STORE.q("SELECT 1 FROM relay_logs WHERE relay = '198.51.100.67'"))
+
 print()
 if fails:
     print("%d FAILED: %s" % (len(fails), ", ".join(fails)))

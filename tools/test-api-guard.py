@@ -62,7 +62,7 @@ print("the rule")
 check("it parses", subprocess.run([BASH, "-n", posix(TOOL)], capture_output=True).returncode == 0)
 r = run("198.51.100.1,198.51.100.2", "--print")
 check("every relay, and this machine itself, may reach 8443",
-      "tcp dport 8443 ip saddr { 127.0.0.1, 198.51.100.1, 198.51.100.2 } accept" in r.stdout, r.stdout)
+      "tcp dport 8443 ip saddr { 127.0.0.1, 198.51.100.1, 10.10.58.65, 198.51.100.2, 10.10.106.145 } accept" in r.stdout, r.stdout)
 check("and anybody else is dropped, IPv6 included",
       r.stdout.index("accept") < r.stdout.index("tcp dport 8443 drop"), r.stdout)
 check("it replaces itself rather than piling up",
@@ -81,7 +81,7 @@ check("  on the ports it proxies only - its own upstreams, DoH and the rest, are
       "tcp dport { 80, 443, 1119, 4070 }" in out and "8453" not in out and "18119" not in out)
 r = run("198.51.100.1, 1.2.3,abc,300.1.1.1", "--print")
 check("a mistake in RELAY_IP is left out, and said",
-      "{ 127.0.0.1, 198.51.100.1 }" in r.stdout and "ignoring '1.2.3'" in r.stderr
+      "{ 127.0.0.1, 198.51.100.1, 10.10.58.65 }" in r.stdout and "ignoring '1.2.3'" in r.stderr
       and "ignoring 'abc'" in r.stderr and "300.1.1.1" not in r.stdout, r.stdout + r.stderr)
 r = run(None, "--print")
 check("no relays at all leaves this machine only, and says so",

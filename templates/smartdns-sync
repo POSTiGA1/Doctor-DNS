@@ -158,6 +158,24 @@ API_PORT = 8443
 # It comes out on the exit's own 8443, which is why the exit accepts the
 # request from its own loopback.
 API_TUNNEL_PORT = 18843
+# Whether the tunnel carries anything, as the last call to the API found it:
+# down when the call through the tunnel failed and the one straight to the
+# exit answered. nginx is sent straight to the exit while it is down. A
+# tunnel whose own end stops listening when it is down needs none of this -
+# nginx turns to the exit by itself - but one whose end stays open does not
+# let it: a layer-3 tunnel's forwarder takes each connection and closes it,
+# and a tunnel that connected but carries nothing takes it and keeps it. Both
+# cut every customer of the relay until the tunnel came back.
+TUNNEL_DOWN = {"down": False}
+
+
+def note_tunnel(down):
+    """What the last call found of the tunnel; said when it changes."""
+    if down != TUNNEL_DOWN["down"]:
+        log(WARN if down else INFO,
+            "the tunnel carries nothing - customers go straight to the exit until it does"
+            if down else "the tunnel carries again - customers go through it")
+    TUNNEL_DOWN["down"] = down
 
 
 def api_endpoints():
@@ -241,7 +259,9 @@ def post(path, payload):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     ways = api_endpoints()
+    tunnel_failed = False
     for i, (host, port) in enumerate(ways):
+        through_tunnel = (host, port) == ("127.0.0.1", API_TUNNEL_PORT)
         conn = NamedHTTPS(host, port, sync_sni(), timeout=25, context=ctx)
         try:
             try:
@@ -253,6 +273,7 @@ def post(path, payload):
                 if i + 1 < len(ways):
                     log(WARN, "the API is not answering through the tunnel"
                               " (%s) - going straight to the exit" % e)
+                    tunnel_failed = tunnel_failed or through_tunnel
                     continue
                 raise
             if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
@@ -268,6 +289,11 @@ def post(path, payload):
             )
             res = conn.getresponse()
             data = json.loads(res.read() or b"{}")
+            if through_tunnel:
+                note_tunnel(False)
+            elif tunnel_failed:
+                # Straight to the exit answered where the tunnel did not.
+                note_tunnel(True)
             if res.status != 200:
                 raise RuntimeError("exit returned %d: %s" % (res.status, data))
             return data
@@ -2020,7 +2046,21 @@ TUNNEL_TRANSPORTS = {
     "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
                 "wsmux", "xdi", "udp"),
     "direct": ("stealth", "wss", "tcp", "ws"),
+    # BackPack's layer-3 direct tunnel: the relay dials, and the two machines
+    # share a small network the ports ride on. Carriers, not transports.
+    "l3": ("xdi", "pck", "sni", "udp", "quic"),
 }
+
+
+def l3_block(relay):
+    """A relay's layer-3 tunnel to its exit: (its address, the exit's, the
+    interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
+    both ends work out the same one with nothing passed between them. The
+    installer's l3_block, the same way."""
+    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+    n = int(h, 16) % 16384
+    base = "10.10.%d.%%d" % (n // 64)
+    return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
 # This end of each port the tunnel carries, and the exit's port it comes out on.
 TUNNEL_PORTS = (("https", 18443, 443), ("http", 18080, 80), ("spotify", 14070, 4070),
                 ("blizzard", 11119, 1119))
@@ -2111,6 +2151,79 @@ KCP_TUNING = ("kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 
               "kcp_acknodelay = true\n")
 
 
+# BackPack's performance presets, with its own numbers - tunnelspec/preset.go,
+# directpreset.go and l3preset.go in v1.8.5, the version installed - picked by
+# the admin for a tunnel and written at both of its ends. None picked is the
+# tunnel as it always was. Which a kind of tunnel has is BackPack's too:
+# throughput on kcp alone, none of aggressive on the direct engine, none of
+# throughput on layer 3. The installer has the same table (tunnel_tuning).
+TUNNEL_PRESETS = ("balance", "turbo", "aggressive", "throughput")
+# keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+# mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+PRESET_REVERSE = {
+    "balance": (75, 40, 2048, 4, False, 4 << 20, 4, 32768, 4 << 20, 256 << 10, 512, 2),
+    "turbo": (75, 40, 4096, 8, False, 8 << 20, 8, 32768, 16 << 20, 2 << 20, 1024, 3),
+    "aggressive": (60, 25, 8192, 16, True, 32 << 20, 16, 65535, 32 << 20, 16 << 20, 2048, 4),
+    "throughput": (75, 40, 8192, 16, False, 32 << 20, 8, 65535, 64 << 20, 32 << 20, 4096, 1),
+}
+# mux frame, receive and stream buffers, sessions
+PRESET_DIRECT = {"balance": (32768, 4 << 20, 256 << 10, 1),
+                 "turbo": (32768, 16 << 20, 2 << 20, 1),
+                 "throughput": (65535, 32 << 20, 16 << 20, 4)}
+# interface queue, socket buffers
+PRESET_L3 = {"balance": (1024, 4 << 20), "turbo": (4096, 8 << 20), "aggressive": (16384, 32 << 20)}
+MUX_TRANSPORTS = ("tcpmux", "wsmux", "wssmux")
+
+
+def preset_ok(direction, transport, preset):
+    """Whether this kind of tunnel has this preset - none always."""
+    if not preset:
+        return True
+    if direction == "direct":
+        return preset in PRESET_DIRECT
+    if direction == "l3":
+        return preset in PRESET_L3
+    return preset in PRESET_REVERSE and (preset != "throughput" or transport == "kcp")
+
+
+def tunnel_tuning(spec, side):
+    """The preset's lines for one end - server or client of a reverse tunnel,
+    either end of a direct or a layer-3 one. With none picked, a KCP
+    transport still gets its drive (KCP_TUNING) and nothing else changes.
+    Error correction comes with a preset only: it has to match at both ends,
+    and a preset is written at both at once."""
+    p, t = spec.get("preset") or "", spec["transport"]
+    if not p:
+        return KCP_TUNING if side in ("server", "client") and t in KCP_TRANSPORTS else ""
+    if side == "l3":
+        q, b = PRESET_L3[p]
+        return 'preset = "%s"\ntxqueuelen = %d\nsockbuf = %d\nqdisc = "fq_codel"\n' % (p, q, b)
+    if side == "direct":
+        f, r, st, se = PRESET_DIRECT[p]
+        return ("sessions = %d\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %d\n"
+                "mux_recievebuffer = %d\nmux_streambuffer = %d\n" % (se, f, r, st))
+    ka, hb, ch, pool, aggr, buf, mc, mf, mr, ms, wnd, par = PRESET_REVERSE[p]
+    out = ['preset = "%s"\n' % p]
+    if side == "server":
+        out.append("channel_size = %d\nkeepalive_period = %d\nnodelay = true\nheartbeat = %d\n"
+                   % (ch, ka, hb))
+    else:
+        out.append("connection_pool = %d\naggressive_pool = %s\nkeepalive_period = %d\n"
+                   "nodelay = true\n" % (pool, "true" if aggr else "false", ka))
+    out.append("so_rcvbuf = %d\nso_sndbuf = %d\n" % (buf, buf))
+    if t in MUX_TRANSPORTS:
+        out.append("%s = %d\nmux_version = 2\nmux_framesize = %d\nmux_recievebuffer = %d\n"
+                   "mux_streambuffer = %d\n"
+                   % ("mux_con" if side == "server" else "mux_session", mc, mf, mr, ms))
+    if t in KCP_TRANSPORTS:
+        bulk = p == "throughput"
+        out.append("kcp_mtu = 1250\nkcp_interval = %d\nkcp_resend = 2\nkcp_nodelay = 1\n"
+                   "kcp_nocongestion = 1\nkcp_sndwnd = %d\nkcp_rcvwnd = %d\n"
+                   "kcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %d\n"
+                   % (20 if bulk else 10, wnd, wnd, "false" if bulk else "true", par))
+    return "".join(out)
+
+
 def tunnel_toml_text(spec, exit_ip, secret, carried=None):
     # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
     # a node's carries only the proxy's ports, on its own.
@@ -2118,6 +2231,14 @@ def tunnel_toml_text(spec, exit_ip, secret, carried=None):
         carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
     ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
     out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
+    if spec["direction"] == "l3":
+        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "")
+        out.append('[l3]\nmode = "dial"\naddr = "%s:%d"\nlocal_ip = "%s/30"\npeer_ip = "%s"\n'
+                   'ports = [%s]\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+                   % (exit_ip, spec["port"], mine, theirs, ports, spec["transport"], iface,
+                      tunnel_token(secret)))
+        out.append(tunnel_tuning(spec, "l3"))
+        return "".join(out)
     if spec["direction"] == "reverse":
         out.append('[server]\nbind_addr = "0.0.0.0:%d"\nports = [%s]\n' % (spec["port"], ports))
         if spec["transport"] in ("wss", "wssmux"):
@@ -2126,8 +2247,7 @@ def tunnel_toml_text(spec, exit_ip, secret, carried=None):
         out.append('[direct]\nrole = "iran"\naddr = "%s:%d"\nports = [%s]\n'
                    % (exit_ip, spec["port"], ports))
     out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-    if spec["transport"] in KCP_TRANSPORTS:
-        out.append(KCP_TUNING)
+    out.append(tunnel_tuning(spec, "server" if spec["direction"] == "reverse" else "direct"))
     if spec["direction"] == "reverse":
         out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
     return "".join(out)
@@ -2149,7 +2269,13 @@ def clean_tunnel(spec):
     if direction not in TUNNEL_TRANSPORTS or transport not in TUNNEL_TRANSPORTS[direction] \
             or not 1 <= port <= 65535:
         return None
-    return {"direction": direction, "transport": transport, "port": port}
+    preset = spec.get("preset") or ""
+    if not preset_ok(direction, transport, preset):
+        return None
+    out = {"direction": direction, "transport": transport, "port": port}
+    if preset:
+        out["preset"] = preset
+    return out
 
 
 def write_if_changed(path, text, mode=0o644):
@@ -2236,7 +2362,7 @@ def apply_tunnel(raw):
         if not point_exit_nginx(exit_ip, False):
             error = error or "nginx راه مستقیم را نپذیرفت"
         set_sync_env({"TUNNEL": "off", "TUNNEL_TRANSPORT": "", "TUNNEL_DIRECTION": "",
-                      "TUNNEL_PORT": ""})
+                      "TUNNEL_PORT": "", "TUNNEL_PRESET": ""})
         TUNNEL_REPORT["state"] = {"on": False, "error": error}
         return
     os.makedirs(TUNNEL_DIR, mode=0o700, exist_ok=True)
@@ -2258,10 +2384,13 @@ def apply_tunnel(raw):
         running = sh("systemctl", "is-active", "smartdns-tunnel").returncode == 0
         log(INFO, "tunnel %s, %s, port %d, as the admin panel says"
             % (spec["transport"], spec["direction"], spec["port"]))
-    if not point_exit_nginx(exit_ip, True):
+    if not point_exit_nginx(exit_ip, not TUNNEL_DOWN["down"]):
         error = error or "nginx راه تونل را نپذیرفت؛ رله مستقیم به سرور خارج می‌رود"
+    if TUNNEL_DOWN["down"]:
+        error = error or "تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به سرور خارج می‌رود"
     set_sync_env({"TUNNEL": "backpack", "TUNNEL_TRANSPORT": spec["transport"],
-                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"])})
+                  "TUNNEL_DIRECTION": spec["direction"], "TUNNEL_PORT": str(spec["port"]),
+                  "TUNNEL_PRESET": spec.get("preset") or ""})
     TUNNEL_REPORT["state"] = {"on": True, "error": error, "running": running}
 
 
@@ -2625,8 +2754,7 @@ def exit_side_toml(relay, spec, secret, where):
                    "-subj", "/CN=localhost", "-keyout", k, "-out", c)
             out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
     out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-    if spec["transport"] in KCP_TRANSPORTS:
-        out.append(KCP_TUNING)
+    out.append(tunnel_tuning(spec, "client" if spec["direction"] == "reverse" else "direct"))
     if spec["direction"] == "reverse":
         out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
     return "".join(out)
@@ -2666,7 +2794,8 @@ def apply_exits(raw):
     changed = EXIT_PLAN["order"] != order[:8]
     EXIT_PLAN.update(main=main, order=order[:8],
                      capped={ip for ip in raw.get("capped") or [] if is_ipv4(ip)})
-    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"):
+    if not point_exit_nginx(main, (CFG.get("TUNNEL") or "off") == "backpack"
+                            and not TUNNEL_DOWN["down"]):
         log(WARN, "nginx refused the way to the exits - kept the one it had")
     elif changed:
         log(INFO, "exits: %s first" % order[0])

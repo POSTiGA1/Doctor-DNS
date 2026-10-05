@@ -5838,8 +5838,10 @@ class API(http.server.BaseHTTPRequestHandler):
         # Loopback as well as the paired relays: a relay whose sync comes
         # through the tunnel arrives here from this machine's own address.
         # Nothing is waved through - the secret below is still required.
+        # And a relay over a layer-3 tunnel, from its address on it.
         if self.client_address[0] not in self.relays \
                 and self.client_address[0] not in self.nodes \
+                and self.client_address[0] not in getattr(self, "l3_relays", ()) \
                 and self.client_address[0] not in ("127.0.0.1", "::1"):
             return False
         given = self.headers.get("Authorization", "")
@@ -6659,11 +6661,20 @@ def api_address(cfg):
     return (cfg.get("API_BIND") or "0.0.0.0", port)
 
 
+def l3_relay(relay):
+    """Where a relay arrives from over a layer-3 tunnel to this exit: its end
+    of the /30 the installer's l3_block picks by its address. Only that
+    tunnel's interface carries it."""
+    n = int(hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4], 16) % 16384
+    return "10.10.%d.%d" % (n // 64, (n % 64) * 4 + 1)
+
+
 def serve_api(cfg, store):
     API.store = store
     API.secret = cfg["SYNC_SECRET"]
     # Comma separated, so one exit can serve several relays.
     API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+    API.l3_relays = frozenset(l3_relay(r) for r in API.relays)
     # The installer's tunnel, which is to the first relay only.
     API.tunnel = cfg.get("TUNNEL") or "off"
     API.nodes = tuple(x.strip() for x in (cfg.get("NODE_IP") or "").split(",") if x.strip())

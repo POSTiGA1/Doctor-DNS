@@ -123,7 +123,7 @@ admin.subprocess.run = fake_run
 admin.systemctl = lambda *a: ran.append(("systemctl",) + a)
 check("a relay is added: nginx checked, reloaded, the panel's list rewritten, the panel restarted",
       admin.set_relays(["198.51.100.1", "198.51.100.2"]) == ""
-      and open(admin.RELAYS_CONF).read().count("allow ") == 2
+      and open(admin.RELAYS_CONF).read().count("allow ") == 4
       and "RELAY_IP=198.51.100.1,198.51.100.2" in open(admin.PANEL_ENV).read()
       and "SYNC_SECRET=s3cret" in open(admin.PANEL_ENV).read()
       and "TUNNEL=backpack" in open(admin.PANEL_ENV).read()

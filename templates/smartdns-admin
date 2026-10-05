@@ -1727,7 +1727,9 @@ def set_relays(ips):
     back if refused, then the panel's list - the panel restarts on it, which
     reloads the sync API's list and its firewall rule. "" or why not."""
     body = ("# The relays this exit lets in: written by the installer and the admin panel.\n"
-            + "".join("allow %s;\n" % ip for ip in ips))
+            + "".join("allow %s;\n" % ip for ip in ips)
+            # And where each would arrive from over a layer-3 tunnel.
+            + "".join("allow %s;\n" % l3_block(ip)[0] for ip in ips))
     try:
         with open(RELAYS_CONF, encoding="utf-8") as fh:
             before = fh.read()
@@ -1796,7 +1798,35 @@ TUNNEL_TRANSPORTS = {
     "reverse": ("stealth", "wss", "wssmux", "tcp", "tcpmux", "kcp", "pck", "quic", "ws",
                 "wsmux", "xdi", "udp"),
     "direct": ("stealth", "wss", "tcp", "ws"),
+    # BackPack's layer-3 direct tunnel: the relay dials, and the two machines
+    # share a small network the ports ride on. Carriers, not transports.
+    "l3": ("xdi", "pck", "sni", "udp", "quic"),
 }
+# What a direction can carry, said when something else is picked.
+TRANSPORT_LIMIT = {
+    "reverse": "این ترنسپورت در حالت معکوس نیست",
+    "direct": "مستقیم قدیمی فقط stealth، wss، tcp و ws را دارد",
+    "l3": "حالت مستقیم فقط xdi، pck، sni، udp و quic را دارد",
+}
+# Direct is BackPack's direct as its own menu makes it now - the layer-3 one,
+# "l3" in the settings. The older direct engine ("direct") is not offered
+# for a new tunnel: one that has it keeps it, shown as the old direct, until
+# the admin moves it.
+DIRECTION_WORDS = {"reverse": "معکوس", "direct": "مستقیم قدیمی", "l3": "مستقیم"}
+OLD_DIRECT_GONE = "مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید"
+
+
+def l3_block(relay):
+    """A relay's layer-3 tunnel to this exit: (its address, this exit's, the
+    interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
+    both ends work out the same one with nothing passed between them. The
+    installer's l3_block and smartdns-sync's, the same way."""
+    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+    n = int(h, 16) % 16384
+    base = "10.10.%d.%%d" % (n // 64)
+    return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
+
+
 TRANSPORT_WORDS = {
     "stealth": "رمزشده، شبیه بایت‌های تصادفی — پیشنهادی",
     "wss": "شبیه یک سایت HTTPS معمولی",
@@ -1809,6 +1839,7 @@ TRANSPORT_WORDS = {
     "ws": "وب‌سوکت — رمز ندارد",
     "wsmux": "وب‌سوکت مشترک — رمز ندارد",
     "xdi": "داخل پینگ — برای جایی که فقط پینگ رد می‌شود",
+    "sni": "مثل pck، که با نام یک سایت مجاز شروع می‌شود — فقط L3",
     "udp": "دیتاگرام خام — در آزمایش ما وصل نشد",
 }
 # The ports a tunnel may not take - the installer's list, on either machine.
@@ -1922,8 +1953,96 @@ KCP_TUNING = ("kcp_mtu = 1250\nkcp_interval = 10\nkcp_resend = 2\nkcp_nodelay = 
               "kcp_acknodelay = true\n")
 
 
+# BackPack's performance presets, with its own numbers - tunnelspec/preset.go,
+# directpreset.go and l3preset.go in v1.8.5, the version installed - picked by
+# the admin for a tunnel and written at both of its ends. None picked is the
+# tunnel as it always was. Which a kind of tunnel has is BackPack's too:
+# throughput on kcp alone, none of aggressive on the direct engine, none of
+# throughput on layer 3. The installer has the same table (tunnel_tuning).
+TUNNEL_PRESETS = ("balance", "turbo", "aggressive", "throughput")
+# keepalive, heartbeat, channel size, pool, aggressive pool, socket buffers,
+# mux sessions, mux frame, mux receive and stream buffers, KCP window, parity
+PRESET_REVERSE = {
+    "balance": (75, 40, 2048, 4, False, 4 << 20, 4, 32768, 4 << 20, 256 << 10, 512, 2),
+    "turbo": (75, 40, 4096, 8, False, 8 << 20, 8, 32768, 16 << 20, 2 << 20, 1024, 3),
+    "aggressive": (60, 25, 8192, 16, True, 32 << 20, 16, 65535, 32 << 20, 16 << 20, 2048, 4),
+    "throughput": (75, 40, 8192, 16, False, 32 << 20, 8, 65535, 64 << 20, 32 << 20, 4096, 1),
+}
+# mux frame, receive and stream buffers, sessions
+PRESET_DIRECT = {"balance": (32768, 4 << 20, 256 << 10, 1),
+                 "turbo": (32768, 16 << 20, 2 << 20, 1),
+                 "throughput": (65535, 32 << 20, 16 << 20, 4)}
+# interface queue, socket buffers
+PRESET_L3 = {"balance": (1024, 4 << 20), "turbo": (4096, 8 << 20), "aggressive": (16384, 32 << 20)}
+MUX_TRANSPORTS = ("tcpmux", "wsmux", "wssmux")
+
+
+def preset_ok(direction, transport, preset):
+    """Whether this kind of tunnel has this preset - none always."""
+    if not preset:
+        return True
+    if direction == "direct":
+        return preset in PRESET_DIRECT
+    if direction == "l3":
+        return preset in PRESET_L3
+    return preset in PRESET_REVERSE and (preset != "throughput" or transport == "kcp")
+
+
+def tunnel_tuning(spec, side):
+    """The preset's lines for one end - server or client of a reverse tunnel,
+    either end of a direct or a layer-3 one. With none picked, a KCP
+    transport still gets its drive (KCP_TUNING) and nothing else changes.
+    Error correction comes with a preset only: it has to match at both ends,
+    and a preset is written at both at once."""
+    p, t = spec.get("preset") or "", spec["transport"]
+    if not p:
+        return KCP_TUNING if side in ("server", "client") and t in KCP_TRANSPORTS else ""
+    if side == "l3":
+        q, b = PRESET_L3[p]
+        return 'preset = "%s"\ntxqueuelen = %d\nsockbuf = %d\nqdisc = "fq_codel"\n' % (p, q, b)
+    if side == "direct":
+        f, r, st, se = PRESET_DIRECT[p]
+        return ("sessions = %d\nnodelay = true\nkeepalive_period = 75\nmux_framesize = %d\n"
+                "mux_recievebuffer = %d\nmux_streambuffer = %d\n" % (se, f, r, st))
+    ka, hb, ch, pool, aggr, buf, mc, mf, mr, ms, wnd, par = PRESET_REVERSE[p]
+    out = ['preset = "%s"\n' % p]
+    if side == "server":
+        out.append("channel_size = %d\nkeepalive_period = %d\nnodelay = true\nheartbeat = %d\n"
+                   % (ch, ka, hb))
+    else:
+        out.append("connection_pool = %d\naggressive_pool = %s\nkeepalive_period = %d\n"
+                   "nodelay = true\n" % (pool, "true" if aggr else "false", ka))
+    out.append("so_rcvbuf = %d\nso_sndbuf = %d\n" % (buf, buf))
+    if t in MUX_TRANSPORTS:
+        out.append("%s = %d\nmux_version = 2\nmux_framesize = %d\nmux_recievebuffer = %d\n"
+                   "mux_streambuffer = %d\n"
+                   % ("mux_con" if side == "server" else "mux_session", mc, mf, mr, ms))
+    if t in KCP_TRANSPORTS:
+        bulk = p == "throughput"
+        out.append("kcp_mtu = 1250\nkcp_interval = %d\nkcp_resend = 2\nkcp_nodelay = 1\n"
+                   "kcp_nocongestion = 1\nkcp_sndwnd = %d\nkcp_rcvwnd = %d\n"
+                   "kcp_acknodelay = %s\nkcp_datashards = 10\nkcp_parityshards = %d\n"
+                   % (20 if bulk else 10, wnd, wnd, "false" if bulk else "true", par))
+    return "".join(out)
+PRESET_WORDS = {
+    "": "پیش‌فرض — مثل همیشه",
+    "balance": "balance — کم‌مصرف، برای سرور کوچک",
+    "turbo": "turbo — پیشنهاد BackPack برای بیشتر مسیرها",
+    "aggressive": "aggressive — بیشترین حافظه و سرعت",
+    "throughput": "throughput — دانلود سنگین؛ فقط kcp در حالت معکوس",
+}
+
+
 def exit_tunnel_toml(ip, spec, secret, where):
     out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
+    if spec["direction"] == "l3":
+        theirs, mine, iface = l3_block(ip)
+        out.append('[l3]\nmode = "listen"\naddr = "0.0.0.0:%d"\nlocal_ip = "%s/30"\n'
+                   'peer_ip = "%s"\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+                   % (spec["port"], mine, theirs, spec["transport"], iface,
+                      tunnel_token(secret)))
+        out.append(tunnel_tuning(spec, "l3"))
+        return "".join(out)
     if spec["direction"] == "reverse":
         out.append('[client]\nremote_addr = "%s:%d"\n' % (ip, spec["port"]))
     else:
@@ -1936,8 +2055,7 @@ def exit_tunnel_toml(ip, spec, secret, where):
                                 "-out", c], capture_output=True, timeout=60)
             out.append('tls_cert = "%s"\ntls_key = "%s"\n' % (c, k))
     out.append('transport = "%s"\ntoken = "%s"\n' % (spec["transport"], tunnel_token(secret)))
-    if spec["transport"] in KCP_TRANSPORTS:
-        out.append(KCP_TUNING)
+    out.append(tunnel_tuning(spec, "client" if spec["direction"] == "reverse" else "direct"))
     if spec["direction"] == "reverse":
         out.append('web_port = 0\nskip_optz = true\nlog_level = "info"\n')
     return "".join(out)
@@ -1987,7 +2105,7 @@ def apply_exit_tunnel(ip):
             fh.write(text)
         os.chmod(path + ".tmp", 0o600)
         os.replace(path + ".tmp", path)
-    if spec["direction"] == "direct":
+    if spec["direction"] != "reverse":
         # This end listens: its port answers that relay and nobody else.
         port = spec["port"]
         rules = ("# written by the doctor dns admin panel: the tunnel's port answers %s only\n"
@@ -2075,9 +2193,10 @@ def tunnel_block(p, ip, to):
             row = STORE.one("SELECT value FROM settings WHERE key = ?",
                             ("node_tunnel_state:%s:%s" % (to, ip),))
             there = bool(row and row["value"] == "1")
-        words = {"reverse": "معکوس", "direct": "مستقیم"}
-        summary = "%s، %s، درگاه %d" % (spec["transport"], words.get(spec["direction"], ""),
-                                         spec["port"])
+        summary = "%s، %s، درگاه %d" % (spec["transport"],
+                                         DIRECTION_WORDS.get(spec["direction"], ""),
+                                         spec["port"]) + (
+            "، " + spec["preset"] if spec.get("preset") else "")
         if seen.get("error"):
             state = "<span class='warn'>رله: %s</span>" % html.escape(seen["error"])
         elif not seen.get("on"):
@@ -2096,7 +2215,12 @@ def tunnel_block(p, ip, to):
     options = "".join(
         "<option value='%s'%s>%s — %s</option>"
         % (t, " selected" if t == spec.get("transport", "stealth") else "", t,
-           TRANSPORT_WORDS.get(t, "")) for t in TUNNEL_TRANSPORTS["reverse"])
+           TRANSPORT_WORDS.get(t, ""))
+        for t in TUNNEL_TRANSPORTS["reverse"] + ("sni",))
+    presets = "".join(
+        "<option value='%s'%s>%s</option>"
+        % (k, " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
+        for k in ("",) + TUNNEL_PRESETS)
     return (
         "<details><summary>%s%s</summary>"
         "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px'>"
@@ -2106,19 +2230,44 @@ def tunnel_block(p, ip, to):
         "<label style='display:block'><input type='radio' name='on' value='1'%s> تونل BackPack</label>"
         "<label style='display:block'>کدام سر وصل شود: <select name='direction'>"
         "<option value='reverse'%s>معکوس — سرور خارج به رله وصل می‌شود</option>"
-        "<option value='direct'%s>مستقیم — رله به سرور خارج وصل می‌شود</option></select></label>"
+        "%s%s</select></label>"
         "<label style='display:block'>ترنسپورت: <select name='transport'>%s</select></label>"
         "<label style='display:block'>درگاه: <input name='port' value='%s' dir='ltr' "
         "style='width:90px'></label>"
-        "<p class='muted'>حالت مستقیم فقط stealth، wss، tcp و ws را دارد. در حالت معکوس این "
-        "درگاه روی رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، "
-        "بازش کنید. تا وقتی تونل وصل نیست، رله مستقیم به سرور خارج می‌رود.</p>"
+        "<label style='display:block'>پروفایل سرعت: <select name='preset'>%s</select></label>"
+        "<p class='muted'>پروفایل‌ها همان‌های خود BackPack‌اند و روی هر دو سر تونل نوشته "
+        "می‌شوند؛ «پیش‌فرض» یعنی تونل همان‌طور که تا حالا بود. مستقیم throughput ندارد و "
+        "در حالت معکوس throughput فقط روی kcp است. با عوض کردن پروفایل، تونل یک بار "
+        "ری‌استارت می‌شود.</p>"
+        "<p class='muted'>مستقیم همان Direct منوی خود BackPack است: رله به سرور خارج وصل "
+        "می‌شود، دو سرور یک شبکهٔ کوچک مشترک می‌گیرند، و فقط xdi، pck، sni، udp و quic را "
+        "دارد؛ xdi درگاه باز نمی‌خواهد، فقط پینگ در دو جهت. در حالت معکوس این درگاه روی "
+        "رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش "
+        "کنید. تا وقتی تونل چیزی رد نمی‌کند، رله مستقیم به سرور خارج می‌رود.</p>"
         "<button class='ghost'>ذخیرهٔ تونل</button></form></details>"
         % (label, summary, p, ip, html.escape(to), "" if spec else " checked",
            " checked" if spec else "",
            " selected" if direction == "reverse" else "",
-           " selected" if direction == "direct" else "", options,
-           spec.get("port") or 8444))
+           # Only to the main exit: a node's end is built by its own sync,
+           # which does not make this kind.
+           "<option value='l3'%s>مستقیم — رله به سرور خارج وصل می‌شود، با شبکهٔ مشترک دو "
+           "سرور</option>" % (" selected" if direction == "l3" else "")
+           if to == exit_address() else "",
+           # The old direct, only for a tunnel that already has it.
+           "<option value='direct' selected>مستقیم قدیمی — دیگر انتخاب نمی‌شود</option>"
+           if direction == "direct" else "", options,
+           spec.get("port") or 8444, presets))
+
+def preset_problem(direction, transport, preset):
+    """Why this tunnel cannot have this preset, or "" when it can."""
+    if preset and preset not in TUNNEL_PRESETS:
+        return "پروفایل را از فهرست انتخاب کنید"
+    if preset_ok(direction, transport, preset):
+        return ""
+    if preset == "throughput":
+        return "throughput فقط روی kcp در حالت معکوس است"
+    return "%s: این نوع تونل این پروفایل را ندارد" % preset
+
 
 def save_node_tunnel(ip, to, one):
     """The tunnel from relay `ip` to node `to`: kept here, and built by
@@ -2132,19 +2281,26 @@ def save_node_tunnel(ip, to, one):
         return ("nodes?m=تونل رلهٔ %s به %s خاموش شد؛ تا یک دقیقه دیگر "
                              "مستقیم وصل می‌شود" % (ip, to))
     direction, transport = one("direction"), one("transport")
+    if direction == "l3":
+        return "nodes?m=!مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید"
+    if direction == "direct" and (relay_tunnel(ip, to) or {}).get("direction") != "direct":
+        return "nodes?m=!" + OLD_DIRECT_GONE
     if direction not in TUNNEL_TRANSPORTS:
         return "nodes?m=!جهت تونل را انتخاب کنید"
     if transport not in TUNNEL_TRANSPORTS[direction]:
-        return "nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد"
+        return "nodes?m=!" + TRANSPORT_LIMIT[direction]
     try:
         port = int(one("port").strip())
     except ValueError:
         return "nodes?m=!درگاه را عددی بنویسید"
-    why = tunnel_port_problem(port, ip, direction, to)
+    why = tunnel_port_problem(port, ip, direction, to) \
+        or preset_problem(direction, transport, one("preset"))
     if why:
         return ("nodes?m=!%s" % why)
     spec = {"transport": transport, "direction": direction, "port": port, "exit": to,
             "slot": node_slot(to)}
+    if one("preset"):
+        spec["preset"] = one("preset")
     STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
               " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
               (key, json.dumps(spec, sort_keys=True)))
@@ -2972,6 +3128,8 @@ def forget_server(ip):
     # each would keep a device of its customer's.
     STORE.run("DELETE FROM wg_devices WHERE relay = ?", (ip,))
     STORE.run("DELETE FROM settings WHERE key IN (?, ?)", ("wg_pub:" + ip, "wg_error:" + ip))
+    # And the last log it sent, which the logs page kept showing for good.
+    STORE.run("DELETE FROM relay_logs WHERE relay = ?", (ip,))
 
 
 def current_hosts():
@@ -9257,7 +9415,13 @@ class Admin(http.server.BaseHTTPRequestHandler):
         out.append("</div>")
 
         out.append("<div id='relays'></div>")
-        rows = STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+        # The servers the panel has now: one taken off before its log went
+        # with it is not shown, nor kept.
+        hosts = current_hosts()
+        rows = [r for r in STORE.q("SELECT * FROM relay_logs ORDER BY relay")
+                if r["relay"] in hosts]
+        STORE.run("DELETE FROM relay_logs WHERE relay NOT IN (%s)"
+                  % ",".join("?" * len(hosts)), tuple(hosts))
         if not rows:
             out.append("<div class='card'><h2>سرورهای ایران</h2><p class='muted'>هنوز لاگی "
                        "نفرستاده‌اند. هر سرور ایران لاگش را هر ۵ دقیقه یک بار می‌فرستد؛ "
@@ -10938,19 +11102,24 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 return self.redirect("nodes?m=تونل رلهٔ %s خاموش شد؛ رله تا یک دقیقه دیگر "
                                      "مستقیم وصل می‌شود" % ip)
             direction, transport = one("direction"), one("transport")
+            if direction == "direct" and (relay_tunnel(ip) or {}).get("direction") != "direct":
+                return self.redirect("nodes?m=!" + OLD_DIRECT_GONE)
             if direction not in TUNNEL_TRANSPORTS:
                 return self.redirect("nodes?m=!جهت تونل را انتخاب کنید")
             if transport not in TUNNEL_TRANSPORTS[direction]:
-                return self.redirect("nodes?m=!حالت مستقیم فقط stealth، wss، tcp و ws را دارد")
+                return self.redirect("nodes?m=!" + TRANSPORT_LIMIT[direction])
             try:
                 port = int(one("port").strip())
             except ValueError:
                 return self.redirect("nodes?m=!درگاه را عددی بنویسید")
-            why = tunnel_port_problem(port, ip, direction)
+            why = tunnel_port_problem(port, ip, direction) \
+                or preset_problem(direction, transport, one("preset"))
             if why:
                 return self.redirect("nodes?m=!%s" % why)
             spec = {"transport": transport, "direction": direction, "port": port,
                     "exit": exit_address()}
+            if one("preset"):
+                spec["preset"] = one("preset")
             STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
                       " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                       ("relay_tunnel:" + ip, json.dumps(spec, sort_keys=True)))

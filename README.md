@@ -378,7 +378,8 @@ notice nothing: DNS, the allowlist, usage, speed limits and both panels all sit
 in front of the tunnel.
 
 - The relay's nginx goes through the tunnel, and straight to the exit only
-  while the tunnel is down.
+  while the tunnel is down - or up and carrying nothing, which the relay's
+  sync notices and undoes as soon as the tunnel carries again.
 - The relay's sync with the panel (port 8443) goes through the tunnel too.
   Filtering kills a large upload on the direct path - a customer's receipt
   never arrived - and it falls back to direct when the tunnel's end is not up.
@@ -396,8 +397,19 @@ Which transport suits a route depends on the route, so try one or two:
 random bytes, and is the default; **wss** and **wssmux** look like an ordinary
 HTTPS website; **tcp**, **ws** and their pooled forms are not encrypted, so the
 names of the sites still show. In our own test **quic** and **udp** did not
-connect at all. A *direct* tunnel, where the relay dials the exit, has four
-transports: stealth, wss, tcp and ws.
+connect at all.
+
+A *direct* tunnel, where the relay dials the exit, is BackPack's own Direct as
+its menu makes it now: the two machines get a small network of their own, and
+it rides inside ping (**xdi**), hand-made TCP (**pck**, **sni**), **udp** or
+**quic**. xdi needs no port opened, only ping both ways - on a route where
+everything else was filtered it was the one that got through. BackPack's older
+direct engine is not offered any more; a tunnel that has it keeps it.
+
+Each tunnel can take one of BackPack's performance presets - **balance**,
+**turbo**, **aggressive** or **throughput** - picked on the exit or on the
+tunnel's card in the admin panel and written at both ends at once. None
+picked is the tunnel as it has always been.
 
 ### Access control
 
