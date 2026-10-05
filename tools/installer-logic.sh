@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.4"
+VERSION="0.10.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2816,6 +2816,13 @@ if is_relay; then
     Manage the list with:  smartdns status | list | add | del | bypass
 
 ' "$RELAY_IP"
+elif [ "$ROLE" = node ]; then
+    # A node's relays are the panel's, written by its sync: none are known here.
+    printf '
+    This node only accepts connections from the panel'"'"'s relays, so it is not an
+    open proxy.
+
+'
 else
     printf '
     This exit only accepts connections from %s, so it is not an open proxy.

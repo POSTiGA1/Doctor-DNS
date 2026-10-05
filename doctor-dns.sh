@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.10.4"
+VERSION="0.10.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -2816,6 +2816,13 @@ if is_relay; then
     Manage the list with:  smartdns status | list | add | del | bypass
 
 ' "$RELAY_IP"
+elif [ "$ROLE" = node ]; then
+    # A node's relays are the panel's, written by its sync: none are known here.
+    printf '
+    This node only accepts connections from the panel'"'"'s relays, so it is not an
+    open proxy.
+
+'
 else
     printf '
     This exit only accepts connections from %s, so it is not an open proxy.
@@ -14844,12 +14851,14 @@ exit 0
 #}
 #
 #
-#def l3_block(relay):
+#def l3_block(relay, node=None):
 #    """A relay's layer-3 tunnel to its exit: (its address, the exit's, the
 #    interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
 #    both ends work out the same one with nothing passed between them. The
-#    installer's l3_block, the same way."""
-#    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+#    installer's l3_block, the same way. One to a node is picked by the two
+#    addresses: the relay has it beside the one to the main exit."""
+#    key = "%s:%s" % (relay, node) if node else relay
+#    h = hashlib.sha256(("doctor-dns-l3:%s" % key).encode()).hexdigest()[:4]
 #    n = int(h, 16) % 16384
 #    base = "10.10.%d.%%d" % (n // 64)
 #    return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
@@ -15019,12 +15028,13 @@ exit 0
 #def tunnel_toml_text(spec, exit_ip, secret, carried=None):
 #    # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
 #    # a node's carries only the proxy's ports, on its own.
+#    node = carried is not None
 #    if carried is None:
 #        carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
 #    ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
 #    out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
 #    if spec["direction"] == "l3":
-#        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "")
+#        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "", exit_ip if node else None)
 #        out.append('[l3]\nmode = "dial"\naddr = "%s:%d"\nlocal_ip = "%s/30"\npeer_ip = "%s"\n'
 #                   'ports = [%s]\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
 #                   % (exit_ip, spec["port"], mine, theirs, ports, spec["transport"], iface,
@@ -15104,7 +15114,7 @@ exit 0
 #    new = exit_conf_text(exit_ip, tunnel,
 #                         EXIT_PLAN["order"] if EXIT_PLAN["main"] == exit_ip else None,
 #                         {ip for ip, h in EXIT_HEALTH.items() if h["down"]}
-#                         | EXIT_PLAN["capped"], dict(NODE_TUNNELS))
+#                         | EXIT_PLAN["capped"], node_tunnel_ways())
 #    if old == new:
 #        return True
 #    write_if_changed(EXIT_CONF, new)
@@ -15229,15 +15239,19 @@ exit 0
 #    return True
 #
 #
-#def apply_node_relays(raw):
+#def apply_node_relays(raw, tunnels=None):
 #    """Let in exactly the relays the panel serves. An empty or unreadable
-#    list changes nothing: it would shut every relay out."""
+#    list changes nothing: it would shut every relay out. A relay with a
+#    layer-3 tunnel here arrives from its end of it as well."""
 #    ips = []
 #    for ip in raw or []:
 #        if is_ipv4(ip) and ip not in ips:
 #            ips.append(ip)
 #    if not ips:
 #        return
+#    for relay, spec in (tunnels.items() if isinstance(tunnels, dict) else ()):
+#        if relay in ips and isinstance(spec, dict) and spec.get("direction") == "l3":
+#            ips.append(l3_block(relay, (CFG or {}).get("SELF_IP") or "")[0])
 #    before = read_text(RELAYS_CONF)
 #    if nginx_swap(RELAYS_CONF, relays_conf_text(ips)):
 #        if before != relays_conf_text(ips):
@@ -15312,7 +15326,7 @@ exit 0
 #    except Exception as e:
 #        log(WARN, "upgrade not started: %s" % e)
 #    try:
-#        apply_node_relays(answer.get("relays"))
+#        apply_node_relays(answer.get("relays"), answer.get("tunnels"))
 #    except Exception as e:
 #        log_exception("relays not applied: %s" % e)
 #    try:
@@ -15409,6 +15423,7 @@ exit 0
 #        ms = exit_answers("127.0.0.1", 18443) if ip == main and tunnel else None
 #        if ip in NODE_TUNNELS:
 #            ms = exit_answers("127.0.0.1", NODE_TUNNELS[ip])
+#            note_node_tunnel(ip, ms is not None)
 #        seen[ip] = ms if ms is not None else exit_answers(ip, 443)
 #
 #    workers = [threading.Thread(target=check, args=(ip,)) for ip in order]
@@ -15419,6 +15434,9 @@ exit 0
 #    for ip in list(EXIT_HEALTH):
 #        if ip not in order:
 #            del EXIT_HEALTH[ip]
+#    for ip in list(NODE_TUNNEL_HEALTH):
+#        if ip not in NODE_TUNNELS:
+#            del NODE_TUNNEL_HEALTH[ip]
 #    for ip in order:
 #        h = EXIT_HEALTH.setdefault(ip, {"fails": 0, "oks": 0, "down": False, "ms": None})
 #        ms = seen.get(ip)
@@ -15443,6 +15461,32 @@ exit 0
 ## On a relay: the node's tunnel's first port here, for each node it has one to.
 #NODE_TUNNELS = {}
 #NODE_TUNNEL_REPORT = {"state": None}
+## Whether each node's tunnel carries a handshake through it, as the main
+## exit's TUNNEL_DOWN: two misses and nginx goes straight to the node, two
+## answers and back through it. A layer-3 tunnel's end here takes every
+## connection whether the tunnel carries or not, so nginx would never turn to
+## the node by itself.
+#NODE_TUNNEL_HEALTH = {}
+#
+#
+#def note_node_tunnel(node, ok):
+#    h = NODE_TUNNEL_HEALTH.setdefault(node, {"fails": 0, "oks": 0, "down": False})
+#    if ok:
+#        h["fails"], h["oks"] = 0, h["oks"] + 1
+#        if h["oks"] >= 2 and h["down"]:
+#            h["down"] = False
+#            log(INFO, "the tunnel to %s carries again - customers go through it" % node)
+#    else:
+#        h["fails"], h["oks"] = h["fails"] + 1, 0
+#        if h["fails"] >= 2 and not h["down"]:
+#            h["down"] = True
+#            log(WARN, "the tunnel to %s carries nothing - customers go straight to it" % node)
+#
+#
+#def node_tunnel_ways():
+#    """The node tunnels nginx goes through: those that carry."""
+#    return {n: base for n, base in NODE_TUNNELS.items()
+#            if not NODE_TUNNEL_HEALTH.get(n, {}).get("down")}
 #
 #
 #def instance_nft(ip):
@@ -15525,7 +15569,9 @@ exit 0
 #        carried = [(name, base + i, port) for i, (name, _, port) in enumerate(TUNNEL_PORTS)]
 #        text = tunnel_toml_text(spec, node, CFG["SYNC_SECRET"], carried)
 #        up = run_instance(node, text, spec["port"] if spec["direction"] == "reverse" else None)
-#        states[node] = {"running": up, "error": ""}
+#        states[node] = {"running": up, "error": (
+#            "تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به این سرور می‌رود"
+#            if up and NODE_TUNNEL_HEALTH.get(node, {}).get("down") else "")}
 #    NODE_TUNNELS.clear()
 #    NODE_TUNNELS.update({n: base for n, (_, base) in want.items()})
 #    NODE_TUNNEL_REPORT["state"] = states
@@ -15534,6 +15580,13 @@ exit 0
 #def exit_side_toml(relay, spec, secret, where):
 #    """A node's end of a relay's tunnel - the exit's, word for word."""
 #    out = ["# written by doctor dns: the admin panel's relays card\n"]
+#    if spec["direction"] == "l3":
+#        theirs, mine, iface = l3_block(relay, (CFG or {}).get("SELF_IP") or "")
+#        out.append('[l3]\nmode = "listen"\naddr = "0.0.0.0:%d"\nlocal_ip = "%s/30"\n'
+#                   'peer_ip = "%s"\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+#                   % (spec["port"], mine, theirs, spec["transport"], iface, tunnel_token(secret)))
+#        out.append(tunnel_tuning(spec, "l3"))
+#        return "".join(out)
 #    if spec["direction"] == "reverse":
 #        out.append('[client]\nremote_addr = "%s:%d"\n' % (relay, spec["port"]))
 #    else:
@@ -15569,7 +15622,7 @@ exit 0
 #    for relay, spec in want.items():
 #        where = os.path.join(RELAY_TUNNEL_DIR, relay)
 #        states[relay] = run_instance(relay, exit_side_toml(relay, spec, CFG["SYNC_SECRET"], where),
-#                                     spec["port"] if spec["direction"] == "direct" else None)
+#                                     spec["port"] if spec["direction"] != "reverse" else None)
 #    NODE_STATE["tunnels"] = states
 #
 #
@@ -22105,6 +22158,8 @@ exit 0
 ## the admin moves it.
 #DIRECTION_WORDS = {"reverse": "معکوس", "direct": "مستقیم قدیمی", "l3": "مستقیم"}
 #OLD_DIRECT_GONE = "مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید"
+## The version whose relays and nodes build a direct tunnel between them.
+#NODE_L3_SINCE = "0.10.5"
 #
 #
 #def l3_block(relay):
@@ -22323,6 +22378,27 @@ exit 0
 #    "throughput": "throughput — دانلود سنگین؛ فقط kcp در حالت معکوس",
 #}
 #
+## The tunnel form's transports and presets: only those the direction picked
+## has (each option's data-d), run as the form loads and on every change. One
+## hidden while picked gives its place to the first that is left.
+#TUNNEL_PICK = """<script>
+#function tunnelPick(f) {
+#  var d = f.direction.value, t = f.transport, p = f.preset;
+#  function fit(s) {
+#    for (var i = 0; i < s.options.length; i++) {
+#      var o = s.options[i], ok = (" " + o.dataset.d + " ").indexOf(" " + d + " ") >= 0;
+#      if (s === p && o.value === "throughput" && d === "reverse" && t.value !== "kcp") ok = false;
+#      o.hidden = o.disabled = !ok;
+#    }
+#    if (s.selectedIndex < 0 || s.options[s.selectedIndex].disabled)
+#      for (var j = 0; j < s.options.length; j++)
+#        if (!s.options[j].disabled) { s.selectedIndex = j; break; }
+#  }
+#  fit(t); fit(p);
+#}
+#tunnelPick(document.currentScript.previousElementSibling);
+#</script>"""
+#
 #
 #def exit_tunnel_toml(ip, spec, secret, where):
 #    out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
@@ -22503,18 +22579,24 @@ exit 0
 #            " <span class='warn'>(%s)</span>" % html.escape(seen["error"])
 #            if seen.get("error") else "")
 #    direction = spec.get("direction") or "reverse"
+#    # Each option says which directions have it, and TUNNEL_PICK shows only
+#    # those of the direction picked - picking direct used to leave reverse's
+#    # transports in the list.
 #    options = "".join(
-#        "<option value='%s'%s>%s — %s</option>"
-#        % (t, " selected" if t == spec.get("transport", "stealth") else "", t,
+#        "<option value='%s' data-d='%s'%s>%s — %s</option>"
+#        % (t, " ".join(d for d in TUNNEL_TRANSPORTS if t in TUNNEL_TRANSPORTS[d]),
+#           " selected" if t == spec.get("transport", "stealth") else "", t,
 #           TRANSPORT_WORDS.get(t, ""))
 #        for t in TUNNEL_TRANSPORTS["reverse"] + ("sni",))
 #    presets = "".join(
-#        "<option value='%s'%s>%s</option>"
-#        % (k, " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
+#        "<option value='%s' data-d='%s'%s>%s</option>"
+#        % (k, " ".join(d for d in TUNNEL_TRANSPORTS if preset_ok(d, "kcp", k)),
+#           " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
 #        for k in ("",) + TUNNEL_PRESETS)
 #    return (
 #        "<details><summary>%s%s</summary>"
-#        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px'>"
+#        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px' "
+#        "onchange='tunnelPick(this)'>"
 #        "<input type='hidden' name='ip' value='%s'><input type='hidden' name='exit' value='%s'>"
 #        "<label style='display:block'><input type='radio' name='on' value='0'%s> خاموش — رله "
 #        "مستقیم به سرور خارج وصل شود</label>"
@@ -22535,19 +22617,16 @@ exit 0
 #        "دارد؛ xdi درگاه باز نمی‌خواهد، فقط پینگ در دو جهت. در حالت معکوس این درگاه روی "
 #        "رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش "
 #        "کنید. تا وقتی تونل چیزی رد نمی‌کند، رله مستقیم به سرور خارج می‌رود.</p>"
-#        "<button class='ghost'>ذخیرهٔ تونل</button></form></details>"
+#        "<button class='ghost'>ذخیرهٔ تونل</button></form>%s</details>"
 #        % (label, summary, p, ip, html.escape(to), "" if spec else " checked",
 #           " checked" if spec else "",
 #           " selected" if direction == "reverse" else "",
-#           # Only to the main exit: a node's end is built by its own sync,
-#           # which does not make this kind.
 #           "<option value='l3'%s>مستقیم — رله به سرور خارج وصل می‌شود، با شبکهٔ مشترک دو "
-#           "سرور</option>" % (" selected" if direction == "l3" else "")
-#           if to == exit_address() else "",
+#           "سرور</option>" % (" selected" if direction == "l3" else ""),
 #           # The old direct, only for a tunnel that already has it.
 #           "<option value='direct' selected>مستقیم قدیمی — دیگر انتخاب نمی‌شود</option>"
 #           if direction == "direct" else "", options,
-#           spec.get("port") or 8444, presets))
+#           spec.get("port") or 8444, presets, TUNNEL_PICK))
 #
 #def preset_problem(direction, transport, preset):
 #    """Why this tunnel cannot have this preset, or "" when it can."""
@@ -22572,8 +22651,6 @@ exit 0
 #        return ("nodes?m=تونل رلهٔ %s به %s خاموش شد؛ تا یک دقیقه دیگر "
 #                             "مستقیم وصل می‌شود" % (ip, to))
 #    direction, transport = one("direction"), one("transport")
-#    if direction == "l3":
-#        return "nodes?m=!مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید"
 #    if direction == "direct" and (relay_tunnel(ip, to) or {}).get("direction") != "direct":
 #        return "nodes?m=!" + OLD_DIRECT_GONE
 #    if direction not in TUNNEL_TRANSPORTS:
@@ -22588,6 +22665,14 @@ exit 0
 #        or preset_problem(direction, transport, one("preset"))
 #    if why:
 #        return ("nodes?m=!%s" % why)
+#    # One from before builds it as another kind - the relay over its tunnel
+#    # to the main exit's addresses, the node as the old direct.
+#    if direction == "l3":
+#        for h in (ip, to):
+#            row = STORE.one("SELECT value FROM settings WHERE key = ?", ("version:" + h,))
+#            if version_key(row["value"] if row else "") < version_key(NODE_L3_SINCE):
+#                return ("nodes?m=!مستقیم تا نود از نسخهٔ %s است؛ اول %s را آپدیت کنید"
+#                        % (NODE_L3_SINCE, h))
 #    spec = {"transport": transport, "direction": direction, "port": port, "exit": to,
 #            "slot": node_slot(to)}
 #    if one("preset"):
@@ -41400,6 +41485,7 @@ exit 0
 #"است.": ".",
 #"است، نه در دیتابیس — پس نسخهٔ پشتیبان هم رمزگذاری‌شده است. برای بازگردانی روی سرور دیگری این کلید را هم لازم دارید؛ کنار نسخهٔ پشتیبان ولی جدا از آن نگهش دارید. کلید گم شود، عکس‌ها برنمی‌گردند (بقیهٔ اطلاعات چرا).": ", not in the database — so the backup is encrypted too. To restore on another server you need this key as well; keep it next to the backup but apart from it. If the key is lost, the pictures cannot be recovered (the rest of the data can).",
 #"است؛ از این به بعد با آن وارد شوید": "; sign in with it from now on",
+#"است؛ اول": "on; upgrade",
 #"است؛ ربات تلگرام بیشتر از ۵۰ مگ نمی‌فرستد": "; the Telegram bot does not send more than 50 MB",
 #"استار سیتیزن": "Star Citizen",
 #"استارکرفت": "StarCraft II",
@@ -41848,6 +41934,7 @@ exit 0
 #"تونل این رله مال نصب‌کننده است؛ با --tunnel عوضش کنید": "This relay’s tunnel belongs to the installer; change it with --tunnel",
 #"تونل رلهٔ": "Tunnel of relay",
 #"تونل رله‌ها — سرور خارج": "Relays’ tunnels — exit server",
+#"تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به این سرور می‌رود": "The tunnel is up but carries nothing; the relay goes straight to this server for now",
 #"تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به سرور خارج می‌رود": "The tunnel is up but carries nothing; the relay goes straight to the exit for now",
 #"تونل — سرور خارج": "Tunnel — exit server",
 #"تونل‌ها": "Tunnels",
@@ -42168,6 +42255,7 @@ exit 0
 #"ذخیرهٔ تونل": "Save tunnel",
 #"ذخیرهٔ رمز": "Save password",
 #"ذخیرهٔ فهرست مشتری‌ها": "Save the customers list",
+#"را آپدیت کنید": "first",
 #"را از App Store یا Google Play نصب کنید.": "app from the App Store or Google Play.",
 #"را با عدد بنویسید؛ خالی یعنی خاموش": "must be a number; empty means off",
 #"را بزنید؛ وگرنه ربات نمی‌تواند به شما پیام بدهد.": "; otherwise the bot cannot message you.",
@@ -42676,7 +42764,7 @@ exit 0
 #"مدت باید عدد درستِ روز باشد، از ۱ تا ۳۶۵۰": "The length must be a whole number of days, from 1 to 3650",
 #"مرتب‌سازی:": "Sort:",
 #"مستقیم": "Direct",
-#"مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید": "Direct is to the main exit only, for now; pick reverse to the nodes",
+#"مستقیم تا نود از نسخهٔ": "Direct to a node is from version",
 #"مستقیم قدیمی": "old direct",
 #"مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید": "The old direct is not offered any more; pick reverse or direct",
 #"مستقیم قدیمی فقط stealth، wss، tcp و ws را دارد": "The old direct has stealth, wss, tcp and ws only",

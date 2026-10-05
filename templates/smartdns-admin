@@ -1814,6 +1814,8 @@ TRANSPORT_LIMIT = {
 # the admin moves it.
 DIRECTION_WORDS = {"reverse": "معکوس", "direct": "مستقیم قدیمی", "l3": "مستقیم"}
 OLD_DIRECT_GONE = "مستقیم قدیمی دیگر انتخاب نمی‌شود؛ معکوس یا مستقیم را انتخاب کنید"
+# The version whose relays and nodes build a direct tunnel between them.
+NODE_L3_SINCE = "0.10.5"
 
 
 def l3_block(relay):
@@ -2032,6 +2034,27 @@ PRESET_WORDS = {
     "throughput": "throughput — دانلود سنگین؛ فقط kcp در حالت معکوس",
 }
 
+# The tunnel form's transports and presets: only those the direction picked
+# has (each option's data-d), run as the form loads and on every change. One
+# hidden while picked gives its place to the first that is left.
+TUNNEL_PICK = """<script>
+function tunnelPick(f) {
+  var d = f.direction.value, t = f.transport, p = f.preset;
+  function fit(s) {
+    for (var i = 0; i < s.options.length; i++) {
+      var o = s.options[i], ok = (" " + o.dataset.d + " ").indexOf(" " + d + " ") >= 0;
+      if (s === p && o.value === "throughput" && d === "reverse" && t.value !== "kcp") ok = false;
+      o.hidden = o.disabled = !ok;
+    }
+    if (s.selectedIndex < 0 || s.options[s.selectedIndex].disabled)
+      for (var j = 0; j < s.options.length; j++)
+        if (!s.options[j].disabled) { s.selectedIndex = j; break; }
+  }
+  fit(t); fit(p);
+}
+tunnelPick(document.currentScript.previousElementSibling);
+</script>"""
+
 
 def exit_tunnel_toml(ip, spec, secret, where):
     out = ["# written by the doctor dns admin panel - its relays card changes it\n"]
@@ -2212,18 +2235,24 @@ def tunnel_block(p, ip, to):
             " <span class='warn'>(%s)</span>" % html.escape(seen["error"])
             if seen.get("error") else "")
     direction = spec.get("direction") or "reverse"
+    # Each option says which directions have it, and TUNNEL_PICK shows only
+    # those of the direction picked - picking direct used to leave reverse's
+    # transports in the list.
     options = "".join(
-        "<option value='%s'%s>%s — %s</option>"
-        % (t, " selected" if t == spec.get("transport", "stealth") else "", t,
+        "<option value='%s' data-d='%s'%s>%s — %s</option>"
+        % (t, " ".join(d for d in TUNNEL_TRANSPORTS if t in TUNNEL_TRANSPORTS[d]),
+           " selected" if t == spec.get("transport", "stealth") else "", t,
            TRANSPORT_WORDS.get(t, ""))
         for t in TUNNEL_TRANSPORTS["reverse"] + ("sni",))
     presets = "".join(
-        "<option value='%s'%s>%s</option>"
-        % (k, " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
+        "<option value='%s' data-d='%s'%s>%s</option>"
+        % (k, " ".join(d for d in TUNNEL_TRANSPORTS if preset_ok(d, "kcp", k)),
+           " selected" if k == spec.get("preset", "") else "", PRESET_WORDS[k])
         for k in ("",) + TUNNEL_PRESETS)
     return (
         "<details><summary>%s%s</summary>"
-        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px'>"
+        "<form method='post' action='/%s/relay-tunnel' style='margin-top:8px' "
+        "onchange='tunnelPick(this)'>"
         "<input type='hidden' name='ip' value='%s'><input type='hidden' name='exit' value='%s'>"
         "<label style='display:block'><input type='radio' name='on' value='0'%s> خاموش — رله "
         "مستقیم به سرور خارج وصل شود</label>"
@@ -2244,19 +2273,16 @@ def tunnel_block(p, ip, to):
         "دارد؛ xdi درگاه باز نمی‌خواهد، فقط پینگ در دو جهت. در حالت معکوس این درگاه روی "
         "رله باز می‌شود و در حالت مستقیم روی سرور خارج؛ اگر فایروالی جلویش هست، بازش "
         "کنید. تا وقتی تونل چیزی رد نمی‌کند، رله مستقیم به سرور خارج می‌رود.</p>"
-        "<button class='ghost'>ذخیرهٔ تونل</button></form></details>"
+        "<button class='ghost'>ذخیرهٔ تونل</button></form>%s</details>"
         % (label, summary, p, ip, html.escape(to), "" if spec else " checked",
            " checked" if spec else "",
            " selected" if direction == "reverse" else "",
-           # Only to the main exit: a node's end is built by its own sync,
-           # which does not make this kind.
            "<option value='l3'%s>مستقیم — رله به سرور خارج وصل می‌شود، با شبکهٔ مشترک دو "
-           "سرور</option>" % (" selected" if direction == "l3" else "")
-           if to == exit_address() else "",
+           "سرور</option>" % (" selected" if direction == "l3" else ""),
            # The old direct, only for a tunnel that already has it.
            "<option value='direct' selected>مستقیم قدیمی — دیگر انتخاب نمی‌شود</option>"
            if direction == "direct" else "", options,
-           spec.get("port") or 8444, presets))
+           spec.get("port") or 8444, presets, TUNNEL_PICK))
 
 def preset_problem(direction, transport, preset):
     """Why this tunnel cannot have this preset, or "" when it can."""
@@ -2281,8 +2307,6 @@ def save_node_tunnel(ip, to, one):
         return ("nodes?m=تونل رلهٔ %s به %s خاموش شد؛ تا یک دقیقه دیگر "
                              "مستقیم وصل می‌شود" % (ip, to))
     direction, transport = one("direction"), one("transport")
-    if direction == "l3":
-        return "nodes?m=!مستقیم فعلاً فقط تا سرور خارج اصلی است؛ تا نودها معکوس را انتخاب کنید"
     if direction == "direct" and (relay_tunnel(ip, to) or {}).get("direction") != "direct":
         return "nodes?m=!" + OLD_DIRECT_GONE
     if direction not in TUNNEL_TRANSPORTS:
@@ -2297,6 +2321,14 @@ def save_node_tunnel(ip, to, one):
         or preset_problem(direction, transport, one("preset"))
     if why:
         return ("nodes?m=!%s" % why)
+    # One from before builds it as another kind - the relay over its tunnel
+    # to the main exit's addresses, the node as the old direct.
+    if direction == "l3":
+        for h in (ip, to):
+            row = STORE.one("SELECT value FROM settings WHERE key = ?", ("version:" + h,))
+            if version_key(row["value"] if row else "") < version_key(NODE_L3_SINCE):
+                return ("nodes?m=!مستقیم تا نود از نسخهٔ %s است؛ اول %s را آپدیت کنید"
+                        % (NODE_L3_SINCE, h))
     spec = {"transport": transport, "direction": direction, "port": port, "exit": to,
             "slot": node_slot(to)}
     if one("preset"):

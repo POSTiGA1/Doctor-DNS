@@ -404,7 +404,9 @@ its menu makes it now: the two machines get a small network of their own, and
 it rides inside ping (**xdi**), hand-made TCP (**pck**, **sni**), **udp** or
 **quic**. xdi needs no port opened, only ping both ways - on a route where
 everything else was filtered it was the one that got through. BackPack's older
-direct engine is not offered any more; a tunnel that has it keeps it.
+direct engine is not offered any more; a tunnel that has it keeps it. A
+relay's tunnel to a node can be direct too, beside its tunnel to the exit, and
+while it carries nothing the relay goes straight to the node.
 
 Each tunnel can take one of BackPack's performance presets - **balance**,
 **turbo**, **aggressive** or **throughput** - picked on the exit or on the

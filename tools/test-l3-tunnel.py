@@ -11,8 +11,10 @@ port at the far end of that network; the exit listens, its port answering
 the relay alone. The exit lets the relay in from its tunnel address -
 nginx, the sync API and the port 8443 rule alike. The pairing token carries
 it ("-l"), the installer asks for it, and the admin panel offers it for the
-main exit only: a node's end is built by its own sync, which does not make
-this kind.
+main exit and the nodes. To a node, the block is picked by the relay's
+address and the node's, so the relay's tunnels to its exit and its nodes
+each have their own; the node builds its end and lets the relay in from it,
+and while that tunnel carries nothing the relay goes straight to the node.
 """
 import importlib.machinery
 import importlib.util
@@ -178,10 +180,90 @@ check("the exit's port answers the relay alone, as for direct",
       'if spec["direction"] != "reverse":' in admin_src
       and '[ "$TUNNEL_DIRECTION" != reverse ]; }; then' in LOGIC)
 
+print("a relay's tunnel to a node")
+NODE = "192.0.2.80"
+sync_src = open(os.path.join(ROOT, "templates", "smartdns-sync"), encoding="utf-8").read()
+base = sync.NODE_TUNNEL_BASE + 10
+carried = [(name, base + i, port) for i, (name, _, port) in enumerate(sync.TUNNEL_PORTS)]
+sync.CFG = {"SELF_IP": RELAY}
+r = tomllib.loads(sync.tunnel_toml_text(spec, NODE, SECRET, carried))["l3"]
+sync.CFG = {"SELF_IP": NODE}
+n = tomllib.loads(sync.exit_side_toml(RELAY, spec, SECRET, "/tmp/x"))["l3"]
+nmine, ntheirs, niface = sync.l3_block(RELAY, NODE)
+check("the relay dials the node, the proxy's ports on its own loopback ports for it",
+      r["mode"] == "dial" and r["addr"] == "%s:8477" % NODE
+      and r["ports"] == ["127.0.0.1:%d=%d" % (base + i, p)
+                         for i, p in enumerate((443, 80, 4070, 1119))])
+check("the node listens, the two ends' addresses crossed, the same carrier, interface and token",
+      n["mode"] == "listen" and n["addr"] == "0.0.0.0:8477" and "ports" not in n
+      and r["local_ip"] == nmine + "/30" and r["peer_ip"] == ntheirs
+      and n["local_ip"] == ntheirs + "/30" and n["peer_ip"] == nmine
+      and (r["carrier"], r["iface"], r["token"]) == (n["carrier"], n["iface"], n["token"])
+      == ("xdi", niface, sync.tunnel_token(SECRET)))
+check("  its own block and interface on the relay, beside the one to the main exit",
+      sync.l3_block(RELAY, NODE)[0] != sync.l3_block(RELAY)[0] and niface != iface
+      and sync.l3_block(RELAY, NODE) != sync.l3_block(RELAY, "192.0.2.81"))
+check("  the node's port answers the relay alone",
+      'spec["port"] if spec["direction"] != "reverse" else None)\n    NODE_STATE' in sync_src)
+written = []
+sync.nginx_swap = lambda path, text: written.append(text) or True
+sync.CFG = {"SELF_IP": NODE}
+sync.apply_node_relays([RELAY, "192.0.2.90"], {RELAY: dict(spec, slot=1),
+                                                "192.0.2.90": {"direction": "reverse",
+                                                               "transport": "tcp", "port": 9000}})
+check("the node lets the relay in from its tunnel address too, and only that relay's",
+      written and written[-1].count("allow ") == 3 and "allow %s;" % nmine in written[-1])
+sync.NODE_TUNNELS.clear()
+sync.NODE_TUNNELS[NODE] = base
+sync.note_node_tunnel(NODE, False)
+first = dict(sync.node_tunnel_ways())
+sync.note_node_tunnel(NODE, False)
+down = dict(sync.node_tunnel_ways())
+sync.note_node_tunnel(NODE, True)
+sync.note_node_tunnel(NODE, True)
+check("a node tunnel that carries nothing twice running sends nginx straight to the node, "
+      "and back through it once it carries twice",
+      first == {NODE: base} and down == {} and sync.node_tunnel_ways() == {NODE: base}
+      and "node_tunnel_ways())" in sync_src)
+sync.NODE_TUNNELS.clear()
+
 print("the admin panel")
-check("offered for the main exit, refused for a node",
-      "<option value='l3'%s>" in admin_src and "if to == exit_address() else" in admin_src
-      and 'if direction == "l3":\n        return "nodes?m=!' in admin_src)
+
+
+class Versions:
+    def __init__(self, have):
+        self.have, self.saved = have, []
+
+    def one(self, sql, args):
+        key = args[0]
+        if key.startswith("version:") and key[8:] in self.have:
+            return {"value": self.have[key[8:]]}
+        return None
+
+    def run(self, sql, args=()):
+        if sql.startswith("INSERT"):
+            self.saved.append(args)
+
+    def q(self, *a):
+        return []
+
+
+admin.node_list = lambda: [NODE]
+admin.node_slot = lambda n: 1
+admin.all_tunnels = lambda: []
+admin.relay_tunnel = lambda ip, to: {}
+form = {"on": "1", "direction": "l3", "transport": "xdi", "port": "8477", "preset": ""}
+admin.STORE = Versions({RELAY: "0.10.5", NODE: "0.10.4"})
+old = admin.save_node_tunnel(RELAY, NODE, lambda k: form.get(k, ""))
+admin.STORE, kept_old = Versions({RELAY: "0.10.5", NODE: "0.10.5"}), admin.STORE.saved
+new = admin.save_node_tunnel(RELAY, NODE, lambda k: form.get(k, ""))
+check("a node takes it once both ends are of the version that builds it",
+      old.startswith("nodes?m=!") and NODE in old and not kept_old
+      and not new.startswith("nodes?m=!") and len(admin.STORE.saved) == 1
+      and '"direction": "l3"' in admin.STORE.saved[0][1], old + " | " + new)
+check("offered for the main exit and the nodes alike",
+      "<option value='l3'%s>" in admin_src and "if to == exit_address() else" not in admin_src
+      and 'if direction == "l3":\n        return "nodes?m=!' not in admin_src)
 check("what each direction can carry is said when something else is picked",
       set(admin.TRANSPORT_LIMIT) == set(admin.TUNNEL_TRANSPORTS) == {"reverse", "direct", "l3"}
       and admin.TUNNEL_TRANSPORTS["l3"] == sync.TUNNEL_TRANSPORTS["l3"]

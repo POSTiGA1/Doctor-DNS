@@ -199,6 +199,26 @@ check("a choice on the tunnel's form, kept with the tunnel, shown on its card",
       "<select name='preset'>" in asrc and asrc.count('spec["preset"] = one("preset")') == 2
       and '"، " + spec["preset"] if spec.get("preset") else ""' in asrc)
 
+
+class NoRows:
+    def one(self, *a):
+        return None
+
+
+admin.STORE = NoRows()
+admin.exit_address = lambda: "198.51.100.1"
+admin.installer_tunnel = lambda: None
+admin.node_list = lambda: []
+admin.relay_tunnel = lambda ip, to: {}
+card = admin.tunnel_block("p", "203.0.113.5", "198.51.100.1")
+said = dict(re.findall(r"<option value='([a-z]+)' data-d='([a-z0-9 ]*)'", card))
+check("the form shows only what the direction picked has: direct, not reverse's transports",
+      said.get("xdi") == "reverse l3" and said.get("sni") == "l3"
+      and said.get("kcp") == "reverse" and said.get("stealth") == "reverse direct"
+      and said.get("aggressive") == "reverse l3" and said.get("throughput") == "reverse direct"
+      and "onchange='tunnelPick(this)'" in card
+      and card.index("</form><script>") < card.index("tunnelPick(document.currentScript"))
+
 print()
 if fails:
     print("%d failed" % len(fails))

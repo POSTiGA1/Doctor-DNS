@@ -2052,12 +2052,14 @@ TUNNEL_TRANSPORTS = {
 }
 
 
-def l3_block(relay):
+def l3_block(relay, node=None):
     """A relay's layer-3 tunnel to its exit: (its address, the exit's, the
     interface) - a /30 of 10.10.0.0/16 picked by the relay's own address, so
     both ends work out the same one with nothing passed between them. The
-    installer's l3_block, the same way."""
-    h = hashlib.sha256(("doctor-dns-l3:%s" % relay).encode()).hexdigest()[:4]
+    installer's l3_block, the same way. One to a node is picked by the two
+    addresses: the relay has it beside the one to the main exit."""
+    key = "%s:%s" % (relay, node) if node else relay
+    h = hashlib.sha256(("doctor-dns-l3:%s" % key).encode()).hexdigest()[:4]
     n = int(h, 16) % 16384
     base = "10.10.%d.%%d" % (n // 64)
     return base % ((n % 64) * 4 + 1), base % ((n % 64) * 4 + 2), "ddl" + h
@@ -2227,12 +2229,13 @@ def tunnel_tuning(spec, side):
 def tunnel_toml_text(spec, exit_ip, secret, carried=None):
     # The main exit's carries the sync API's too, on 18843 - see api_endpoints;
     # a node's carries only the proxy's ports, on its own.
+    node = carried is not None
     if carried is None:
         carried = list(TUNNEL_PORTS[:2]) + [("api", API_TUNNEL_PORT, API_PORT)] + list(TUNNEL_PORTS[2:])
     ports = ", ".join('"127.0.0.1:%d=%d"' % (local, port) for _, local, port in carried)
     out = ["# written by doctor dns: the installer, or the admin panel's relays card\n"]
     if spec["direction"] == "l3":
-        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "")
+        mine, theirs, iface = l3_block((CFG or {}).get("SELF_IP") or "", exit_ip if node else None)
         out.append('[l3]\nmode = "dial"\naddr = "%s:%d"\nlocal_ip = "%s/30"\npeer_ip = "%s"\n'
                    'ports = [%s]\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
                    % (exit_ip, spec["port"], mine, theirs, ports, spec["transport"], iface,
@@ -2312,7 +2315,7 @@ def point_exit_nginx(exit_ip, tunnel):
     new = exit_conf_text(exit_ip, tunnel,
                          EXIT_PLAN["order"] if EXIT_PLAN["main"] == exit_ip else None,
                          {ip for ip, h in EXIT_HEALTH.items() if h["down"]}
-                         | EXIT_PLAN["capped"], dict(NODE_TUNNELS))
+                         | EXIT_PLAN["capped"], node_tunnel_ways())
     if old == new:
         return True
     write_if_changed(EXIT_CONF, new)
@@ -2437,15 +2440,19 @@ def nginx_swap(path, text):
     return True
 
 
-def apply_node_relays(raw):
+def apply_node_relays(raw, tunnels=None):
     """Let in exactly the relays the panel serves. An empty or unreadable
-    list changes nothing: it would shut every relay out."""
+    list changes nothing: it would shut every relay out. A relay with a
+    layer-3 tunnel here arrives from its end of it as well."""
     ips = []
     for ip in raw or []:
         if is_ipv4(ip) and ip not in ips:
             ips.append(ip)
     if not ips:
         return
+    for relay, spec in (tunnels.items() if isinstance(tunnels, dict) else ()):
+        if relay in ips and isinstance(spec, dict) and spec.get("direction") == "l3":
+            ips.append(l3_block(relay, (CFG or {}).get("SELF_IP") or "")[0])
     before = read_text(RELAYS_CONF)
     if nginx_swap(RELAYS_CONF, relays_conf_text(ips)):
         if before != relays_conf_text(ips):
@@ -2520,7 +2527,7 @@ def node_once():
     except Exception as e:
         log(WARN, "upgrade not started: %s" % e)
     try:
-        apply_node_relays(answer.get("relays"))
+        apply_node_relays(answer.get("relays"), answer.get("tunnels"))
     except Exception as e:
         log_exception("relays not applied: %s" % e)
     try:
@@ -2617,6 +2624,7 @@ def probe_exits():
         ms = exit_answers("127.0.0.1", 18443) if ip == main and tunnel else None
         if ip in NODE_TUNNELS:
             ms = exit_answers("127.0.0.1", NODE_TUNNELS[ip])
+            note_node_tunnel(ip, ms is not None)
         seen[ip] = ms if ms is not None else exit_answers(ip, 443)
 
     workers = [threading.Thread(target=check, args=(ip,)) for ip in order]
@@ -2627,6 +2635,9 @@ def probe_exits():
     for ip in list(EXIT_HEALTH):
         if ip not in order:
             del EXIT_HEALTH[ip]
+    for ip in list(NODE_TUNNEL_HEALTH):
+        if ip not in NODE_TUNNELS:
+            del NODE_TUNNEL_HEALTH[ip]
     for ip in order:
         h = EXIT_HEALTH.setdefault(ip, {"fails": 0, "oks": 0, "down": False, "ms": None})
         ms = seen.get(ip)
@@ -2651,6 +2662,32 @@ NODE_TUNNEL_BASE = 20000
 # On a relay: the node's tunnel's first port here, for each node it has one to.
 NODE_TUNNELS = {}
 NODE_TUNNEL_REPORT = {"state": None}
+# Whether each node's tunnel carries a handshake through it, as the main
+# exit's TUNNEL_DOWN: two misses and nginx goes straight to the node, two
+# answers and back through it. A layer-3 tunnel's end here takes every
+# connection whether the tunnel carries or not, so nginx would never turn to
+# the node by itself.
+NODE_TUNNEL_HEALTH = {}
+
+
+def note_node_tunnel(node, ok):
+    h = NODE_TUNNEL_HEALTH.setdefault(node, {"fails": 0, "oks": 0, "down": False})
+    if ok:
+        h["fails"], h["oks"] = 0, h["oks"] + 1
+        if h["oks"] >= 2 and h["down"]:
+            h["down"] = False
+            log(INFO, "the tunnel to %s carries again - customers go through it" % node)
+    else:
+        h["fails"], h["oks"] = h["fails"] + 1, 0
+        if h["fails"] >= 2 and not h["down"]:
+            h["down"] = True
+            log(WARN, "the tunnel to %s carries nothing - customers go straight to it" % node)
+
+
+def node_tunnel_ways():
+    """The node tunnels nginx goes through: those that carry."""
+    return {n: base for n, base in NODE_TUNNELS.items()
+            if not NODE_TUNNEL_HEALTH.get(n, {}).get("down")}
 
 
 def instance_nft(ip):
@@ -2733,7 +2770,9 @@ def apply_node_tunnels(raw):
         carried = [(name, base + i, port) for i, (name, _, port) in enumerate(TUNNEL_PORTS)]
         text = tunnel_toml_text(spec, node, CFG["SYNC_SECRET"], carried)
         up = run_instance(node, text, spec["port"] if spec["direction"] == "reverse" else None)
-        states[node] = {"running": up, "error": ""}
+        states[node] = {"running": up, "error": (
+            "تونل وصل است ولی چیزی رد نمی‌کند؛ رله فعلاً مستقیم به این سرور می‌رود"
+            if up and NODE_TUNNEL_HEALTH.get(node, {}).get("down") else "")}
     NODE_TUNNELS.clear()
     NODE_TUNNELS.update({n: base for n, (_, base) in want.items()})
     NODE_TUNNEL_REPORT["state"] = states
@@ -2742,6 +2781,13 @@ def apply_node_tunnels(raw):
 def exit_side_toml(relay, spec, secret, where):
     """A node's end of a relay's tunnel - the exit's, word for word."""
     out = ["# written by doctor dns: the admin panel's relays card\n"]
+    if spec["direction"] == "l3":
+        theirs, mine, iface = l3_block(relay, (CFG or {}).get("SELF_IP") or "")
+        out.append('[l3]\nmode = "listen"\naddr = "0.0.0.0:%d"\nlocal_ip = "%s/30"\n'
+                   'peer_ip = "%s"\ncarrier = "%s"\niface = "%s"\ntoken = "%s"\n'
+                   % (spec["port"], mine, theirs, spec["transport"], iface, tunnel_token(secret)))
+        out.append(tunnel_tuning(spec, "l3"))
+        return "".join(out)
     if spec["direction"] == "reverse":
         out.append('[client]\nremote_addr = "%s:%d"\n' % (relay, spec["port"]))
     else:
@@ -2777,7 +2823,7 @@ def apply_relay_tunnels(raw):
     for relay, spec in want.items():
         where = os.path.join(RELAY_TUNNEL_DIR, relay)
         states[relay] = run_instance(relay, exit_side_toml(relay, spec, CFG["SYNC_SECRET"], where),
-                                     spec["port"] if spec["direction"] == "direct" else None)
+                                     spec["port"] if spec["direction"] != "reverse" else None)
     NODE_STATE["tunnels"] = states
 
 
